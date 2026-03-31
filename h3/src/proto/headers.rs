@@ -10,8 +10,117 @@ use http::{
     uri::{self, Authority, Parts, PathAndQuery, Scheme, Uri},
     Extensions, HeaderMap, Method, StatusCode,
 };
+use smallvec::SmallVec;
 
 use crate::{ext::Protocol, qpack::HeaderField};
+
+define_enum_with_values! {
+    /// Represents the order of HTTP/3 pseudo-header fields in the header block.
+    ///
+    /// HTTP/3 pseudo-header fields are a set of predefined header fields that start with ':'.
+    /// The order of these fields in a header block is significant for fingerprinting purposes.
+    /// This enum defines the possible pseudo-header fields and their default order.
+    @U8
+    pub enum PseudoId {
+        /// The `:method` pseudo-header field.
+        Method => 0x0001,
+        /// The `:scheme` pseudo-header field.
+        Scheme => 0x0002,
+        /// The `:authority` pseudo-header field.
+        Authority => 0x0003,
+        /// The `:path` pseudo-header field.
+        Path => 0x0004,
+        /// The `:protocol` pseudo-header field.
+        Protocol => 0x0005,
+        /// The `:status` pseudo-header field.
+        Status => 0x0006,
+    }
+}
+
+/// Represents the order of HTTP/3 pseudo-header fields in a header block.
+///
+/// This structure maintains an ordered list of pseudo-header fields (such as `:method`, `:scheme`, etc.)
+/// for use when encoding HTTP/3 header blocks. The order of pseudo-headers can be configured to match
+/// specific browser fingerprints (e.g. Chrome uses "masp" = Method, Authority, Scheme, Path;
+/// Firefox uses "msap" = Method, Scheme, Authority, Path).
+///
+/// Typically, a `PseudoOrder` is constructed using the [`PseudoOrderBuilder`] to enforce uniqueness
+/// and correct ordering.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct PseudoOrder {
+    ids: SmallVec<[PseudoId; PseudoId::DEFAULT_STACK_SIZE]>,
+}
+
+/// A builder for constructing a [`PseudoOrder`].
+#[derive(Debug)]
+pub struct PseudoOrderBuilder {
+    ids: SmallVec<[PseudoId; PseudoId::DEFAULT_STACK_SIZE]>,
+    mask: u8,
+}
+
+// ===== impl PseudoOrder =====
+
+impl PseudoOrder {
+    /// Creates a new [`PseudoOrderBuilder`].
+    #[inline]
+    pub fn builder() -> PseudoOrderBuilder {
+        PseudoOrderBuilder {
+            ids: SmallVec::new(),
+            mask: 0,
+        }
+    }
+}
+
+impl Default for PseudoOrder {
+    #[inline]
+    fn default() -> Self {
+        PseudoOrder {
+            ids: SmallVec::from(PseudoId::DEFAULT_IDS),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a PseudoOrder {
+    type Item = &'a PseudoId;
+    type IntoIter = std::slice::Iter<'a, PseudoId>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.ids.iter()
+    }
+}
+
+// ===== impl PseudoOrderBuilder =====
+
+impl PseudoOrderBuilder {
+    /// Pushes a pseudo-header ID to the order, ignoring duplicates.
+    pub fn push(mut self, id: PseudoId) -> Self {
+        let mask_id = id.mask_id();
+        if mask_id != 0 {
+            if self.mask & mask_id == 0 {
+                self.mask |= mask_id;
+                self.ids.push(id);
+            }
+        }
+        self
+    }
+
+    /// Extends the order with multiple pseudo-header IDs.
+    pub fn extend(mut self, iter: impl IntoIterator<Item = PseudoId>) -> Self {
+        for id in iter {
+            self = self.push(id);
+        }
+        self
+    }
+
+    /// Builds the [`PseudoOrder`], filling in any missing IDs from the default order.
+    pub fn build(mut self) -> PseudoOrder {
+        if self.ids.len() != PseudoId::DEFAULT_IDS.len() {
+            self = self.extend(PseudoId::DEFAULT_IDS);
+        }
+        PseudoOrder { ids: self.ids }
+    }
+}
 
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq, Clone))]
@@ -129,6 +238,11 @@ impl Header {
         self.pseudo.len() + self.fields.len()
     }
 
+    /// Sets the pseudo-header field order for this header block.
+    pub fn set_pseudo_order(&mut self, order: PseudoOrder) {
+        self.pseudo.order = order;
+    }
+
     #[cfg(test)]
     pub(crate) fn authory_mut(&mut self) -> &mut Option<Authority> {
         &mut self.pseudo.authority
@@ -161,28 +275,39 @@ impl Iterator for HeaderIter {
         //# All pseudo-header fields MUST appear in the header section before
         //# regular header fields.
         if let Some(ref mut pseudo) = self.pseudo {
-            if let Some(method) = pseudo.method.take() {
-                return Some((":method", method.as_str()).into());
-            }
-
-            if let Some(scheme) = pseudo.scheme.take() {
-                return Some((":scheme", scheme.as_str().as_bytes()).into());
-            }
-
-            if let Some(authority) = pseudo.authority.take() {
-                return Some((":authority", authority.as_str().as_bytes()).into());
-            }
-
-            if let Some(path) = pseudo.path.take() {
-                return Some((":path", path.as_str().as_bytes()).into());
-            }
-
-            if let Some(status) = pseudo.status.take() {
-                return Some((":status", status.as_str()).into());
-            }
-
-            if let Some(protocol) = pseudo.protocol.take() {
-                return Some((":protocol", protocol.as_str().as_bytes()).into());
+            for pseudo_type in &pseudo.order {
+                match pseudo_type {
+                    PseudoId::Method => {
+                        if let Some(method) = pseudo.method.take() {
+                            return Some((":method", method.as_str()).into());
+                        }
+                    }
+                    PseudoId::Scheme => {
+                        if let Some(scheme) = pseudo.scheme.take() {
+                            return Some((":scheme", scheme.as_str().as_bytes()).into());
+                        }
+                    }
+                    PseudoId::Authority => {
+                        if let Some(authority) = pseudo.authority.take() {
+                            return Some((":authority", authority.as_str().as_bytes()).into());
+                        }
+                    }
+                    PseudoId::Path => {
+                        if let Some(path) = pseudo.path.take() {
+                            return Some((":path", path.as_str().as_bytes()).into());
+                        }
+                    }
+                    PseudoId::Status => {
+                        if let Some(status) = pseudo.status.take() {
+                            return Some((":status", status.as_str()).into());
+                        }
+                    }
+                    PseudoId::Protocol => {
+                        if let Some(protocol) = pseudo.protocol.take() {
+                            return Some((":protocol", protocol.as_str().as_bytes()).into());
+                        }
+                    }
+                }
             }
         }
 
@@ -345,6 +470,9 @@ struct Pseudo {
 
     protocol: Option<Protocol>,
 
+    // Pseudo-header field order
+    order: PseudoOrder,
+
     len: usize,
 }
 
@@ -404,6 +532,9 @@ impl Pseudo {
         //# All HTTP/3 requests MUST include exactly one value for the :method,
         //# :scheme, and :path pseudo-header fields, unless the request is a
         //# CONNECT request; see Section 4.4.
+        // Extract pseudo-header order from extensions, if provided.
+        let order = ext.get::<PseudoOrder>().cloned().unwrap_or_default();
+
         Self {
             method: Some(method),
             scheme,
@@ -411,6 +542,7 @@ impl Pseudo {
             path,
             status: None,
             protocol,
+            order,
             len,
         }
     }
@@ -427,8 +559,9 @@ impl Pseudo {
             authority: None,
             path: None,
             status: Some(status),
-            len: 1,
             protocol: None,
+            order: Default::default(),
+            len: 1,
         }
     }
 
@@ -640,6 +773,110 @@ mod tests {
                 name: std::borrow::Cow::Borrowed(b"other-header"),
                 value: std::borrow::Cow::Borrowed(b"other-header-value")
             },]
+        );
+    }
+
+    #[test]
+    fn test_pseudo_order_default() {
+        let order = PseudoOrder::builder().build();
+        assert_eq!(order.ids.len(), PseudoId::DEFAULT_STACK_SIZE);
+        assert_eq!(order.ids.as_slice(), PseudoId::DEFAULT_IDS);
+    }
+
+    #[test]
+    fn test_pseudo_order_duplicate() {
+        let order = PseudoOrder::builder()
+            .push(PseudoId::Scheme)
+            .push(PseudoId::Scheme)
+            .build();
+
+        assert_eq!(order.ids.len(), PseudoId::DEFAULT_IDS.len());
+        assert_eq!(order.ids[0], PseudoId::Scheme);
+        assert_ne!(order.ids[1], PseudoId::Scheme);
+    }
+
+    #[test]
+    fn test_pseudo_order_custom_chrome_masp() {
+        // Chrome uses "masp" order: Method, Authority, Scheme, Path
+        let order = PseudoOrder::builder()
+            .push(PseudoId::Method)
+            .push(PseudoId::Authority)
+            .push(PseudoId::Scheme)
+            .push(PseudoId::Path)
+            .build();
+
+        let mut headers = Header::request(
+            Method::GET,
+            Uri::from_static("https://example.com/test"),
+            HeaderMap::new(),
+            Extensions::default(),
+        )
+        .unwrap();
+        headers.set_pseudo_order(order);
+
+        let pseudo_fields: Vec<_> = headers
+            .into_iter()
+            .filter(|h| h.name.as_ref().starts_with(b":"))
+            .map(|h| String::from_utf8_lossy(h.name.as_ref()).into_owned())
+            .collect();
+
+        assert_eq!(
+            pseudo_fields,
+            vec![":method", ":authority", ":scheme", ":path"]
+        );
+    }
+
+    #[test]
+    fn test_pseudo_order_custom_firefox_msap() {
+        // Firefox uses "msap" order: Method, Scheme, Authority, Path
+        let order = PseudoOrder::builder()
+            .push(PseudoId::Method)
+            .push(PseudoId::Scheme)
+            .push(PseudoId::Authority)
+            .push(PseudoId::Path)
+            .build();
+
+        let mut headers = Header::request(
+            Method::GET,
+            Uri::from_static("https://example.com/test"),
+            HeaderMap::new(),
+            Extensions::default(),
+        )
+        .unwrap();
+        headers.set_pseudo_order(order);
+
+        let pseudo_fields: Vec<_> = headers
+            .into_iter()
+            .filter(|h| h.name.as_ref().starts_with(b":"))
+            .map(|h| String::from_utf8_lossy(h.name.as_ref()).into_owned())
+            .collect();
+
+        assert_eq!(
+            pseudo_fields,
+            vec![":method", ":scheme", ":authority", ":path"]
+        );
+    }
+
+    #[test]
+    fn test_pseudo_order_default_unchanged() {
+        // Default order should match the original hardcoded behavior
+        let headers = Header::request(
+            Method::GET,
+            Uri::from_static("https://example.com/test"),
+            HeaderMap::new(),
+            Extensions::default(),
+        )
+        .unwrap();
+
+        let pseudo_fields: Vec<_> = headers
+            .into_iter()
+            .filter(|h| h.name.as_ref().starts_with(b":"))
+            .map(|h| String::from_utf8_lossy(h.name.as_ref()).into_owned())
+            .collect();
+
+        assert_eq!(
+            pseudo_fields,
+            vec![":method", ":scheme", ":authority", ":path"]
         );
     }
 }

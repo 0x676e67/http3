@@ -1,3 +1,5 @@
+#[macro_use]
+mod macros;
 pub mod coding;
 #[allow(dead_code)]
 pub mod frame;
