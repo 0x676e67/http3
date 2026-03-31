@@ -1,4 +1,5 @@
 use bytes::{Buf, BufMut, Bytes};
+use smallvec::SmallVec;
 use std::{
     convert::TryInto,
     fmt::{self, Debug},
@@ -457,19 +458,17 @@ setting_identifiers! {
     WEBTRANSPORT_MAX_SESSIONS = 0x2b603743,
 }
 
-const SETTINGS_LEN: usize = 8;
+const SETTINGS_INLINE: usize = 16;
 
 #[derive(Debug, PartialEq)]
 pub struct Settings {
-    entries: [(SettingId, u64); SETTINGS_LEN],
-    len: usize,
+    entries: SmallVec<[(SettingId, u64); SETTINGS_INLINE]>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            entries: [(SettingId::NONE, 0); SETTINGS_LEN],
-            len: 0,
+            entries: SmallVec::new(),
         }
     }
 }
@@ -477,44 +476,35 @@ impl Default for Settings {
 impl FrameHeader for Settings {
     const TYPE: FrameType = FrameType::SETTINGS;
     fn len(&self) -> usize {
-        self.entries[..self.len].iter().fold(0, |len, (id, val)| {
+        self.entries.iter().fold(0, |len, (id, val)| {
             len + VarInt::from_u64(id.0).unwrap().size() + VarInt::from_u64(*val).unwrap().size()
         })
     }
 }
 
 impl Settings {
-    pub const MAX_ENCODED_SIZE: usize = SETTINGS_LEN * 2 * VarInt::MAX_SIZE;
-
     pub fn insert(&mut self, id: SettingId, value: u64) -> Result<(), SettingsError> {
-        if self.len >= self.entries.len() {
-            return Err(SettingsError::Exceeded);
-        }
-
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
         //# The same setting identifier MUST NOT occur more than once in the
         //# SETTINGS frame.
-        if self.entries[..self.len].iter().any(|(i, _)| *i == id) {
+        if self.entries.iter().any(|(i, _)| *i == id) {
             return Err(SettingsError::Repeated(id));
         }
 
-        self.entries[self.len] = (id, value);
-        self.len += 1;
+        self.entries.push((id, value));
         Ok(())
     }
 
     pub fn get(&self, id: SettingId) -> Option<u64> {
-        for (entry_id, value) in self.entries.iter() {
-            if id == *entry_id {
-                return Some(*value);
-            }
-        }
-        None
+        self.entries
+            .iter()
+            .find(|(entry_id, _)| *entry_id == id)
+            .map(|(_, value)| *value)
     }
 
     pub(crate) fn encode<T: BufMut>(&self, buf: &mut T) {
         self.encode_header(buf);
-        for (id, val) in self.entries[..self.len].iter() {
+        for (id, val) in self.entries.iter() {
             id.encode(buf);
             buf.write_var(*val);
         }
@@ -563,7 +553,6 @@ impl Settings {
 
 #[derive(Debug, PartialEq)]
 pub enum SettingsError {
-    Exceeded,
     Malformed,
     Repeated(SettingId),
     InvalidSettingId(u64),
@@ -575,10 +564,6 @@ impl std::error::Error for SettingsError {}
 impl fmt::Display for SettingsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SettingsError::Exceeded => write!(
-                f,
-                "max settings number exceeded, check for duplicate entries"
-            ),
             SettingsError::Malformed => write!(f, "malformed settings frame"),
             SettingsError::Repeated(id) => write!(f, "got setting 0x{:x} twice", id.0),
             SettingsError::InvalidSettingId(id) => write!(f, "setting id 0x{:x} is invalid", id),
@@ -659,37 +644,36 @@ mod tests {
 
     #[test]
     fn settings_frame() {
+        let mut send_settings = Settings::default();
+        send_settings
+            .insert(SettingId::MAX_HEADER_LIST_SIZE, 0xfad1)
+            .unwrap();
+        send_settings
+            .insert(SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2)
+            .unwrap();
+        send_settings
+            .insert(SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3)
+            .unwrap();
+        send_settings.insert(SettingId(95), 0).unwrap();
+
+        // Decoded settings will not contain the unknown SettingId(95)
+        let mut recv_settings = Settings::default();
+        recv_settings
+            .insert(SettingId::MAX_HEADER_LIST_SIZE, 0xfad1)
+            .unwrap();
+        recv_settings
+            .insert(SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2)
+            .unwrap();
+        recv_settings
+            .insert(SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3)
+            .unwrap();
+
         codec_frame_check(
-            Frame::Settings(Settings {
-                entries: [
-                    (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
-                    (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
-                    (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
-                    (SettingId(95), 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                ],
-                len: 4,
-            }),
+            Frame::Settings(send_settings),
             &[
                 4, 18, 6, 128, 0, 250, 209, 1, 128, 0, 250, 210, 7, 128, 0, 250, 211, 64, 95, 0,
             ],
-            Frame::Settings(Settings {
-                entries: [
-                    (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
-                    (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
-                    (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
-                    // check without the Grease setting because this is ignored
-                    (SettingId(0), 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                ],
-                len: 3,
-            }),
+            Frame::Settings(recv_settings),
         );
     }
 

@@ -3,7 +3,7 @@ use std::convert::TryFrom;
 use crate::proto::{frame, varint::VarInt};
 
 /// Configures the HTTP/3 connection
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Config {
     /// Just like in HTTP/2, HTTP/3 also uses the concept of "grease"
@@ -14,6 +14,18 @@ pub struct Config {
 
     #[cfg(test)]
     pub(crate) send_settings: bool,
+
+    /// When set, controls the exact order of settings in the SETTINGS frame.
+    /// Each entry in the list specifies a SettingId whose value will be resolved
+    /// from known settings fields or `extra_settings`. When `None`, the default
+    /// insertion order is used.
+    pub(crate) settings_order: Option<Vec<frame::SettingId>>,
+
+    /// Arbitrary (id, value) setting entries for browser-specific unknown settings
+    /// or controlled GREASE. These are used when `settings_order` references IDs
+    /// not covered by the known `Settings` fields, or appended at the end in
+    /// default mode.
+    pub(crate) extra_settings: Vec<(frame::SettingId, u64)>,
 
     /// HTTP/3 Settings
     pub settings: Settings,
@@ -69,66 +81,101 @@ impl From<&frame::Settings> for Settings {
     }
 }
 
+impl Config {
+    /// Resolve the value for a given setting ID from known settings fields
+    /// or extra_settings.
+    fn resolve_setting_value(&self, id: &frame::SettingId) -> Option<u64> {
+        match *id {
+            frame::SettingId::MAX_HEADER_LIST_SIZE => {
+                Some(self.settings.max_field_section_size)
+            }
+            frame::SettingId::ENABLE_CONNECT_PROTOCOL => {
+                Some(self.settings.enable_extended_connect as u64)
+            }
+            frame::SettingId::ENABLE_WEBTRANSPORT => {
+                Some(self.settings.enable_webtransport as u64)
+            }
+            frame::SettingId::H3_DATAGRAM => {
+                Some(self.settings.enable_datagram as u64)
+            }
+            frame::SettingId::WEBTRANSPORT_MAX_SESSIONS => {
+                Some(self.settings.max_webtransport_sessions)
+            }
+            _ => self
+                .extra_settings
+                .iter()
+                .find(|(sid, _)| sid == id)
+                .map(|(_, v)| *v),
+        }
+    }
+}
+
 impl TryFrom<Config> for frame::Settings {
     type Error = frame::SettingsError;
     fn try_from(value: Config) -> Result<Self, Self::Error> {
         let mut settings = frame::Settings::default();
 
-        let Config {
-            send_grease,
-            #[cfg(test)]
-                send_settings: _,
-            settings:
-                Settings {
-                    max_field_section_size,
-                    enable_webtransport,
-                    enable_extended_connect,
-                    enable_datagram,
-                    max_webtransport_sessions,
-                },
-        } = value;
-
-        if send_grease {
-            //  Grease Settings (https://www.rfc-editor.org/rfc/rfc9114.html#name-defined-settings-parameters)
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
-            //# Setting identifiers of the format 0x1f * N + 0x21 for non-negative
-            //# integer values of N are reserved to exercise the requirement that
-            //# unknown identifiers be ignored.  Such settings have no defined
-            //# meaning.  Endpoints SHOULD include at least one such setting in their
-            //# SETTINGS frame.
-
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
-            //# Setting identifiers that were defined in [HTTP/2] where there is no
-            //# corresponding HTTP/3 setting have also been reserved
-            //# (Section 11.2.2).  These reserved settings MUST NOT be sent, and
-            //# their receipt MUST be treated as a connection error of type
-            //# H3_SETTINGS_ERROR.
-            match settings.insert(frame::SettingId::grease(), 0) {
-                Ok(_) => (),
-                Err(_err) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!("Error when adding the grease Setting. Reason {}", _err);
+        if let Some(ref order) = value.settings_order {
+            // Impersonation mode: insert settings in the exact specified order.
+            // GREASE and extra settings are placed wherever the caller put them
+            // in the order list — `send_grease` is ignored in this mode.
+            for id in order {
+                if let Some(val) = value.resolve_setting_value(id) {
+                    settings.insert(*id, val)?;
                 }
             }
-        }
+        } else {
+            // Default mode: existing behavior.
+            if value.send_grease {
+                //  Grease Settings (https://www.rfc-editor.org/rfc/rfc9114.html#name-defined-settings-parameters)
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
+                //# Setting identifiers of the format 0x1f * N + 0x21 for non-negative
+                //# integer values of N are reserved to exercise the requirement that
+                //# unknown identifiers be ignored.  Such settings have no defined
+                //# meaning.  Endpoints SHOULD include at least one such setting in their
+                //# SETTINGS frame.
 
-        settings.insert(
-            frame::SettingId::MAX_HEADER_LIST_SIZE,
-            max_field_section_size,
-        )?;
-        settings.insert(
-            frame::SettingId::ENABLE_CONNECT_PROTOCOL,
-            enable_extended_connect as u64,
-        )?;
-        settings.insert(
-            frame::SettingId::ENABLE_WEBTRANSPORT,
-            enable_webtransport as u64,
-        )?;
-        settings.insert(frame::SettingId::H3_DATAGRAM, enable_datagram as u64)?;
-        settings.insert(
-            frame::SettingId::WEBTRANSPORT_MAX_SESSIONS,
-            max_webtransport_sessions,
-        )?;
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
+                //# Setting identifiers that were defined in [HTTP/2] where there is no
+                //# corresponding HTTP/3 setting have also been reserved
+                //# (Section 11.2.2).  These reserved settings MUST NOT be sent, and
+                //# their receipt MUST be treated as a connection error of type
+                //# H3_SETTINGS_ERROR.
+                match settings.insert(frame::SettingId::grease(), 0) {
+                    Ok(_) => (),
+                    Err(_err) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!("Error when adding the grease Setting. Reason {}", _err);
+                    }
+                }
+            }
+
+            settings.insert(
+                frame::SettingId::MAX_HEADER_LIST_SIZE,
+                value.settings.max_field_section_size,
+            )?;
+            settings.insert(
+                frame::SettingId::ENABLE_CONNECT_PROTOCOL,
+                value.settings.enable_extended_connect as u64,
+            )?;
+            settings.insert(
+                frame::SettingId::ENABLE_WEBTRANSPORT,
+                value.settings.enable_webtransport as u64,
+            )?;
+            settings.insert(
+                frame::SettingId::H3_DATAGRAM,
+                value.settings.enable_datagram as u64,
+            )?;
+            settings.insert(
+                frame::SettingId::WEBTRANSPORT_MAX_SESSIONS,
+                value.settings.max_webtransport_sessions,
+            )?;
+
+            // Append extra settings at the end in default mode
+            for (id, val) in &value.extra_settings {
+                settings.insert(*id, *val)?;
+            }
+        }
 
         Ok(settings)
     }
@@ -173,6 +220,8 @@ impl Default for Config {
             send_grease: true,
             #[cfg(test)]
             send_settings: true,
+            settings_order: None,
+            extra_settings: Vec::new(),
             settings: Default::default(),
         }
     }

@@ -11,6 +11,7 @@ use crate::{
     config::Config,
     connection::ConnectionInner,
     error::ConnectionError,
+    proto::frame::SettingId,
     quic::{self},
     shared_state::SharedState,
 };
@@ -111,6 +112,28 @@ impl Builder {
         self
     }
 
+    /// Set the exact order of settings in the SETTINGS frame.
+    ///
+    /// Each `SettingId` in the list will be encoded in that order. Values are
+    /// resolved from known config settings (e.g. `max_field_section_size`) or
+    /// from entries added via [`extra_setting`](Self::extra_setting).
+    ///
+    /// When set, `send_grease` is ignored — place GREASE entries explicitly
+    /// in the order via `extra_setting`.
+    pub fn settings_order(&mut self, order: Vec<SettingId>) -> &mut Self {
+        self.config.settings_order = Some(order);
+        self
+    }
+
+    /// Add an arbitrary (id, value) setting entry.
+    ///
+    /// Used for browser-specific unknown settings, controlled GREASE, or any
+    /// setting ID not covered by the typed builder methods.
+    pub fn extra_setting(&mut self, id: SettingId, value: u64) -> &mut Self {
+        self.config.extra_settings.push((id, value));
+        self
+    }
+
     /// Create a new HTTP/3 client from a `quic` connection
     pub async fn build<C, O, B>(
         &mut self,
@@ -125,14 +148,16 @@ impl Builder {
         let shared = SharedState::default();
 
         let conn_state = Arc::new(shared);
+        let max_field_section_size = self.config.settings.max_field_section_size;
+        let send_grease_frame = self.config.send_grease;
 
-        let inner = ConnectionInner::new(quic, conn_state.clone(), self.config).await?;
+        let inner = ConnectionInner::new(quic, conn_state.clone(), self.config.clone()).await?;
         let send_request = SendRequest {
             open,
             conn_state,
-            max_field_section_size: self.config.settings.max_field_section_size,
+            max_field_section_size,
             sender_count: Arc::new(AtomicUsize::new(1)),
-            send_grease_frame: self.config.send_grease,
+            send_grease_frame,
             _buf: PhantomData,
         };
 

@@ -152,7 +152,7 @@ where
             return Ok(());
         }
 
-        let settings = frame::Settings::try_from(self.config).map_err(|_err| {
+        let settings = frame::Settings::try_from(self.config.clone()).map_err(|_err| {
             // TODO: converting a config to settings should never fail
             //       it should be impossible to construct a config which cannot be represented as settings
             self.handle_connection_error(InternalConnectionError::new(
@@ -311,10 +311,10 @@ where
             pending_recv_streams: Vec::with_capacity(3),
             got_peer_settings: false,
             send_grease_frame: config.send_grease,
-            config,
-            accepted_streams: Default::default(),
             // send grease stream if configured
             send_grease_stream_flag: config.send_grease,
+            config,
+            accepted_streams: Default::default(),
             // start at first step
             grease_step: GreaseStatus::NotStarted(PhantomData),
         };

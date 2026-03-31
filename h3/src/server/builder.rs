@@ -131,9 +131,10 @@ impl Builder {
         let (sender, receiver) = mpsc::unbounded_channel();
         let shared = SharedState::default();
 
+        let max_field_section_size = self.config.settings.max_field_section_size;
         Ok(Connection {
-            inner: ConnectionInner::new(conn, Arc::new(shared), self.config).await?,
-            max_field_section_size: self.config.settings.max_field_section_size,
+            inner: ConnectionInner::new(conn, Arc::new(shared), self.config.clone()).await?,
+            max_field_section_size,
             request_end_send: sender,
             request_end_recv: receiver,
             ongoing_streams: HashSet::new(),

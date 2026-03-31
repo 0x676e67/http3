@@ -40,7 +40,9 @@ where
     Ok(())
 }
 
-const WRITE_BUF_ENCODE_SIZE: usize = StreamType::MAX_ENCODED_SIZE + Frame::MAX_ENCODED_SIZE;
+// Must be large enough to encode a full SETTINGS frame (stream type + frame header + all entries).
+// 16 settings × 16 bytes each (worst-case varint) + stream type + frame header = ~272 bytes.
+const WRITE_BUF_ENCODE_SIZE: usize = 512;
 
 /// Wrap frames to encode their header on the stack before sending them on the wire
 ///
