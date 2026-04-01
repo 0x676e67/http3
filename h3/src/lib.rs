@@ -55,6 +55,7 @@ mod stream;
 #[cfg(not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"))]
 mod webtransport;
 
+pub use proto::frame::SettingId;
 pub use proto::headers::{PseudoId, PseudoOrder, PseudoOrderBuilder};
 
 #[cfg(test)]
