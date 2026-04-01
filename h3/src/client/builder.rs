@@ -136,8 +136,8 @@ impl Builder {
     /// resolved from known config settings (e.g. `max_field_section_size`) or
     /// from entries added via [`extra_setting`](Self::extra_setting).
     ///
-    /// When set, `send_grease` is ignored — place GREASE entries explicitly
-    /// in the order via `extra_setting`.
+    /// When `send_grease` is enabled (the default), a GREASE entry is always
+    /// appended after all ordered settings — do not include it in this list.
     pub fn settings_order(&mut self, order: Vec<SettingId>) -> &mut Self {
         self.config.settings_order = Some(order);
         self

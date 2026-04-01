@@ -139,8 +139,6 @@ impl TryFrom<Config> for frame::Settings {
 
         if let Some(ref order) = value.settings_order {
             // Impersonation mode: insert settings in the exact specified order.
-            // GREASE and extra settings are placed wherever the caller put them
-            // in the order list — `send_grease` is ignored in this mode.
             for id in order {
                 if let Some(val) = value.resolve_setting_value(id) {
                     settings.insert(*id, val)?;
@@ -148,30 +146,6 @@ impl TryFrom<Config> for frame::Settings {
             }
         } else {
             // Default mode: existing behavior.
-            if value.send_grease {
-                //  Grease Settings (https://www.rfc-editor.org/rfc/rfc9114.html#name-defined-settings-parameters)
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
-                //# Setting identifiers of the format 0x1f * N + 0x21 for non-negative
-                //# integer values of N are reserved to exercise the requirement that
-                //# unknown identifiers be ignored.  Such settings have no defined
-                //# meaning.  Endpoints SHOULD include at least one such setting in their
-                //# SETTINGS frame.
-
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
-                //# Setting identifiers that were defined in [HTTP/2] where there is no
-                //# corresponding HTTP/3 setting have also been reserved
-                //# (Section 11.2.2).  These reserved settings MUST NOT be sent, and
-                //# their receipt MUST be treated as a connection error of type
-                //# H3_SETTINGS_ERROR.
-                match settings.insert(frame::SettingId::grease(), 0) {
-                    Ok(_) => (),
-                    Err(_err) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!("Error when adding the grease Setting. Reason {}", _err);
-                    }
-                }
-            }
-
             settings.insert(
                 frame::SettingId::MAX_HEADER_LIST_SIZE,
                 value.settings.max_field_section_size,
@@ -204,6 +178,36 @@ impl TryFrom<Config> for frame::Settings {
             // Append extra settings at the end in default mode
             for (id, val) in &value.extra_settings {
                 settings.insert(*id, *val)?;
+            }
+        }
+
+        //  Grease Settings (https://www.rfc-editor.org/rfc/rfc9114.html#name-defined-settings-parameters)
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
+        //# Setting identifiers of the format 0x1f * N + 0x21 for non-negative
+        //# integer values of N are reserved to exercise the requirement that
+        //# unknown identifiers be ignored.  Such settings have no defined
+        //# meaning.  Endpoints SHOULD include at least one such setting in their
+        //# SETTINGS frame.
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
+        //# Setting identifiers that were defined in [HTTP/2] where there is no
+        //# corresponding HTTP/3 setting have also been reserved
+        //# (Section 11.2.2).  These reserved settings MUST NOT be sent, and
+        //# their receipt MUST be treated as a connection error of type
+        //# H3_SETTINGS_ERROR.
+
+        // GREASE is always appended last, matching Chromium's behavior.
+        // The value is a random u32, matching Chromium's implementation:
+        //   uint32_t result;
+        //   QuicRandom::GetInstance()->RandBytes(&result, sizeof(result));
+        //   settings.values[setting_id] = result;
+        if value.send_grease {
+            match settings.insert(frame::SettingId::grease(), fastrand::u32(..) as u64) {
+                Ok(_) => (),
+                Err(_err) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!("Error when adding the grease Setting. Reason {}", _err);
+                }
             }
         }
 

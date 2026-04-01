@@ -392,10 +392,11 @@ pub struct SettingId(pub u64);
 impl SettingId {
     const NONE: SettingId = SettingId(0);
 
-    /// returns a SettingId type with random number of the 0x1f * N + 0x21
-    /// format within the range of the Varint implementation
+    /// Returns a SettingId with a random number of the `0x1f * N + 0x21`
+    /// format. The multiplier N is bounded to a u32, matching Chromium's
+    /// GREASE setting ID generation.
     pub fn grease() -> Self {
-        SettingId(fastrand::u64(0..0x210842108421083) * 0x1f + 0x21)
+        SettingId(fastrand::u32(..) as u64 * 0x1f + 0x21)
     }
 
     fn is_supported(self) -> bool {
