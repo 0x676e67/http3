@@ -318,6 +318,14 @@ where
             // start at first step
             grease_step: GreaseStatus::NotStarted(PhantomData),
         };
+
+        // Enable the QPACK dynamic-table decoder when the client advertises a
+        // non-zero table capacity.  The server may then use the dynamic table for
+        // response-header compression; we need a stateful decoder to handle it.
+        if conn_inner.config.settings.qpack_max_table_capacity > 0 {
+            *conn_inner.shared.qpack_decoder.write().unwrap() = Some(qpack::Decoder::default());
+        }
+
         conn_inner.send_control_stream_headers().await?;
 
         Ok(conn_inner)
@@ -509,16 +517,23 @@ where
         // check if a connection error occurred on a stream
         let _ = self.poll_connection_error(cx)?;
 
-        let recv = {
-            // TODO
-            self.poll_accept_recv(cx)?;
-            if let Some(v) = &mut self.control_recv {
-                v
-            } else {
-                // Try later
-                return Poll::Pending;
-            }
-        };
+        // Accept all pending unidirectional streams (control, QPACK encoder/decoder, …).
+        self.poll_accept_recv(cx)?;
+
+        if self.control_recv.is_none() {
+            // Control stream not yet received; try later.
+            return Poll::Pending;
+        }
+
+        // Process the QPACK encoder stream BEFORE blocking on the control stream.
+        // `ready!()` below returns Poll::Pending when the control stream has no new
+        // frame, so any code after that point is skipped in the common case.  The
+        // encoder stream is independent of the H3 control stream and must be drained
+        // every time we are polled so that dynamic-table updates are applied promptly
+        // and the QUIC-level waker for the encoder stream is re-registered.
+        self.poll_qpack_encoder(cx);
+
+        let recv = self.control_recv.as_mut().expect("checked above");
 
         let res = match ready!(recv.poll_next(cx)) {
             Err(FrameStreamError::Quic(StreamErrorIncoming::ConnectionErrorIncoming {
@@ -804,7 +819,124 @@ where
     pub fn accepted_streams_mut(&mut self) -> &mut AcceptedStreams<C, B> {
         &mut self.accepted_streams
     }
-}
+
+    /// Drive the QPACK encoder stream: read all available encoder instructions,
+    /// update the decoder dynamic table, queue InsertCountIncrement acks, and
+    /// flush any pending ack bytes to the decoder send stream.
+    ///
+    /// Must be called from the connection driver loop so the task waker is
+    /// registered on the encoder stream.  When new encoder data arrives,
+    /// the QUIC runtime wakes this task and `qpack_blocked_waker` is fired to
+    /// unblock any `recv_response` futures waiting on dynamic-table entries.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub(crate) fn poll_qpack_encoder(&mut self, cx: &mut Context<'_>) {
+        // Phase 1: drain all available data from the server's encoder stream
+        // into the stream's internal buffer, registering a waker for future data.
+        loop {
+            match &mut self.qpack_streams.encoder_recv {
+                Some(AcceptedRecvStream::Encoder(stream)) => {
+                    match stream.poll_read(cx) {
+                        Poll::Pending => break,
+                        Poll::Ready(Err(_)) => break,
+                        Poll::Ready(Ok(eos)) => {
+                            if eos {
+                                break;
+                            }
+                            // Data added to buffer; loop to drain more.
+                        }
+                    }
+                }
+                _ => return,
+            }
+        }
+
+        // Phase 2: process buffered encoder instructions with the dynamic decoder.
+        let mut ack_buf = BytesMut::new();
+        let mut any_instruction_processed = false;
+        if let Some(AcceptedRecvStream::Encoder(stream)) = &mut self.qpack_streams.encoder_recv {
+            let buf = stream.buf_mut();
+            let total = buf.remaining();
+            if total > 0 {
+                // parse_instruction inside on_encoder_recv uses
+                // std::io::Cursor::new(read.chunk()), which only sees the FIRST
+                // contiguous segment of a BufList.  Phase 1 may push each
+                // arriving QUIC packet as a separate Bytes chunk, so a QPACK
+                // encoder instruction that spans two packets would stall at the
+                // chunk boundary: parse_instruction returns Ok(None), the buffer
+                // is never drained, wake() fires on every poll, but the decoder
+                // table is never updated and decode_header keeps returning
+                // MissingRefs — a true deadlock.  Coalescing all buffered bytes
+                // into one contiguous Bytes removes the chunk boundary before
+                // handing control to on_encoder_recv.
+                let mut flat = {
+                    let mut tmp = BytesMut::with_capacity(total);
+                    while buf.has_remaining() {
+                        let n = {
+                            let chunk = buf.chunk();
+                            tmp.extend_from_slice(chunk);
+                            chunk.len()
+                        };
+                        buf.advance(n);
+                    }
+                    tmp.freeze()
+                };
+                {
+                    let mut dec_guard = self.shared.qpack_decoder.write().unwrap();
+                    if let Some(decoder) = dec_guard.as_mut() {
+                        let before = flat.remaining();
+                        let _ = decoder.on_encoder_recv(&mut flat, &mut ack_buf);
+                        // Only wake blocked streams when on_encoder_recv
+                        // actually consumed bytes (i.e. the table changed).
+                        any_instruction_processed = flat.remaining() < before;
+                    }
+                    // Lock released here, before waking blocked streams.
+                }
+                // Return any unprocessed bytes (partial instruction awaiting
+                // more network data) to the stream buffer so the next call
+                // can retry after Phase 1 adds the missing bytes.
+                if flat.has_remaining() {
+                    buf.push_bytes(&mut flat);
+                }
+            }
+        }
+
+        // Wake any recv_response/poll_recv_trailers futures that were parked on
+        // MissingRefs.  Do this AFTER releasing the decoder lock so the woken
+        // task can immediately acquire the lock to retry decoding.
+        if any_instruction_processed {
+            self.shared.qpack_blocked_waker.wake();
+        }
+
+        if !ack_buf.is_empty() {
+            self.shared
+                .qpack_pending_writes
+                .lock()
+                .unwrap()
+                .extend_from_slice(&ack_buf);
+        }
+
+        // Phase 3: flush pending ack bytes to the QPACK decoder send stream.
+        let to_send: Bytes = {
+            let mut pw = self.shared.qpack_pending_writes.lock().unwrap();
+            if pw.is_empty() {
+                return;
+            }
+            pw.split().freeze()
+        };
+
+        // Split into ≤ 512-byte chunks (WriteBuf internal-buffer limit).
+        let mut remaining = to_send.clone();
+        while remaining.has_remaining() {
+            let chunk_len = remaining.len().min(512);
+            let chunk = remaining.split_to(chunk_len);
+            if let Some(decoder_send) = &mut self.qpack_streams.decoder_send {
+                // Errors are ignored: if the decoder stream is gone the
+                // connection will likely close via another path.
+                let _ = decoder_send.send_data(chunk);
+            }
+        }
+    }
+} // end impl ConnectionInner
 
 #[allow(missing_docs)]
 pub struct RequestStream<S, B> {
@@ -986,27 +1118,76 @@ where
             }
         }
 
-        let qpack::Decoded { fields, .. } =
-            match qpack::decode_stateless(&mut trailers, self.max_field_section_size) {
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
-                //# An HTTP/3 implementation MAY impose a limit on the maximum size of
-                //# the message header it will accept on an individual HTTP message.
-                Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
+        let qpack::Decoded {
+            fields, dyn_ref: _, ..
+        } = {
+            // Try the stateful decoder first (dynamic table); fall back to
+            // stateless decoding when no decoder is configured.
+            //
+            // Register the waker INSIDE the decoder lock, serialising the
+            // registration with poll_qpack_encoder which releases the same
+            // lock before calling wake().  This prevents a lost-wakeup race.
+            let decode_result = {
+                let guard = self.conn_state.qpack_decoder.read().unwrap();
+                guard.as_ref().map(|d| {
+                    self.conn_state.qpack_blocked_waker.register(cx.waker());
+                    d.decode_header(&mut trailers.clone())
+                })
+            };
+            match decode_result {
+                Some(Ok(decoded)) => {
+                    if decoded.dyn_ref {
+                        let stream_id = self.stream.id().into_inner();
+                        let mut pw = self.conn_state.qpack_pending_writes.lock().unwrap();
+                        qpack::ack_header(stream_id, &mut *pw);
+                        self.conn_state.waker().wake();
+                    }
+                    decoded
+                }
+                Some(Err(qpack::DecoderError::MissingRefs(_))) => {
+                    // Dynamic table entry not yet available; waker already
+                    // registered above inside the lock.
+                    self.trailers = Some(trailers);
+                    return Poll::Pending;
+                }
+                Some(Err(qpack::DecoderError::HeaderTooLong(cancel_size))) => {
                     return Poll::Ready(Err(StreamError::HeaderTooBig {
                         actual_size: cancel_size,
                         max_size: self.max_field_section_size,
                     }));
                 }
-                Ok(decoded) => decoded,
-                Err(_e) => {
+                Some(Err(_e)) => {
                     return Poll::Ready(Err(self.handle_connection_error_on_stream(
                         InternalConnectionError {
                             code: Code::QPACK_DECOMPRESSION_FAILED,
                             message: "Failed to decode trailers".to_string(),
                         },
-                    )))
+                    )));
                 }
-            };
+                None => {
+                    match qpack::decode_stateless(&mut trailers, self.max_field_section_size) {
+                        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+                        //# An HTTP/3 implementation MAY impose a limit on the maximum size of
+                        //# the message header it will accept on an individual HTTP message.
+                        Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
+                            return Poll::Ready(Err(StreamError::HeaderTooBig {
+                                actual_size: cancel_size,
+                                max_size: self.max_field_section_size,
+                            }));
+                        }
+                        Ok(decoded) => decoded,
+                        Err(_e) => {
+                            return Poll::Ready(Err(self.handle_connection_error_on_stream(
+                                InternalConnectionError {
+                                    code: Code::QPACK_DECOMPRESSION_FAILED,
+                                    message: "Failed to decode trailers".to_string(),
+                                },
+                            )));
+                        }
+                    }
+                }
+            }
+        };
 
         Poll::Ready(Ok(Some(
             Header::try_from(fields)

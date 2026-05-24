@@ -2,12 +2,13 @@
 
 use std::{
     borrow::Cow,
-    sync::{atomic::AtomicBool, OnceLock},
+    sync::{atomic::AtomicBool, Mutex, OnceLock, RwLock},
 };
 
+use bytes::BytesMut;
 use futures_util::task::AtomicWaker;
 
-use crate::{config::Settings, error::internal_error::ErrorOrigin};
+use crate::{config::Settings, error::internal_error::ErrorOrigin, qpack};
 
 #[derive(Debug)]
 /// This struct represents the shared state of the h3 connection and the stream structs
@@ -20,6 +21,15 @@ pub struct SharedState {
     closing: AtomicBool,
     /// Waker for the connection
     waker: AtomicWaker,
+    /// QPACK dynamic-table decoder.  `Some` when qpack_max_table_capacity > 0.
+    /// Read lock: decode_header (&self).  Write lock: on_encoder_recv (&mut self).
+    pub(crate) qpack_decoder: RwLock<Option<qpack::Decoder>>,
+    /// Bytes queued for writing to the QPACK decoder send stream
+    /// (InsertCountIncrement + HeaderAck instructions).
+    pub(crate) qpack_pending_writes: Mutex<BytesMut>,
+    /// Waker for futures blocked on QPACK dynamic-table inserts
+    /// (i.e., `recv_response` waiting for MissingRefs to be resolved).
+    pub(crate) qpack_blocked_waker: AtomicWaker,
 }
 
 impl Default for SharedState {
@@ -29,6 +39,9 @@ impl Default for SharedState {
             connection_error: OnceLock::new(),
             closing: AtomicBool::new(false),
             waker: AtomicWaker::new(),
+            qpack_decoder: RwLock::new(None),
+            qpack_pending_writes: Mutex::new(BytesMut::new()),
+            qpack_blocked_waker: AtomicWaker::new(),
         }
     }
 }

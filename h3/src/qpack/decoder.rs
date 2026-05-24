@@ -82,10 +82,29 @@ pub struct Decoder {
     table: DynamicTable,
 }
 
+impl fmt::Debug for Decoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Decoder").finish_non_exhaustive()
+    }
+}
+
 impl Decoder {
     // Decode field lines received on Request of Push stream.
     // https://www.rfc-editor.org/rfc/rfc9204.html#name-field-line-representations
     pub fn decode_header<T: Buf>(&self, buf: &mut T) -> Result<Decoded, DecoderError> {
+        // When the dynamic table has not yet received a SetDynamicTableCapacity
+        // instruction (max_mem_size == 0), HeaderPrefix::get() returns (0, 0)
+        // regardless of the encoded_insert_count.  If the header block actually
+        // references the dynamic table (encoded_insert_count != 0, signalled by
+        // a non-zero first byte), we cannot decode it correctly until
+        // on_encoder_recv() has been called.  Return MissingRefs so the caller
+        // parks the stream and retries after more encoder data is available.
+        if self.table.max_mem_size() == 0 {
+            if buf.chunk().first().map_or(false, |&b| b != 0) {
+                return Err(DecoderError::MissingRefs(1));
+            }
+        }
+
         let (required_ref, base) = HeaderPrefix::decode(buf)?
             .get(self.table.total_inserted(), self.table.max_mem_size())?;
 
@@ -259,6 +278,14 @@ pub fn decode_stateless<T: Buf>(buf: &mut T, max_size: u64) -> Result<Decoded, D
         mem_size,
         dyn_ref: false,
     })
+}
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Self {
+            table: DynamicTable::new(),
+        }
+    }
 }
 
 #[cfg(test)]

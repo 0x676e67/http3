@@ -97,7 +97,7 @@ where
     /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_response(&mut self) -> Result<Response<()>, StreamError> {
-        let mut frame = future::poll_fn(|cx| self.inner.stream.poll_next(cx))
+        let frame = future::poll_fn(|cx| self.inner.stream.poll_next(cx))
             .await
             .map_err(|e| self.handle_frame_stream_error_on_request_stream(e))?
             .ok_or_else(|| {
@@ -123,8 +123,44 @@ where
         //# mismatch, it MUST respond with a connection error of type
         //# H3_GENERAL_PROTOCOL_ERROR.
 
-        let decoded = if let Frame::Headers(ref mut encoded) = frame {
-            match qpack::decode_stateless(encoded, self.inner.max_field_section_size) {
+        let decoded = if let Frame::Headers(ref encoded) = frame {
+            // Capture a cheap clone (Bytes is reference-counted) so we can
+            // re-decode after the dynamic-table decoder processes more encoder
+            // stream data (MissingRefs case).
+            let encoded_bytes = encoded.clone();
+            let max_size = self.inner.max_field_section_size;
+            let conn_state = self.inner.conn_state.clone();
+            let stream_id = self.inner.stream.id().into_inner();
+
+            let decoded = future::poll_fn(move |cx| {
+                let mut buf = encoded_bytes.clone();
+
+                // Acquire the decoder lock, register our waker INSIDE the lock,
+                // then attempt to decode.  Registering inside the lock serialises
+                // with poll_qpack_encoder which releases this same lock before
+                // calling qpack_blocked_waker.wake().  This prevents a
+                // lost-wakeup race where wake() fires between our decode check
+                // and our register() call, which would cause an infinite sleep.
+                let guard = conn_state.qpack_decoder.read().unwrap();
+                match guard.as_ref() {
+                    Some(decoder) => {
+                        conn_state.qpack_blocked_waker.register(cx.waker());
+                        match decoder.decode_header(&mut buf) {
+                            Ok(decoded) => Poll::Ready(Ok(decoded)),
+                            Err(qpack::DecoderError::MissingRefs(_)) => Poll::Pending,
+                            Err(e) => Poll::Ready(Err(e)),
+                        }
+                    }
+                    // No dynamic decoder — fall back to stateless decoding.
+                    None => {
+                        drop(guard);
+                        Poll::Ready(qpack::decode_stateless(&mut buf, max_size))
+                    }
+                }
+            })
+            .await;
+
+            match decoded {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
                 //# An HTTP/3 implementation MAY impose a limit on the maximum size of
                 //# the message header it will accept on an individual HTTP message.
@@ -135,7 +171,16 @@ where
                         max_size: self.inner.max_field_section_size,
                     });
                 }
-                Ok(decoded) => decoded,
+                Ok(decoded) => {
+                    // Send a header acknowledgement when the dynamic table was used.
+                    if decoded.dyn_ref {
+                        let mut pw = self.inner.conn_state.qpack_pending_writes.lock().unwrap();
+                        qpack::ack_header(stream_id, &mut *pw);
+                        // Wake the connection driver so it flushes the ack.
+                        self.inner.conn_state.waker().wake();
+                    }
+                    decoded
+                }
                 Err(_e) => {
                     return Err(
                         self.handle_connection_error_on_stream(InternalConnectionError {

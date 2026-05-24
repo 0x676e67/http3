@@ -214,6 +214,27 @@ where
     }
 }
 
+impl<B: Buf> From<bytes::Bytes> for WriteBuf<B> {
+    /// Wrap raw bytes (e.g., QPACK decoder-stream instructions) into a `WriteBuf`
+    /// without any H3 framing.  Panics if `bytes.len()` exceeds the internal
+    /// buffer size (512 B), which is far more than any batch of QPACK acks.
+    fn from(raw: bytes::Bytes) -> Self {
+        assert!(
+            raw.len() <= WRITE_BUF_ENCODE_SIZE,
+            "raw bytes too large for WriteBuf ({})",
+            raw.len()
+        );
+        let mut me = Self {
+            buf: [0; WRITE_BUF_ENCODE_SIZE],
+            len: raw.len(),
+            pos: 0,
+            frame: None,
+        };
+        me.buf[..raw.len()].copy_from_slice(&raw);
+        me
+    }
+}
+
 impl<B> Buf for WriteBuf<B>
 where
     B: Buf,
