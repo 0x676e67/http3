@@ -168,8 +168,6 @@ impl Builder {
         let shared = SharedState::default();
 
         let conn_state = Arc::new(shared);
-        let max_field_section_size = self.config.settings.max_field_section_size;
-        let send_grease_frame = self.config.send_grease;
 
         let inner = ConnectionInner::new(quic, conn_state.clone(), self.config.clone()).await?;
         let qpack_decoder = inner.qpack_decoder();
@@ -177,9 +175,9 @@ impl Builder {
             open,
             conn_state,
             qpack_decoder,
-            max_field_section_size,
+            max_field_section_size: self.config.settings.max_field_section_size,
             sender_count: Arc::new(AtomicUsize::new(1)),
-            send_grease_frame,
+            send_grease_frame: self.config.send_grease,
             _buf: PhantomData,
         };
 
