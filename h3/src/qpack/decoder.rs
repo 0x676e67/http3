@@ -83,6 +83,16 @@ pub struct Decoder {
 }
 
 impl Decoder {
+    pub(crate) fn new(
+        max_table_capacity: u64,
+        max_blocked_streams: u64,
+    ) -> Result<Self, DecoderError> {
+        let mut table = DynamicTable::new();
+        table.set_max_size(max_table_capacity.try_into()?)?;
+        table.set_max_blocked(max_blocked_streams.try_into()?)?;
+        Ok(Self { table })
+    }
+
     // Decode field lines received on Request of Push stream.
     // https://www.rfc-editor.org/rfc/rfc9204.html#name-field-line-representations
     pub fn decode_header<T: Buf>(&self, buf: &mut T) -> Result<Decoded, DecoderError> {

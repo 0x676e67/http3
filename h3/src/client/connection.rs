@@ -2,7 +2,7 @@
 
 use std::{
     marker::PhantomData,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{atomic::AtomicUsize, Arc, Mutex},
     task::{Context, Poll},
 };
 
@@ -113,6 +113,7 @@ where
 {
     pub(super) open: T,
     pub(super) conn_state: Arc<SharedState>,
+    pub(super) qpack_decoder: Arc<Mutex<qpack::Decoder>>,
     pub(super) max_field_section_size: u64, // maximum size for a header we receive
     // counts instances of SendRequest to close the connection when the last is dropped.
     pub(super) sender_count: Arc<AtomicUsize>,
@@ -220,6 +221,7 @@ where
                 self.max_field_section_size,
                 self.conn_state.clone(),
                 self.send_grease_frame,
+                Some(self.qpack_decoder.clone()),
             ),
         };
         // send the grease frame only once
@@ -239,6 +241,7 @@ where
 
         Self {
             conn_state: self.conn_state.clone(),
+            qpack_decoder: self.qpack_decoder.clone(),
             open: self.open.clone(),
             max_field_section_size: self.max_field_section_size,
             sender_count: self.sender_count.clone(),
@@ -377,6 +380,7 @@ where
 impl<C, B> Connection<C, B>
 where
     C: quic::Connection<B>,
+    C::SendStream: quic::SendStreamUnframed<B>,
     B: Buf,
 {
     /// Initiate a graceful shutdown, accepting `max_push` potentially in-flight server pushes
@@ -395,6 +399,14 @@ where
     /// Maintain the connection state until it is closed
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ConnectionError> {
+        if let Err(err) = self.inner.poll_accept_recv(cx) {
+            return Poll::Ready(err);
+        }
+
+        if let Poll::Ready(Err(err)) = self.inner.poll_qpack_encoder(cx) {
+            return Poll::Ready(err);
+        }
+
         while let Poll::Ready(result) = self.inner.poll_control(cx) {
             match result {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
