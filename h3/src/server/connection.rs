@@ -131,10 +131,9 @@ where
                 return Ok(None);
             }
         };
+        // send the grease frame only once
         self.inner.send_grease_frame = false;
         let resolver = self.create_resolver_internal(stream);
-
-        // send the grease frame only once
 
         Ok(Some(resolver))
     }
