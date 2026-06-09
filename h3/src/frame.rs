@@ -70,33 +70,33 @@ where
         );
 
         loop {
-            let end = self.try_recv(cx)?;
-
-            return match self.decoder.decode(self.stream.buf_mut())? {
+            match self.decoder.decode(self.stream.buf_mut())? {
                 Some(Frame::Data(PayloadLen(len))) => {
                     self.remaining_data = len;
-                    Poll::Ready(Ok(Some(Frame::Data(PayloadLen(len)))))
+                    return Poll::Ready(Ok(Some(Frame::Data(PayloadLen(len)))));
                 }
                 frame @ Some(Frame::WebTransportStream(_)) => {
                     self.remaining_data = usize::MAX;
-                    Poll::Ready(Ok(frame))
+                    return Poll::Ready(Ok(frame));
                 }
-                Some(frame) => Poll::Ready(Ok(Some(frame))),
-                None => match end {
-                    // Received a chunk but frame is incomplete, poll until we get `Pending`.
-                    Poll::Ready(false) => continue,
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(true) => {
-                        if self.stream.buf_mut().has_remaining() {
-                            // Reached the end of receive stream, but there is still some data:
-                            // The frame is incomplete.
-                            Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
-                        } else {
-                            Poll::Ready(Ok(None))
-                        }
+                Some(frame) => return Poll::Ready(Ok(Some(frame))),
+                None => {}
+            }
+
+            match self.try_recv(cx)? {
+                // Received a chunk but frame is incomplete, poll until we get `Pending`.
+                Poll::Ready(false) => continue,
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(true) => {
+                    if self.stream.buf_mut().has_remaining() {
+                        // Reached the end of receive stream, but there is still some data:
+                        // The frame is incomplete.
+                        return Poll::Ready(Err(FrameStreamError::UnexpectedEnd));
+                    } else {
+                        return Poll::Ready(Ok(None));
                     }
-                },
-            };
+                }
+            }
         }
     }
 
@@ -320,7 +320,13 @@ mod tests {
     use assert_matches::assert_matches;
     use bytes::{BufMut, Bytes, BytesMut};
     use futures_util::future::poll_fn;
-    use std::collections::VecDeque;
+    use std::{
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
     use crate::proto::{coding::Encode, frame::FrameType, varint::VarInt};
 
@@ -434,6 +440,26 @@ mod tests {
             Ok(Some(b)) if b.remaining() == 4
         );
         assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
+    }
+
+    #[tokio::test]
+    async fn poll_next_consumes_buffered_frame_before_reading_more() {
+        let mut recv = FakeRecv::default();
+        let reads = recv.reads();
+        let mut buf = BytesMut::with_capacity(64);
+
+        Frame::headers(&b"header"[..]).encode_with_payload(&mut buf);
+        Frame::headers(&b"trailer"[..]).encode_with_payload(&mut buf);
+        recv.chunk(buf.freeze());
+        recv.chunk(Bytes::from_static(b"unused"));
+
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+
+        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+
+        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -595,12 +621,17 @@ mod tests {
     #[derive(Default)]
     struct FakeRecv {
         chunks: VecDeque<Bytes>,
+        reads: Arc<AtomicUsize>,
     }
 
     impl FakeRecv {
         fn chunk(&mut self, buf: Bytes) -> &mut Self {
             self.chunks.push_back(buf);
             self
+        }
+
+        fn reads(&self) -> Arc<AtomicUsize> {
+            self.reads.clone()
         }
     }
 
@@ -611,6 +642,7 @@ mod tests {
             &mut self,
             _: &mut Context<'_>,
         ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
             Poll::Ready(Ok(self.chunks.pop_front()))
         }
 
