@@ -139,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // sending request results in a bidirectional stream,
         // which is also used for receiving response
-        let mut stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, _> =
+        let mut stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes, Bytes> =
             send_request.send_request(req).await?;
 
         // finish on the sending side
