@@ -1243,7 +1243,7 @@ where
             decoder
                 .lock()
                 .map_err(|_| qpack::DecoderError::UnknownPrefix(0))?
-                .decode_header(encoded)?
+                .decode_header_limited(encoded, self.max_field_section_size)?
         } else {
             qpack::decode_stateless(encoded, self.max_field_section_size)?
         };

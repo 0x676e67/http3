@@ -295,6 +295,7 @@ where
 /// #    -> JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>
 /// # where
 /// #    C: quic::Connection<B> + Send + 'static,
+/// #    C::SendStream: quic::SendStreamUnframed<B>,
 /// #    C::SendStream: Send + 'static,
 /// #    C::RecvStream: Send + 'static,
 /// #    B: Buf + Send + 'static,
@@ -320,6 +321,7 @@ where
 /// #    -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 /// # where
 /// #    C: quic::Connection<B> + Send + 'static,
+/// #    C::SendStream: quic::SendStreamUnframed<B>,
 /// #    C::SendStream: Send + 'static,
 /// #    C::RecvStream: Send + 'static,
 /// #    B: Buf + Send + 'static,
