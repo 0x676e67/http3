@@ -317,8 +317,8 @@ where
         //# request that the sender close the control stream.
         let decoder = Arc::new(Mutex::new(
             qpack::Decoder::new(
-                config.settings.qpack_max_table_capacity,
-                config.settings.qpack_blocked_streams,
+                config.settings.qpack_max_table_capacity.unwrap_or(0),
+                config.settings.qpack_blocked_streams.unwrap_or(0),
             )
             .map_err(|err| {
                 conn.close_raw_connection_with_h3_error(InternalConnectionError::new(
@@ -433,11 +433,11 @@ where
 
         // Get all currently pending streams
         loop {
+            //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+            //# An endpoint MUST allow its peer to create an encoder stream and a
+            //# decoder stream even if the connection's settings prevent their use.
             match self
                 .conn
-                //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
-                //# An endpoint MUST allow its peer to create an encoder stream and a
-                //# decoder stream even if the connection's settings prevent their use.
                 .poll_accept_recv(cx)
                 .map_err(|e| self.handle_connection_error(e))?
             {
@@ -556,7 +556,6 @@ where
         Ok(())
     }
 
-    #[allow(missing_docs)]
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_qpack_encoder(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectionError>>
     where

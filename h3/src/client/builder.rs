@@ -114,19 +114,21 @@ impl Builder {
 
     /// Set the QPACK dynamic table capacity the encoder is permitted to use, in bytes.
     ///
-    /// Sent as `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (0x1). A value of `0` (default)
-    /// means the encoder must not use the dynamic table.
+    /// Sent as `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (0x1). When this is not called,
+    /// the setting is omitted and the protocol default of `0` applies. Passing `0`
+    /// explicitly sends the setting with value `0`.
     pub fn qpack_max_table_capacity(&mut self, value: u64) -> &mut Self {
-        self.config.settings.qpack_max_table_capacity = value;
+        self.config.settings.qpack_max_table_capacity = Some(value);
         self
     }
 
     /// Set the maximum number of blocked streams the QPACK decoder is willing to tolerate.
     ///
-    /// Sent as `SETTINGS_QPACK_BLOCKED_STREAMS` (0x7). A value of `0` (default)
-    /// means the decoder does not support blocking.
+    /// Sent as `SETTINGS_QPACK_BLOCKED_STREAMS` (0x7). When this is not called,
+    /// the setting is omitted and the protocol default of `0` applies. Passing `0`
+    /// explicitly sends the setting with value `0`.
     pub fn qpack_blocked_streams(&mut self, value: u64) -> &mut Self {
-        self.config.settings.qpack_blocked_streams = value;
+        self.config.settings.qpack_blocked_streams = Some(value);
         self
     }
 
