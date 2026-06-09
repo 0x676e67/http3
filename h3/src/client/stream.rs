@@ -124,7 +124,7 @@ where
         //# H3_GENERAL_PROTOCOL_ERROR.
 
         let decoded = if let Frame::Headers(ref mut encoded) = frame {
-            match qpack::decode_stateless(encoded, self.inner.max_field_section_size) {
+            match self.inner.decode_header_block(encoded) {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
                 //# An HTTP/3 implementation MAY impose a limit on the maximum size of
                 //# the message header it will accept on an individual HTTP message.

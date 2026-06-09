@@ -131,11 +131,10 @@ where
                 return Ok(None);
             }
         };
-
+        self.inner.send_grease_frame = false;
         let resolver = self.create_resolver_internal(stream);
 
         // send the grease frame only once
-        self.inner.send_grease_frame = false;
 
         Ok(Some(resolver))
     }
@@ -150,6 +149,7 @@ where
             send_grease_frame: self.inner.send_grease_frame,
             max_field_section_size: self.max_field_section_size,
             shared: self.inner.shared.clone(),
+            qpack_decoder: self.inner.qpack_decoder(),
         }
     }
 
