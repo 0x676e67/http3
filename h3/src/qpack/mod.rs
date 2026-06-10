@@ -1,5 +1,5 @@
 pub use self::{
-    decoder::{decode_stateless, Decoded, Decoder, DecoderError},
+    decoder::{ack_header, decode_stateless, stream_canceled, Decoded, Decoder, DecoderError},
     encoder::{encode_stateless, EncoderError},
     field::HeaderField,
 };

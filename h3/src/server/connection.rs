@@ -149,6 +149,7 @@ where
             max_field_section_size: self.max_field_section_size,
             shared: self.inner.shared.clone(),
             qpack_decoder: self.inner.qpack_decoder(),
+            qpack_decoder_send_buf: self.inner.qpack_decoder_send_buf(),
         }
     }
 

@@ -64,7 +64,7 @@ where
     B: Buf,
 {
     decoder_send: Option<C::SendStream>,
-    decoder_send_buf: BytesMut,
+    decoder_send_buf: Arc<Mutex<BytesMut>>,
     decoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
     encoder_send: Option<C::SendStream>,
     encoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
@@ -301,7 +301,7 @@ where
 
         let qpack_streams = QpackStreams {
             decoder_send: qpack_decoder.ok(),
-            decoder_send_buf: BytesMut::new(),
+            decoder_send_buf: Arc::new(Mutex::new(BytesMut::new())),
             decoder_recv: None,
             encoder_send: qpack_encoder.ok(),
             encoder_recv: None,
@@ -351,6 +351,11 @@ where
     #[allow(missing_docs)]
     pub(crate) fn qpack_decoder(&self) -> Arc<Mutex<qpack::Decoder>> {
         self.decoder.clone()
+    }
+
+    #[allow(missing_docs)]
+    pub(crate) fn qpack_decoder_send_buf(&self) -> Arc<Mutex<BytesMut>> {
+        self.qpack_streams.decoder_send_buf.clone()
     }
 
     /// Send GOAWAY with specified max_id, iff max_id is smaller than the previous one.
@@ -581,13 +586,28 @@ where
         loop {
             while encoder_recv.has_remaining() {
                 let before = encoder_recv.buf().remaining();
-                let decoder_send_before = self.qpack_streams.decoder_send_buf.len();
+                let decoder_send_before = self
+                    .qpack_streams
+                    .decoder_send_buf
+                    .lock()
+                    .map(|buf| buf.len())
+                    .unwrap_or(0);
                 let decoder = self.decoder.clone();
+                let decoder_send_buf = self.qpack_streams.decoder_send_buf.clone();
                 let decode_result = match decoder.lock() {
-                    Ok(mut decoder) => decoder.on_encoder_recv(
-                        encoder_recv.buf_mut(),
-                        &mut self.qpack_streams.decoder_send_buf,
-                    ),
+                    Ok(mut decoder) => match decoder_send_buf.lock() {
+                        Ok(mut decoder_send_buf) => {
+                            decoder.on_encoder_recv(encoder_recv.buf_mut(), &mut *decoder_send_buf)
+                        }
+                        Err(_) => {
+                            return Poll::Ready(Err(self.handle_connection_error(
+                                InternalConnectionError::new(
+                                    Code::QPACK_DECODER_STREAM_ERROR,
+                                    "QPACK decoder stream buffer lock poisoned".to_string(),
+                                ),
+                            )))
+                        }
+                    },
                     Err(_) => {
                         return Poll::Ready(Err(self.handle_connection_error(
                             InternalConnectionError::new(
@@ -608,7 +628,12 @@ where
 
                 let after = encoder_recv.buf().remaining();
                 let made_progress = after != before
-                    || self.qpack_streams.decoder_send_buf.len() != decoder_send_before;
+                    || self
+                        .qpack_streams
+                        .decoder_send_buf
+                        .lock()
+                        .map(|buf| buf.len() != decoder_send_before)
+                        .unwrap_or(false);
                 if made_progress {
                     self.waker().wake();
                 }
@@ -673,11 +698,16 @@ where
     where
         C::SendStream: quic::SendStreamUnframed<B>,
     {
-        if !self.qpack_streams.decoder_send_buf.has_remaining() {
-            return Poll::Ready(Ok(()));
-        }
+        let decoder_send_buf = self.qpack_streams.decoder_send_buf.clone();
 
         let Some(decoder_send) = self.qpack_streams.decoder_send.as_mut() else {
+            if decoder_send_buf
+                .lock()
+                .map(|buf| !buf.has_remaining())
+                .unwrap_or(false)
+            {
+                return Poll::Ready(Ok(()));
+            }
             return Poll::Ready(Err(self.handle_connection_error(
                 InternalConnectionError::new(
                     Code::QPACK_DECODER_STREAM_ERROR,
@@ -686,8 +716,24 @@ where
             )));
         };
 
-        while self.qpack_streams.decoder_send_buf.has_remaining() {
-            match decoder_send.poll_send(cx, &mut self.qpack_streams.decoder_send_buf) {
+        loop {
+            let mut decoder_send_buf = match decoder_send_buf.lock() {
+                Ok(buf) => buf,
+                Err(_) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::QPACK_DECODER_STREAM_ERROR,
+                            "QPACK decoder stream buffer lock poisoned".to_string(),
+                        ),
+                    )))
+                }
+            };
+
+            if !decoder_send_buf.has_remaining() {
+                return Poll::Ready(Ok(()));
+            }
+
+            match decoder_send.poll_send(cx, &mut *decoder_send_buf) {
                 Poll::Ready(Ok(0)) | Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(_)) => {}
                 Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
@@ -711,8 +757,6 @@ where
                 }
             }
         }
-
-        Poll::Ready(Ok(()))
     }
 
     /// Waits for the control stream to be received and reads subsequent frames.
@@ -1026,10 +1070,74 @@ pub struct RequestStream<S, B> {
     pub(super) conn_state: Arc<SharedState>,
     pub(super) max_field_section_size: u64,
     pub(super) qpack_decoder: Option<Arc<Mutex<qpack::Decoder>>>,
+    qpack_request_state: Option<QpackRequestState>,
     send_grease_frame: bool,
 }
 
-impl<S, B> RequestStream<S, B> {
+struct QpackRequestState {
+    stream_id: u64,
+    decoder_send_buf: Arc<Mutex<BytesMut>>,
+    shared: Arc<SharedState>,
+    cancel_on_drop: bool,
+}
+
+impl QpackRequestState {
+    fn new(
+        stream_id: u64,
+        decoder_send_buf: Arc<Mutex<BytesMut>>,
+        shared: Arc<SharedState>,
+    ) -> Self {
+        Self {
+            stream_id,
+            decoder_send_buf,
+            shared,
+            cancel_on_drop: false,
+        }
+    }
+
+    fn mark_cancel_on_drop(&mut self) {
+        self.cancel_on_drop = true;
+    }
+
+    fn acknowledge(&mut self, decoded: &qpack::Decoded) -> Result<(), qpack::DecoderError> {
+        self.cancel_on_drop = false;
+
+        if decoded.dyn_ref {
+            self.with_decoder_send_buf(|buf| qpack::ack_header(self.stream_id, buf))?;
+        }
+
+        Ok(())
+    }
+
+    fn with_decoder_send_buf(
+        &self,
+        f: impl FnOnce(&mut BytesMut),
+    ) -> Result<(), qpack::DecoderError> {
+        let mut buf = self
+            .decoder_send_buf
+            .lock()
+            .map_err(|_| qpack::DecoderError::UnknownPrefix(0))?;
+        let before = buf.len();
+        f(&mut buf);
+        if buf.len() != before {
+            self.shared.waker().wake();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for QpackRequestState {
+    fn drop(&mut self) {
+        if self.cancel_on_drop {
+            let _ = self.with_decoder_send_buf(|buf| qpack::stream_canceled(self.stream_id, buf));
+        }
+    }
+}
+
+impl<S, B> RequestStream<S, B>
+where
+    S: quic::RecvStream,
+{
     #[allow(missing_docs)]
     pub fn new(
         stream: FrameStream<S, B>,
@@ -1037,13 +1145,23 @@ impl<S, B> RequestStream<S, B> {
         conn_state: Arc<SharedState>,
         grease: bool,
         qpack_decoder: Option<Arc<Mutex<qpack::Decoder>>>,
+        qpack_decoder_send_buf: Option<Arc<Mutex<BytesMut>>>,
     ) -> Self {
+        let qpack_request_state = qpack_decoder_send_buf.map(|decoder_send_buf| {
+            QpackRequestState::new(
+                stream.id().into_inner(),
+                decoder_send_buf,
+                conn_state.clone(),
+            )
+        });
+
         Self {
             stream,
             conn_state,
             max_field_section_size,
             trailers: None,
             qpack_decoder,
+            qpack_request_state,
             send_grease_frame: grease,
         }
     }
@@ -1202,7 +1320,7 @@ where
             }
         }
 
-        let qpack::Decoded { fields, .. } = match self.decode_header_block(&mut trailers) {
+        let qpack::Decoded { fields, .. } = match self.decode_header_block_tracked(&mut trailers) {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
             //# An HTTP/3 implementation MAY impose a limit on the maximum size of
             //# the message header it will accept on an individual HTTP message.
@@ -1257,6 +1375,30 @@ where
 
         if decoded.mem_size > self.max_field_section_size {
             return Err(qpack::DecoderError::HeaderTooLong(decoded.mem_size));
+        }
+
+        Ok(decoded)
+    }
+
+    pub(super) fn decode_header_block_tracked<T: Buf>(
+        &mut self,
+        encoded: &mut T,
+    ) -> Result<qpack::Decoded, qpack::DecoderError> {
+        let decoded = match self.decode_header_block(encoded) {
+            Ok(decoded) => decoded,
+            Err(error @ qpack::DecoderError::MissingRefs(required_ref)) => {
+                if required_ref > 0 {
+                    if let Some(qpack_state) = &mut self.qpack_request_state {
+                        qpack_state.mark_cancel_on_drop();
+                    }
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+
+        if let Some(qpack_state) = &mut self.qpack_request_state {
+            qpack_state.acknowledge(&decoded)?;
         }
 
         Ok(decoded)
@@ -1371,6 +1513,7 @@ where
                 conn_state: self.conn_state.clone(),
                 max_field_section_size: 0,
                 qpack_decoder: None,
+                qpack_request_state: None,
                 send_grease_frame: self.send_grease_frame,
             },
             RequestStream {
@@ -1379,6 +1522,7 @@ where
                 conn_state: self.conn_state,
                 max_field_section_size: self.max_field_section_size,
                 qpack_decoder: self.qpack_decoder,
+                qpack_request_state: self.qpack_request_state,
                 send_grease_frame: self.send_grease_frame,
             },
         )
