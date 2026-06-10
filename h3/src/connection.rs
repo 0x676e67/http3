@@ -596,6 +596,7 @@ where
                         )))
                     }
                 };
+                self.waker().wake();
                 if let Err(err) = decode_result {
                     return Poll::Ready(Err(self.handle_connection_error(
                         InternalConnectionError::new(

@@ -135,7 +135,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request = async move {
         info!("sending request ...");
 
-        let req = http::Request::builder().uri(uri).body(()).unwrap();
+        let req = http::Request::builder().uri(uri.clone()).body(()).unwrap();
+
+        // sending request results in a bidirectional stream,
+        // which is also used for receiving response
+        let mut stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, _> =
+            send_request.send_request(req).await?;
+
+        // finish on the sending side
+        stream.finish().await?;
+
+        info!("receiving response ...");
+
+        let resp = stream.recv_response().await?;
+
+        info!("response: {:?} {}", resp.version(), resp.status());
+        info!("headers: {:#?}", resp.headers());
+
+        // `recv_data()` must be called after `recv_response()` for
+        // receiving potential response body
+        while let Some(mut chunk) = stream.recv_data().await? {
+            let mut out = tokio::io::stdout();
+            out.write_all_buf(&mut chunk).await.unwrap();
+            out.flush().await.unwrap();
+        }
+
+        let req = http::Request::builder().uri(uri.clone()).body(()).unwrap();
 
         // sending request results in a bidirectional stream,
         // which is also used for receiving response
