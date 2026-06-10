@@ -9,6 +9,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{future, ready};
 use http::HeaderMap;
 use stream::WriteBuf;
+use tokio::sync::mpsc;
 
 #[cfg(feature = "tracing")]
 use tracing::{instrument, warn};
@@ -64,10 +65,17 @@ where
     B: Buf,
 {
     decoder_send: Option<C::SendStream>,
-    decoder_send_buf: Arc<Mutex<BytesMut>>,
+    decoder_send_buf: BytesMut,
+    decoder_events_send: mpsc::UnboundedSender<QpackDecoderEvent>,
+    decoder_events_recv: mpsc::UnboundedReceiver<QpackDecoderEvent>,
     decoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
     encoder_send: Option<C::SendStream>,
     encoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
+}
+
+pub(crate) enum QpackDecoderEvent {
+    HeaderAck(u64),
+    StreamCancel(u64),
 }
 
 #[allow(missing_docs)]
@@ -299,9 +307,12 @@ where
             Ok(control_send) => control_send,
         };
 
+        let (decoder_events_send, decoder_events_recv) = mpsc::unbounded_channel();
         let qpack_streams = QpackStreams {
             decoder_send: qpack_decoder.ok(),
-            decoder_send_buf: Arc::new(Mutex::new(BytesMut::new())),
+            decoder_send_buf: BytesMut::new(),
+            decoder_events_send,
+            decoder_events_recv,
             decoder_recv: None,
             encoder_send: qpack_encoder.ok(),
             encoder_recv: None,
@@ -348,14 +359,12 @@ where
         Ok(conn_inner)
     }
 
-    #[allow(missing_docs)]
     pub(crate) fn qpack_decoder(&self) -> Arc<Mutex<qpack::Decoder>> {
         self.decoder.clone()
     }
 
-    #[allow(missing_docs)]
-    pub(crate) fn qpack_decoder_send_buf(&self) -> Arc<Mutex<BytesMut>> {
-        self.qpack_streams.decoder_send_buf.clone()
+    pub(crate) fn qpack_decoder_events(&self) -> mpsc::UnboundedSender<QpackDecoderEvent> {
+        self.qpack_streams.decoder_events_send.clone()
     }
 
     /// Send GOAWAY with specified max_id, iff max_id is smaller than the previous one.
@@ -586,28 +595,13 @@ where
         loop {
             while encoder_recv.has_remaining() {
                 let before = encoder_recv.buf().remaining();
-                let decoder_send_before = self
-                    .qpack_streams
-                    .decoder_send_buf
-                    .lock()
-                    .map(|buf| buf.len())
-                    .unwrap_or(0);
+                let decoder_send_before = self.qpack_streams.decoder_send_buf.len();
                 let decoder = self.decoder.clone();
-                let decoder_send_buf = self.qpack_streams.decoder_send_buf.clone();
                 let decode_result = match decoder.lock() {
-                    Ok(mut decoder) => match decoder_send_buf.lock() {
-                        Ok(mut decoder_send_buf) => {
-                            decoder.on_encoder_recv(encoder_recv.buf_mut(), &mut *decoder_send_buf)
-                        }
-                        Err(_) => {
-                            return Poll::Ready(Err(self.handle_connection_error(
-                                InternalConnectionError::new(
-                                    Code::QPACK_DECODER_STREAM_ERROR,
-                                    "QPACK decoder stream buffer lock poisoned".to_string(),
-                                ),
-                            )))
-                        }
-                    },
+                    Ok(mut decoder) => decoder.on_encoder_recv(
+                        encoder_recv.buf_mut(),
+                        &mut self.qpack_streams.decoder_send_buf,
+                    ),
                     Err(_) => {
                         return Poll::Ready(Err(self.handle_connection_error(
                             InternalConnectionError::new(
@@ -628,12 +622,7 @@ where
 
                 let after = encoder_recv.buf().remaining();
                 let made_progress = after != before
-                    || self
-                        .qpack_streams
-                        .decoder_send_buf
-                        .lock()
-                        .map(|buf| buf.len() != decoder_send_before)
-                        .unwrap_or(false);
+                    || self.qpack_streams.decoder_send_buf.len() != decoder_send_before;
                 if made_progress {
                     self.waker().wake();
                 }
@@ -698,14 +687,10 @@ where
     where
         C::SendStream: quic::SendStreamUnframed<B>,
     {
-        let decoder_send_buf = self.qpack_streams.decoder_send_buf.clone();
+        self.drain_qpack_decoder_events();
 
         let Some(decoder_send) = self.qpack_streams.decoder_send.as_mut() else {
-            if decoder_send_buf
-                .lock()
-                .map(|buf| !buf.has_remaining())
-                .unwrap_or(false)
-            {
+            if !self.qpack_streams.decoder_send_buf.has_remaining() {
                 return Poll::Ready(Ok(()));
             }
             return Poll::Ready(Err(self.handle_connection_error(
@@ -716,24 +701,8 @@ where
             )));
         };
 
-        loop {
-            let mut decoder_send_buf = match decoder_send_buf.lock() {
-                Ok(buf) => buf,
-                Err(_) => {
-                    return Poll::Ready(Err(self.handle_connection_error(
-                        InternalConnectionError::new(
-                            Code::QPACK_DECODER_STREAM_ERROR,
-                            "QPACK decoder stream buffer lock poisoned".to_string(),
-                        ),
-                    )))
-                }
-            };
-
-            if !decoder_send_buf.has_remaining() {
-                return Poll::Ready(Ok(()));
-            }
-
-            match decoder_send.poll_send(cx, &mut *decoder_send_buf) {
+        while self.qpack_streams.decoder_send_buf.has_remaining() {
+            match decoder_send.poll_send(cx, &mut self.qpack_streams.decoder_send_buf) {
                 Poll::Ready(Ok(0)) | Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(_)) => {}
                 Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
@@ -756,6 +725,27 @@ where
                     )));
                 }
             }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    fn drain_qpack_decoder_events(&mut self) {
+        let before = self.qpack_streams.decoder_send_buf.len();
+
+        while let Ok(event) = self.qpack_streams.decoder_events_recv.try_recv() {
+            match event {
+                QpackDecoderEvent::HeaderAck(stream_id) => {
+                    qpack::ack_header(stream_id, &mut self.qpack_streams.decoder_send_buf)
+                }
+                QpackDecoderEvent::StreamCancel(stream_id) => {
+                    qpack::stream_canceled(stream_id, &mut self.qpack_streams.decoder_send_buf)
+                }
+            }
+        }
+
+        if self.qpack_streams.decoder_send_buf.len() != before {
+            self.waker().wake();
         }
     }
 
@@ -785,13 +775,7 @@ where
             })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
             Err(FrameStreamError::Quic(StreamErrorIncoming::StreamTerminated {
                 error_code: err,
-            })) =>
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
-            //# If either control
-            //# stream is closed at any point, this MUST be treated as a connection
-            //# error of type H3_CLOSED_CRITICAL_STREAM.
-            // TODO: Add Test, that reset also triggers this
-            {
+            })) => {
                 return Poll::Ready(Err(self.handle_connection_error(
                     InternalConnectionError::new(
                         Code::H3_CLOSED_CRITICAL_STREAM,
@@ -807,12 +791,7 @@ where
                     ),
                 )));
             }
-            Err(FrameStreamError::UnexpectedEnd) =>
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.1
-            //# When a stream terminates cleanly, if the last frame on the stream was
-            //# truncated, this MUST be treated as a connection error of type
-            //# H3_FRAME_ERROR.
-            {
+            Err(FrameStreamError::UnexpectedEnd) => {
                 return Poll::Ready(Err(self.handle_connection_error(
                     InternalConnectionError::new(
                         Code::H3_FRAME_ERROR,
@@ -1076,7 +1055,7 @@ pub struct RequestStream<S, B> {
 
 struct QpackRequestState {
     stream_id: u64,
-    decoder_send_buf: Arc<Mutex<BytesMut>>,
+    decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
     shared: Arc<SharedState>,
     cancel_on_drop: bool,
 }
@@ -1084,12 +1063,12 @@ struct QpackRequestState {
 impl QpackRequestState {
     fn new(
         stream_id: u64,
-        decoder_send_buf: Arc<Mutex<BytesMut>>,
+        decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
         shared: Arc<SharedState>,
     ) -> Self {
         Self {
             stream_id,
-            decoder_send_buf,
+            decoder_events,
             shared,
             cancel_on_drop: false,
         }
@@ -1103,25 +1082,17 @@ impl QpackRequestState {
         self.cancel_on_drop = false;
 
         if decoded.dyn_ref {
-            self.with_decoder_send_buf(|buf| qpack::ack_header(self.stream_id, buf))?;
+            self.send_event(QpackDecoderEvent::HeaderAck(self.stream_id))?;
         }
 
         Ok(())
     }
 
-    fn with_decoder_send_buf(
-        &self,
-        f: impl FnOnce(&mut BytesMut),
-    ) -> Result<(), qpack::DecoderError> {
-        let mut buf = self
-            .decoder_send_buf
-            .lock()
-            .map_err(|_| qpack::DecoderError::UnknownPrefix(0))?;
-        let before = buf.len();
-        f(&mut buf);
-        if buf.len() != before {
-            self.shared.waker().wake();
-        }
+    fn send_event(&self, event: QpackDecoderEvent) -> Result<(), qpack::DecoderError> {
+        self.decoder_events
+            .send(event)
+            .map_err(|_| qpack::DecoderError::UnexpectedEnd)?;
+        self.shared.waker().wake();
         Ok(())
     }
 }
@@ -1129,7 +1100,7 @@ impl QpackRequestState {
 impl Drop for QpackRequestState {
     fn drop(&mut self) {
         if self.cancel_on_drop {
-            let _ = self.with_decoder_send_buf(|buf| qpack::stream_canceled(self.stream_id, buf));
+            let _ = self.send_event(QpackDecoderEvent::StreamCancel(self.stream_id));
         }
     }
 }
@@ -1139,20 +1110,16 @@ where
     S: quic::RecvStream,
 {
     #[allow(missing_docs)]
-    pub fn new(
+    pub(crate) fn new(
         stream: FrameStream<S, B>,
         max_field_section_size: u64,
         conn_state: Arc<SharedState>,
         grease: bool,
         qpack_decoder: Option<Arc<Mutex<qpack::Decoder>>>,
-        qpack_decoder_send_buf: Option<Arc<Mutex<BytesMut>>>,
+        qpack_decoder_events: Option<mpsc::UnboundedSender<QpackDecoderEvent>>,
     ) -> Self {
-        let qpack_request_state = qpack_decoder_send_buf.map(|decoder_send_buf| {
-            QpackRequestState::new(
-                stream.id().into_inner(),
-                decoder_send_buf,
-                conn_state.clone(),
-            )
+        let qpack_request_state = qpack_decoder_events.map(|decoder_events| {
+            QpackRequestState::new(stream.id().into_inner(), decoder_events, conn_state.clone())
         });
 
         Self {
