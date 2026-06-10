@@ -131,11 +131,12 @@ where
         self.stream.send_id()
     }
 
-    fn send_data<T: Into<h3::stream::WriteBuf<B>>>(
+    fn poll_send_data(
         &mut self,
-        data: T,
-    ) -> Result<(), StreamErrorIncoming> {
-        self.stream.send_data(data)
+        cx: &mut std::task::Context<'_>,
+        data: &mut h3::stream::WriteBuf<B>,
+    ) -> Poll<Result<(), StreamErrorIncoming>> {
+        self.stream.poll_send_data(cx, data)
     }
 
     fn poll_ready(
@@ -250,11 +251,12 @@ where
         self.stream.poll_ready(cx)
     }
 
-    fn send_data<T: Into<h3::stream::WriteBuf<B>>>(
+    fn poll_send_data(
         &mut self,
-        data: T,
-    ) -> Result<(), StreamErrorIncoming> {
-        self.stream.send_data(data)
+        cx: &mut std::task::Context<'_>,
+        data: &mut h3::stream::WriteBuf<B>,
+    ) -> Poll<Result<(), StreamErrorIncoming>> {
+        self.stream.poll_send_data(cx, data)
     }
 }
 

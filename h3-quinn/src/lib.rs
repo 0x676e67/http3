@@ -6,6 +6,7 @@
 use std::{
     convert::TryInto,
     future::Future,
+    marker::PhantomData,
     pin::Pin,
     sync::Arc,
     task::{self, ready, Poll},
@@ -309,16 +310,20 @@ where
         self.send.poll_ready(cx)
     }
 
+    fn poll_send_data(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        data: &mut WriteBuf<B>,
+    ) -> Poll<Result<(), StreamErrorIncoming>> {
+        self.send.poll_send_data(cx, data)
+    }
+
     fn poll_finish(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
         self.send.poll_finish(cx)
     }
 
     fn reset(&mut self, reset_code: u64) {
         self.send.reset(reset_code)
-    }
-
-    fn send_data<D: Into<WriteBuf<B>>>(&mut self, data: D) -> Result<(), StreamErrorIncoming> {
-        self.send.send_data(data)
     }
 
     fn send_id(&self) -> StreamId {
@@ -468,7 +473,7 @@ fn convert_write_error_to_stream_error(error: quinn::WriteError) -> StreamErrorI
 /// Implements a [`quic::SendStream`] backed by a [`quinn::SendStream`].
 pub struct SendStream<B: Buf> {
     stream: quinn::SendStream,
-    writing: Option<WriteBuf<B>>,
+    _marker: PhantomData<B>,
 }
 
 impl<B> SendStream<B>
@@ -478,7 +483,7 @@ where
     fn new(stream: quinn::SendStream) -> SendStream<B> {
         Self {
             stream,
-            writing: None,
+            _marker: PhantomData,
         }
     }
 }
@@ -488,25 +493,28 @@ where
     B: Buf,
 {
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-        if let Some(ref mut data) = self.writing {
-            while data.has_remaining() {
-                let stream = Pin::new(&mut self.stream);
-                let written = ready!(stream.poll_write(cx, data.chunk()))
-                    .map_err(convert_write_error_to_stream_error)?;
-                data.advance(written);
-            }
-        }
-        // all data is written
-        self.writing = None;
+    fn poll_ready(&mut self, _cx: &mut task::Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
         Poll::Ready(Ok(()))
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    fn poll_finish(
+    fn poll_send_data(
         &mut self,
-        _cx: &mut task::Context<'_>,
+        cx: &mut task::Context<'_>,
+        data: &mut WriteBuf<B>,
     ) -> Poll<Result<(), StreamErrorIncoming>> {
+        while data.has_remaining() {
+            let stream = Pin::new(&mut self.stream);
+            let written = ready!(stream.poll_write(cx, data.chunk()))
+                .map_err(convert_write_error_to_stream_error)?;
+            data.advance(written);
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    fn poll_finish(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+        ready!(self.poll_ready(cx))?;
         Poll::Ready(
             self.stream
                 .finish()
@@ -519,24 +527,6 @@ where
         let _ = self
             .stream
             .reset(VarInt::from_u64(reset_code).unwrap_or(VarInt::MAX));
-    }
-
-    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    fn send_data<D: Into<WriteBuf<B>>>(&mut self, data: D) -> Result<(), StreamErrorIncoming> {
-        if self.writing.is_some() {
-            // This can only happen if the traits are misused by h3 itself
-            // If this happens log an error and close the connection with H3_INTERNAL_ERROR
-
-            #[cfg(feature = "tracing")]
-            tracing::error!("send_data called while send stream is not ready");
-            return Err(StreamErrorIncoming::ConnectionErrorIncoming {
-                connection_error: ConnectionErrorIncoming::InternalError(
-                    "internal error in the http stack".to_string(),
-                ),
-            });
-        }
-        self.writing = Some(data.into());
-        Ok(())
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
@@ -556,11 +546,6 @@ where
         cx: &mut task::Context<'_>,
         buf: &mut D,
     ) -> Poll<Result<usize, StreamErrorIncoming>> {
-        if self.writing.is_some() {
-            // This signifies a bug in implementation
-            panic!("poll_send called while send stream is not ready")
-        }
-
         let s = Pin::new(&mut self.stream);
 
         let res = ready!(s.poll_write(cx, buf.chunk()));

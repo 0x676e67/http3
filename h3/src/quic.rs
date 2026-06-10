@@ -170,10 +170,23 @@ pub trait OpenStreams<B: Buf> {
 /// A trait describing the "send" actions of a QUIC stream.
 pub trait SendStream<B: Buf> {
     /// Polls if the stream can send more data.
+    ///
+    /// This method must return [`Poll::Ready(Ok(()))`] before each call to
+    /// [`SendStream::poll_send_data`]. Implementations may also use this method
+    /// to flush data previously accepted by [`SendStream::poll_send_data`].
     fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), StreamErrorIncoming>>;
 
-    /// Send more data on the stream.
-    fn send_data<T: Into<WriteBuf<B>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming>;
+    /// Begin sending data and drive the send operation with the provided context.
+    ///
+    /// Callers must call [`SendStream::poll_ready`] and receive
+    /// [`Poll::Ready(Ok(()))`] immediately before polling this method. If this
+    /// method returns [`Poll::Pending`], callers must poll
+    /// [`SendStream::poll_ready`] again before retrying this method.
+    fn poll_send_data(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        data: &mut WriteBuf<B>,
+    ) -> Poll<Result<(), StreamErrorIncoming>>;
 
     /// Poll to finish the sending side of the stream.
     fn poll_finish(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), StreamErrorIncoming>>;
