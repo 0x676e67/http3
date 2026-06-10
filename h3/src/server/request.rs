@@ -3,15 +3,15 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use bytes::{Buf, BytesMut};
+use bytes::Buf;
 use http::{Request, StatusCode};
 
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{self, UnboundedSender};
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
 use crate::{
-    connection::{self},
+    connection::{self, QpackDecoderEvent},
     error::{
         connection_error_creators::{CloseStream, HandleFrameStreamErrorOnRequestStream},
         internal_error::InternalConnectionError,
@@ -44,7 +44,7 @@ where
     pub(super) max_field_section_size: u64,
     pub(super) shared: Arc<SharedState>,
     pub(super) qpack_decoder: Arc<Mutex<qpack::Decoder>>,
-    pub(super) qpack_decoder_send_buf: Arc<Mutex<BytesMut>>,
+    pub(super) qpack_decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
 }
 
 impl<C, B> ConnectionState for RequestResolver<C, B>
@@ -163,7 +163,7 @@ where
                 self.shared.clone(),
                 self.send_grease_frame,
                 Some(self.qpack_decoder.clone()),
-                Some(self.qpack_decoder_send_buf.clone()),
+                Some(self.qpack_decoder_events.clone()),
             ),
         };
 
@@ -192,26 +192,15 @@ where
     }
 
     fn ack_header(&mut self) -> Result<(), StreamError> {
-        let qpack_decoder_send_buf = self.qpack_decoder_send_buf.clone();
-        let mut decoder_send_buf = match qpack_decoder_send_buf.lock() {
-            Ok(buf) => buf,
-            Err(_) => {
-                return Err(
-                    self.handle_connection_error_on_stream(InternalConnectionError {
-                        code: Code::QPACK_DECOMPRESSION_FAILED,
-                        message: "QPACK decoder stream buffer lock poisoned".to_string(),
-                    }),
-                )
-            }
-        };
-        let before = decoder_send_buf.len();
-        qpack::ack_header(
-            self.frame_stream.send_id().into_inner(),
-            &mut *decoder_send_buf,
-        );
-        if decoder_send_buf.len() != before {
-            self.waker().wake();
-        }
+        self.qpack_decoder_events
+            .send(QpackDecoderEvent::HeaderAck(self.frame_stream.send_id().into_inner()))
+            .map_err(|_| {
+                self.handle_connection_error_on_stream(InternalConnectionError {
+                    code: Code::QPACK_DECOMPRESSION_FAILED,
+                    message: "QPACK decoder event channel closed".to_string(),
+                })
+            })?;
+        self.waker().wake();
         Ok(())
     }
 }

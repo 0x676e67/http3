@@ -9,12 +9,13 @@ use std::{
 use bytes::{Buf, BytesMut};
 use futures_util::future;
 use http::request;
+use tokio::sync::mpsc;
 
 #[cfg(feature = "tracing")]
 use tracing::{info, instrument, trace};
 
 use crate::{
-    connection::{self, ConnectionInner},
+    connection::{self, ConnectionInner, QpackDecoderEvent},
     error::{
         connection_error_creators::CloseStream, internal_error::InternalConnectionError, Code,
         ConnectionError, StreamError,
@@ -114,7 +115,7 @@ where
     pub(super) open: T,
     pub(super) conn_state: Arc<SharedState>,
     pub(super) qpack_decoder: Arc<Mutex<qpack::Decoder>>,
-    pub(super) qpack_decoder_send_buf: Arc<Mutex<BytesMut>>,
+    pub(super) qpack_decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
     pub(super) max_field_section_size: u64, // maximum size for a header we receive
     // counts instances of SendRequest to close the connection when the last is dropped.
     pub(super) sender_count: Arc<AtomicUsize>,
@@ -223,7 +224,7 @@ where
                 self.conn_state.clone(),
                 self.send_grease_frame,
                 Some(self.qpack_decoder.clone()),
-                Some(self.qpack_decoder_send_buf.clone()),
+                Some(self.qpack_decoder_events.clone()),
             ),
         };
         // send the grease frame only once
@@ -244,7 +245,7 @@ where
         Self {
             conn_state: self.conn_state.clone(),
             qpack_decoder: self.qpack_decoder.clone(),
-            qpack_decoder_send_buf: self.qpack_decoder_send_buf.clone(),
+            qpack_decoder_events: self.qpack_decoder_events.clone(),
             open: self.open.clone(),
             max_field_section_size: self.max_field_section_size,
             sender_count: self.sender_count.clone(),
