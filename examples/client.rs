@@ -27,6 +27,14 @@ struct Opt {
     #[structopt(name = "keylogfile", long)]
     pub key_log_file: bool,
 
+    #[structopt(
+        long,
+        short = "n",
+        default_value = "1",
+        help = "Number of concurrent requests to send"
+    )]
+    pub requests: usize,
+
     #[structopt()]
     pub uri: String,
 }
@@ -41,6 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let opt = Opt::from_args();
+
+    if opt.requests == 0 {
+        Err("requests must be greater than 0")?;
+    }
 
     // DNS lookup
 
@@ -113,9 +125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // h3_quinn implements the trait w/ quinn to make it work with h3.
     let quinn_conn = h3_quinn::Connection::new(conn);
 
-    let (mut driver, mut send_request) = h3::client::builder()
-        .qpack_max_table_capacity(65536u64)
+    let (mut driver, send_request) = h3::client::builder()
         .max_field_section_size(262144u64)
+        .qpack_max_table_capacity(65536u64)
         .qpack_blocked_streams(100u64)
         .enable_datagram(true)
         .send_grease(true)
@@ -133,57 +145,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //             So we "move" it.
     //                  vvvv
     let request = async move {
-        info!("sending request ...");
+        let mut requests = Vec::with_capacity(opt.requests);
 
-        let req = http::Request::builder().uri(uri.clone()).body(()).unwrap();
+        for request_id in 0..opt.requests {
+            let uri = uri.clone();
+            let mut send_request = send_request.clone();
 
-        // sending request results in a bidirectional stream,
-        // which is also used for receiving response
-        let mut stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, _> =
-            send_request.send_request(req).await?;
+            requests.push(async move {
+                info!(request_id, "sending request ...");
 
-        // finish on the sending side
-        stream.finish().await?;
+                let req = http::Request::builder().uri(uri).body(()).unwrap();
 
-        info!("receiving response ...");
+                // sending request results in a bidirectional stream,
+                // which is also used for receiving response
+                let mut stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, _> =
+                    send_request.send_request(req).await?;
 
-        let resp = stream.recv_response().await?;
+                // finish on the sending side
+                stream.finish().await?;
 
-        info!("response: {:?} {}", resp.version(), resp.status());
-        info!("headers: {:#?}", resp.headers());
+                info!(request_id, "receiving response ...");
 
-        // `recv_data()` must be called after `recv_response()` for
-        // receiving potential response body
-        while let Some(mut chunk) = stream.recv_data().await? {
-            let mut out = tokio::io::stdout();
-            out.write_all_buf(&mut chunk).await.unwrap();
-            out.flush().await.unwrap();
+                let resp = stream.recv_response().await?;
+
+                info!(
+                    request_id,
+                    "response: {:?} {}",
+                    resp.version(),
+                    resp.status()
+                );
+                info!(request_id, "headers: {:#?}", resp.headers());
+
+                // `recv_data()` must be called after `recv_response()` for
+                // receiving potential response body
+                while let Some(mut chunk) = stream.recv_data().await? {
+                    let mut out = tokio::io::stdout();
+                    out.write_all_buf(&mut chunk).await.unwrap();
+                    out.flush().await.unwrap();
+                }
+
+                Ok::<_, StreamError>(())
+            });
         }
 
-        let req = http::Request::builder().uri(uri.clone()).body(()).unwrap();
-
-        // sending request results in a bidirectional stream,
-        // which is also used for receiving response
-        let mut stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, _> =
-            send_request.send_request(req).await?;
-
-        // finish on the sending side
-        stream.finish().await?;
-
-        info!("receiving response ...");
-
-        let resp = stream.recv_response().await?;
-
-        info!("response: {:?} {}", resp.version(), resp.status());
-        info!("headers: {:#?}", resp.headers());
-
-        // `recv_data()` must be called after `recv_response()` for
-        // receiving potential response body
-        while let Some(mut chunk) = stream.recv_data().await? {
-            let mut out = tokio::io::stdout();
-            out.write_all_buf(&mut chunk).await.unwrap();
-            out.flush().await.unwrap();
-        }
+        future::try_join_all(requests).await?;
 
         Ok::<_, StreamError>(())
     };
