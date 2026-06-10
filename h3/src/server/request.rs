@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use bytes::Buf;
+use bytes::{Buf, BytesMut};
 use http::{Request, StatusCode};
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -44,6 +44,7 @@ where
     pub(super) max_field_section_size: u64,
     pub(super) shared: Arc<SharedState>,
     pub(super) qpack_decoder: Arc<Mutex<qpack::Decoder>>,
+    pub(super) qpack_decoder_send_buf: Arc<Mutex<BytesMut>>,
 }
 
 impl<C, B> ConnectionState for RequestResolver<C, B>
@@ -135,7 +136,12 @@ where
             //# An HTTP/3 implementation MAY impose a limit on the maximum size of
             //# the message header it will accept on an individual HTTP message.
             Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => Err(cancel_size),
-            Ok(decoded) => Ok(decoded),
+            Ok(decoded) => {
+                if decoded.dyn_ref {
+                    self.ack_header()?;
+                }
+                Ok(decoded)
+            }
             Err(_e) => {
                 return Err(
                     self.handle_connection_error_on_stream(InternalConnectionError {
@@ -157,6 +163,7 @@ where
                 self.shared.clone(),
                 self.send_grease_frame,
                 Some(self.qpack_decoder.clone()),
+                Some(self.qpack_decoder_send_buf.clone()),
             ),
         };
 
@@ -182,6 +189,30 @@ where
         }
 
         Ok(decoded)
+    }
+
+    fn ack_header(&mut self) -> Result<(), StreamError> {
+        let qpack_decoder_send_buf = self.qpack_decoder_send_buf.clone();
+        let mut decoder_send_buf = match qpack_decoder_send_buf.lock() {
+            Ok(buf) => buf,
+            Err(_) => {
+                return Err(
+                    self.handle_connection_error_on_stream(InternalConnectionError {
+                        code: Code::QPACK_DECOMPRESSION_FAILED,
+                        message: "QPACK decoder stream buffer lock poisoned".to_string(),
+                    }),
+                )
+            }
+        };
+        let before = decoder_send_buf.len();
+        qpack::ack_header(
+            self.frame_stream.send_id().into_inner(),
+            &mut *decoder_send_buf,
+        );
+        if decoder_send_buf.len() != before {
+            self.waker().wake();
+        }
+        Ok(())
     }
 }
 

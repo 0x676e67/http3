@@ -114,6 +114,7 @@ where
     pub(super) open: T,
     pub(super) conn_state: Arc<SharedState>,
     pub(super) qpack_decoder: Arc<Mutex<qpack::Decoder>>,
+    pub(super) qpack_decoder_send_buf: Arc<Mutex<BytesMut>>,
     pub(super) max_field_section_size: u64, // maximum size for a header we receive
     // counts instances of SendRequest to close the connection when the last is dropped.
     pub(super) sender_count: Arc<AtomicUsize>,
@@ -222,6 +223,7 @@ where
                 self.conn_state.clone(),
                 self.send_grease_frame,
                 Some(self.qpack_decoder.clone()),
+                Some(self.qpack_decoder_send_buf.clone()),
             ),
         };
         // send the grease frame only once
@@ -242,6 +244,7 @@ where
         Self {
             conn_state: self.conn_state.clone(),
             qpack_decoder: self.qpack_decoder.clone(),
+            qpack_decoder_send_buf: self.qpack_decoder_send_buf.clone(),
             open: self.open.clone(),
             max_field_section_size: self.max_field_section_size,
             sender_count: self.sender_count.clone(),
