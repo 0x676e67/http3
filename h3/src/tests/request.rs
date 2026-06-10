@@ -87,6 +87,54 @@ async fn get() {
 }
 
 #[tokio::test]
+async fn request_stream_drop_resets_request_body() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+    let (server_accepted_tx, server_accepted_rx) = tokio::sync::oneshot::channel();
+    let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
+
+    let client_fut = async {
+        let (mut driver, mut client) = client::new(pair.client().await).await.expect("client init");
+        let drive_fut = async { future::poll_fn(|cx| driver.poll_close(cx)).await };
+        let req_fut = async move {
+            let request_stream = client
+                .send_request(Request::get("http://localhost/drop").body(()).unwrap())
+                .await
+                .expect("request");
+            let _ = server_accepted_rx.await;
+            drop(request_stream);
+
+            let _ = server_done_rx.await;
+            drop(client);
+        };
+        tokio::join!(req_fut, drive_fut)
+    };
+
+    let server_fut = async {
+        let conn = server.next().await;
+        let mut incoming_req = server::Connection::new(conn).await.unwrap();
+
+        let (_request, mut request_stream) = get_stream_blocking(&mut incoming_req)
+            .await
+            .expect("accept");
+        let _ = server_accepted_tx.send(());
+
+        match request_stream.recv_data().await {
+            Err(StreamError::RemoteTerminate { code }) => {
+                assert_eq!(code, Code::H3_REQUEST_CANCELLED.value());
+            }
+            Err(err) => panic!("unexpected stream error: {err:?}"),
+            Ok(_) => panic!("expected request stream reset"),
+        }
+
+        let _ = server_done_tx.send(());
+    };
+
+    tokio::join!(server_fut, client_fut);
+}
+
+#[tokio::test]
 async fn get_with_trailers_unknown_content_type() {
     init_tracing();
     let mut pair = Pair::default();
