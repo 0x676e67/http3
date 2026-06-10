@@ -1,5 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
+use bytes::Bytes;
 use futures::future;
 use h3::error::{ConnectionError, StreamError};
 use rustls::pki_types::CertificateDer;
@@ -112,7 +113,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // h3_quinn implements the trait w/ quinn to make it work with h3.
     let quinn_conn = h3_quinn::Connection::new(conn);
 
-    let (mut driver, mut send_request) = h3::client::new(quinn_conn).await?;
+    let (mut driver, mut send_request) = h3::client::builder()
+        .qpack_max_table_capacity(65536u64)
+        .max_field_section_size(262144u64)
+        .qpack_blocked_streams(100u64)
+        .enable_datagram(true)
+        .send_grease(true)
+        .build(quinn_conn)
+        .await?;
 
     let drive = async move {
         return Err::<(), ConnectionError>(future::poll_fn(|cx| driver.poll_close(cx)).await);
@@ -127,11 +135,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request = async move {
         info!("sending request ...");
 
+        let req = http::Request::builder().uri(uri.clone()).body(()).unwrap();
+
+        // sending request results in a bidirectional stream,
+        // which is also used for receiving response
+        let mut stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, _> =
+            send_request.send_request(req).await?;
+
+        // finish on the sending side
+        stream.finish().await?;
+
+        info!("receiving response ...");
+
+        let resp = stream.recv_response().await?;
+
+        info!("response: {:?} {}", resp.version(), resp.status());
+        info!("headers: {:#?}", resp.headers());
+
+        // `recv_data()` must be called after `recv_response()` for
+        // receiving potential response body
+        while let Some(mut chunk) = stream.recv_data().await? {
+            let mut out = tokio::io::stdout();
+            out.write_all_buf(&mut chunk).await.unwrap();
+            out.flush().await.unwrap();
+        }
+
         let req = http::Request::builder().uri(uri).body(()).unwrap();
 
         // sending request results in a bidirectional stream,
         // which is also used for receiving response
-        let mut stream = send_request.send_request(req).await?;
+        let mut stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, _> =
+            send_request.send_request(req).await?;
 
         // finish on the sending side
         stream.finish().await?;
