@@ -581,6 +581,7 @@ where
         loop {
             while encoder_recv.has_remaining() {
                 let before = encoder_recv.buf().remaining();
+                let decoder_send_before = self.qpack_streams.decoder_send_buf.len();
                 let decoder = self.decoder.clone();
                 let decode_result = match decoder.lock() {
                     Ok(mut decoder) => decoder.on_encoder_recv(
@@ -596,7 +597,6 @@ where
                         )))
                     }
                 };
-                self.waker().wake();
                 if let Err(err) = decode_result {
                     return Poll::Ready(Err(self.handle_connection_error(
                         InternalConnectionError::new(
@@ -606,7 +606,14 @@ where
                     )));
                 }
 
-                if encoder_recv.buf().remaining() == before {
+                let after = encoder_recv.buf().remaining();
+                let made_progress = after != before
+                    || self.qpack_streams.decoder_send_buf.len() != decoder_send_before;
+                if made_progress {
+                    self.waker().wake();
+                }
+
+                if after == before {
                     break;
                 }
             }
