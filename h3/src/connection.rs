@@ -809,7 +809,7 @@ where
 
 #[allow(missing_docs)]
 pub struct RequestStream<S, B> {
-    pub(super) stream: AbortOnDrop<S, B>,
+    pub(super) stream: RequestStreamGuard<S, B>,
     pub(super) trailers: Option<Bytes>,
     pub(super) conn_state: Arc<SharedState>,
     pub(super) max_field_section_size: u64,
@@ -819,13 +819,13 @@ pub struct RequestStream<S, B> {
 type ResetOnDrop<S, B> = fn(&mut FrameStream<S, B>, Code);
 type StopSendingOnDrop<S, B> = fn(&mut FrameStream<S, B>, Code);
 
-pub(super) struct AbortOnDrop<S, B> {
+pub(super) struct RequestStreamGuard<S, B> {
     stream: Option<FrameStream<S, B>>,
     reset_on_drop: Option<ResetOnDrop<S, B>>,
     stop_sending_on_drop: Option<StopSendingOnDrop<S, B>>,
 }
 
-impl<S, B> AbortOnDrop<S, B> {
+impl<S, B> RequestStreamGuard<S, B> {
     fn new(
         stream: FrameStream<S, B>,
         reset_on_drop: Option<ResetOnDrop<S, B>>,
@@ -853,7 +853,7 @@ impl<S, B> AbortOnDrop<S, B> {
     }
 }
 
-impl<S, B> Deref for AbortOnDrop<S, B> {
+impl<S, B> Deref for RequestStreamGuard<S, B> {
     type Target = FrameStream<S, B>;
 
     fn deref(&self) -> &Self::Target {
@@ -861,13 +861,13 @@ impl<S, B> Deref for AbortOnDrop<S, B> {
     }
 }
 
-impl<S, B> DerefMut for AbortOnDrop<S, B> {
+impl<S, B> DerefMut for RequestStreamGuard<S, B> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.stream.as_mut().expect("stream is present")
     }
 }
 
-impl<S, B> Drop for AbortOnDrop<S, B> {
+impl<S, B> Drop for RequestStreamGuard<S, B> {
     fn drop(&mut self) {
         let Some(stream) = self.stream.as_mut() else {
             return;
@@ -882,7 +882,7 @@ impl<S, B> Drop for AbortOnDrop<S, B> {
     }
 }
 
-impl<S, B> SendStream<B> for AbortOnDrop<S, B>
+impl<S, B> SendStream<B> for RequestStreamGuard<S, B>
 where
     S: SendStream<B>,
     B: Buf,
@@ -934,9 +934,9 @@ where
         max_field_section_size: u64,
         conn_state: Arc<SharedState>,
         grease: bool,
-        abort_on_drop: bool,
+        cancel_on_drop: bool,
     ) -> Self {
-        let (reset_on_drop, stop_sending_on_drop) = if abort_on_drop {
+        let (reset_on_drop, stop_sending_on_drop) = if cancel_on_drop {
             (
                 Some(reset_on_drop::<S, B> as ResetOnDrop<S, B>),
                 Some(stop_sending_on_drop::<S, B> as StopSendingOnDrop<S, B>),
@@ -946,7 +946,7 @@ where
         };
 
         Self {
-            stream: AbortOnDrop::new(stream, reset_on_drop, stop_sending_on_drop),
+            stream: RequestStreamGuard::new(stream, reset_on_drop, stop_sending_on_drop),
             conn_state,
             max_field_section_size,
             trailers: None,
@@ -1270,14 +1270,14 @@ where
 
         (
             RequestStream {
-                stream: AbortOnDrop::new(send, reset_on_drop, None),
+                stream: RequestStreamGuard::new(send, reset_on_drop, None),
                 trailers: None,
                 conn_state: self.conn_state.clone(),
                 max_field_section_size: 0,
                 send_grease_frame: self.send_grease_frame,
             },
             RequestStream {
-                stream: AbortOnDrop::new(recv, None, stop_sending_on_drop),
+                stream: RequestStreamGuard::new(recv, None, stop_sending_on_drop),
                 trailers: self.trailers,
                 conn_state: self.conn_state,
                 max_field_section_size: self.max_field_section_size,
