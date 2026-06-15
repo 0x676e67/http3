@@ -2,7 +2,7 @@
 
 use std::{
     marker::PhantomData,
-    sync::{atomic::AtomicUsize, Arc, Mutex},
+    sync::{atomic::AtomicUsize, Arc},
     task::{Context, Poll},
 };
 
@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tracing::{info, instrument, trace};
 
 use crate::{
-    connection::{self, ConnectionInner, QpackDecoderEvent},
+    connection::{self, ConnectionInner, QpackDecoder, QpackDecoderEvent},
     error::{
         connection_error_creators::CloseStream, internal_error::InternalConnectionError, Code,
         ConnectionError, StreamError,
@@ -114,7 +114,7 @@ where
 {
     pub(super) open: T,
     pub(super) conn_state: Arc<SharedState>,
-    pub(super) qpack_decoder: Arc<Mutex<qpack::Decoder>>,
+    pub(super) qpack_decoder: QpackDecoder,
     pub(super) qpack_decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
     pub(super) max_field_section_size: u64, // maximum size for a header we receive
     // counts instances of SendRequest to close the connection when the last is dropped.
