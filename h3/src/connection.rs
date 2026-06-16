@@ -1241,6 +1241,12 @@ where
                     max_size: self.max_field_section_size,
                 }));
             }
+            Err(qpack::DecoderError::MissingRefs(_)) => {
+                // QPACK decoding advances the buffer; MissingRefs must retry from the original block.
+                self.trailers = Some(trailers);
+                self.waker().register(cx.waker());
+                return Poll::Pending;
+            }
             Ok(decoded) => decoded,
             Err(_e) => {
                 return Poll::Ready(Err(self.handle_connection_error_on_stream(
