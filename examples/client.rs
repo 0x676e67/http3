@@ -35,13 +35,16 @@ struct Opt {
     )]
     pub requests: usize,
 
-    #[structopt(long, default_value = "65536", help = "QPACK max table capacity")]
-    pub qpack_max_table_capacity: u64,
+    #[structopt(long, help = "QPACK max table capacity")]
+    pub qpack_max_table_capacity: Option<u64>,
 
-    #[structopt(long, default_value = "100", help = "QPACK blocked streams")]
-    pub qpack_blocked_streams: u64,
+    #[structopt(long, help = "QPACK blocked streams")]
+    pub qpack_blocked_streams: Option<u64>,
 
-    #[structopt()]
+    #[structopt(
+        default_value = "https://cloudflare-quic.com",
+        help = "URI of the server to connect to"
+    )]
     pub uri: String,
 }
 
