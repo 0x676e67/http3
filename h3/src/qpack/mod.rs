@@ -128,7 +128,9 @@ impl QpackDecoder {
         self.stream_state = Some(QpackDecoderStreamState {
             stream_id,
             shared,
-            cancel_on_drop: false,
+            // Until the header block is successfully decoded, dropping the tracked
+            // stream abandons it and must notify the peer encoder.
+            cancel_on_drop: true,
         });
         self
     }
