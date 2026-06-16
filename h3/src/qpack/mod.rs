@@ -5,12 +5,15 @@ pub use self::{
 };
 
 use std::{
-    ops::{Deref, DerefMut},
-    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError},
-    task::Context,
+    sync::{Arc, RwLock, TryLockError},
+    task::{ready, Context, Poll},
 };
 
+use bytes::{Buf, BufMut};
 use futures_util::task::AtomicWaker;
+use tokio::sync::mpsc;
+
+use crate::shared_state::{ConnectionState, SharedState};
 
 mod block;
 mod dynamic;
@@ -52,8 +55,9 @@ pub(crate) enum QpackDecoderEvent {
     StreamCancel(u64),
 }
 
-struct DecoderState {
+struct QpackDecoderInner {
     decoder: RwLock<Decoder>,
+    decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
     read_waker: AtomicWaker,
     write_waker: AtomicWaker,
 }
@@ -62,128 +66,183 @@ struct DecoderState {
 ///
 /// The decoder is read-mostly: header blocks decode through read guards, while the
 /// peer encoder stream updates the dynamic table through a write guard.
-#[derive(Clone)]
-pub(crate) struct QpackDecoder(Arc<DecoderState>);
-
-/// Read guard for QPACK header block decoding.
-///
-/// Dropping the guard wakes any task waiting to process encoder stream updates.
-pub(crate) struct QpackDecoderReadGuard<'a> {
-    guard: RwLockReadGuard<'a, Decoder>,
-    state: Arc<DecoderState>,
+pub(crate) struct QpackDecoder {
+    inner: Arc<QpackDecoderInner>,
+    stream_state: Option<QpackDecoderStreamState>,
 }
 
-impl Deref for QpackDecoderReadGuard<'_> {
-    type Target = Decoder;
+/// Per-stream QPACK decoder state used to emit decoder stream instructions.
+struct QpackDecoderStreamState {
+    stream_id: u64,
+    shared: Arc<SharedState>,
+    cancel_on_drop: bool,
+}
 
-    #[inline(always)]
-    fn deref(&self) -> &Self::Target {
-        &self.guard
+impl Clone for QpackDecoder {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            stream_state: None,
+        }
     }
 }
 
-impl Drop for QpackDecoderReadGuard<'_> {
+impl Drop for QpackDecoder {
     fn drop(&mut self) {
-        self.state.write_waker.wake();
-    }
-}
-
-/// Write guard for QPACK encoder stream processing.
-///
-/// Dropping the guard wakes any task waiting to decode header blocks.
-pub(crate) struct QpackDecoderWriteGuard<'a> {
-    guard: RwLockWriteGuard<'a, Decoder>,
-    state: Arc<DecoderState>,
-}
-
-impl Deref for QpackDecoderWriteGuard<'_> {
-    type Target = Decoder;
-
-    #[inline(always)]
-    fn deref(&self) -> &Self::Target {
-        &self.guard
-    }
-}
-
-impl DerefMut for QpackDecoderWriteGuard<'_> {
-    #[inline(always)]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
-    }
-}
-
-impl Drop for QpackDecoderWriteGuard<'_> {
-    fn drop(&mut self) {
-        self.state.read_waker.wake();
+        if let Some(stream_state) = &self.stream_state {
+            if stream_state.cancel_on_drop {
+                if self
+                    .inner
+                    .decoder_events
+                    .send(QpackDecoderEvent::StreamCancel(stream_state.stream_id))
+                    .is_ok()
+                {
+                    stream_state.shared.waker().wake();
+                }
+            }
+        }
     }
 }
 
 impl QpackDecoder {
-    /// Wraps a connection-owned QPACK decoder in shared read/write state.
+    /// Creates a new [`QpackDecoder`] instance.
     #[inline(always)]
-    pub(crate) fn new(decoder: Decoder) -> Self {
-        Self(Arc::new(DecoderState {
-            decoder: RwLock::new(decoder),
-            read_waker: AtomicWaker::new(),
-            write_waker: AtomicWaker::new(),
-        }))
-    }
-
-    /// Attempts to acquire a read guard without blocking the current task.
-    ///
-    /// If a writer currently holds the decoder, the provided waker is registered
-    /// and `Ok(None)` is returned.
-    #[inline(always)]
-    pub(crate) fn try_read(
-        &self,
-        cx: &mut Context<'_>,
-    ) -> Result<Option<QpackDecoderReadGuard<'_>>, DecoderError> {
-        match self.0.decoder.try_read() {
-            Ok(guard) => Ok(Some(QpackDecoderReadGuard {
-                guard,
-                state: self.0.clone(),
-            })),
-            Err(TryLockError::WouldBlock) => {
-                self.0.read_waker.register(cx.waker());
-                match self.0.decoder.try_read() {
-                    Ok(guard) => Ok(Some(QpackDecoderReadGuard {
-                        guard,
-                        state: self.0.clone(),
-                    })),
-                    Err(TryLockError::WouldBlock) => Ok(None),
-                    Err(TryLockError::Poisoned(_)) => Err(DecoderError::UnexpectedEnd),
-                }
-            }
-            Err(TryLockError::Poisoned(_)) => Err(DecoderError::UnexpectedEnd),
+    pub(crate) fn new(
+        decoder: Decoder,
+        decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(QpackDecoderInner {
+                decoder: RwLock::new(decoder),
+                decoder_events,
+                read_waker: AtomicWaker::new(),
+                write_waker: AtomicWaker::new(),
+            }),
+            stream_state: None,
         }
     }
 
-    /// Attempts to acquire a write guard without blocking the current task.
-    ///
-    /// If readers currently hold the decoder, the provided waker is registered
-    /// and `Ok(None)` is returned.
+    /// Returns a stream-scoped decoder handle that tracks decoder stream instructions.
     #[inline(always)]
-    pub(crate) fn try_write(
+    pub(crate) fn track_stream(mut self, stream_id: u64, shared: Arc<SharedState>) -> Self {
+        self.stream_state = Some(QpackDecoderStreamState {
+            stream_id,
+            shared,
+            cancel_on_drop: false,
+        });
+        self
+    }
+
+    /// Processes bytes received from the peer QPACK encoder stream.
+    ///
+    /// Returns `Poll::Pending` when a header decode currently holds a read lock;
+    /// the provided waker is registered and will be woken once a write may make progress.
+    pub(crate) fn poll_on_recv_encoder<R: Buf, W: BufMut>(
         &self,
         cx: &mut Context<'_>,
-    ) -> Result<Option<QpackDecoderWriteGuard<'_>>, DecoderError> {
-        match self.0.decoder.try_write() {
-            Ok(guard) => Ok(Some(QpackDecoderWriteGuard {
-                guard,
-                state: self.0.clone(),
-            })),
+        read: &mut R,
+        write: &mut W,
+    ) -> Poll<Result<usize, DecoderError>> {
+        let mut decoder = match self.inner.decoder.try_write() {
+            Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => {
-                self.0.write_waker.register(cx.waker());
-                match self.0.decoder.try_write() {
-                    Ok(guard) => Ok(Some(QpackDecoderWriteGuard {
-                        guard,
-                        state: self.0.clone(),
-                    })),
-                    Err(TryLockError::WouldBlock) => Ok(None),
-                    Err(TryLockError::Poisoned(_)) => Err(DecoderError::UnexpectedEnd),
+                self.inner.write_waker.register(cx.waker());
+                match self.inner.decoder.try_write() {
+                    Ok(guard) => guard,
+                    Err(TryLockError::WouldBlock) => return Poll::Pending,
+                    Err(TryLockError::Poisoned(_)) => {
+                        return Poll::Ready(Err(DecoderError::UnexpectedEnd))
+                    }
                 }
             }
-            Err(TryLockError::Poisoned(_)) => Err(DecoderError::UnexpectedEnd),
+            Err(TryLockError::Poisoned(_)) => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+        };
+
+        let result = decoder.on_encoder_recv(read, write);
+        drop(decoder);
+        self.inner.read_waker.wake();
+
+        Poll::Ready(result)
+    }
+
+    /// Decodes a header block using either stateless QPACK or the dynamic table.
+    ///
+    /// When `use_dynamic_table` is `false`, no lock is acquired and dynamic table
+    /// references are rejected by `decode_stateless`.
+    pub(crate) fn poll_decode_header_limited<T: Buf>(
+        &self,
+        cx: &mut Context<'_>,
+        encoded: &mut T,
+        max_size: u64,
+        use_dynamic_table: bool,
+    ) -> Poll<Result<Decoded, DecoderError>> {
+        if !use_dynamic_table {
+            return Poll::Ready(decode_stateless(encoded, max_size));
         }
+
+        let decoder = match self.inner.decoder.try_read() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => {
+                self.inner.read_waker.register(cx.waker());
+                match self.inner.decoder.try_read() {
+                    Ok(guard) => guard,
+                    Err(TryLockError::WouldBlock) => return Poll::Pending,
+                    Err(TryLockError::Poisoned(_)) => {
+                        return Poll::Ready(Err(DecoderError::UnexpectedEnd))
+                    }
+                }
+            }
+            Err(TryLockError::Poisoned(_)) => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+        };
+
+        let decoded = decoder.decode_header_limited(encoded, max_size);
+        drop(decoder);
+        self.inner.write_waker.wake();
+
+        Poll::Ready(decoded)
+    }
+
+    /// Decodes a header block and tracks decoder stream instructions for it.
+    pub(crate) fn poll_decode_header_limited_tracked<T: Buf>(
+        &mut self,
+        cx: &mut Context<'_>,
+        encoded: &mut T,
+        max_size: u64,
+        use_dynamic_table: bool,
+    ) -> Poll<Result<Decoded, DecoderError>> {
+        let decoded = match ready!(self.poll_decode_header_limited(
+            cx,
+            encoded,
+            max_size,
+            use_dynamic_table,
+        )) {
+            Ok(decoded) => decoded,
+            Err(error @ DecoderError::MissingRefs(required_ref)) => {
+                if required_ref > 0 {
+                    if let Some(stream_state) = &mut self.stream_state {
+                        stream_state.cancel_on_drop = true;
+                    }
+                }
+                return Poll::Ready(Err(error));
+            }
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+
+        if let Some(stream_state) = &mut self.stream_state {
+            stream_state.cancel_on_drop = false;
+            if decoded.dyn_ref {
+                if self
+                    .inner
+                    .decoder_events
+                    .send(QpackDecoderEvent::HeaderAck(stream_state.stream_id))
+                    .is_err()
+                {
+                    return Poll::Ready(Err(DecoderError::UnexpectedEnd));
+                }
+                stream_state.shared.waker().wake();
+            }
+        }
+
+        Poll::Ready(Ok(decoded))
     }
 }

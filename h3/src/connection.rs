@@ -67,7 +67,6 @@ where
 {
     decoder_send: Option<C::SendStream>,
     decoder_send_buf: BytesMut,
-    decoder_events_send: mpsc::UnboundedSender<QpackDecoderEvent>,
     decoder_events_recv: mpsc::UnboundedReceiver<QpackDecoderEvent>,
     decoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
     encoder_send: Option<C::SendStream>,
@@ -307,7 +306,6 @@ where
         let qpack_streams = QpackStreams {
             decoder_send: qpack_decoder.ok(),
             decoder_send_buf: BytesMut::new(),
-            decoder_events_send,
             decoder_events_recv,
             decoder_recv: None,
             encoder_send: qpack_encoder.ok(),
@@ -330,6 +328,7 @@ where
                     format!("invalid QPACK decoder configuration: {}", err),
                 ))
             })?,
+            decoder_events_send,
         );
 
         let mut conn_inner = Self {
@@ -431,20 +430,13 @@ where
         let _ = self.poll_connection_error(cx)?;
 
         // Get all currently pending streams
-        loop {
-            //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
-            //# An endpoint MUST allow its peer to create an encoder stream and a
-            //# decoder stream even if the connection's settings prevent their use.
-            match self
-                .conn
-                .poll_accept_recv(cx)
-                .map_err(|e| self.handle_connection_error(e))?
-            {
-                Poll::Ready(stream) => self
-                    .pending_recv_streams
-                    .push(Some(AcceptRecvStream::new(stream))),
-                Poll::Pending => break,
-            }
+        while let Poll::Ready(stream) = self
+            .conn
+            .poll_accept_recv(cx)
+            .map_err(|e| self.handle_connection_error(e))?
+        {
+            self.pending_recv_streams
+                .push(Some(AcceptRecvStream::new(stream)));
         }
 
         for stream in self.pending_recv_streams.iter_mut().filter(|s| s.is_some()) {
@@ -556,7 +548,10 @@ where
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub fn poll_qpack_encoder(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectionError>>
+    pub fn poll_qpack_encoder_stream(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectionError>>
     where
         C::SendStream: quic::SendStreamUnframed<B>,
     {
@@ -586,38 +581,26 @@ where
                 let decoder_send_before = self.qpack_streams.decoder_send_buf.len();
                 let decoder = self.qpack_decoder.clone();
 
-                let decode_result = {
-                    let mut decoder = match decoder.try_write(cx) {
-                        Ok(Some(decoder)) => decoder,
-                        Ok(None) => {
-                            self.qpack_streams.encoder_recv =
-                                Some(AcceptedRecvStream::Encoder(encoder_recv));
-                            return Poll::Pending;
-                        }
-                        Err(err) => {
-                            return Poll::Ready(Err(self.handle_connection_error(
-                                InternalConnectionError::new(
-                                    Code::QPACK_ENCODER_STREAM_ERROR,
-                                    format!("QPACK decoder state lock poisoned: {err}"),
-                                ),
-                            )))
-                        }
-                    };
-
-                    decoder.on_encoder_recv(
-                        encoder_recv.buf_mut(),
-                        &mut self.qpack_streams.decoder_send_buf,
-                    )
+                match decoder.poll_on_recv_encoder(
+                    cx,
+                    encoder_recv.buf_mut(),
+                    &mut self.qpack_streams.decoder_send_buf,
+                ) {
+                    Poll::Ready(Ok(_)) => (),
+                    Poll::Ready(Err(err)) => {
+                        return Poll::Ready(Err(self.handle_connection_error(
+                            InternalConnectionError::new(
+                                Code::QPACK_ENCODER_STREAM_ERROR,
+                                format!("invalid QPACK encoder stream instruction: {err}"),
+                            ),
+                        )))
+                    }
+                    Poll::Pending => {
+                        self.qpack_streams.encoder_recv =
+                            Some(AcceptedRecvStream::Encoder(encoder_recv));
+                        return Poll::Pending;
+                    }
                 };
-
-                if let Err(err) = decode_result {
-                    return Poll::Ready(Err(self.handle_connection_error(
-                        InternalConnectionError::new(
-                            Code::QPACK_ENCODER_STREAM_ERROR,
-                            format!("invalid QPACK encoder stream instruction: {err}"),
-                        ),
-                    )));
-                }
 
                 let after = encoder_recv.buf().remaining();
                 let made_progress = after != before
@@ -1044,11 +1027,6 @@ where
     pub(crate) fn qpack_decoder(&self) -> QpackDecoder {
         self.qpack_decoder.clone()
     }
-
-    #[inline(always)]
-    pub(crate) fn qpack_decoder_events(&self) -> mpsc::UnboundedSender<QpackDecoderEvent> {
-        self.qpack_streams.decoder_events_send.clone()
-    }
 }
 
 #[allow(missing_docs)]
@@ -1057,61 +1035,9 @@ pub struct RequestStream<S, B> {
     pub(super) trailers: Option<Bytes>,
     pub(super) conn_state: Arc<SharedState>,
     pub(super) max_field_section_size: u64,
-    pub(super) qpack_decoder: Option<QpackDecoder>,
-    qpack_request_state: Option<QpackRequestState>,
+    pub(super) qpack_decoder: QpackDecoder,
+    use_qpack_dynamic_table: bool,
     send_grease_frame: bool,
-}
-
-struct QpackRequestState {
-    stream_id: u64,
-    decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
-    shared: Arc<SharedState>,
-    cancel_on_drop: bool,
-}
-
-impl QpackRequestState {
-    fn new(
-        stream_id: u64,
-        decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
-        shared: Arc<SharedState>,
-    ) -> Self {
-        Self {
-            stream_id,
-            decoder_events,
-            shared,
-            cancel_on_drop: false,
-        }
-    }
-
-    fn mark_cancel_on_drop(&mut self) {
-        self.cancel_on_drop = true;
-    }
-
-    fn acknowledge(&mut self, decoded: &qpack::Decoded) -> Result<(), qpack::DecoderError> {
-        self.cancel_on_drop = false;
-
-        if decoded.dyn_ref {
-            self.send_event(QpackDecoderEvent::HeaderAck(self.stream_id))?;
-        }
-
-        Ok(())
-    }
-
-    fn send_event(&self, event: QpackDecoderEvent) -> Result<(), qpack::DecoderError> {
-        self.decoder_events
-            .send(event)
-            .map_err(|_| qpack::DecoderError::UnexpectedEnd)?;
-        self.shared.waker().wake();
-        Ok(())
-    }
-}
-
-impl Drop for QpackRequestState {
-    fn drop(&mut self) {
-        if self.cancel_on_drop {
-            let _ = self.send_event(QpackDecoderEvent::StreamCancel(self.stream_id));
-        }
-    }
 }
 
 impl<S, B> RequestStream<S, B>
@@ -1124,12 +1050,14 @@ where
         max_field_section_size: u64,
         conn_state: Arc<SharedState>,
         grease: bool,
-        qpack_decoder: Option<QpackDecoder>,
-        qpack_decoder_events: Option<mpsc::UnboundedSender<QpackDecoderEvent>>,
+        qpack_decoder: QpackDecoder,
+        use_qpack_dynamic_table: bool,
     ) -> Self {
-        let qpack_request_state = qpack_decoder_events.map(|decoder_events| {
-            QpackRequestState::new(stream.id().into_inner(), decoder_events, conn_state.clone())
-        });
+        let qpack_decoder = if use_qpack_dynamic_table {
+            qpack_decoder.track_stream(stream.id().into_inner(), conn_state.clone())
+        } else {
+            qpack_decoder
+        };
 
         Self {
             stream,
@@ -1137,7 +1065,7 @@ where
             max_field_section_size,
             trailers: None,
             qpack_decoder,
-            qpack_request_state,
+            use_qpack_dynamic_table,
             send_grease_frame: grease,
         }
     }
@@ -1295,14 +1223,13 @@ where
             }
         }
 
-        let decode_result = match self.poll_decode_header_block(cx, &mut trailers) {
+        let decode_result = match self.poll_decode_header_block_tracked(cx, &mut trailers) {
             Poll::Ready(decode_result) => decode_result,
             Poll::Pending => {
                 self.trailers = Some(trailers);
                 return Poll::Pending;
             }
         };
-        let decode_result = self.track_decoded_header_block(decode_result);
 
         let qpack::Decoded { fields, .. } = match decode_result {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
@@ -1344,61 +1271,18 @@ where
         self.stream.stop_sending(err_code);
     }
 
-    fn poll_decode_header_block(
-        &self,
-        cx: &mut Context<'_>,
-        encoded: &mut Bytes,
-    ) -> Poll<Result<qpack::Decoded, qpack::DecoderError>> {
-        let decoded = if let Some(decoder) = &self.qpack_decoder {
-            let decoder = match decoder.try_read(cx) {
-                Ok(Some(decoder)) => decoder,
-                Ok(None) => return Poll::Pending,
-                Err(err) => return Poll::Ready(Err(err)),
-            };
-
-            decoder.decode_header_limited(encoded, self.max_field_section_size)?
-        } else {
-            qpack::decode_stateless(encoded, self.max_field_section_size)?
-        };
-
-        if decoded.mem_size > self.max_field_section_size {
-            return Poll::Ready(Err(qpack::DecoderError::HeaderTooLong(decoded.mem_size)));
-        }
-
-        Poll::Ready(Ok(decoded))
-    }
-
-    fn track_decoded_header_block(
-        &mut self,
-        decoded: Result<qpack::Decoded, qpack::DecoderError>,
-    ) -> Result<qpack::Decoded, qpack::DecoderError> {
-        let decoded = match decoded {
-            Ok(decoded) => decoded,
-            Err(error @ qpack::DecoderError::MissingRefs(required_ref)) => {
-                if required_ref > 0 {
-                    if let Some(qpack_state) = &mut self.qpack_request_state {
-                        qpack_state.mark_cancel_on_drop();
-                    }
-                }
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
-
-        if let Some(qpack_state) = &mut self.qpack_request_state {
-            qpack_state.acknowledge(&decoded)?;
-        }
-
-        Ok(decoded)
-    }
-
-    pub(super) fn poll_decode_header_block_tracked(
+    #[inline(always)]
+    pub(crate) fn poll_decode_header_block_tracked(
         &mut self,
         cx: &mut Context<'_>,
         encoded: &mut Bytes,
     ) -> Poll<Result<qpack::Decoded, qpack::DecoderError>> {
-        let decoded = ready!(self.poll_decode_header_block(cx, encoded));
-        Poll::Ready(self.track_decoded_header_block(decoded))
+        self.qpack_decoder.poll_decode_header_limited_tracked(
+            cx,
+            encoded,
+            self.max_field_section_size,
+            self.use_qpack_dynamic_table,
+        )
     }
 }
 
@@ -1509,8 +1393,8 @@ where
                 trailers: None,
                 conn_state: self.conn_state.clone(),
                 max_field_section_size: 0,
-                qpack_decoder: None,
-                qpack_request_state: None,
+                qpack_decoder: self.qpack_decoder.clone(),
+                use_qpack_dynamic_table: false,
                 send_grease_frame: self.send_grease_frame,
             },
             RequestStream {
@@ -1519,7 +1403,7 @@ where
                 conn_state: self.conn_state,
                 max_field_section_size: self.max_field_section_size,
                 qpack_decoder: self.qpack_decoder,
-                qpack_request_state: self.qpack_request_state,
+                use_qpack_dynamic_table: self.use_qpack_dynamic_table,
                 send_grease_frame: self.send_grease_frame,
             },
         )
