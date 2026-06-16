@@ -1,13 +1,12 @@
 use std::{
     convert::TryFrom,
     marker::PhantomData,
-    ops::Deref,
-    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError},
+    sync::Arc,
     task::{Context, Poll},
 };
 
 use bytes::{Buf, Bytes, BytesMut};
-use futures_util::{future, ready, task::AtomicWaker};
+use futures_util::{future, ready};
 use http::HeaderMap;
 use stream::WriteBuf;
 use tokio::sync::mpsc;
@@ -32,6 +31,7 @@ use crate::{
         varint::VarInt,
     },
     qpack,
+    qpack::{QpackDecoder, QpackDecoderEvent},
     quic::{self, RecvStream, SendStream, SendStreamUnframed, StreamErrorIncoming},
     shared_state::{ConnectionState, SharedState},
     stream::{self, AcceptRecvStream, AcceptedRecvStream, BufRecvStream, UniStreamHeader},
@@ -72,83 +72,6 @@ where
     decoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
     encoder_send: Option<C::SendStream>,
     encoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
-}
-
-pub(crate) enum QpackDecoderEvent {
-    HeaderAck(u64),
-    StreamCancel(u64),
-}
-
-struct QpackDecoderState {
-    decoder: RwLock<qpack::Decoder>,
-    write_waker: AtomicWaker,
-}
-
-#[derive(Clone)]
-pub(crate) struct QpackDecoder(Arc<QpackDecoderState>);
-
-pub(crate) struct QpackDecoderReadGuard<'a> {
-    guard: Option<RwLockReadGuard<'a, qpack::Decoder>>,
-    state: Arc<QpackDecoderState>,
-}
-
-impl Deref for QpackDecoderReadGuard<'_> {
-    type Target = qpack::Decoder;
-
-    #[inline(always)]
-    fn deref(&self) -> &Self::Target {
-        self.guard
-            .as_deref()
-            .expect("QPACK decoder read guard is present")
-    }
-}
-
-impl Drop for QpackDecoderReadGuard<'_> {
-    fn drop(&mut self) {
-        let _ = self.guard.take();
-        self.state.write_waker.wake();
-    }
-}
-
-impl QpackDecoder {
-    #[inline(always)]
-    fn new(decoder: qpack::Decoder) -> Self {
-        Self(Arc::new(QpackDecoderState {
-            decoder: RwLock::new(decoder),
-            write_waker: AtomicWaker::new(),
-        }))
-    }
-
-    #[inline(always)]
-    pub(crate) fn read(&self) -> Result<QpackDecoderReadGuard<'_>, qpack::DecoderError> {
-        self.0
-            .decoder
-            .read()
-            .map(|guard| QpackDecoderReadGuard {
-                guard: Some(guard),
-                state: self.0.clone(),
-            })
-            .map_err(|_| qpack::DecoderError::UnexpectedEnd)
-    }
-
-    #[inline(always)]
-    fn try_write(
-        &self,
-        cx: &mut Context<'_>,
-    ) -> Result<Option<RwLockWriteGuard<'_, qpack::Decoder>>, qpack::DecoderError> {
-        match self.0.decoder.try_write() {
-            Ok(guard) => Ok(Some(guard)),
-            Err(TryLockError::WouldBlock) => {
-                self.0.write_waker.register(cx.waker());
-                match self.0.decoder.try_write() {
-                    Ok(guard) => Ok(Some(guard)),
-                    Err(TryLockError::WouldBlock) => Ok(None),
-                    Err(TryLockError::Poisoned(_)) => Err(qpack::DecoderError::UnexpectedEnd),
-                }
-            }
-            Err(TryLockError::Poisoned(_)) => Err(qpack::DecoderError::UnexpectedEnd),
-        }
-    }
 }
 
 #[allow(missing_docs)]
@@ -1372,7 +1295,13 @@ where
             }
         }
 
-        let decode_result = self.decode_header_block(&mut trailers);
+        let decode_result = match self.poll_decode_header_block(cx, &mut trailers) {
+            Poll::Ready(decode_result) => decode_result,
+            Poll::Pending => {
+                self.trailers = Some(trailers);
+                return Poll::Pending;
+            }
+        };
         let decode_result = self.track_decoded_header_block(decode_result);
 
         let qpack::Decoded { fields, .. } = match decode_result {
@@ -1415,23 +1344,28 @@ where
         self.stream.stop_sending(err_code);
     }
 
-    fn decode_header_block(
+    fn poll_decode_header_block(
         &self,
+        cx: &mut Context<'_>,
         encoded: &mut Bytes,
-    ) -> Result<qpack::Decoded, qpack::DecoderError> {
+    ) -> Poll<Result<qpack::Decoded, qpack::DecoderError>> {
         let decoded = if let Some(decoder) = &self.qpack_decoder {
-            decoder
-                .read()?
-                .decode_header_limited(encoded, self.max_field_section_size)?
+            let decoder = match decoder.try_read(cx) {
+                Ok(Some(decoder)) => decoder,
+                Ok(None) => return Poll::Pending,
+                Err(err) => return Poll::Ready(Err(err)),
+            };
+
+            decoder.decode_header_limited(encoded, self.max_field_section_size)?
         } else {
             qpack::decode_stateless(encoded, self.max_field_section_size)?
         };
 
         if decoded.mem_size > self.max_field_section_size {
-            return Err(qpack::DecoderError::HeaderTooLong(decoded.mem_size));
+            return Poll::Ready(Err(qpack::DecoderError::HeaderTooLong(decoded.mem_size)));
         }
 
-        Ok(decoded)
+        Poll::Ready(Ok(decoded))
     }
 
     fn track_decoded_header_block(
@@ -1458,12 +1392,13 @@ where
         Ok(decoded)
     }
 
-    pub(super) fn decode_header_block_tracked(
+    pub(super) fn poll_decode_header_block_tracked(
         &mut self,
+        cx: &mut Context<'_>,
         encoded: &mut Bytes,
-    ) -> Result<qpack::Decoded, qpack::DecoderError> {
-        let decoded = self.decode_header_block(encoded);
-        self.track_decoded_header_block(decoded)
+    ) -> Poll<Result<qpack::Decoded, qpack::DecoderError>> {
+        let decoded = ready!(self.poll_decode_header_block(cx, encoded));
+        Poll::Ready(self.track_decoded_header_block(decoded))
     }
 }
 
