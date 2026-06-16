@@ -69,15 +69,7 @@ pub(crate) struct QpackDecoder(Arc<DecoderState>);
 ///
 /// Dropping the guard wakes any task waiting to process encoder stream updates.
 pub(crate) struct QpackDecoderReadGuard<'a> {
-    guard: Option<RwLockReadGuard<'a, Decoder>>,
-    state: Arc<DecoderState>,
-}
-
-/// Write guard for QPACK encoder stream processing.
-///
-/// Dropping the guard wakes any task waiting to decode header blocks.
-pub(crate) struct QpackDecoderWriteGuard<'a> {
-    guard: RwLockWriteGuard<'a, Decoder>,
+    guard: RwLockReadGuard<'a, Decoder>,
     state: Arc<DecoderState>,
 }
 
@@ -86,17 +78,22 @@ impl Deref for QpackDecoderReadGuard<'_> {
 
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
-        self.guard
-            .as_deref()
-            .expect("QPACK decoder read guard is present")
+        &self.guard
     }
 }
 
 impl Drop for QpackDecoderReadGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.guard.take();
         self.state.write_waker.wake();
     }
+}
+
+/// Write guard for QPACK encoder stream processing.
+///
+/// Dropping the guard wakes any task waiting to decode header blocks.
+pub(crate) struct QpackDecoderWriteGuard<'a> {
+    guard: RwLockWriteGuard<'a, Decoder>,
+    state: Arc<DecoderState>,
 }
 
 impl Deref for QpackDecoderWriteGuard<'_> {
@@ -143,14 +140,14 @@ impl QpackDecoder {
     ) -> Result<Option<QpackDecoderReadGuard<'_>>, DecoderError> {
         match self.0.decoder.try_read() {
             Ok(guard) => Ok(Some(QpackDecoderReadGuard {
-                guard: Some(guard),
+                guard,
                 state: self.0.clone(),
             })),
             Err(TryLockError::WouldBlock) => {
                 self.0.read_waker.register(cx.waker());
                 match self.0.decoder.try_read() {
                     Ok(guard) => Ok(Some(QpackDecoderReadGuard {
-                        guard: Some(guard),
+                        guard,
                         state: self.0.clone(),
                     })),
                     Err(TryLockError::WouldBlock) => Ok(None),
