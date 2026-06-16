@@ -9,7 +9,6 @@ use std::{
 use bytes::{Buf, BytesMut};
 use futures_util::future;
 use http::request;
-use tokio::sync::mpsc;
 
 #[cfg(feature = "tracing")]
 use tracing::{info, instrument, trace};
@@ -22,7 +21,7 @@ use crate::{
     },
     frame::FrameStream,
     proto::{frame::Frame, headers::Header, push::PushId},
-    qpack::{self, QpackDecoder, QpackDecoderEvent},
+    qpack::{self, QpackDecoder},
     quic::{self, StreamId},
     shared_state::{ConnectionState, SharedState},
     stream::{self, BufRecvStream},
@@ -115,7 +114,7 @@ where
     pub(super) open: T,
     pub(super) conn_state: Arc<SharedState>,
     pub(super) qpack_decoder: QpackDecoder,
-    pub(super) qpack_decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
+    pub(super) use_qpack_dynamic_table: bool,
     pub(super) max_field_section_size: u64, // maximum size for a header we receive
     // counts instances of SendRequest to close the connection when the last is dropped.
     pub(super) sender_count: Arc<AtomicUsize>,
@@ -223,8 +222,8 @@ where
                 self.max_field_section_size,
                 self.conn_state.clone(),
                 self.send_grease_frame,
-                Some(self.qpack_decoder.clone()),
-                Some(self.qpack_decoder_events.clone()),
+                self.qpack_decoder.clone(),
+                self.use_qpack_dynamic_table,
             ),
         };
         // send the grease frame only once
@@ -245,7 +244,7 @@ where
         Self {
             conn_state: self.conn_state.clone(),
             qpack_decoder: self.qpack_decoder.clone(),
-            qpack_decoder_events: self.qpack_decoder_events.clone(),
+            use_qpack_dynamic_table: self.use_qpack_dynamic_table,
             open: self.open.clone(),
             max_field_section_size: self.max_field_section_size,
             sender_count: self.sender_count.clone(),
@@ -409,7 +408,7 @@ where
             return Poll::Ready(err);
         }
 
-        if let Poll::Ready(Err(err)) = self.inner.poll_qpack_encoder(cx) {
+        if let Poll::Ready(Err(err)) = self.inner.poll_qpack_encoder_stream(cx) {
             return Poll::Ready(err);
         }
 
