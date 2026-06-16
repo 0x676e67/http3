@@ -35,6 +35,12 @@ struct Opt {
     )]
     pub requests: usize,
 
+    #[structopt(long, default_value = "65536", help = "QPACK max table capacity")]
+    pub qpack_max_table_capacity: u64,
+
+    #[structopt(long, default_value = "100", help = "QPACK blocked streams")]
+    pub qpack_blocked_streams: u64,
+
     #[structopt()]
     pub uri: String,
 }
@@ -127,8 +133,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (mut driver, send_request) = h3::client::builder()
         .max_field_section_size(262144u64)
-        .qpack_max_table_capacity(65536u64)
-        .qpack_blocked_streams(100u64)
+        .qpack_max_table_capacity(opt.qpack_max_table_capacity)
+        .qpack_blocked_streams(opt.qpack_blocked_streams)
         .enable_datagram(true)
         .send_grease(true)
         .build(quinn_conn)

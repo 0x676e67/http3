@@ -117,8 +117,8 @@ impl Builder {
     /// Sent as `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (0x1). When this is not called,
     /// the setting is omitted and the protocol default of `0` applies. Passing `0`
     /// explicitly sends the setting with value `0`.
-    pub fn qpack_max_table_capacity(&mut self, value: u64) -> &mut Self {
-        self.config.settings.qpack_max_table_capacity = Some(value);
+    pub fn qpack_max_table_capacity<T: Into<Option<u64>>>(&mut self, value: T) -> &mut Self {
+        self.config.settings.qpack_max_table_capacity = value.into();
         self
     }
 
@@ -127,8 +127,8 @@ impl Builder {
     /// Sent as `SETTINGS_QPACK_BLOCKED_STREAMS` (0x7). When this is not called,
     /// the setting is omitted and the protocol default of `0` applies. Passing `0`
     /// explicitly sends the setting with value `0`.
-    pub fn qpack_blocked_streams(&mut self, value: u64) -> &mut Self {
-        self.config.settings.qpack_blocked_streams = Some(value);
+    pub fn qpack_blocked_streams<T: Into<Option<u64>>>(&mut self, value: T) -> &mut Self {
+        self.config.settings.qpack_blocked_streams = value.into();
         self
     }
 
@@ -170,13 +170,11 @@ impl Builder {
         let conn_state = Arc::new(shared);
 
         let inner = ConnectionInner::new(quic, conn_state.clone(), self.config.clone()).await?;
-        let qpack_decoder = inner.qpack_decoder();
-        let qpack_decoder_events = inner.qpack_decoder_events();
         let send_request = SendRequest {
             open,
             conn_state,
-            qpack_decoder,
-            qpack_decoder_events,
+            qpack_decoder: inner.qpack_decoder(),
+            use_qpack_dynamic_table: self.config.settings.qpack_max_table_capacity.unwrap_or(0) > 0,
             max_field_section_size: self.config.settings.max_field_section_size,
             sender_count: Arc::new(AtomicUsize::new(1)),
             send_grease_frame: self.config.send_grease,
