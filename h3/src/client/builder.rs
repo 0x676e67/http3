@@ -174,7 +174,7 @@ impl Builder {
             open,
             conn_state,
             qpack_decoder: inner.qpack_decoder(),
-            use_qpack_dynamic_table: self.config.settings.qpack_max_table_capacity.is_some(),
+            use_qpack_dynamic_table: self.config.settings.qpack_max_table_capacity.unwrap_or(0) > 0,
             max_field_section_size: self.config.settings.max_field_section_size,
             sender_count: Arc::new(AtomicUsize::new(1)),
             send_grease_frame: self.config.send_grease,
