@@ -15,14 +15,14 @@ use tokio::sync::mpsc;
 use tracing::{info, instrument, trace};
 
 use crate::{
-    connection::{self, ConnectionInner, QpackDecoder, QpackDecoderEvent},
+    connection::{self, ConnectionInner},
     error::{
         connection_error_creators::CloseStream, internal_error::InternalConnectionError, Code,
         ConnectionError, StreamError,
     },
     frame::FrameStream,
     proto::{frame::Frame, headers::Header, push::PushId},
-    qpack,
+    qpack::{self, QpackDecoder, QpackDecoderEvent},
     quic::{self, StreamId},
     shared_state::{ConnectionState, SharedState},
     stream::{self, BufRecvStream},
