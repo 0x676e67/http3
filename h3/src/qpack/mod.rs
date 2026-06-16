@@ -228,32 +228,21 @@ impl QpackDecoder {
             Err(error) => return Poll::Ready(Err(error)),
         };
 
-        let mut ack = None;
         if let Some(stream_state) = &mut self.stream_state {
             stream_state.cancel_on_drop = false;
             if decoded.dyn_ref {
-                ack = Some((stream_state.stream_id, stream_state.shared.clone()));
-            }
-        }
-
-        if decoded.dyn_ref {
-            if let Some((stream_id, shared)) = ack {
-                if let Err(error) = self.send_event(QpackDecoderEvent::HeaderAck(stream_id)) {
-                    return Poll::Ready(Err(error));
+                if self
+                    .inner
+                    .decoder_events
+                    .send(QpackDecoderEvent::HeaderAck(stream_state.stream_id))
+                    .is_err()
+                {
+                    return Poll::Ready(Err(DecoderError::UnexpectedEnd));
                 }
-                shared.waker().wake();
+                stream_state.shared.waker().wake();
             }
         }
 
         Poll::Ready(Ok(decoded))
-    }
-
-    /// Enqueues a QPACK decoder stream instruction event.
-    #[inline(always)]
-    pub(crate) fn send_event(&self, event: QpackDecoderEvent) -> Result<(), DecoderError> {
-        self.inner
-            .decoder_events
-            .send(event)
-            .map_err(|_| DecoderError::UnexpectedEnd)
     }
 }
