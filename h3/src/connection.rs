@@ -1223,10 +1223,12 @@ where
             }
         }
 
+        // QPACK decoding advances the buffer; retry paths must keep the original block.
+        let encoded_trailers = trailers.clone();
         let decode_result = match self.poll_decode_header_block_tracked(cx, &mut trailers) {
             Poll::Ready(decode_result) => decode_result,
             Poll::Pending => {
-                self.trailers = Some(trailers);
+                self.trailers = Some(encoded_trailers);
                 return Poll::Pending;
             }
         };
@@ -1243,7 +1245,7 @@ where
             }
             Err(qpack::DecoderError::MissingRefs(_)) => {
                 // QPACK decoding advances the buffer; MissingRefs must retry from the original block.
-                self.trailers = Some(trailers);
+                self.trailers = Some(encoded_trailers);
                 self.waker().register(cx.waker());
                 return Poll::Pending;
             }
