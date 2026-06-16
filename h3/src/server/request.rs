@@ -3,12 +3,12 @@ use std::{convert::TryFrom, sync::Arc};
 use bytes::Buf;
 use http::{Request, StatusCode};
 
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::UnboundedSender;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
 use crate::{
-    connection::{self, QpackDecoder, QpackDecoderEvent},
+    connection::{self},
     error::{
         connection_error_creators::{CloseStream, HandleFrameStreamErrorOnRequestStream},
         internal_error::InternalConnectionError,
@@ -40,8 +40,6 @@ where
     pub(super) send_grease_frame: bool,
     pub(super) max_field_section_size: u64,
     pub(super) shared: Arc<SharedState>,
-    pub(super) qpack_decoder: QpackDecoder,
-    pub(super) qpack_decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
 }
 
 impl<C, B> ConnectionState for RequestResolver<C, B>
@@ -128,27 +126,12 @@ where
             }
         };
 
-        let decoded = match self
-            .qpack_decoder
-            .read()
-            .map_err(|_| {
-                self.handle_connection_error_on_stream(InternalConnectionError {
-                    code: Code::QPACK_DECOMPRESSION_FAILED,
-                    message: "QPACK decoder state lock failed".to_string(),
-                })
-            })?
-            .decode_header_limited(&mut encoded, self.max_field_section_size)
-        {
+        let decoded = match qpack::decode_stateless(&mut encoded, self.max_field_section_size) {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
             //# An HTTP/3 implementation MAY impose a limit on the maximum size of
             //# the message header it will accept on an individual HTTP message.
             Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => Err(cancel_size),
-            Ok(decoded) => {
-                if decoded.dyn_ref {
-                    self.ack_header()?;
-                }
-                Ok(decoded)
-            }
+            Ok(decoded) => Ok(decoded),
             Err(_e) => {
                 return Err(
                     self.handle_connection_error_on_stream(InternalConnectionError {
@@ -169,8 +152,8 @@ where
                 self.max_field_section_size,
                 self.shared.clone(),
                 self.send_grease_frame,
-                Some(self.qpack_decoder.clone()),
-                Some(self.qpack_decoder_events.clone()),
+                None,
+                None,
             ),
         };
 
@@ -179,21 +162,6 @@ where
             decoded,
             self.max_field_section_size,
         ))
-    }
-
-    fn ack_header(&self) -> Result<(), StreamError> {
-        self.qpack_decoder_events
-            .send(QpackDecoderEvent::HeaderAck(
-                self.frame_stream.send_id().into_inner(),
-            ))
-            .map_err(|_| {
-                self.handle_connection_error_on_stream(InternalConnectionError {
-                    code: Code::QPACK_DECOMPRESSION_FAILED,
-                    message: "QPACK decoder event channel closed".to_string(),
-                })
-            })?;
-        self.waker().wake();
-        Ok(())
     }
 }
 
