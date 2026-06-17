@@ -147,28 +147,27 @@ impl QpackDecoder {
     ) -> Poll<Result<usize, DecoderError>> {
         match self.inner.decoder.try_write() {
             Ok(mut decoder) => {
-                // Conduct the first blind test.
                 let result = decoder.on_encoder_recv(read, write);
                 drop(decoder);
                 self.inner.read_waker.wake();
                 Poll::Ready(result)
             }
             Err(TryLockError::WouldBlock) => {
-                // We register the write waker.
+                // A header decode is holding a read lock. Register before retrying
+                // so a read-lock release cannot be missed between attempts.
                 self.inner.write_waker.register(cx.waker());
                 match self.inner.decoder.try_write() {
                     Ok(mut decoder) => {
-                        // An extremely rare situation: The lock became idle immediately after registration.
-                        // Since we have it, it means we don't need to sleep.
+                        // The read lock was released after registration; process now
+                        // instead of returning Pending and waiting for another wake.
                         let result = decoder.on_encoder_recv(read, write);
                         drop(decoder);
                         self.inner.read_waker.wake();
                         Poll::Ready(result)
                     }
                     Err(TryLockError::WouldBlock) => {
-                        // Defense mechanism activated: At this point, returning "Pending" is safe,
-                        // and the other party will definitely see the latest waker we registered
-                        // in the previous line when they release the write lock.
+                        // Still blocked. The registered waker will be notified when
+                        // the current readers release the decoder.
                         Poll::Pending
                     }
                     Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
@@ -195,28 +194,27 @@ impl QpackDecoder {
 
         match self.inner.decoder.try_read() {
             Ok(decoder) => {
-                // Conduct the first blind test.
                 let decoded = decoder.decode_header_limited(encoded, max_size);
                 drop(decoder);
                 self.inner.write_waker.wake();
                 Poll::Ready(decoded)
             }
             Err(TryLockError::WouldBlock) => {
-                // We register the read waker.
+                // The encoder stream is updating the dynamic table. Register before
+                // retrying so a write-lock release cannot be missed between attempts.
                 self.inner.read_waker.register(cx.waker());
                 match self.inner.decoder.try_read() {
                     Ok(decoder) => {
-                        // An extremely rare situation: The lock became idle immediately after registration.
-                        // Since we have it, it means we don't need to sleep.
+                        // The write lock was released after registration; decode now
+                        // instead of returning Pending and waiting for another wake.
                         let decoded = decoder.decode_header_limited(encoded, max_size);
                         drop(decoder);
                         self.inner.write_waker.wake();
                         Poll::Ready(decoded)
                     }
                     Err(TryLockError::WouldBlock) => {
-                        // Defense mechanism activated: At this point, returning "Pending" is safe,
-                        // and the other party will definitely see the latest waker we registered
-                        // in the previous line when they release the write lock.
+                        // Still blocked. The registered waker will be notified when
+                        // the writer releases the decoder.
                         Poll::Pending
                     }
                     Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
