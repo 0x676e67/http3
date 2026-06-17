@@ -125,8 +125,9 @@ where
 
         let decoded = if let Frame::Headers(ref encoded) = frame {
             loop {
+                // QPACK decoding advances the buffer; MissingRefs must retry from the original block.
                 let mut encoded = encoded.clone();
-                match self.inner.decode_header_block(&mut encoded) {
+                match future::poll_fn(|cx| self.inner.poll_decode_header(cx, &mut encoded)).await {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
                     //# An HTTP/3 implementation MAY impose a limit on the maximum size of
                     //# the message header it will accept on an individual HTTP message.

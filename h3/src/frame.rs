@@ -70,33 +70,32 @@ where
         );
 
         loop {
-            match self.decoder.decode(self.stream.buf_mut())? {
+            // Decode buffered frames before reading more from the transport.
+            return match self.decoder.decode(self.stream.buf_mut())? {
                 Some(Frame::Data(PayloadLen(len))) => {
                     self.remaining_data = len;
-                    return Poll::Ready(Ok(Some(Frame::Data(PayloadLen(len)))));
+                    Poll::Ready(Ok(Some(Frame::Data(PayloadLen(len)))))
                 }
                 frame @ Some(Frame::WebTransportStream(_)) => {
                     self.remaining_data = usize::MAX;
-                    return Poll::Ready(Ok(frame));
+                    Poll::Ready(Ok(frame))
                 }
-                Some(frame) => return Poll::Ready(Ok(Some(frame))),
-                None => {}
-            }
-
-            match self.try_recv(cx)? {
-                // Received a chunk but frame is incomplete, poll until we get `Pending`.
-                Poll::Ready(false) => continue,
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(true) => {
-                    if self.stream.buf_mut().has_remaining() {
-                        // Reached the end of receive stream, but there is still some data:
-                        // The frame is incomplete.
-                        return Poll::Ready(Err(FrameStreamError::UnexpectedEnd));
-                    } else {
-                        return Poll::Ready(Ok(None));
+                Some(frame) => Poll::Ready(Ok(Some(frame))),
+                None => match self.try_recv(cx)? {
+                    // Received a chunk but frame is incomplete, poll until we get `Pending`.
+                    Poll::Ready(false) => continue,
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(true) => {
+                        if self.stream.buf_mut().has_remaining() {
+                            // Reached the end of receive stream, but there is still some data:
+                            // The frame is incomplete.
+                            Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
+                        } else {
+                            Poll::Ready(Ok(None))
+                        }
                     }
-                }
-            }
+                },
+            };
         }
     }
 
@@ -447,26 +446,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_next_consumes_buffered_frame_before_reading_more() {
-        let mut recv = FakeRecv::default();
-        let reads = recv.reads();
-        let mut buf = BytesMut::with_capacity(64);
-
-        Frame::headers(&b"header"[..]).encode_with_payload(&mut buf);
-        Frame::headers(&b"trailer"[..]).encode_with_payload(&mut buf);
-        recv.chunk(buf.freeze());
-        recv.chunk(Bytes::from_static(b"unused"));
-
-        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
-
-        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
-        assert_eq!(reads.load(Ordering::Relaxed), 1);
-
-        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
-        assert_eq!(reads.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
     async fn poll_next_incomplete_frame() {
         let mut recv = FakeRecv::default();
         let mut buf = BytesMut::with_capacity(64);
@@ -618,6 +597,26 @@ mod tests {
             |cx| to_bytes(stream.poll_data(cx)),
             Ok(Some(b)) if &*b == b"dy"
         );
+    }
+
+    #[tokio::test]
+    async fn poll_next_consumes_buffered_frame_before_reading_more() {
+        let mut recv = FakeRecv::default();
+        let reads = recv.reads();
+        let mut buf = BytesMut::with_capacity(64);
+
+        Frame::headers(&b"header"[..]).encode_with_payload(&mut buf);
+        Frame::headers(&b"trailer"[..]).encode_with_payload(&mut buf);
+        recv.chunk(buf.freeze());
+        recv.chunk(Bytes::from_static(b"unused"));
+
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+
+        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+
+        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
     }
 
     // Helpers

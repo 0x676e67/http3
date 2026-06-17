@@ -108,7 +108,7 @@ fn convert_to_connection_error(error: ErrorOrigin) -> ConnectionError {
 pub trait CloseStream: ConnectionState {
     /// Handles a connection error on a stream
     fn handle_connection_error_on_stream(
-        &mut self,
+        &self,
         internal_error: InternalConnectionError,
     ) -> StreamError {
         let err = self.set_conn_error_and_wake(internal_error);
