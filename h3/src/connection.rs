@@ -1285,7 +1285,7 @@ where
         cx: &mut Context<'_>,
         encoded: &mut Bytes,
     ) -> Poll<Result<qpack::Decoded, qpack::DecoderError>> {
-        self.qpack_decoder.poll_decode_header_limited_tracked(
+        self.qpack_decoder.poll_decode_header_tracked(
             cx,
             encoded,
             self.max_field_section_size,

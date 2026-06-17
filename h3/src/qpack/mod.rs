@@ -145,33 +145,43 @@ impl QpackDecoder {
         read: &mut R,
         write: &mut W,
     ) -> Poll<Result<usize, DecoderError>> {
-        let mut decoder = match self.inner.decoder.try_write() {
-            Ok(guard) => guard,
+        match self.inner.decoder.try_write() {
+            Ok(mut decoder) => {
+                let result = decoder.on_encoder_recv(read, write);
+                drop(decoder);
+                self.inner.read_waker.wake();
+                Poll::Ready(result)
+            }
             Err(TryLockError::WouldBlock) => {
+                // A header decode is holding a read lock. Register before retrying
+                // so a read-lock release cannot be missed between attempts.
                 self.inner.write_waker.register(cx.waker());
                 match self.inner.decoder.try_write() {
-                    Ok(guard) => guard,
-                    Err(TryLockError::WouldBlock) => return Poll::Pending,
-                    Err(TryLockError::Poisoned(_)) => {
-                        return Poll::Ready(Err(DecoderError::UnexpectedEnd))
+                    Ok(mut decoder) => {
+                        // The read lock was released after registration; process now
+                        // instead of returning Pending and waiting for another wake.
+                        let result = decoder.on_encoder_recv(read, write);
+                        drop(decoder);
+                        self.inner.read_waker.wake();
+                        Poll::Ready(result)
                     }
+                    Err(TryLockError::WouldBlock) => {
+                        // Still blocked. The registered waker will be notified when
+                        // the current readers release the decoder.
+                        Poll::Pending
+                    }
+                    Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
                 }
             }
-            Err(TryLockError::Poisoned(_)) => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
-        };
-
-        let result = decoder.on_encoder_recv(read, write);
-        drop(decoder);
-        self.inner.read_waker.wake();
-
-        Poll::Ready(result)
+            Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+        }
     }
 
     /// Decodes a header block using either stateless QPACK or the dynamic table.
     ///
     /// When `use_dynamic_table` is `false`, no lock is acquired and dynamic table
     /// references are rejected by `decode_stateless`.
-    pub(crate) fn poll_decode_header_limited<T: Buf>(
+    pub(crate) fn poll_decode_header<T: Buf>(
         &self,
         cx: &mut Context<'_>,
         encoded: &mut T,
@@ -182,53 +192,59 @@ impl QpackDecoder {
             return Poll::Ready(decode_stateless(encoded, max_size));
         }
 
-        let decoder = match self.inner.decoder.try_read() {
-            Ok(guard) => guard,
+        match self.inner.decoder.try_read() {
+            Ok(decoder) => {
+                let decoded = decoder.decode_header_limited(encoded, max_size);
+                drop(decoder);
+                self.inner.write_waker.wake();
+                Poll::Ready(decoded)
+            }
             Err(TryLockError::WouldBlock) => {
+                // The encoder stream is updating the dynamic table. Register before
+                // retrying so a write-lock release cannot be missed between attempts.
                 self.inner.read_waker.register(cx.waker());
                 match self.inner.decoder.try_read() {
-                    Ok(guard) => guard,
-                    Err(TryLockError::WouldBlock) => return Poll::Pending,
-                    Err(TryLockError::Poisoned(_)) => {
-                        return Poll::Ready(Err(DecoderError::UnexpectedEnd))
+                    Ok(decoder) => {
+                        // The write lock was released after registration; decode now
+                        // instead of returning Pending and waiting for another wake.
+                        let decoded = decoder.decode_header_limited(encoded, max_size);
+                        drop(decoder);
+                        self.inner.write_waker.wake();
+                        Poll::Ready(decoded)
                     }
+                    Err(TryLockError::WouldBlock) => {
+                        // Still blocked. The registered waker will be notified when
+                        // the writer releases the decoder.
+                        Poll::Pending
+                    }
+                    Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
                 }
             }
-            Err(TryLockError::Poisoned(_)) => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
-        };
-
-        let decoded = decoder.decode_header_limited(encoded, max_size);
-        drop(decoder);
-        self.inner.write_waker.wake();
-
-        Poll::Ready(decoded)
+            Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+        }
     }
 
     /// Decodes a header block and tracks decoder stream instructions for it.
-    pub(crate) fn poll_decode_header_limited_tracked<T: Buf>(
+    pub(crate) fn poll_decode_header_tracked<T: Buf>(
         &mut self,
         cx: &mut Context<'_>,
         encoded: &mut T,
         max_size: u64,
         use_dynamic_table: bool,
     ) -> Poll<Result<Decoded, DecoderError>> {
-        let decoded = match ready!(self.poll_decode_header_limited(
-            cx,
-            encoded,
-            max_size,
-            use_dynamic_table,
-        )) {
-            Ok(decoded) => decoded,
-            Err(error @ DecoderError::MissingRefs(required_ref)) => {
-                if required_ref > 0 {
-                    if let Some(stream_state) = &mut self.stream_state {
-                        stream_state.cancel_on_drop = true;
+        let decoded =
+            match ready!(self.poll_decode_header(cx, encoded, max_size, use_dynamic_table,)) {
+                Ok(decoded) => decoded,
+                Err(error @ DecoderError::MissingRefs(required_ref)) => {
+                    if required_ref > 0 {
+                        if let Some(stream_state) = &mut self.stream_state {
+                            stream_state.cancel_on_drop = true;
+                        }
                     }
+                    return Poll::Ready(Err(error));
                 }
-                return Poll::Ready(Err(error));
-            }
-            Err(error) => return Poll::Ready(Err(error)),
-        };
+                Err(error) => return Poll::Ready(Err(error)),
+            };
 
         if let Some(stream_state) = &mut self.stream_state {
             stream_state.cancel_on_drop = false;
