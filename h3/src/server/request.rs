@@ -1,7 +1,4 @@
-use std::{
-    convert::TryFrom,
-    sync::{Arc, Mutex},
-};
+use std::{convert::TryFrom, sync::Arc};
 
 use bytes::Buf;
 use http::{Request, StatusCode};
@@ -22,7 +19,7 @@ use crate::{
         frame::{Frame, PayloadLen},
         headers::Header,
     },
-    qpack::{self},
+    qpack::{self, QpackDecoder},
     quic::{self, SendStream, StreamId},
     shared_state::{ConnectionState, SharedState},
 };
@@ -43,7 +40,7 @@ where
     pub(super) send_grease_frame: bool,
     pub(super) max_field_section_size: u64,
     pub(super) shared: Arc<SharedState>,
-    pub(super) qpack_decoder: Arc<Mutex<qpack::Decoder>>,
+    pub(super) qpack_decoder: QpackDecoder,
 }
 
 impl<C, B> ConnectionState for RequestResolver<C, B>
@@ -130,7 +127,7 @@ where
             }
         };
 
-        let decoded = match self.decode_header_block(&mut encoded) {
+        let decoded = match qpack::decode_stateless(&mut encoded, self.max_field_section_size) {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
             //# An HTTP/3 implementation MAY impose a limit on the maximum size of
             //# the message header it will accept on an individual HTTP message.
@@ -156,7 +153,8 @@ where
                 self.max_field_section_size,
                 self.shared.clone(),
                 self.send_grease_frame,
-                Some(self.qpack_decoder.clone()),
+                self.qpack_decoder,
+                false,
             ),
         };
 
@@ -165,23 +163,6 @@ where
             decoded,
             self.max_field_section_size,
         ))
-    }
-
-    fn decode_header_block<T: Buf>(
-        &self,
-        encoded: &mut T,
-    ) -> Result<qpack::Decoded, qpack::DecoderError> {
-        let decoded = self
-            .qpack_decoder
-            .lock()
-            .map_err(|_| qpack::DecoderError::UnknownPrefix(0))?
-            .decode_header_limited(encoded, self.max_field_section_size)?;
-
-        if decoded.mem_size > self.max_field_section_size {
-            return Err(qpack::DecoderError::HeaderTooLong(decoded.mem_size));
-        }
-
-        Ok(decoded)
     }
 }
 
