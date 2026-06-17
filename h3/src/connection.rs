@@ -1225,7 +1225,7 @@ where
 
         // QPACK decoding advances the buffer; retry paths must keep the original block.
         let encoded_trailers = trailers.clone();
-        let decode_result = match self.poll_decode_header_block_tracked(cx, &mut trailers) {
+        let decode_result = match self.poll_decode_header(cx, &mut trailers) {
             Poll::Ready(decode_result) => decode_result,
             Poll::Pending => {
                 self.trailers = Some(encoded_trailers);
@@ -1280,12 +1280,12 @@ where
     }
 
     #[inline(always)]
-    pub(crate) fn poll_decode_header_block_tracked(
+    pub(crate) fn poll_decode_header(
         &mut self,
         cx: &mut Context<'_>,
         encoded: &mut Bytes,
     ) -> Poll<Result<qpack::Decoded, qpack::DecoderError>> {
-        self.qpack_decoder.poll_decode_header_tracked(
+        self.qpack_decoder.poll_decode_header(
             cx,
             encoded,
             self.max_field_section_size,

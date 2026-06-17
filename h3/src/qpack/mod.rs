@@ -6,7 +6,7 @@ pub use self::{
 
 use std::{
     sync::{Arc, RwLock, TryLockError},
-    task::{ready, Context, Poll},
+    task::{Context, Poll},
 };
 
 use bytes::{Buf, BufMut};
@@ -177,12 +177,12 @@ impl QpackDecoder {
         }
     }
 
-    /// Decodes a header block using either stateless QPACK or the dynamic table.
+    /// Decodes a header block and tracks decoder stream instructions for it.
     ///
     /// When `use_dynamic_table` is `false`, no lock is acquired and dynamic table
     /// references are rejected by `decode_stateless`.
     pub(crate) fn poll_decode_header<T: Buf>(
-        &self,
+        &mut self,
         cx: &mut Context<'_>,
         encoded: &mut T,
         max_size: u64,
@@ -192,12 +192,12 @@ impl QpackDecoder {
             return Poll::Ready(decode_stateless(encoded, max_size));
         }
 
-        match self.inner.decoder.try_read() {
+        let decoded = match self.inner.decoder.try_read() {
             Ok(decoder) => {
                 let decoded = decoder.decode_header_limited(encoded, max_size);
                 drop(decoder);
                 self.inner.write_waker.wake();
-                Poll::Ready(decoded)
+                decoded
             }
             Err(TryLockError::WouldBlock) => {
                 // The encoder stream is updating the dynamic table. Register before
@@ -210,41 +210,33 @@ impl QpackDecoder {
                         let decoded = decoder.decode_header_limited(encoded, max_size);
                         drop(decoder);
                         self.inner.write_waker.wake();
-                        Poll::Ready(decoded)
+                        decoded
                     }
                     Err(TryLockError::WouldBlock) => {
                         // Still blocked. The registered waker will be notified when
                         // the writer releases the decoder.
-                        Poll::Pending
+                        return Poll::Pending;
                     }
-                    Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+                    Err(TryLockError::Poisoned(_)) => {
+                        return Poll::Ready(Err(DecoderError::UnexpectedEnd))
+                    }
                 }
             }
-            Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
-        }
-    }
+            Err(TryLockError::Poisoned(_)) => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+        };
 
-    /// Decodes a header block and tracks decoder stream instructions for it.
-    pub(crate) fn poll_decode_header_tracked<T: Buf>(
-        &mut self,
-        cx: &mut Context<'_>,
-        encoded: &mut T,
-        max_size: u64,
-        use_dynamic_table: bool,
-    ) -> Poll<Result<Decoded, DecoderError>> {
-        let decoded =
-            match ready!(self.poll_decode_header(cx, encoded, max_size, use_dynamic_table,)) {
-                Ok(decoded) => decoded,
-                Err(error @ DecoderError::MissingRefs(required_ref)) => {
-                    if required_ref > 0 {
-                        if let Some(stream_state) = &mut self.stream_state {
-                            stream_state.cancel_on_drop = true;
-                        }
+        let decoded = match decoded {
+            Ok(decoded) => decoded,
+            Err(error @ DecoderError::MissingRefs(required_ref)) => {
+                if required_ref > 0 {
+                    if let Some(stream_state) = &mut self.stream_state {
+                        stream_state.cancel_on_drop = true;
                     }
-                    return Poll::Ready(Err(error));
                 }
-                Err(error) => return Poll::Ready(Err(error)),
-            };
+                return Poll::Ready(Err(error));
+            }
+            Err(error) => return Poll::Ready(Err(error)),
+        };
 
         if let Some(stream_state) = &mut self.stream_state {
             stream_state.cancel_on_drop = false;
