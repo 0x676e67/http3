@@ -140,7 +140,7 @@ where
     /// Grease steam is started without data
     Started(Option<S>),
     /// Grease stream is started with data
-    DataPrepared(Option<S>),
+    DataPrepared(Option<S>, WriteBuf<B>),
     /// Data is sent on grease stream
     DataSent(S),
     /// Grease stream is finished
@@ -920,13 +920,13 @@ where
         if matches!(self.grease_step, GreaseStatus::NotStarted(_)) {
             self.grease_step = match self.conn.poll_open_send(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(_)) => {
+                Poll::Ready(Err(_error)) => {
                     // could not create grease stream
                     // don't try again
                     self.send_grease_stream_flag = false;
 
                     #[cfg(feature = "tracing")]
-                    warn!("grease stream creation failed with");
+                    warn!("grease stream creation failed: {}", _error);
 
                     return Poll::Ready(());
                 }
@@ -940,34 +940,76 @@ where
         //# sent when application-layer padding is desired.  They MAY also be
         //# sent on connections where no data is currently being transferred.
         if let GreaseStatus::Started(stream) = &mut self.grease_step {
-            if let Some(stream) = stream {
-                if stream
-                    .send_data((StreamType::grease(), Frame::Grease))
-                    .is_err()
-                {
+            let Some(mut stream) = stream.take() else {
+                // this should never happen
+                self.send_grease_stream_flag = false;
+                return Poll::Ready(());
+            };
+
+            let mut frame = WriteBuf::from((StreamType::grease(), Frame::Grease));
+            match stream.poll_ready(cx) {
+                Poll::Ready(Ok(())) => (),
+                Poll::Pending => {
+                    self.grease_step = GreaseStatus::Started(Some(stream));
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(_error)) => {
                     self.send_grease_stream_flag = false;
 
                     #[cfg(feature = "tracing")]
-                    warn!("write data on grease stream failed with");
+                    warn!(
+                        "grease stream poll_ready failed before initial write: {}",
+                        _error
+                    );
 
                     return Poll::Ready(());
-                };
+                }
             }
-            self.grease_step = GreaseStatus::DataPrepared(stream.take());
+            match stream.poll_send_data(cx, &mut frame) {
+                Poll::Ready(Ok(_)) => self.grease_step = GreaseStatus::DataSent(stream),
+                Poll::Pending => {
+                    self.grease_step = GreaseStatus::DataPrepared(Some(stream), frame);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(_error)) => {
+                    self.send_grease_stream_flag = false;
+
+                    #[cfg(feature = "tracing")]
+                    warn!("grease stream initial poll_send_data failed: {}", _error);
+
+                    return Poll::Ready(());
+                }
+            }
         };
 
-        if let GreaseStatus::DataPrepared(stream) = &mut self.grease_step {
+        if let GreaseStatus::DataPrepared(stream, frame) = &mut self.grease_step {
             if let Some(stream) = stream {
-                match stream.poll_ready(cx) {
+                if let Err(_error) = ready!(stream.poll_ready(cx)) {
+                    // could not write grease frame
+                    // don't try again
+                    self.send_grease_stream_flag = false;
+
+                    #[cfg(feature = "tracing")]
+                    warn!(
+                        "grease stream poll_ready failed while resuming pending write: {}",
+                        _error
+                    );
+
+                    return Poll::Ready(());
+                }
+                match stream.poll_send_data(cx, frame) {
                     Poll::Ready(Ok(_)) => (),
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(_)) => {
+                    Poll::Ready(Err(_error)) => {
                         // could not write grease frame
                         // don't try again
                         self.send_grease_stream_flag = false;
 
                         #[cfg(feature = "tracing")]
-                        warn!("write data on grease stream failed with");
+                        warn!(
+                            "grease stream poll_send_data failed while resuming pending write: {}",
+                            _error
+                        );
 
                         return Poll::Ready(());
                     }
@@ -997,13 +1039,13 @@ where
             match stream.poll_finish(cx) {
                 Poll::Ready(Ok(_)) => (),
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(_)) => {
+                Poll::Ready(Err(_error)) => {
                     // could not finish grease stream
                     // don't try again
                     self.send_grease_stream_flag = false;
 
                     #[cfg(feature = "tracing")]
-                    warn!("finish grease stream failed with");
+                    warn!("grease stream finish failed: {}", _error);
 
                     return Poll::Ready(());
                 }

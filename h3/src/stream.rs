@@ -34,9 +34,12 @@ where
     D: Into<WriteBuf<B>>,
     B: Buf,
 {
-    stream.send_data(data)?;
-    future::poll_fn(|cx| stream.poll_ready(cx)).await?;
-
+    let mut data = data.into();
+    future::poll_fn(|cx| {
+        ready!(stream.poll_ready(cx))?;
+        stream.poll_send_data(cx, &mut data)
+    })
+    .await?;
     Ok(())
 }
 
@@ -51,7 +54,7 @@ const WRITE_BUF_ENCODE_SIZE: usize = 512;
 /// this type makes it possible to prefix wire data with the `StreamType`.
 ///
 /// Conveying frames as `Into<WriteBuf>` makes it possible to encode only when generating wire-format
-/// data is necessary (say, in `quic::SendStream::send_data`). It also has a public API ergonomy
+/// data is necessary (say, in `quic::SendStream::poll_send_data`). It also has a public API ergonomy
 /// advantage: `WriteBuf` doesn't have to appear in public associated types. On the other hand,
 /// QUIC implementers have to call `into()`, which will encode the header in `Self::buf`.
 pub struct WriteBuf<B> {
@@ -551,8 +554,12 @@ where
         self.stream.poll_ready(cx)
     }
 
-    fn send_data<T: Into<WriteBuf<B>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
-        self.stream.send_data(data)
+    fn poll_send_data(
+        &mut self,
+        cx: &mut Context<'_>,
+        data: &mut WriteBuf<B>,
+    ) -> Poll<Result<(), StreamErrorIncoming>> {
+        self.stream.poll_send_data(cx, data)
     }
 }
 
@@ -726,6 +733,67 @@ mod tests {
     use crate::proto::coding::BufExt;
 
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct WriteOrderState {
+        ready_calls: usize,
+        poll_send_calls: usize,
+    }
+
+    struct WriteOrderStream {
+        state: Arc<Mutex<WriteOrderState>>,
+    }
+
+    impl SendStream<Bytes> for WriteOrderStream {
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+            self.state.lock().unwrap().ready_calls += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_send_data(
+            &mut self,
+            cx: &mut Context<'_>,
+            data: &mut WriteBuf<Bytes>,
+        ) -> Poll<Result<(), StreamErrorIncoming>> {
+            let mut state = self.state.lock().unwrap();
+            state.poll_send_calls += 1;
+            if state.poll_send_calls == 1 {
+                data.advance(1);
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                data.advance(data.remaining());
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_finish(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn reset(&mut self, _reset_code: u64) {}
+
+        fn send_id(&self) -> quic::StreamId {
+            0u64.try_into().unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn write_uses_poll_send_data_and_flushes_pending_data() {
+        let state = Arc::new(Mutex::new(WriteOrderState::default()));
+        let mut stream = WriteOrderStream {
+            state: state.clone(),
+        };
+
+        write(&mut stream, Frame::Data(Bytes::from_static(b"hello")))
+            .await
+            .unwrap();
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.poll_send_calls, 2);
+        assert_eq!(state.ready_calls, 2);
+    }
 
     #[test]
     fn write_wt_uni_header() {

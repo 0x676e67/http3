@@ -172,8 +172,12 @@ where
         self.stream.poll_ready(cx)
     }
 
-    fn send_data<D: Into<WriteBuf<B>>>(&mut self, data: D) -> Result<(), StreamErrorIncoming> {
-        self.stream.send_data(data)
+    fn poll_send_data(
+        &mut self,
+        cx: &mut Context<'_>,
+        data: &mut WriteBuf<B>,
+    ) -> Poll<Result<(), StreamErrorIncoming>> {
+        self.stream.poll_send_data(cx, data)
     }
 
     fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
