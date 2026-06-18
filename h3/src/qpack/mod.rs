@@ -7,11 +7,12 @@ pub use self::{
 };
 
 use std::{
-    sync::{RwLock, TryLockError},
+    sync::{RwLock, RwLockReadGuard, TryLockError},
     task::{Context, Poll, Waker},
 };
 
 use bytes::{Buf, BufMut};
+use futures_util::task::AtomicWaker;
 use tokio::sync::mpsc;
 
 mod block;
@@ -57,31 +58,52 @@ pub(crate) enum QpackDecoderEvent {
 /// Shared QPACK decoder state for a single HTTP/3 connection.
 ///
 /// The decoder is read-mostly: header blocks decode through read guards, while the
-/// peer encoder stream updates the dynamic table through a write guard.
+/// connection driver updates the dynamic table through a write guard. Request wakers
+/// wait for dynamic-table updates; the writer waker lets the driver resume after active
+/// decodes release their read guards.
 pub(crate) struct QpackDecoder {
     decoder: RwLock<Decoder>,
+    /// Request wakers consumed by the connection driver after an encoder update.
     decoder_waker: mpsc::UnboundedSender<Waker>,
+    /// Connection-driver waker used while a request holds a read guard.
+    write_waker: AtomicWaker,
 }
 
 impl QpackDecoder {
-    /// Creates a new [`QpackDecoder`] instance.
+    /// Creates the connection's shared decoder.
+    ///
+    /// `decoder_waker` sends blocked request wakers to the connection driver. The
+    /// receiving side is kept with the connection's QPACK streams.
     #[inline(always)]
     pub(crate) fn new(decoder: Decoder, decoder_waker: mpsc::UnboundedSender<Waker>) -> Self {
         QpackDecoder {
             decoder: RwLock::new(decoder),
             decoder_waker,
+            write_waker: AtomicWaker::new(),
         }
     }
 
-    /// Processes bytes received from the peer QPACK encoder stream.
+    /// Applies instructions received on the peer QPACK encoder stream.
     ///
-    /// Returns `Poll::Pending` when a header decode currently holds a read lock;
-    /// the provided waker is registered and will be woken once a write may make progress.
+    /// Updating the dynamic table requires exclusive access to the decoder. If a
+    /// request is decoding a field section, this registers the connection driver
+    /// and returns [`Poll::Pending`]. The second lock attempt closes the gap between
+    /// the failed first attempt and waker registration.
     pub(crate) fn poll_on_recv_encoder<R: Buf, W: BufMut>(
         &self,
+        cx: &mut Context<'_>,
         read: &mut R,
         write: &mut W,
     ) -> Poll<Result<usize, DecoderError>> {
+        match self.decoder.try_write() {
+            Ok(mut decoder) => return Poll::Ready(decoder.on_encoder_recv(read, write)),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Poisoned(_)) => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+        }
+
+        // A reader may finish between the first attempt and registration.
+        self.write_waker.register(cx.waker());
+
         match self.decoder.try_write() {
             Ok(mut decoder) => Poll::Ready(decoder.on_encoder_recv(read, write)),
             Err(TryLockError::WouldBlock) => Poll::Pending,
@@ -89,10 +111,41 @@ impl QpackDecoder {
         }
     }
 
-    /// Decodes a header block and tracks decoder stream instructions for it.
+    /// Releases a decode guard and wakes a driver waiting to update the table.
     ///
-    /// When `use_dynamic_table` is `false`, no lock is acquired and dynamic table
-    /// references are rejected by `decode_stateless`.
+    /// A field section with missing references must also register its request task.
+    /// `waiter_registered` is true when registration already happened while waiting
+    /// for the read lock.
+    fn finish_decode(
+        &self,
+        cx: &Context<'_>,
+        decoder: RwLockReadGuard<'_, Decoder>,
+        decoded: Result<Decoded, DecoderError>,
+        waiter_registered: bool,
+    ) -> Poll<Result<Decoded, DecoderError>> {
+        if matches!(&decoded, Err(DecoderError::MissingRefs(_))) && !waiter_registered {
+            // Register while the read guard still prevents an encoder update. This
+            // keeps the driver from updating the table before the waiter is visible.
+            let _ = self.decoder_waker.send(cx.waker().clone());
+        }
+
+        // A writer blocked in poll_on_recv_encoder can continue once the guard drops.
+        drop(decoder);
+        self.write_waker.wake();
+        Poll::Ready(decoded)
+    }
+
+    /// Decodes one QPACK field section.
+    ///
+    /// Stateless decoding is used when dynamic-table support is disabled. Otherwise
+    /// the decoder is read-locked so request tasks can decode concurrently while the
+    /// connection driver is idle.
+    ///
+    /// [`DecoderError::MissingRefs`] is returned after the request waker has been
+    /// queued. The caller turns that result into [`Poll::Pending`] and restores the
+    /// encoded input, since decoding may advance it before reporting the missing
+    /// references. A direct [`Poll::Pending`] means the encoder stream currently owns
+    /// the write lock.
     pub(crate) fn poll_decode_header<T: Buf>(
         &self,
         cx: &mut Context<'_>,
@@ -104,63 +157,25 @@ impl QpackDecoder {
             return Poll::Ready(decode_stateless(encoded, max_size));
         }
 
-        // 1. First attempt: Try to acquire the read lock immediately.
         match self.decoder.try_read() {
             Ok(decoder) => {
-                match decoder.decode_header_limited(encoded, max_size) {
-                    // The read lock was acquired, but decoding requires dynamic table entries
-                    // that have not yet been received from the peer encoder stream.
-                    Err(DecoderError::MissingRefs(_)) => {
-                        // Enqueue the cloned waker into the mpsc channel so the connection driver
-                        // can wake this task once the dynamic table is updated.
-                        let _ = self.decoder_waker.send(cx.waker().clone());
-
-                        // Double-check: The driver might have released the write lock and updated
-                        // the dynamic table right between the decoding failure and waker registration.
-                        match self.decoder.try_read() {
-                            Ok(retry_decoder) => {
-                                match retry_decoder.decode_header_limited(encoded, max_size) {
-                                    // If it still results in missing references even though the lock is now available,
-                                    // we can safely yield Pending since our waker is already queued in the channel.
-                                    Err(DecoderError::MissingRefs(_)) => {
-                                        // Still missing references. Yield Pending safely.
-                                        Poll::Pending
-                                    }
-                                    other => Poll::Ready(other),
-                                }
-                            }
-                            Err(_) => Poll::Pending,
-                        }
-                    }
-                    // Return successfully decoded headers or unrecoverable hard errors immediately.
-                    other => Poll::Ready(other),
-                }
+                let decoded = decoder.decode_header_limited(encoded, max_size);
+                self.finish_decode(cx, decoder, decoded, false)
             }
             Err(TryLockError::WouldBlock) => {
-                // 2. Lock contention: The encoder stream is currently updating the dynamic table
-                // and holding the write lock. Register before retrying so a write-lock release
-                // cannot be missed between attempts.
+                // Register before retrying; the writer drains this queue after its update.
                 let _ = self.decoder_waker.send(cx.waker().clone());
 
-                // 3. Double-check under lock contention scenario.
                 match self.decoder.try_read() {
                     Ok(decoder) => {
-                        match decoder.decode_header_limited(encoded, max_size) {
-                            // If it still results in missing references even though the lock is now available,
-                            // we can safely yield Pending since our waker is already queued in the channel.
-                            Err(DecoderError::MissingRefs(_)) => Poll::Pending,
-                            other => Poll::Ready(other),
-                        }
+                        let decoded = decoder.decode_header_limited(encoded, max_size);
+                        self.finish_decode(cx, decoder, decoded, true)
                     }
-                    Err(TryLockError::WouldBlock) => {
-                        // Still blocked by the write lock. The registered waker will be notified
-                        // when the connection driver releases the write lock and flushes the channel.
-                        Poll::Pending
-                    }
+                    Err(TryLockError::WouldBlock) => Poll::Pending,
                     Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
                 }
             }
-            Err(TryLockError::Poisoned(_)) => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+            Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
         }
     }
 }

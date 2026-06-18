@@ -574,6 +574,7 @@ where
                 let before = encoder_recv.buf().remaining();
                 let decoder_send_before = self.qpack_streams.decoder_send_buf.len();
                 match self.shared.qpack_decoder.poll_on_recv_encoder(
+                    cx,
                     encoder_recv.buf_mut(),
                     &mut self.qpack_streams.decoder_send_buf,
                 ) {
