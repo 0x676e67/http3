@@ -1331,10 +1331,12 @@ where
             self.use_qpack_dynamic_table,
         ) {
             Poll::Ready(Ok(decoded)) => {
-                if let Some(field_section) = &mut self.qpack_field_section {
-                    if let Err(err) = field_section.acknowledge(&decoded) {
-                        return Poll::Ready(Err(err));
-                    }
+                if let Some(Err(err)) = self
+                    .qpack_field_section
+                    .as_mut()
+                    .map(|v| v.acknowledge(&decoded))
+                {
+                    return Poll::Ready(Err(err));
                 }
 
                 self.waker().wake();
@@ -1343,7 +1345,7 @@ where
             Poll::Ready(Err(qpack::DecoderError::MissingRefs(required_ref)))
                 if required_ref > 0 =>
             {
-                if let Some(field_section) = &mut self.qpack_field_section {
+                if let Some(field_section) = self.qpack_field_section.as_mut() {
                     field_section.cancel_on_drop();
                 }
                 *encoded = original;
