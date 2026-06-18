@@ -67,7 +67,6 @@ where
 {
     decoder_send: Option<C::SendStream>,
     decoder_send_buf: BytesMut,
-    decoder_insert_count: usize,
     decoder_waker_recv: mpsc::UnboundedReceiver<Waker>,
     decoder_events_recv: mpsc::UnboundedReceiver<QpackDecoderEvent>,
     decoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
@@ -302,7 +301,6 @@ where
         let qpack_streams = QpackStreams {
             decoder_send: qpack_decoder.ok(),
             decoder_send_buf: BytesMut::new(),
-            decoder_insert_count: 0,
             decoder_waker_recv,
             decoder_events_recv,
             decoder_recv: None,
@@ -580,12 +578,8 @@ where
                     encoder_recv.buf_mut(),
                     &mut self.qpack_streams.decoder_send_buf,
                 ) {
-                    Poll::Ready(Ok(insert_count)) => {
+                    Poll::Ready(Ok(_)) => {
                         self.poll_qpack_wakers(cx);
-                        if insert_count != self.qpack_streams.decoder_insert_count {
-                            self.qpack_streams.decoder_insert_count = insert_count;
-                            self.poll_qpack_wakers(cx);
-                        }
                     }
                     Poll::Ready(Err(err)) => {
                         self.poll_qpack_wakers(cx);
