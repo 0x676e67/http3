@@ -139,19 +139,6 @@ where
                         });
                     }
                     Ok(decoded) => break decoded,
-                    Err(qpack::DecoderError::MissingRefs(_)) => {
-                        let mut registered = false;
-                        future::poll_fn(|cx| {
-                            if registered {
-                                Poll::Ready(())
-                            } else {
-                                self.waker().register(cx.waker());
-                                registered = true;
-                                Poll::Pending
-                            }
-                        })
-                        .await;
-                    }
                     Err(_e) => {
                         return Err(self.handle_connection_error_on_stream(
                             InternalConnectionError {

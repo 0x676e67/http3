@@ -1,12 +1,11 @@
 use std::{path::PathBuf, sync::Arc};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use futures::future;
-use h3::error::{ConnectionError, StreamError};
+use h3::error::{Code, ConnectionError, StreamError};
 use rustls::pki_types::CertificateDer;
 use rustls_native_certs::CertificateResult;
 use structopt::StructOpt;
-use tokio::io::AsyncWriteExt;
 use tracing::{error, info};
 
 use h3_quinn::quinn;
@@ -187,11 +186,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // `recv_data()` must be called after `recv_response()` for
                 // receiving potential response body
-                while let Some(mut chunk) = stream.recv_data().await? {
-                    let mut out = tokio::io::stdout();
-                    out.write_all_buf(&mut chunk).await.unwrap();
-                    out.flush().await.unwrap();
+                let mut body = Vec::new();
+                while let Some(chunk) = stream.recv_data().await? {
+                    body.extend_from_slice(chunk.chunk());
                 }
+                info!(
+                    request_id,
+                    "body: {}",
+                    String::from_utf8(body).map_err(|err| {
+                        StreamError::StreamError {
+                            code: Code::H3_NO_ERROR,
+                            reason: err.to_string(),
+                        }
+                    })?
+                );
 
                 Ok::<_, StreamError>(())
             });

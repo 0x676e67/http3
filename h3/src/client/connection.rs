@@ -21,7 +21,7 @@ use crate::{
     },
     frame::FrameStream,
     proto::{frame::Frame, headers::Header, push::PushId},
-    qpack::{self, QpackDecoder},
+    qpack,
     quic::{self, StreamId},
     shared_state::{ConnectionState, SharedState},
     stream::{self, BufRecvStream},
@@ -113,7 +113,6 @@ where
 {
     pub(super) open: T,
     pub(super) conn_state: Arc<SharedState>,
-    pub(super) qpack_decoder: QpackDecoder,
     pub(super) use_qpack_dynamic_table: bool,
     pub(super) max_field_section_size: u64, // maximum size for a header we receive
     // counts instances of SendRequest to close the connection when the last is dropped.
@@ -222,7 +221,6 @@ where
                 self.max_field_section_size,
                 self.conn_state.clone(),
                 self.send_grease_frame,
-                self.qpack_decoder.clone(),
                 self.use_qpack_dynamic_table,
             ),
         };
@@ -243,7 +241,6 @@ where
 
         Self {
             conn_state: self.conn_state.clone(),
-            qpack_decoder: self.qpack_decoder.clone(),
             use_qpack_dynamic_table: self.use_qpack_dynamic_table,
             open: self.open.clone(),
             max_field_section_size: self.max_field_section_size,
