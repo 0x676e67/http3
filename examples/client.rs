@@ -190,16 +190,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 while let Some(chunk) = stream.recv_data().await? {
                     body.extend_from_slice(chunk.chunk());
                 }
-                // info!(
-                //     request_id,
-                //     "body: {}",
-                //     String::from_utf8(body).map_err(|err| {
-                //         StreamError::StreamError {
-                //             code: Code::H3_NO_ERROR,
-                //             reason: err.to_string(),
-                //         }
-                //     })?
-                // );
+                info!(
+                    request_id,
+                    "body: {}",
+                    String::from_utf8(body).map_err(|err| {
+                        StreamError::StreamError {
+                            code: Code::H3_NO_ERROR,
+                            reason: err.to_string(),
+                        }
+                    })?
+                );
 
                 Ok::<_, StreamError>(())
             });
