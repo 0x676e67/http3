@@ -81,7 +81,10 @@ impl QpackDecoder {
         write: &mut W,
     ) -> Poll<Result<usize, DecoderError>> {
         match self.decoder.try_write() {
-            Ok(mut decoder) => Poll::Ready(decoder.on_encoder_recv(read, write)),
+            Ok(mut decoder) => {
+                tracing::info!("Processing bytes received from the peer QPACK encoder stream");
+                Poll::Ready(decoder.on_encoder_recv(read, write))
+            }
             Err(TryLockError::WouldBlock) => Poll::Pending,
             Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
         }
@@ -103,10 +106,14 @@ impl QpackDecoder {
         }
 
         let decoded = match self.decoder.try_read() {
-            Ok(decoder) => decoder.decode_header_limited(encoded, max_size),
+            Ok(decoder) => {
+                tracing::info!("Decoding header with dynamic table");
+                decoder.decode_header_limited(encoded, max_size)
+            }
             Err(TryLockError::WouldBlock) => {
                 // The encoder stream is updating the dynamic table. Register before
                 // retrying so a write-lock release cannot be missed between attempts.
+                tracing::info!("Registering waker for decoder stream");
                 let _ = self.decoder_waker.send(cx.waker().clone());
                 match self.decoder.try_read() {
                     Ok(decoder) => decoder.decode_header_limited(encoded, max_size),

@@ -159,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let uri = uri.clone();
             let mut send_request = send_request.clone();
 
-            requests.push(async move {
+            let join = tokio::spawn(async move {
                 info!(request_id, "sending request ...");
 
                 let req = http::Request::builder().uri(uri).body(()).unwrap();
@@ -190,22 +190,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 while let Some(chunk) = stream.recv_data().await? {
                     body.extend_from_slice(chunk.chunk());
                 }
-                info!(
-                    request_id,
-                    "body: {}",
-                    String::from_utf8(body).map_err(|err| {
-                        StreamError::StreamError {
-                            code: Code::H3_NO_ERROR,
-                            reason: err.to_string(),
-                        }
-                    })?
-                );
+                // info!(
+                //     request_id,
+                //     "body: {}",
+                //     String::from_utf8(body).map_err(|err| {
+                //         StreamError::StreamError {
+                //             code: Code::H3_NO_ERROR,
+                //             reason: err.to_string(),
+                //         }
+                //     })?
+                // );
 
                 Ok::<_, StreamError>(())
             });
+
+            requests.push(join);
         }
 
-        future::try_join_all(requests).await?;
+        let _ = future::try_join_all(requests).await;
 
         Ok::<_, StreamError>(())
     };
