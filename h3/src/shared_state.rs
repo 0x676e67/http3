@@ -2,14 +2,19 @@
 
 use std::{
     borrow::Cow,
+    fmt,
     sync::{atomic::AtomicBool, OnceLock},
 };
 
 use futures_util::task::AtomicWaker;
+use tokio::sync::mpsc;
 
-use crate::{config::Settings, error::internal_error::ErrorOrigin};
+use crate::{
+    config::Settings,
+    error::internal_error::ErrorOrigin,
+    qpack::{QpackDecoder, QpackDecoderEvent},
+};
 
-#[derive(Debug)]
 /// This struct represents the shared state of the h3 connection and the stream structs
 pub struct SharedState {
     /// The settings, sent by the peer
@@ -20,15 +25,35 @@ pub struct SharedState {
     closing: AtomicBool,
     /// Waker for the connection
     waker: AtomicWaker,
+    /// Shared QPACK decoder state for the connection.
+    pub(crate) qpack_decoder: QpackDecoder,
+    /// Sender used by streams to enqueue QPACK decoder stream instructions.
+    pub(crate) qpack_decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
 }
 
-impl Default for SharedState {
-    fn default() -> Self {
-        Self {
+impl fmt::Debug for SharedState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedState")
+            .field("settings", &self.settings)
+            .field("connection_error", &self.connection_error)
+            .field("closing", &self.closing)
+            .field("waker", &self.waker)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedState {
+    pub(crate) fn new(
+        qpack_decoder: QpackDecoder,
+        qpack_decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
+    ) -> Self {
+        SharedState {
             settings: OnceLock::new(),
             connection_error: OnceLock::new(),
             closing: AtomicBool::new(false),
             waker: AtomicWaker::new(),
+            qpack_decoder,
+            qpack_decoder_events,
         }
     }
 }
