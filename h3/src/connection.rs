@@ -30,9 +30,8 @@ use crate::{
         stream::StreamType,
         varint::VarInt,
     },
-    qpack,
-    qpack::{QpackDecoder, QpackDecoderEvent},
-    quic::{self, RecvStream, SendStream, SendStreamUnframed, StreamErrorIncoming},
+    qpack::{self, QpackDecoder, QpackDecoderEvent},
+    quic::{self, RecvStream, SendStream, SendStreamUnframed, StreamErrorIncoming, StreamId},
     shared_state::{ConnectionState, SharedState},
     stream::{self, AcceptRecvStream, AcceptedRecvStream, BufRecvStream, UniStreamHeader},
     webtransport::SessionId,
@@ -712,12 +711,14 @@ where
 
         while let Poll::Ready(Some(event)) = self.qpack_streams.decoder_events_recv.poll_recv(cx) {
             match event {
-                QpackDecoderEvent::HeaderAck(stream_id) => {
-                    qpack::ack_header(stream_id, &mut self.qpack_streams.decoder_send_buf)
-                }
-                QpackDecoderEvent::StreamCancel(stream_id) => {
-                    qpack::stream_canceled(stream_id, &mut self.qpack_streams.decoder_send_buf)
-                }
+                QpackDecoderEvent::HeaderAck(stream_id) => qpack::ack_header(
+                    stream_id.into_inner(),
+                    &mut self.qpack_streams.decoder_send_buf,
+                ),
+                QpackDecoderEvent::StreamCancel(stream_id) => qpack::stream_canceled(
+                    stream_id.into_inner(),
+                    &mut self.qpack_streams.decoder_send_buf,
+                ),
             }
         }
 
@@ -1038,13 +1039,13 @@ pub struct RequestStream<S, B> {
 }
 
 struct QpackFieldSectionGuard {
-    stream_id: u64,
+    stream_id: StreamId,
     shared: Arc<SharedState>,
     cancel_on_drop: bool,
 }
 
 impl QpackFieldSectionGuard {
-    fn new(stream_id: u64, shared: Arc<SharedState>) -> Self {
+    fn new(stream_id: StreamId, shared: Arc<SharedState>) -> Self {
         Self {
             stream_id,
             shared,
@@ -1101,7 +1102,7 @@ where
         use_qpack_dynamic_table: bool,
     ) -> Self {
         let qpack_field_section = use_qpack_dynamic_table
-            .then(|| QpackFieldSectionGuard::new(stream.id().into_inner(), conn_state.clone()));
+            .then(|| QpackFieldSectionGuard::new(stream.id(), conn_state.clone()));
 
         Self {
             stream,
