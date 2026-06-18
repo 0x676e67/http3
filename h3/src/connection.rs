@@ -663,7 +663,7 @@ where
     where
         C::SendStream: quic::SendStreamUnframed<B>,
     {
-        self.drain_qpack_decoder_events(cx);
+        self.poll_qpack_decoder_events(cx);
 
         let Some(decoder_send) = self.qpack_streams.decoder_send.as_mut() else {
             if !self.qpack_streams.decoder_send_buf.has_remaining() {
@@ -704,27 +704,6 @@ where
         }
 
         Poll::Ready(Ok(()))
-    }
-
-    fn drain_qpack_decoder_events(&mut self, cx: &mut Context<'_>) {
-        let before = self.qpack_streams.decoder_send_buf.len();
-
-        while let Poll::Ready(Some(event)) = self.qpack_streams.decoder_events_recv.poll_recv(cx) {
-            match event {
-                QpackDecoderEvent::HeaderAck(stream_id) => qpack::ack_header(
-                    stream_id.into_inner(),
-                    &mut self.qpack_streams.decoder_send_buf,
-                ),
-                QpackDecoderEvent::StreamCancel(stream_id) => qpack::stream_canceled(
-                    stream_id.into_inner(),
-                    &mut self.qpack_streams.decoder_send_buf,
-                ),
-            }
-        }
-
-        if self.qpack_streams.decoder_send_buf.len() != before {
-            self.waker().wake();
-        }
     }
 
     /// Waits for the control stream to be received and reads subsequent frames.
@@ -1023,6 +1002,27 @@ where
     fn poll_qpack_wakers(&mut self, cx: &mut Context<'_>) {
         while let Poll::Ready(Some(waker)) = self.qpack_streams.decoder_waker_recv.poll_recv(cx) {
             waker.wake();
+        }
+    }
+
+    fn poll_qpack_decoder_events(&mut self, cx: &mut Context<'_>) {
+        let before = self.qpack_streams.decoder_send_buf.len();
+
+        while let Poll::Ready(Some(event)) = self.qpack_streams.decoder_events_recv.poll_recv(cx) {
+            match event {
+                QpackDecoderEvent::HeaderAck(stream_id) => qpack::ack_header(
+                    stream_id.into_inner(),
+                    &mut self.qpack_streams.decoder_send_buf,
+                ),
+                QpackDecoderEvent::StreamCancel(stream_id) => qpack::stream_canceled(
+                    stream_id.into_inner(),
+                    &mut self.qpack_streams.decoder_send_buf,
+                ),
+            }
+        }
+
+        if self.qpack_streams.decoder_send_buf.len() != before {
+            self.waker().wake();
         }
     }
 }
