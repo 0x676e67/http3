@@ -1,3 +1,5 @@
+use crate::quic::StreamId;
+
 pub use self::{
     decoder::{ack_header, decode_stateless, stream_canceled, Decoded, Decoder, DecoderError},
     encoder::{encode_stateless, EncoderError},
@@ -48,8 +50,8 @@ impl std::fmt::Display for Error {
 
 /// Event emitted by request streams for QPACK decoder stream instructions.
 pub(crate) enum QpackDecoderEvent {
-    HeaderAck(u64),
-    StreamCancel(u64),
+    HeaderAck(StreamId),
+    StreamCancel(StreamId),
 }
 
 /// Shared QPACK decoder state for a single HTTP/3 connection.
