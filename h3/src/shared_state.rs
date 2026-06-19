@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use crate::{
     config::Settings,
     error::internal_error::ErrorOrigin,
-    qpack::{QpackDecoder, QpackDecoderEvent},
+    qpack::{QpackDecoder, QpackEvent},
 };
 
 /// This struct represents the shared state of the h3 connection and the stream structs
@@ -28,7 +28,7 @@ pub struct SharedState {
     /// Shared QPACK decoder state for the connection.
     pub(crate) qpack_decoder: QpackDecoder,
     /// Sender used by streams to enqueue QPACK decoder stream instructions.
-    pub(crate) qpack_decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
+    pub(crate) qpack_decoder_events: mpsc::UnboundedSender<QpackEvent>,
 }
 
 impl fmt::Debug for SharedState {
@@ -45,7 +45,7 @@ impl fmt::Debug for SharedState {
 impl SharedState {
     pub(crate) fn new(
         qpack_decoder: QpackDecoder,
-        qpack_decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
+        qpack_decoder_events: mpsc::UnboundedSender<QpackEvent>,
     ) -> Self {
         SharedState {
             settings: OnceLock::new(),

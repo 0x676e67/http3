@@ -2,7 +2,7 @@ use std::{
     convert::TryFrom,
     marker::PhantomData,
     sync::Arc,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -30,7 +30,7 @@ use crate::{
         stream::StreamType,
         varint::VarInt,
     },
-    qpack::{self, QpackDecoder, QpackDecoderEvent},
+    qpack::{self, QpackDecoder, QpackEvent},
     quic::{self, RecvStream, SendStream, SendStreamUnframed, StreamErrorIncoming, StreamId},
     shared_state::{ConnectionState, SharedState},
     stream::{self, AcceptRecvStream, AcceptedRecvStream, BufRecvStream, UniStreamHeader},
@@ -66,8 +66,7 @@ where
 {
     decoder_send: Option<C::SendStream>,
     decoder_send_buf: BytesMut,
-    decoder_waker_recv: mpsc::UnboundedReceiver<Waker>,
-    decoder_events_recv: mpsc::UnboundedReceiver<QpackDecoderEvent>,
+    decoder_events_recv: mpsc::UnboundedReceiver<QpackEvent>,
     decoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
     encoder_send: Option<C::SendStream>,
     encoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
@@ -295,12 +294,10 @@ where
             Ok(control_send) => control_send,
         };
 
-        let (decoder_waker_send, decoder_waker_recv) = mpsc::unbounded_channel();
         let (decoder_events_send, decoder_events_recv) = mpsc::unbounded_channel();
         let qpack_streams = QpackStreams {
             decoder_send: qpack_decoder.ok(),
             decoder_send_buf: BytesMut::new(),
-            decoder_waker_recv,
             decoder_events_recv,
             decoder_recv: None,
             encoder_send: qpack_encoder.ok(),
@@ -323,7 +320,7 @@ where
                     format!("invalid QPACK decoder configuration: {}", err),
                 ))
             })?,
-            decoder_waker_send,
+            decoder_events_send.clone(),
         );
 
         let mut conn_inner = Self {
@@ -579,10 +576,10 @@ where
                     &mut self.qpack_streams.decoder_send_buf,
                 ) {
                     Poll::Ready(Ok(_)) => {
-                        self.poll_qpack_wakers(cx);
+                        self.poll_qpack_decoder_events(cx);
                     }
                     Poll::Ready(Err(err)) => {
-                        self.poll_qpack_wakers(cx);
+                        self.poll_qpack_decoder_events(cx);
                         return Poll::Ready(Err(self.handle_connection_error(
                             InternalConnectionError::new(
                                 Code::QPACK_ENCODER_STREAM_ERROR,
@@ -999,27 +996,23 @@ where
         &mut self.accepted_streams
     }
 
-    #[inline(always)]
-    fn poll_qpack_wakers(&mut self, cx: &mut Context<'_>) {
-        while let Poll::Ready(Some(waker)) = self.qpack_streams.decoder_waker_recv.poll_recv(cx) {
-            waker.wake();
-        }
-    }
-
-    #[inline(always)]
     fn poll_qpack_decoder_events(&mut self, cx: &mut Context<'_>) {
         let before = self.qpack_streams.decoder_send_buf.len();
 
         while let Poll::Ready(Some(event)) = self.qpack_streams.decoder_events_recv.poll_recv(cx) {
             match event {
-                QpackDecoderEvent::HeaderAck(stream_id) => qpack::ack_header(
+                QpackEvent::HeaderAck(stream_id) => qpack::ack_header(
                     stream_id.into_inner(),
                     &mut self.qpack_streams.decoder_send_buf,
                 ),
-                QpackDecoderEvent::StreamCancel(stream_id) => qpack::stream_canceled(
+                QpackEvent::StreamCancel(stream_id) => qpack::stream_canceled(
                     stream_id.into_inner(),
                     &mut self.qpack_streams.decoder_send_buf,
                 ),
+                // Resume a request stream that was blocked by missing dynamic table references
+                // or decoder lock contention. Spurious wakeups due to network packet fragmentation
+                // are safely resolved by the stream re-registering itself upon re-polling.
+                QpackEvent::Waker(waker) => waker.wake(),
             }
         }
 
@@ -1063,7 +1056,7 @@ impl QpackFieldSectionGuard {
         if decoded.dyn_ref {
             self.shared
                 .qpack_decoder_events
-                .send(QpackDecoderEvent::HeaderAck(self.stream_id))
+                .send(QpackEvent::HeaderAck(self.stream_id))
                 .map_err(|_| qpack::DecoderError::UnexpectedEnd)?;
             self.shared.waker().wake();
         }
@@ -1082,7 +1075,7 @@ impl Drop for QpackFieldSectionGuard {
             if self
                 .shared
                 .qpack_decoder_events
-                .send(QpackDecoderEvent::StreamCancel(self.stream_id))
+                .send(QpackEvent::StreamCancel(self.stream_id))
                 .is_ok()
             {
                 self.shared.waker().wake();

@@ -50,9 +50,11 @@ impl std::fmt::Display for Error {
 }
 
 /// Event emitted by request streams for QPACK decoder stream instructions.
-pub(crate) enum QpackDecoderEvent {
+#[derive(Debug)]
+pub(crate) enum QpackEvent {
     HeaderAck(StreamId),
     StreamCancel(StreamId),
+    Waker(Waker),
 }
 
 /// Shared QPACK decoder state for a single HTTP/3 connection.
@@ -64,7 +66,7 @@ pub(crate) enum QpackDecoderEvent {
 pub(crate) struct QpackDecoder {
     decoder: RwLock<Decoder>,
     /// Request wakers consumed by the connection driver after an encoder update.
-    decoder_waker: mpsc::UnboundedSender<Waker>,
+    events_send: mpsc::UnboundedSender<QpackEvent>,
     /// Connection-driver waker used while a request holds a read guard.
     write_waker: AtomicWaker,
 }
@@ -75,10 +77,10 @@ impl QpackDecoder {
     /// `decoder_waker` sends blocked request wakers to the connection driver. The
     /// receiving side is kept with the connection's QPACK streams.
     #[inline(always)]
-    pub(crate) fn new(decoder: Decoder, decoder_waker: mpsc::UnboundedSender<Waker>) -> Self {
+    pub(crate) fn new(decoder: Decoder, events_send: mpsc::UnboundedSender<QpackEvent>) -> Self {
         QpackDecoder {
             decoder: RwLock::new(decoder),
-            decoder_waker,
+            events_send,
             write_waker: AtomicWaker::new(),
         }
     }
@@ -126,7 +128,11 @@ impl QpackDecoder {
         if matches!(&decoded, Err(DecoderError::MissingRefs(_))) && !waiter_registered {
             // Register while the read guard still prevents an encoder update. This
             // keeps the driver from updating the table before the waiter is visible.
-            if self.decoder_waker.send(cx.waker().clone()).is_err() {
+            if self
+                .events_send
+                .send(QpackEvent::Waker(cx.waker().clone()))
+                .is_err()
+            {
                 return Poll::Ready(Err(DecoderError::UnexpectedEnd));
             }
         }
@@ -169,7 +175,11 @@ impl QpackDecoder {
         }
 
         // Register before retrying; the writer drains this queue after its update.
-        if self.decoder_waker.send(cx.waker().clone()).is_err() {
+        if self
+            .events_send
+            .send(QpackEvent::Waker(cx.waker().clone()))
+            .is_err()
+        {
             return Poll::Ready(Err(DecoderError::UnexpectedEnd));
         }
 
