@@ -1006,6 +1006,7 @@ where
         }
     }
 
+    #[inline(always)]
     fn poll_qpack_decoder_events(&mut self, cx: &mut Context<'_>) {
         let before = self.qpack_streams.decoder_send_buf.len();
 
