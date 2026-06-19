@@ -98,7 +98,7 @@ impl QpackDecoder {
         match self.decoder.try_write() {
             Ok(mut decoder) => return Poll::Ready(decoder.on_encoder_recv(read, write)),
             Err(TryLockError::WouldBlock) => {}
-            Err(TryLockError::Poisoned(_)) => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+            _ => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
         }
 
         // A reader may finish between the first attempt and registration.
@@ -107,7 +107,7 @@ impl QpackDecoder {
         match self.decoder.try_write() {
             Ok(mut decoder) => Poll::Ready(decoder.on_encoder_recv(read, write)),
             Err(TryLockError::WouldBlock) => Poll::Pending,
-            Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+            _ => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
         }
     }
 
@@ -126,7 +126,9 @@ impl QpackDecoder {
         if matches!(&decoded, Err(DecoderError::MissingRefs(_))) && !waiter_registered {
             // Register while the read guard still prevents an encoder update. This
             // keeps the driver from updating the table before the waiter is visible.
-            let _ = self.decoder_waker.send(cx.waker().clone());
+            if self.decoder_waker.send(cx.waker().clone()).is_err() {
+                return Poll::Ready(Err(DecoderError::UnexpectedEnd));
+            }
         }
 
         // A writer blocked in poll_on_recv_encoder can continue once the guard drops.
@@ -160,22 +162,24 @@ impl QpackDecoder {
         match self.decoder.try_read() {
             Ok(decoder) => {
                 let decoded = decoder.decode_header_limited(encoded, max_size);
-                self.finish_decode(cx, decoder, decoded, false)
+                return self.finish_decode(cx, decoder, decoded, false);
             }
-            Err(TryLockError::WouldBlock) => {
-                // Register before retrying; the writer drains this queue after its update.
-                let _ = self.decoder_waker.send(cx.waker().clone());
+            Err(TryLockError::WouldBlock) => {}
+            _ => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+        }
 
-                match self.decoder.try_read() {
-                    Ok(decoder) => {
-                        let decoded = decoder.decode_header_limited(encoded, max_size);
-                        self.finish_decode(cx, decoder, decoded, true)
-                    }
-                    Err(TryLockError::WouldBlock) => Poll::Pending,
-                    Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
-                }
+        // Register before retrying; the writer drains this queue after its update.
+        if self.decoder_waker.send(cx.waker().clone()).is_err() {
+            return Poll::Ready(Err(DecoderError::UnexpectedEnd));
+        }
+
+        match self.decoder.try_read() {
+            Ok(decoder) => {
+                let decoded = decoder.decode_header_limited(encoded, max_size);
+                self.finish_decode(cx, decoder, decoded, true)
             }
-            Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+            Err(TryLockError::WouldBlock) => Poll::Pending,
+            _ => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
         }
     }
 }
