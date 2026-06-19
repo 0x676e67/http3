@@ -26,9 +26,9 @@ pub struct SharedState {
     /// Waker for the connection
     waker: AtomicWaker,
     /// Shared QPACK decoder state for the connection.
-    pub(crate) qpack_decoder: QpackDecoder,
+    pub(crate) decoder: QpackDecoder,
     /// Sender used by streams to enqueue QPACK decoder stream instructions.
-    pub(crate) qpack_decoder_events: mpsc::UnboundedSender<QpackEvent>,
+    pub(crate) decoder_events: mpsc::UnboundedSender<QpackEvent>,
 }
 
 impl fmt::Debug for SharedState {
@@ -44,16 +44,16 @@ impl fmt::Debug for SharedState {
 
 impl SharedState {
     pub(crate) fn new(
-        qpack_decoder: QpackDecoder,
-        qpack_decoder_events: mpsc::UnboundedSender<QpackEvent>,
+        decoder: QpackDecoder,
+        decoder_events: mpsc::UnboundedSender<QpackEvent>,
     ) -> Self {
         SharedState {
             settings: OnceLock::new(),
             connection_error: OnceLock::new(),
             closing: AtomicBool::new(false),
             waker: AtomicWaker::new(),
-            qpack_decoder,
-            qpack_decoder_events,
+            decoder,
+            decoder_events,
         }
     }
 }

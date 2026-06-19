@@ -570,7 +570,7 @@ where
             while encoder_recv.has_remaining() {
                 let before = encoder_recv.buf().remaining();
                 let decoder_send_before = self.qpack_streams.decoder_send_buf.len();
-                match self.shared.qpack_decoder.poll_on_recv_encoder(
+                match self.shared.decoder.poll_on_recv_encoder(
                     cx,
                     encoder_recv.buf_mut(),
                     &mut self.qpack_streams.decoder_send_buf,
@@ -1022,40 +1022,19 @@ where
     }
 }
 
-#[allow(missing_docs)]
-pub struct RequestStream<S, B> {
-    pub(super) stream: FrameStream<S, B>,
-    pub(super) trailers: Option<Bytes>,
-    pub(super) conn_state: Arc<SharedState>,
-    pub(super) max_field_section_size: u64,
-    qpack_field_section: Option<QpackFieldSectionGuard>,
-    use_qpack_dynamic_table: bool,
-    send_grease_frame: bool,
-}
-
-struct QpackFieldSectionGuard {
+struct RequestStreamGurad {
     stream_id: StreamId,
     shared: Arc<SharedState>,
     cancel_on_drop: bool,
 }
 
-impl QpackFieldSectionGuard {
-    fn new(stream_id: StreamId, shared: Arc<SharedState>) -> Self {
-        Self {
-            stream_id,
-            shared,
-            // Until the field section is successfully decoded, dropping the guard
-            // abandons it and must notify the peer encoder.
-            cancel_on_drop: true,
-        }
-    }
-
-    fn acknowledge(&mut self, decoded: &qpack::Decoded) -> Result<(), qpack::DecoderError> {
+impl RequestStreamGurad {
+    fn acknowledge(&mut self, dyn_ref: bool) -> Result<(), qpack::DecoderError> {
         self.cancel_on_drop = false;
 
-        if decoded.dyn_ref {
+        if dyn_ref {
             self.shared
-                .qpack_decoder_events
+                .decoder_events
                 .send(QpackEvent::HeaderAck(self.stream_id))
                 .map_err(|_| qpack::DecoderError::UnexpectedEnd)?;
             self.shared.waker().wake();
@@ -1069,12 +1048,12 @@ impl QpackFieldSectionGuard {
     }
 }
 
-impl Drop for QpackFieldSectionGuard {
+impl Drop for RequestStreamGurad {
     fn drop(&mut self) {
         if self.cancel_on_drop {
             if self
                 .shared
-                .qpack_decoder_events
+                .decoder_events
                 .send(QpackEvent::StreamCancel(self.stream_id))
                 .is_ok()
             {
@@ -1082,6 +1061,17 @@ impl Drop for QpackFieldSectionGuard {
             }
         }
     }
+}
+
+#[allow(missing_docs)]
+pub struct RequestStream<S, B> {
+    pub(super) stream: FrameStream<S, B>,
+    pub(super) trailers: Option<Bytes>,
+    pub(super) conn_state: Arc<SharedState>,
+    pub(super) max_field_section_size: u64,
+    qpack_field_section: Option<RequestStreamGurad>,
+    qpack_dynamic_table: bool,
+    send_grease_frame: bool,
 }
 
 impl<S, B> RequestStream<S, B>
@@ -1094,10 +1084,15 @@ where
         max_field_section_size: u64,
         conn_state: Arc<SharedState>,
         grease: bool,
-        use_qpack_dynamic_table: bool,
+        qpack_dynamic_table: bool,
     ) -> Self {
-        let qpack_field_section = use_qpack_dynamic_table
-            .then(|| QpackFieldSectionGuard::new(stream.id(), conn_state.clone()));
+        let qpack_field_section = qpack_dynamic_table.then(|| RequestStreamGurad {
+            stream_id: stream.id(),
+            shared: conn_state.clone(),
+            // Until the field section is successfully decoded, dropping the guard
+            // abandons it and must notify the peer encoder.
+            cancel_on_drop: true,
+        });
 
         Self {
             stream,
@@ -1105,7 +1100,7 @@ where
             max_field_section_size,
             trailers: None,
             qpack_field_section,
-            use_qpack_dynamic_table,
+            qpack_dynamic_table,
             send_grease_frame: grease,
         }
     }
@@ -1319,17 +1314,17 @@ where
     ) -> Poll<Result<qpack::Decoded, qpack::DecoderError>> {
         // QPACK decoding advances the cursor; Pending retries must restart from the original block.
         let original = encoded.clone();
-        match self.conn_state.qpack_decoder.poll_decode_header(
+        match self.conn_state.decoder.poll_decode_header(
             cx,
             encoded,
             self.max_field_section_size,
-            self.use_qpack_dynamic_table,
+            self.qpack_dynamic_table,
         ) {
             Poll::Ready(Ok(decoded)) => {
                 if let Some(Err(err)) = self
                     .qpack_field_section
                     .as_mut()
-                    .map(|v| v.acknowledge(&decoded))
+                    .map(|v| v.acknowledge(decoded.dyn_ref))
                 {
                     return Poll::Ready(Err(err));
                 }
@@ -1466,7 +1461,7 @@ where
                 conn_state: self.conn_state.clone(),
                 max_field_section_size: 0,
                 qpack_field_section: None,
-                use_qpack_dynamic_table: false,
+                qpack_dynamic_table: false,
                 send_grease_frame: self.send_grease_frame,
             },
             RequestStream {
@@ -1475,7 +1470,7 @@ where
                 conn_state: self.conn_state,
                 max_field_section_size: self.max_field_section_size,
                 qpack_field_section: self.qpack_field_section,
-                use_qpack_dynamic_table: self.use_qpack_dynamic_table,
+                qpack_dynamic_table: self.qpack_dynamic_table,
                 send_grease_frame: self.send_grease_frame,
             },
         )

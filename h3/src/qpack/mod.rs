@@ -159,9 +159,9 @@ impl QpackDecoder {
         cx: &mut Context<'_>,
         encoded: &mut T,
         max_size: u64,
-        use_dynamic_table: bool,
+        dynamic_table: bool,
     ) -> Poll<Result<Decoded, DecoderError>> {
-        if !use_dynamic_table {
+        if !dynamic_table {
             return Poll::Ready(decode_stateless(encoded, max_size));
         }
 
