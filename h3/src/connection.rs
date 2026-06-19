@@ -999,7 +999,8 @@ where
     fn poll_qpack_decoder_events(&mut self, cx: &mut Context<'_>) {
         let before = self.qpack_streams.decoder_send_buf.len();
 
-        while let Poll::Ready(Some(event)) = self.qpack_streams.decoder_events_recv.poll_recv(cx) {
+        if let Poll::Ready(Some(event)) = self.qpack_streams.decoder_events_recv.poll_recv(cx) {
+            tracing::info!("Received QPACK event: {:?}", event);
             match event {
                 QpackEvent::HeaderAck(stream_id) => qpack::ack_header(
                     stream_id.into_inner(),
