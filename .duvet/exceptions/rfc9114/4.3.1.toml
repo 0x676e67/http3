@@ -8,7 +8,7 @@ translating from an HTTP/1.1 request that has a request target in
 a method-specific form; see Section 7.1 of [HTTP].
 '''
 reason = '''
-h3 is not meant to be used for intermediaries.
+http3-rs is not meant to be used for intermediaries.
 '''
 
 [[exception]]
@@ -19,5 +19,5 @@ create a Host field if one is not present in a request by copying
 the value of the :authority pseudo-header field.
 '''
 reason = '''
-h3 is not meant to be used for intermediaries.
+http3-rs is not meant to be used for intermediaries.
 '''

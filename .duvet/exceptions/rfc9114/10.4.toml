@@ -8,5 +8,5 @@ resources that they do not have authority over.
 '''
 reason = '''
 This pertains to the high-level server implementation, as the
-authority of the data being sent is transparent to h3.
+authority of the data being sent is transparent to http3-rs.
 '''
