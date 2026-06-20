@@ -28,11 +28,21 @@ pub enum Error {
 pub struct DynamicTableDecoder<'a> {
     table: &'a DynamicTable,
     base: usize,
+    required_ref: usize,
 }
 
 impl<'a> DynamicTableDecoder<'a> {
     pub(super) fn get_relative(&self, index: usize) -> Result<&HeaderField, Error> {
+        // A field section cannot reference an insertion newer than its declared
+        // Required Insert Count.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
+        let absolute = self
+            .base
+            .checked_sub(index)
+            .filter(|absolute| *absolute != 0 && *absolute <= self.required_ref)
+            .ok_or(Error::BadRelativeIndex(index))?;
         let real_index = self.table.vas.relative_base(self.base, index)?;
+        debug_assert_eq!(self.table.vas.index(real_index), Ok(absolute));
         self.table
             .fields
             .get(real_index)
@@ -40,6 +50,13 @@ impl<'a> DynamicTableDecoder<'a> {
     }
 
     pub(super) fn get_postbase(&self, index: usize) -> Result<&HeaderField, Error> {
+        // Apply the same Required Insert Count bound to post-base references.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
+        self.base
+            .checked_add(index)
+            .and_then(|absolute| absolute.checked_add(1))
+            .filter(|absolute| *absolute <= self.required_ref)
+            .ok_or(Error::BadPostbaseIndex(index))?;
         let real_index = self.table.vas.post_base(self.base, index)?;
         self.table
             .fields
@@ -258,8 +275,12 @@ impl DynamicTable {
         DynamicTable::default()
     }
 
-    pub fn decoder(&self, base: usize) -> DynamicTableDecoder<'_> {
-        DynamicTableDecoder { table: self, base }
+    pub fn decoder(&self, base: usize, required_ref: usize) -> DynamicTableDecoder<'_> {
+        DynamicTableDecoder {
+            table: self,
+            base,
+            required_ref,
+        }
     }
 
     pub fn encoder(&mut self, stream_id: u64) -> DynamicTableEncoder<'_> {
@@ -281,7 +302,9 @@ impl DynamicTable {
 
     pub fn set_max_blocked(&mut self, max: usize) -> Result<(), Error> {
         // TODO handle existing data
-        if max >= SETTINGS_MAX_BLOCKED_STREAMS_MAX {
+        // SETTINGS_QPACK_BLOCKED_STREAMS is limited to 2^16-1.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3
+        if max > SETTINGS_MAX_BLOCKED_STREAMS_MAX {
             return Err(Error::MaxBlockedStreamsTooLarge);
         }
         self.blocked_max = max;
@@ -289,9 +312,7 @@ impl DynamicTable {
     }
 
     pub fn set_max_size(&mut self, size: usize) -> Result<(), Error> {
-        if size > SETTINGS_MAX_TABLE_CAPACITY_MAX {
-            return Err(Error::MaximumTableSizeTooLarge);
-        }
+        Self::validate_max_size(size)?;
 
         if size >= self.max_size {
             self.max_size = size;
@@ -308,26 +329,46 @@ impl DynamicTable {
         Ok(())
     }
 
+    pub(crate) fn validate_max_size(size: usize) -> Result<(), Error> {
+        if size > SETTINGS_MAX_TABLE_CAPACITY_MAX {
+            return Err(Error::MaximumTableSizeTooLarge);
+        }
+        Ok(())
+    }
+
     pub(super) fn put(&mut self, field: HeaderField) -> Result<(), Error> {
         let index = match self.insert(field.clone())? {
             Some(index) => index,
             None => return Ok(()),
         };
 
+        self.update_maps(field, index);
+        Ok(())
+    }
+
+    pub(super) fn put_decoder(&mut self, field: HeaderField) -> Result<(), Error> {
+        let index = self
+            .insert(field.clone())?
+            .ok_or(Error::MaxTableSizeReached)?;
+
+        self.update_maps(field, index);
+        Ok(())
+    }
+
+    fn update_maps(&mut self, field: HeaderField, index: usize) {
         self.field_map
             .entry(field.clone())
             .and_modify(|e| *e = index)
             .or_insert(index);
 
         if StaticTable::find_name(&field.name).is_some() {
-            return Ok(());
+            return;
         }
 
         self.name_map
             .entry(field.name.clone())
             .and_modify(|e| *e = index)
             .or_insert(index);
-        Ok(())
     }
 
     pub(super) fn get_relative(&self, index: usize) -> Result<&HeaderField, Error> {
@@ -1376,6 +1417,12 @@ mod tests {
                 DynamicLookupResult::NotFound
             ))
         );
+    }
+
+    #[test]
+    fn maximum_blocked_streams_value_is_valid() {
+        let mut table = DynamicTable::new();
+        assert_eq!(table.set_max_blocked(65_535), Ok(()));
     }
 
     #[test]

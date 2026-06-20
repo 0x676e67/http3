@@ -658,6 +658,9 @@ where
     where
         C::SendStream: quic::SendStreamUnframed<B>,
     {
+        // The QPACK decoder stream is a critical stream. Its closure is an
+        // H3_CLOSED_CRITICAL_STREAM error, not an instruction decoding error.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
         self.poll_qpack_decoder_events(cx, false);
 
         let Some(decoder_send) = self.qpack_streams.decoder_send.as_mut() else {
@@ -666,7 +669,7 @@ where
             }
             return Poll::Ready(Err(self.handle_connection_error(
                 InternalConnectionError::new(
-                    Code::QPACK_DECODER_STREAM_ERROR,
+                    Code::H3_CLOSED_CRITICAL_STREAM,
                     "QPACK decoder stream is unavailable".to_string(),
                 ),
             )));
@@ -682,7 +685,7 @@ where
                 Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
                     return Poll::Ready(Err(self.handle_connection_error(
                         InternalConnectionError::new(
-                            Code::QPACK_DECODER_STREAM_ERROR,
+                            Code::H3_CLOSED_CRITICAL_STREAM,
                             format!("QPACK decoder stream reset with error code {}", error_code),
                         ),
                     )));
@@ -690,7 +693,7 @@ where
                 Poll::Ready(Err(StreamErrorIncoming::Unknown(error))) => {
                     return Poll::Ready(Err(self.handle_connection_error(
                         InternalConnectionError::new(
-                            Code::QPACK_DECODER_STREAM_ERROR,
+                            Code::H3_CLOSED_CRITICAL_STREAM,
                             format!("QPACK decoder stream error: {}", error),
                         ),
                     )));
@@ -1037,10 +1040,26 @@ struct DecoderGurad {
     stream_id: StreamId,
     shared: Arc<SharedState>,
     cancel_on_drop: bool,
+    blocked: bool,
     decoder: QpackDecoder,
 }
 
 impl DecoderGurad {
+    fn block(&mut self) -> Result<(), qpack::DecoderError> {
+        if !self.blocked {
+            self.decoder.register_blocked_stream()?;
+            self.blocked = true;
+        }
+        Ok(())
+    }
+
+    fn unblock(&mut self) {
+        if self.blocked {
+            self.decoder.unregister_blocked_stream();
+            self.blocked = false;
+        }
+    }
+
     fn acknowledge(&mut self, dyn_ref: bool) -> Result<(), qpack::DecoderError> {
         //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
         //# After processing an encoded field section whose declared Required
@@ -1060,6 +1079,7 @@ impl DecoderGurad {
 
 impl Drop for DecoderGurad {
     fn drop(&mut self) {
+        self.unblock();
         if self.cancel_on_drop {
             //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2
             //# When a stream is reset or reading is abandoned, the decoder emits
@@ -1100,6 +1120,7 @@ where
             // Until the field section is successfully decoded, dropping the guard
             // abandons it and must notify the peer encoder.
             cancel_on_drop: true,
+            blocked: false,
             decoder: decoder.clone(),
         });
 
@@ -1339,6 +1360,7 @@ where
         {
             Poll::Ready(Ok(decoded)) => {
                 if let Some(decoder_gurad) = self.decoder_gurad.as_mut() {
+                    decoder_gurad.unblock();
                     if let Some(err) = decoder_gurad.acknowledge(decoded.dyn_ref).err() {
                         return Poll::Ready(Err(err));
                     }
@@ -1354,6 +1376,11 @@ where
             Poll::Ready(Err(qpack::DecoderError::MissingRefs(required_ref)))
                 if required_ref > 0 =>
             {
+                if let Some(decoder_gurad) = self.decoder_gurad.as_mut() {
+                    if let Err(err) = decoder_gurad.block() {
+                        return Poll::Ready(Err(err));
+                    }
+                }
                 *encoded = original;
                 Poll::Pending
             }
@@ -1504,6 +1531,7 @@ mod qpack_field_section_tests {
                 stream_id: StreamId(0),
                 shared,
                 cancel_on_drop: true,
+                blocked: false,
                 decoder,
             },
             events_recv,
@@ -1555,5 +1583,36 @@ mod qpack_field_section_tests {
             events.try_recv(),
             Ok(QpackEvent::StreamCancel(StreamId(0)))
         ));
+    }
+
+    #[test]
+    fn blocked_stream_limit_counts_each_stream_once() {
+        let (events_send, _events_recv) = mpsc::unbounded_channel();
+        let decoder = QpackDecoder::new(qpack::Decoder::new(128, 1).unwrap(), events_send);
+        let shared = Arc::new(SharedState::default());
+        let mut first = DecoderGurad {
+            stream_id: StreamId(0),
+            shared: shared.clone(),
+            cancel_on_drop: false,
+            blocked: false,
+            decoder: decoder.clone(),
+        };
+        let mut second = DecoderGurad {
+            stream_id: StreamId(4),
+            shared,
+            cancel_on_drop: false,
+            blocked: false,
+            decoder,
+        };
+
+        assert_eq!(first.block(), Ok(()));
+        assert_eq!(first.block(), Ok(()));
+        assert_eq!(
+            second.block(),
+            Err(qpack::DecoderError::TooManyBlockedStreams)
+        );
+
+        first.unblock();
+        assert_eq!(second.block(), Ok(()));
     }
 }
