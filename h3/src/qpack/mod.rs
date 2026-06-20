@@ -7,7 +7,10 @@ pub use self::{
 };
 
 use std::{
-    sync::{Arc, RwLock, RwLockReadGuard, TryLockError},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, RwLock, RwLockReadGuard, TryLockError,
+    },
     task::{Context, Poll, Waker},
 };
 
@@ -61,6 +64,8 @@ struct QpackDecoderInner {
     decoder: RwLock<Decoder>,
     decoder_dynamic_table: bool,
     decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
+    max_blocked_streams: usize,
+    blocked_streams: AtomicUsize,
     /// Connection-driver waker used while a request holds a read guard.
     write_waker: AtomicWaker,
 }
@@ -84,10 +89,13 @@ impl QpackDecoder {
         decoder: Decoder,
         decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
     ) -> Self {
+        let max_blocked_streams = decoder.max_blocked_streams();
         QpackDecoder(Arc::new(QpackDecoderInner {
             decoder_dynamic_table: decoder.dynamic_table_enabled(),
             decoder: RwLock::new(decoder),
             decoder_events_send,
+            max_blocked_streams,
+            blocked_streams: AtomicUsize::new(0),
             write_waker: AtomicWaker::new(),
         }))
     }
@@ -99,6 +107,28 @@ impl QpackDecoder {
     /// contains entries or whether its current capacity was later reduced to zero.
     pub(crate) fn dynamic_table_enabled(&self) -> bool {
         self.0.decoder_dynamic_table
+    }
+
+    /// Registers a request stream that cannot decode its field section yet.
+    ///
+    /// A stream is counted once even if it is polled repeatedly. The caller owns
+    /// that per-stream state and must unregister it after decoding or on drop.
+    /// Exceeding the advertised limit is a connection error.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
+    pub(crate) fn register_blocked_stream(&self) -> Result<(), DecoderError> {
+        self.0
+            .blocked_streams
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current < self.0.max_blocked_streams).then_some(current + 1)
+            })
+            .map(|_| ())
+            .map_err(|_| DecoderError::TooManyBlockedStreams)
+    }
+
+    pub(crate) fn unregister_blocked_stream(&self) {
+        let previous = self.0.blocked_streams.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "QPACK blocked-stream counter underflow");
     }
 
     /// Queues a Section Acknowledgment for the connection driver to send.

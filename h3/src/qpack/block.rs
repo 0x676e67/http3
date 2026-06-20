@@ -128,25 +128,43 @@ impl HeaderPrefix {
         total_inserted: usize,
         max_table_size: usize,
     ) -> Result<(usize, usize), ParseError> {
-        if max_table_size == 0 {
-            return Ok((0, 0));
-        }
-
-        // 4.5.1.1. Required Insert Count
+        // RFC 9204 section 4.5.1.1 defines this reconstruction. It uses the
+        // advertised maximum capacity, not the table's current capacity.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
         let required = if self.encoded_insert_count == 0 {
             0
         } else {
-            let mut insert_count = self.encoded_insert_count - 1;
             let max_entries = max_table_size / 32;
-            let mut wrapped = total_inserted % (2 * max_entries);
-
-            if wrapped >= insert_count + max_entries {
-                insert_count += 2 * max_entries;
-            } else if wrapped + max_entries < insert_count {
-                wrapped += 2 * max_entries;
+            let full_range = 2 * max_entries;
+            if max_entries == 0 || self.encoded_insert_count > full_range {
+                return Err(ParseError::InvalidRequiredInsertCount(
+                    self.encoded_insert_count,
+                ));
             }
 
-            insert_count + total_inserted - wrapped
+            // Reconstruct the largest value no more than MaxEntries ahead of the
+            // decoder's current insert count, as specified by RFC 9204 section 4.5.1.1.
+            let max_value = total_inserted.checked_add(max_entries).ok_or(
+                ParseError::InvalidRequiredInsertCount(self.encoded_insert_count),
+            )?;
+            let max_wrapped = (max_value / full_range) * full_range;
+            let mut required = max_wrapped + self.encoded_insert_count - 1;
+
+            if required > max_value {
+                if required <= full_range {
+                    return Err(ParseError::InvalidRequiredInsertCount(
+                        self.encoded_insert_count,
+                    ));
+                }
+                required -= full_range;
+            }
+
+            if required == 0 {
+                return Err(ParseError::InvalidRequiredInsertCount(
+                    self.encoded_insert_count,
+                ));
+            }
+            required
         };
 
         let base = if required == 0 {
@@ -480,7 +498,35 @@ mod test {
 
     #[test]
     fn header_prefix_table_size_0() {
-        HeaderPrefix::new(10, 5, 12, 0).get(1, 0).unwrap();
+        assert_eq!(HeaderPrefix::new(10, 5, 12, 0).get(1, 0).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn nonzero_insert_count_requires_at_least_one_table_entry() {
+        let prefix = HeaderPrefix {
+            encoded_insert_count: 1,
+            sign_negative: false,
+            delta_base: 0,
+        };
+
+        assert_eq!(
+            prefix.get(0, 31),
+            Err(ParseError::InvalidRequiredInsertCount(1))
+        );
+    }
+
+    #[test]
+    fn encoded_insert_count_cannot_exceed_full_range() {
+        let prefix = HeaderPrefix {
+            encoded_insert_count: 3,
+            sign_negative: false,
+            delta_base: 0,
+        };
+
+        assert_eq!(
+            prefix.get(0, 32),
+            Err(ParseError::InvalidRequiredInsertCount(3))
+        );
     }
 
     #[test]

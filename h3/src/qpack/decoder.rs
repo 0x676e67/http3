@@ -35,6 +35,8 @@ pub enum DecoderError {
     UnknownPrefix(u8),
     MissingRefs(usize),
     BadBaseIndex(isize),
+    InvalidRequiredInsertCount(usize),
+    TooManyBlockedStreams,
     UnexpectedEnd,
     HeaderTooLong(u64),
     BufSize(TryFromIntError),
@@ -51,8 +53,12 @@ impl std::fmt::Display for DecoderError {
             DecoderError::DynamicTable(e) => write!(f, "dynamic table error: {:?}", e),
             DecoderError::InvalidStaticIndex(i) => write!(f, "unknown static index: {}", i),
             DecoderError::UnknownPrefix(p) => write!(f, "unknown instruction code: 0x{}", p),
-            DecoderError::MissingRefs(n) => write!(f, "missing {} refs to decode bloc", n),
+            DecoderError::MissingRefs(n) => write!(f, "missing {} refs to decode block", n),
             DecoderError::BadBaseIndex(i) => write!(f, "out of bounds base index: {}", i),
+            DecoderError::InvalidRequiredInsertCount(i) => {
+                write!(f, "invalid required insert count: {}", i)
+            }
+            DecoderError::TooManyBlockedStreams => write!(f, "too many blocked streams"),
             DecoderError::UnexpectedEnd => write!(f, "unexpected end"),
             DecoderError::HeaderTooLong(_) => write!(f, "header too long"),
             DecoderError::BufSize(_) => write!(f, "number in buffer wrong size"),
@@ -80,6 +86,11 @@ pub struct Decoded {
 
 pub struct Decoder {
     table: DynamicTable,
+    // SETTINGS_QPACK_MAX_TABLE_CAPACITY is a fixed decoding limit. The table's
+    // current capacity is separate and starts at zero.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3
+    max_table_capacity: usize,
+    max_blocked_streams: usize,
 }
 
 impl Decoder {
@@ -87,10 +98,19 @@ impl Decoder {
         max_table_capacity: u64,
         max_blocked_streams: u64,
     ) -> Result<Self, DecoderError> {
+        let max_table_capacity = max_table_capacity.try_into()?;
+        DynamicTable::validate_max_size(max_table_capacity)?;
+        let max_blocked_streams = max_blocked_streams.try_into()?;
+        // The peer encoder raises the current capacity with a Set Dynamic Table
+        // Capacity instruction before inserting entries.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.1
         let mut table = DynamicTable::new();
-        table.set_max_size(max_table_capacity.try_into()?)?;
-        table.set_max_blocked(max_blocked_streams.try_into()?)?;
-        Ok(Self { table })
+        table.set_max_blocked(max_blocked_streams)?;
+        Ok(Self {
+            table,
+            max_table_capacity,
+            max_blocked_streams,
+        })
     }
 
     /// Returns whether the configured maximum dynamic table capacity is non-zero.
@@ -101,7 +121,11 @@ impl Decoder {
     ///
     /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3).
     pub(crate) fn dynamic_table_enabled(&self) -> bool {
-        self.table.max_mem_size() > 0
+        self.max_table_capacity > 0
+    }
+
+    pub(crate) fn max_blocked_streams(&self) -> usize {
+        self.max_blocked_streams
     }
 
     // Decode field lines received on Request of Push stream.
@@ -116,14 +140,14 @@ impl Decoder {
         buf: &mut T,
         max_size: u64,
     ) -> Result<Decoded, DecoderError> {
-        let (required_ref, base) = HeaderPrefix::decode(buf)?
-            .get(self.table.total_inserted(), self.table.max_mem_size())?;
+        let (required_ref, base) =
+            HeaderPrefix::decode(buf)?.get(self.table.total_inserted(), self.max_table_capacity)?;
 
         if required_ref > self.table.total_inserted() {
             return Err(DecoderError::MissingRefs(required_ref));
         }
 
-        let decoder_table = self.table.decoder(base);
+        let decoder_table = self.table.decoder(base, required_ref);
 
         let mut mem_size = 0;
         let mut fields = Vec::new();
@@ -156,8 +180,16 @@ impl Decoder {
             trace!("instruction {:?}", instruction);
 
             match instruction {
-                Instruction::Insert(field) => self.table.put(field)?,
+                // An encoder-stream insertion is mandatory; unlike the local
+                // encoder path it cannot silently choose a literal fallback.
+                Instruction::Insert(field) => self.table.put_decoder(field)?,
                 Instruction::TableSizeUpdate(size) => {
+                    // The encoder can change current capacity but cannot exceed
+                    // the limit advertised in our SETTINGS.
+                    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.1
+                    if size > self.max_table_capacity {
+                        return Err(DynamicTableError::MaximumTableSizeTooLarge.into());
+                    }
                     self.table.set_max_size(size)?;
                 }
             }
@@ -297,7 +329,12 @@ pub fn decode_stateless<T: Buf>(buf: &mut T, max_size: u64) -> Result<Decoded, D
 #[cfg(test)]
 impl From<DynamicTable> for Decoder {
     fn from(table: DynamicTable) -> Self {
-        Self { table }
+        let max_table_capacity = table.max_mem_size();
+        Self {
+            table,
+            max_table_capacity,
+            max_blocked_streams: 0,
+        }
     }
 }
 
@@ -363,6 +400,9 @@ impl From<ParseError> for DecoderError {
             ParseError::String(x) => DecoderError::InvalidString(x),
             ParseError::InvalidPrefix(p) => DecoderError::UnknownPrefix(p),
             ParseError::InvalidBase(b) => DecoderError::BadBaseIndex(b),
+            ParseError::InvalidRequiredInsertCount(i) => {
+                DecoderError::InvalidRequiredInsertCount(i)
+            }
         }
     }
 }
@@ -392,6 +432,71 @@ mod tests {
         assert_eq!(result, Err(DecoderError::HeaderTooLong(44)));
     }
 
+    #[test]
+    fn dynamic_table_capacity_starts_at_zero() {
+        let decoder = Decoder::new(128, 0).unwrap();
+
+        assert!(decoder.dynamic_table_enabled());
+        assert_eq!(decoder.table.max_mem_size(), 0);
+    }
+
+    #[test]
+    fn insert_before_capacity_update_is_rejected() {
+        let mut encoder_stream = Vec::new();
+        InsertWithoutNameRef::new("key", "value")
+            .encode(&mut encoder_stream)
+            .unwrap();
+        let mut decoder = Decoder::new(128, 0).unwrap();
+
+        assert_eq!(
+            decoder.on_encoder_recv(&mut Cursor::new(encoder_stream), &mut Vec::new()),
+            Err(DecoderError::DynamicTable(
+                DynamicTableError::MaxTableSizeReached
+            ))
+        );
+    }
+
+    #[test]
+    fn capacity_update_cannot_exceed_advertised_maximum() {
+        let mut encoder_stream = Vec::new();
+        DynamicTableSizeUpdate(129).encode(&mut encoder_stream);
+        let mut decoder = Decoder::new(128, 0).unwrap();
+
+        assert_eq!(
+            decoder.on_encoder_recv(&mut Cursor::new(encoder_stream), &mut Vec::new()),
+            Err(DecoderError::DynamicTable(
+                DynamicTableError::MaximumTableSizeTooLarge
+            ))
+        );
+    }
+
+    #[test]
+    fn required_insert_count_uses_advertised_capacity() {
+        let mut field_section = Vec::new();
+        HeaderPrefix::new(8, 8, 10, TABLE_SIZE).encode(&mut field_section);
+        let decoder = Decoder::new(TABLE_SIZE as u64, 0).unwrap();
+
+        assert_eq!(
+            decoder.decode_header(&mut Cursor::new(field_section)),
+            Err(DecoderError::MissingRefs(8))
+        );
+    }
+
+    #[test]
+    fn dynamic_reference_cannot_exceed_required_insert_count() {
+        let mut field_section = Vec::new();
+        HeaderPrefix::new(2, 4, 4, TABLE_SIZE).encode(&mut field_section);
+        Indexed::Dynamic(0).encode(&mut field_section);
+        let decoder = Decoder::from(build_table_with_size(4));
+
+        assert_eq!(
+            decoder.decode_header(&mut Cursor::new(field_section)),
+            Err(DecoderError::DynamicTable(
+                DynamicTableError::BadRelativeIndex(0)
+            ))
+        );
+    }
+
     /**
      * https://www.rfc-editor.org/rfc/rfc9204.html#name-insert-with-name-reference
      * 4.3.2.  Insert With Name Reference
@@ -408,7 +513,7 @@ mod tests {
         assert!(decoder.on_encoder_recv(&mut enc, &mut dec).is_ok());
 
         assert_eq!(
-            decoder.table.decoder(1).get_relative(0),
+            decoder.table.decoder(1, 1).get_relative(0),
             Ok(&StaticTable::get(1).unwrap().with_value("serial value"))
         );
 
@@ -476,7 +581,7 @@ mod tests {
         assert!(decoder.on_encoder_recv(&mut enc, &mut dec).is_ok());
 
         assert_eq!(
-            decoder.table.decoder(1).get_relative(0),
+            decoder.table.decoder(1, 1).get_relative(0),
             Ok(&HeaderField::new("key", "value"))
         );
 
@@ -710,7 +815,7 @@ mod tests {
     #[test]
     fn decode_post_base_name_ref_header_field() {
         let mut buf = vec![];
-        HeaderPrefix::new(2, 2, 4, TABLE_SIZE).encode(&mut buf);
+        HeaderPrefix::new(3, 2, 4, TABLE_SIZE).encode(&mut buf);
         LiteralWithPostBaseNameRef::new(0, "new bar3")
             .encode(&mut buf)
             .unwrap();
