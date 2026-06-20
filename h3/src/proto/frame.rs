@@ -148,6 +148,34 @@ impl Frame<PayloadLen> {
         frame
     }
 
+    /// Decodes an unknown frame's type and payload length without waiting for
+    /// the payload itself.
+    ///
+    /// Unknown frame payloads have no semantics and can be discarded as they
+    /// arrive instead of being retained in the frame decoder.
+    ///
+    /// See [RFC 9114, Section 7.2.8](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8).
+    pub(crate) fn decode_unknown_prefix<T: Buf>(
+        buf: &mut T,
+    ) -> Result<Option<(u64, usize)>, FrameError> {
+        let remaining = buf.remaining();
+        let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(remaining + 1))?;
+        if ty == FrameType::WEBTRANSPORT_BI_STREAM {
+            return Ok(None);
+        }
+
+        let len: usize = buf
+            .get_var()
+            .map_err(|_| FrameError::Incomplete(remaining + 1))?
+            .try_into()
+            .map_err(|_| FrameError::InvalidFrameValue)?;
+        if ty.is_known() {
+            Ok(None)
+        } else {
+            Ok(Some((ty.0, len)))
+        }
+    }
+
     /// Decodes only the type and length of a HEADERS frame.
     ///
     /// The caller uses a non-consuming cursor and commits the returned byte count
@@ -351,6 +379,24 @@ impl FrameType {
     }
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
         buf.write_var(self.0);
+    }
+
+    fn is_known(self) -> bool {
+        matches!(
+            self,
+            Self::DATA
+                | Self::HEADERS
+                | Self::H2_PRIORITY
+                | Self::CANCEL_PUSH
+                | Self::SETTINGS
+                | Self::PUSH_PROMISE
+                | Self::H2_PING
+                | Self::GOAWAY
+                | Self::H2_WINDOW_UPDATE
+                | Self::H2_CONTINUATION
+                | Self::MAX_PUSH_ID
+                | Self::WEBTRANSPORT_BI_STREAM
+        )
     }
 
     #[cfg(test)]
