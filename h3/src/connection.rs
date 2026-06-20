@@ -994,13 +994,13 @@ where
     }
 
     fn wake_qpack_decoder_waiters(&mut self, cx: &mut Context<'_>) {
+        for waker in self.qpack_streams.decoder_wakers.drain(..) {
+            waker.wake();
+        }
+
         // Requests can enqueue a waker while the decoder write lock is held.
         // The update is complete, so newly drained waiters can wake immediately.
         self.poll_qpack_decoder_events(cx, true);
-
-        while let Some(waker) = self.qpack_streams.decoder_wakers.pop() {
-            waker.wake();
-        }
     }
 
     fn poll_qpack_decoder_events(&mut self, cx: &mut Context<'_>, wake_waiters: bool) {
