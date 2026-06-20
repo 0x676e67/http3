@@ -1,5 +1,6 @@
 use crate::quic::StreamId;
 
+pub(crate) use self::decoder::DecoderState;
 pub use self::{
     decoder::{ack_header, decode_stateless, stream_canceled, Decoded, Decoder, DecoderError},
     encoder::{encode_stateless, EncoderError},
@@ -210,13 +211,13 @@ impl QpackDecoder {
     /// A field section with missing references must also register its request task.
     /// `waiter_registered` is true when registration already happened while waiting
     /// for the read lock.
-    fn finish_decode(
+    fn finish_decode<T>(
         &self,
         cx: &Context<'_>,
         decoder: RwLockReadGuard<'_, Decoder>,
-        decoded: Result<Decoded, DecoderError>,
+        decoded: Result<T, DecoderError>,
         waiter_registered: bool,
-    ) -> Poll<Result<Decoded, DecoderError>> {
+    ) -> Poll<Result<T, DecoderError>> {
         if !waiter_registered {
             if let Err(DecoderError::MissingRefs(_required_ref)) = &decoded {
                 // Register while the read guard still prevents an encoder update. This
@@ -288,6 +289,48 @@ impl QpackDecoder {
         match self.0.decoder.try_read() {
             Ok(decoder) => {
                 let decoded = decoder.decode_header_limited(encoded, max_size);
+                self.finish_decode(cx, decoder, decoded, true)
+            }
+            Err(TryLockError::WouldBlock) => Poll::Pending,
+            _ => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+        }
+    }
+
+    /// Advances an encoded field section without requiring its complete payload.
+    ///
+    /// The request stream appends transport chunks to `state`. A successful
+    /// `None` result asks for more payload bytes; `Poll::Pending` waits for decoder
+    /// table access or missing dynamic references.
+    ///
+    /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
+    pub(crate) fn poll_decode_header_incremental(
+        &self,
+        cx: &mut Context<'_>,
+        state: &mut DecoderState,
+        end: bool,
+        max_size: u64,
+    ) -> Poll<Result<Option<Decoded>, DecoderError>> {
+        if !self.0.decoder_dynamic_table {
+            return Poll::Ready(decoder::decode_stateless_incremental(state, end, max_size));
+        }
+
+        match self.0.decoder.try_read() {
+            Ok(decoder) => {
+                let decoded = decoder.decode_header_incremental(state, end, max_size);
+                return self.finish_decode(cx, decoder, decoded, false);
+            }
+            Err(TryLockError::WouldBlock) => {}
+            _ => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+        }
+
+        self.0
+            .decoder_events_send
+            .send(QpackEvent::Waker(cx.waker().clone()))
+            .map_err(|_| DecoderError::UnexpectedEnd)?;
+
+        match self.0.decoder.try_read() {
+            Ok(decoder) => {
+                let decoded = decoder.decode_header_incremental(state, end, max_size);
                 self.finish_decode(cx, decoder, decoded, true)
             }
             Err(TryLockError::WouldBlock) => Poll::Pending,
