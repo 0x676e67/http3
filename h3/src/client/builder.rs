@@ -13,7 +13,6 @@ use crate::{
     error::ConnectionError,
     proto::frame::SettingId,
     quic::{self},
-    shared_state::SharedState,
 };
 
 use super::connection::{Connection, SendRequest};
@@ -165,16 +164,11 @@ impl Builder {
         B: Buf,
     {
         let open = quic.opener();
-        let shared = SharedState::default();
-
-        let conn_state = Arc::new(shared);
-
-        let inner = ConnectionInner::new(quic, conn_state.clone(), self.config.clone()).await?;
+        let inner = ConnectionInner::new(quic, self.config.clone()).await?;
         let send_request = SendRequest {
             open,
-            conn_state,
-            qpack_decoder: inner.qpack_decoder(),
-            use_qpack_dynamic_table: self.config.settings.qpack_max_table_capacity.unwrap_or(0) > 0,
+            conn_state: inner.shared.clone(),
+            decoder: inner.qpack_decoder(),
             max_field_section_size: self.config.settings.max_field_section_size,
             sender_count: Arc::new(AtomicUsize::new(1)),
             send_grease_frame: self.config.send_grease,

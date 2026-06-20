@@ -93,6 +93,17 @@ impl Decoder {
         Ok(Self { table })
     }
 
+    /// Returns whether the configured maximum dynamic table capacity is non-zero.
+    ///
+    /// The endpoint advertises this limit to bound the memory the peer encoder may
+    /// use. A zero limit forbids dynamic table entries, allowing field sections to
+    /// use the stateless decoding path.
+    ///
+    /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3).
+    pub(crate) fn dynamic_table_enabled(&self) -> bool {
+        self.table.max_mem_size() > 0
+    }
+
     // Decode field lines received on Request of Push stream.
     // https://www.rfc-editor.org/rfc/rfc9204.html#name-field-line-representations
     #[inline(always)]
@@ -593,6 +604,18 @@ mod tests {
             decoder.decode_header(&mut read),
             Err(DecoderError::MissingRefs(8))
         );
+    }
+
+    #[test]
+    fn static_field_section_has_no_dynamic_reference() {
+        let mut buf = vec![];
+        HeaderPrefix::new(0, 0, 0, TABLE_SIZE).encode(&mut buf);
+        Indexed::Static(18).encode(&mut buf);
+
+        let decoder = Decoder::from(build_table_with_size(0));
+        let decoded = decoder.decode_header(&mut Cursor::new(buf)).unwrap();
+
+        assert!(!decoded.dyn_ref);
     }
 
     fn field(n: usize) -> HeaderField {
