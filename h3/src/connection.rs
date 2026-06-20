@@ -1035,7 +1035,7 @@ where
 
 struct DecoderGurad {
     stream_id: StreamId,
-    shared: Arc<SharedState>,
+    conn_state: Arc<SharedState>,
     cancel_on_drop: bool,
     decoder: QpackDecoder,
 }
@@ -1047,7 +1047,7 @@ impl DecoderGurad {
         //# Insert Count is not zero, the decoder emits a Section Acknowledgment.
         if dyn_ref {
             self.decoder.queue_section_acknowledgment(self.stream_id)?;
-            self.shared.waker().wake();
+            self.conn_state.waker().wake();
         }
 
         Ok(())
@@ -1065,7 +1065,7 @@ impl Drop for DecoderGurad {
             //# When a stream is reset or reading is abandoned, the decoder emits
             //# a Stream Cancellation instruction.
             if self.decoder.queue_stream_cancellation(self.stream_id) {
-                self.shared.waker().wake();
+                self.conn_state.waker().wake();
             }
         }
     }
@@ -1096,7 +1096,7 @@ where
     ) -> Self {
         let decoder_gurad = decoder.dynamic_table_enabled().then(|| DecoderGurad {
             stream_id: stream.id(),
-            shared: conn_state.clone(),
+            conn_state: conn_state.clone(),
             // Until the field section is successfully decoded, dropping the guard
             // abandons it and must notify the peer encoder.
             cancel_on_drop: true,
@@ -1502,7 +1502,7 @@ mod qpack_field_section_tests {
         (
             DecoderGurad {
                 stream_id: StreamId(0),
-                shared,
+                conn_state: shared,
                 cancel_on_drop: true,
                 decoder,
             },
