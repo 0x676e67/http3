@@ -1031,8 +1031,8 @@ where
 struct DecoderGurad {
     stream_id: StreamId,
     shared: Arc<SharedState>,
-    decoder_events: mpsc::UnboundedSender<QpackEvent>,
     cancel_on_drop: bool,
+    decoder_events: mpsc::UnboundedSender<QpackEvent>,
 }
 
 impl DecoderGurad {
@@ -1044,6 +1044,11 @@ impl DecoderGurad {
             self.decoder_events
                 .send(QpackEvent::HeaderAck(self.stream_id))
                 .map_err(|_| qpack::DecoderError::UnexpectedEnd)?;
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                stream_id = ?self.stream_id,
+                "queued QPACK section acknowledgment"
+            );
             self.shared.waker().wake();
         }
 
@@ -1066,6 +1071,11 @@ impl Drop for DecoderGurad {
                 .send(QpackEvent::StreamCancel(self.stream_id))
                 .is_ok()
             {
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    stream_id = ?self.stream_id,
+                    "queued QPACK stream cancellation"
+                );
                 self.shared.waker().wake();
             }
         }
@@ -1078,9 +1088,9 @@ pub struct RequestStream<S, B> {
     pub(super) trailers: Option<Bytes>,
     pub(super) conn_state: Arc<SharedState>,
     pub(super) max_field_section_size: u64,
-    decoder_gurad: Option<DecoderGurad>,
-    decoder_dynamic_table: bool,
     send_grease_frame: bool,
+    decoder_dynamic_table: bool,
+    decoder_gurad: Option<DecoderGurad>,
 }
 
 impl<S, B> RequestStream<S, B>
@@ -1099,10 +1109,10 @@ where
         let decoder_gurad = decoder_dynamic_table.then(|| DecoderGurad {
             stream_id: stream.id(),
             shared: conn_state.clone(),
-            decoder_events,
             // Until the field section is successfully decoded, dropping the guard
             // abandons it and must notify the peer encoder.
             cancel_on_drop: true,
+            decoder_events,
         });
 
         Self {
@@ -1110,9 +1120,9 @@ where
             conn_state,
             max_field_section_size,
             trailers: None,
-            decoder_gurad,
-            decoder_dynamic_table,
             send_grease_frame: grease,
+            decoder_dynamic_table,
+            decoder_gurad,
         }
     }
 }

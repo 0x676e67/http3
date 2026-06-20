@@ -125,15 +125,22 @@ impl QpackDecoder {
         decoded: Result<Decoded, DecoderError>,
         waiter_registered: bool,
     ) -> Poll<Result<Decoded, DecoderError>> {
-        if matches!(&decoded, Err(DecoderError::MissingRefs(_))) && !waiter_registered {
-            // Register while the read guard still prevents an encoder update. This
-            // keeps the driver from updating the table before the waiter is visible.
-            if self
-                .events_send
-                .send(QpackEvent::Waker(cx.waker().clone()))
-                .is_err()
-            {
-                return Poll::Ready(Err(DecoderError::UnexpectedEnd));
+        if !waiter_registered {
+            if let Err(DecoderError::MissingRefs(_required_ref)) = &decoded {
+                // Register while the read guard still prevents an encoder update. This
+                // keeps the driver from updating the table before the waiter is visible.
+                if self
+                    .events_send
+                    .send(QpackEvent::Waker(cx.waker().clone()))
+                    .is_err()
+                {
+                    return Poll::Ready(Err(DecoderError::UnexpectedEnd));
+                }
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    required_ref = *_required_ref,
+                    "queued QPACK decoder waiter for missing references"
+                );
             }
         }
 
@@ -182,6 +189,8 @@ impl QpackDecoder {
         {
             return Poll::Ready(Err(DecoderError::UnexpectedEnd));
         }
+        #[cfg(feature = "tracing")]
+        tracing::debug!("queued QPACK decoder waiter for decoder write lock");
 
         match self.decoder.try_read() {
             Ok(decoder) => {
