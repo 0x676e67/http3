@@ -11,9 +11,7 @@ use http::HeaderMap;
 use stream::WriteBuf;
 use tokio::sync::mpsc;
 
-#[cfg(feature = "tracing")]
-use tracing::{instrument, warn};
-
+use crate::quic::BidiStream;
 use crate::{
     config::Config,
     error::{
@@ -36,6 +34,8 @@ use crate::{
     stream::{self, AcceptRecvStream, AcceptedRecvStream, BufRecvStream, UniStreamHeader},
     webtransport::SessionId,
 };
+#[cfg(feature = "tracing")]
+use tracing::{instrument, warn};
 
 #[allow(missing_docs)]
 pub struct AcceptedStreams<C, B>
@@ -44,7 +44,10 @@ where
     B: Buf,
 {
     #[allow(missing_docs)]
-    pub wt_uni_streams: Vec<(SessionId, BufRecvStream<C::RecvStream, B>)>,
+    pub wt_uni_streams: Vec<(
+        SessionId,
+        BufRecvStream<C::RecvStream, B, <C::RecvStream as RecvStream>::Buf>,
+    )>,
 }
 
 impl<B, C> Default for AcceptedStreams<C, B>
@@ -84,7 +87,7 @@ where
     /// TODO: breaking encapsulation just to see if we can get this to work, will fix before merging
     pub conn: C,
     control_send: C::SendStream,
-    control_recv: Option<FrameStream<C::RecvStream, B>>,
+    control_recv: Option<FrameStream<C::RecvStream, B, <C::RecvStream as RecvStream>::Buf>>,
     pub(crate) qpack_streams: QpackStreams<C, B>,
     /// Buffers incoming uni/recv streams which have yet to be claimed.
     ///
@@ -572,10 +575,13 @@ where
 
         loop {
             while encoder_recv.has_remaining() {
-                let before = encoder_recv.buf().remaining();
+                let Some(buf) = encoder_recv.buf_mut().as_mut() else {
+                    break;
+                };
+                let before = buf.remaining();
                 match self.qpack_streams.decoder.poll_on_recv_encoder(
                     cx,
-                    encoder_recv.buf_mut(),
+                    buf,
                     &mut self.qpack_streams.decoder_send_buf,
                 ) {
                     Poll::Ready(Ok(_)) => {
@@ -597,7 +603,11 @@ where
                     }
                 };
 
-                let after = encoder_recv.buf().remaining();
+                let after = encoder_recv.buf_mut().as_ref().map_or(0, Buf::remaining);
+                if after == 0 {
+                    encoder_recv.buf_mut().take();
+                    continue;
+                }
                 if after == before {
                     break;
                 }
@@ -1108,11 +1118,12 @@ impl Drop for DecoderGurad {
 enum TrailersState {
     Decoding(qpack::DecoderState),
     Decoded(qpack::Decoded),
+    Rejected(u64),
 }
 
 #[allow(missing_docs)]
-pub struct RequestStream<S, B> {
-    pub(super) stream: FrameStream<S, B>,
+pub struct RequestStream<S, B, R> {
+    pub(super) stream: FrameStream<S, B, R>,
     trailers: Option<TrailersState>,
     pub(super) conn_state: Arc<SharedState>,
     pub(super) max_field_section_size: u64,
@@ -1122,9 +1133,10 @@ pub struct RequestStream<S, B> {
     response_headers: Option<qpack::DecoderState>,
 }
 
-impl<S, B> RequestStream<S, B>
+impl<S, B, R> RequestStream<S, B, R>
 where
-    S: quic::RecvStream,
+    S: quic::RecvStream<Buf = R>,
+    R: Buf,
 {
     // This is an implementation bound, not a QPACK wire limit. Complete field
     // lines are discarded from the compressed scratch buffer between chunks.
@@ -1132,7 +1144,7 @@ where
 
     #[allow(missing_docs)]
     pub(crate) fn new(
-        stream: FrameStream<S, B>,
+        stream: FrameStream<S, B, R>,
         max_field_section_size: u64,
         conn_state: Arc<SharedState>,
         grease: bool,
@@ -1161,17 +1173,18 @@ where
     }
 }
 
-impl<S, B> ConnectionState for RequestStream<S, B> {
+impl<S, B, R> ConnectionState for RequestStream<S, B, R> {
     fn shared_state(&self) -> &SharedState {
         &self.conn_state
     }
 }
 
-impl<S, B> CloseStream for RequestStream<S, B> {}
+impl<S, B, R> CloseStream for RequestStream<S, B, R> {}
 
-impl<S, B> RequestStream<S, B>
+impl<S, B, R> RequestStream<S, B, R>
 where
-    S: quic::RecvStream,
+    S: quic::RecvStream<Buf = R>,
+    R: Buf,
 {
     /// Receives and incrementally decodes the first HEADERS frame on a response stream.
     ///
@@ -1204,15 +1217,6 @@ where
             match frame {
                 RequestFrame::Headers => {
                     self.response_headers = Some(qpack::DecoderState::new());
-                }
-                // FrameDecoder can skip an unknown frame and reach a buffered
-                // HEADERS frame in the same pass. Accept that legacy result so
-                // RFC 9114's unknown-frame handling remains transparent.
-                // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
-                RequestFrame::Frame(Frame::Headers(mut encoded)) => {
-                    let mut state = qpack::DecoderState::new();
-                    state.extend(&mut encoded);
-                    self.response_headers = Some(state);
                 }
                 RequestFrame::Frame(frame) => {
                     return Poll::Ready(Err(self.handle_connection_error_on_stream(
@@ -1320,6 +1324,10 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf>, StreamError>> {
+        if matches!(self.trailers, Some(TrailersState::Rejected(_))) {
+            return Poll::Ready(Ok(None));
+        }
+
         if !self.stream.has_data() {
             match ready!(self.stream.poll_next_request(cx)) {
                 Err(frame_stream_error) => {
@@ -1336,12 +1344,6 @@ where
                 Ok(Some(RequestFrame::Headers)) => {
                     self.trailers = Some(TrailersState::Decoding(qpack::DecoderState::new()));
                     // Received trailers, no more data expected
-                    return Poll::Ready(Ok(None));
-                }
-                Ok(Some(RequestFrame::Frame(Frame::Headers(mut encoded)))) => {
-                    let mut state = qpack::DecoderState::new();
-                    state.extend(&mut encoded);
-                    self.trailers = Some(TrailersState::Decoding(state));
                     return Poll::Ready(Ok(None));
                 }
                 Ok(Some(RequestFrame::Frame(Frame::Data { .. }))) => (),
@@ -1391,6 +1393,13 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
         let mut trailers = if let Some(state) = self.trailers.take() {
+            if let TrailersState::Rejected(actual_size) = state {
+                self.trailers = Some(TrailersState::Rejected(actual_size));
+                return Poll::Ready(Err(StreamError::HeaderTooBig {
+                    actual_size,
+                    max_size: self.max_field_section_size,
+                }));
+            }
             state
         } else {
             match ready!(self.stream.poll_next_request(cx)) {
@@ -1407,11 +1416,6 @@ where
                 }
                 Ok(Some(RequestFrame::Headers)) => {
                     TrailersState::Decoding(qpack::DecoderState::new())
-                }
-                Ok(Some(RequestFrame::Frame(Frame::Headers(mut encoded)))) => {
-                    let mut state = qpack::DecoderState::new();
-                    state.extend(&mut encoded);
-                    TrailersState::Decoding(state)
                 }
                 Ok(Some(RequestFrame::Frame(other_frame))) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
@@ -1488,6 +1492,14 @@ where
                         return Poll::Pending;
                     }
                     Poll::Ready(Err(qpack::DecoderError::HeaderTooLong(actual_size))) => {
+                        if let Some(guard) = self.decoder_gurad.as_mut() {
+                            guard.unblock();
+                        }
+                        // The field section is abandoned, so stop receiving its
+                        // remaining bytes instead of interpreting them as DATA.
+                        // https://www.rfc-editor.org/rfc/rfc9114.html#section-8.1
+                        self.stop_sending(Code::H3_REQUEST_CANCELLED);
+                        self.trailers = Some(TrailersState::Rejected(actual_size));
                         return Poll::Ready(Err(StreamError::HeaderTooBig {
                             actual_size,
                             max_size: self.max_field_section_size,
@@ -1563,6 +1575,7 @@ where
         let qpack::Decoded { fields, .. } = match trailers {
             TrailersState::Decoded(decoded) => decoded,
             TrailersState::Decoding(_) => unreachable!("trailers are fully decoded"),
+            TrailersState::Rejected(_) => unreachable!("rejected trailers returned above"),
         };
 
         Poll::Ready(Ok(Some(
@@ -1585,7 +1598,7 @@ where
     }
 }
 
-impl<S, B> RequestStream<S, B>
+impl<S, B, R> RequestStream<S, B, R>
 where
     S: quic::SendStream<B>,
     B: Buf,
@@ -1672,17 +1685,18 @@ where
     }
 }
 
-impl<S, B> RequestStream<S, B>
+impl<S, B, R> RequestStream<S, B, R>
 where
-    S: quic::BidiStream<B>,
+    S: BidiStream<B, RecvStream: RecvStream<Buf = R>> + RecvStream<Buf = R>,
     B: Buf,
+    R: Buf,
 {
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub(crate) fn split(
         self,
     ) -> (
-        RequestStream<S::SendStream, B>,
-        RequestStream<S::RecvStream, B>,
+        RequestStream<S::SendStream, B, R>,
+        RequestStream<S::RecvStream, B, R>,
     ) {
         let (send, recv) = self.stream.split();
 

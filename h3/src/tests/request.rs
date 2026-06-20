@@ -685,6 +685,19 @@ async fn header_too_big_discard_from_client_trailers() {
                     ..
                 }
             );
+            assert!(request_stream
+                .recv_data()
+                .await
+                .expect("rejected trailers close the receive side")
+                .is_none());
+            assert_matches!(
+                request_stream.recv_trailers().await,
+                Err(StreamError::HeaderTooBig {
+                    actual_size: 539,
+                    max_size: 200,
+                    ..
+                })
+            );
             request_stream.finish().await.expect("client finish");
         };
         tokio::select! {biased; _ = req_fut => (), _ = drive_fut => () }
