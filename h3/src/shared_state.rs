@@ -22,17 +22,6 @@ pub struct SharedState {
     waker: AtomicWaker,
 }
 
-impl fmt::Debug for SharedState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SharedState")
-            .field("settings", &self.settings)
-            .field("connection_error", &self.connection_error)
-            .field("closing", &self.closing)
-            .field("waker", &self.waker)
-            .finish_non_exhaustive()
-    }
-}
-
 impl Default for SharedState {
     fn default() -> Self {
         Self {
