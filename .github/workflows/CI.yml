@@ -12,7 +12,7 @@ env:
   toolchain_http3_quinn_msrv: "1.85"
   toolchain_doc: nightly-2025-04-02
   toolchain_lint: stable
-  toolchain_fuzz: nightly-2025-04-02
+  toolchain_fuzz: nightly
 
 jobs:
   ci-pass:
