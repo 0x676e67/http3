@@ -2,7 +2,6 @@
 
 use std::{
     borrow::Cow,
-    fmt,
     sync::{atomic::AtomicBool, OnceLock},
 };
 
