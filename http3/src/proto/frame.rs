@@ -47,6 +47,8 @@ impl fmt::Display for FrameError {
     }
 }
 
+// Keep SETTINGS inline: boxing it would change the public API and allocate per frame.
+#[allow(clippy::large_enum_variant)]
 pub enum Frame<B> {
     Data(B),
     Headers(Bytes),

@@ -1,9 +1,10 @@
 [package]
 name = "http3-datagram-rs"
 version = "0.0.2"
-edition = "2021"
+rust-version = { workspace = true }
+edition = { workspace = true }
 documentation = "https://docs.rs/http3-datagram-rs"
-repository = "https://github.com/0x676e67/http3-rs"
+repository = { workspace = true }
 readme = "readme.md"
 description = "RFC 9297 datagram extension for http3-rs"
 keywords = ["http3", "quic", "rfc9297"]

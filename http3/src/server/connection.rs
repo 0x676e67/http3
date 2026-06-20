@@ -7,7 +7,7 @@ use std::{
     future::poll_fn,
     option::Option,
     result::Result,
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use bytes::Buf;
@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     connection::ConnectionInner,
-    error::{internal_error::InternalConnectionError, Code, ConnectionError},
+    error::{Code, ConnectionError, internal_error::InternalConnectionError},
     frame::FrameStream,
     proto::{
         frame::{Frame, PayloadLen},

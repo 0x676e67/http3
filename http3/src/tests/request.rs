@@ -3,10 +3,10 @@ use std::{hint::black_box, time::Duration};
 use assert_matches::assert_matches;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::future;
-use http::{request, HeaderMap, Request, Response, StatusCode};
+use http::{HeaderMap, Request, Response, StatusCode, request};
 
 use crate::{
-    client,
+    ConnectionState, client,
     config::Settings,
     error::{Code, ConnectionError, LocalError, StreamError},
     proto::{
@@ -20,11 +20,10 @@ use crate::{
     quic::ConnectionErrorIncoming,
     server,
     tests::get_stream_blocking,
-    ConnectionState,
 };
 
 use super::http3_quinn_rs;
-use super::{init_tracing, Pair};
+use super::{Pair, init_tracing};
 
 #[tokio::test]
 async fn get() {

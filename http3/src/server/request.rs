@@ -10,9 +10,9 @@ use tracing::instrument;
 use crate::{
     connection::{self},
     error::{
+        Code, StreamError,
         connection_error_creators::{CloseStream, HandleFrameStreamErrorOnRequestStream},
         internal_error::InternalConnectionError,
-        Code, StreamError,
     },
     frame::{FrameStream, FrameStreamError},
     proto::{
