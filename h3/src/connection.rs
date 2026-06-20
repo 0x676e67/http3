@@ -573,17 +573,16 @@ where
         loop {
             while encoder_recv.has_remaining() {
                 let before = encoder_recv.buf().remaining();
-                let decoder_send_before = self.qpack_streams.decoder_send_buf.len();
                 match self.shared.decoder.poll_on_recv_encoder(
                     cx,
                     encoder_recv.buf_mut(),
                     &mut self.qpack_streams.decoder_send_buf,
                 ) {
                     Poll::Ready(Ok(_)) => {
-                        self.poll_qpack_decoder_wakers(cx);
+                        self.wake_qpack_decoder_waiters(cx);
                     }
                     Poll::Ready(Err(err)) => {
-                        self.poll_qpack_decoder_wakers(cx);
+                        self.wake_qpack_decoder_waiters(cx);
                         return Poll::Ready(Err(self.handle_connection_error(
                             InternalConnectionError::new(
                                 Code::QPACK_ENCODER_STREAM_ERROR,
@@ -599,12 +598,6 @@ where
                 };
 
                 let after = encoder_recv.buf().remaining();
-                let made_progress = after != before
-                    || self.qpack_streams.decoder_send_buf.len() != decoder_send_before;
-                if made_progress {
-                    self.waker().wake();
-                }
-
                 if after == before {
                     break;
                 }
@@ -665,7 +658,7 @@ where
     where
         C::SendStream: quic::SendStreamUnframed<B>,
     {
-        self.poll_qpack_decoder_acknowledge(cx);
+        self.poll_qpack_decoder_events(cx, false);
 
         let Some(decoder_send) = self.qpack_streams.decoder_send.as_mut() else {
             if !self.qpack_streams.decoder_send_buf.has_remaining() {
@@ -1000,19 +993,17 @@ where
         &mut self.accepted_streams
     }
 
-    fn poll_qpack_decoder_wakers(&mut self, cx: &mut Context<'_>) {
+    fn wake_qpack_decoder_waiters(&mut self, cx: &mut Context<'_>) {
         // Requests can enqueue a waker while the decoder write lock is held.
-        // Move those events into decoder_wakers before releasing the waiters.
-        self.poll_qpack_decoder_acknowledge(cx);
+        // The update is complete, so newly drained waiters can wake immediately.
+        self.poll_qpack_decoder_events(cx, true);
 
         while let Some(waker) = self.qpack_streams.decoder_wakers.pop() {
             waker.wake();
         }
     }
 
-    fn poll_qpack_decoder_acknowledge(&mut self, cx: &mut Context<'_>) {
-        let before = self.qpack_streams.decoder_send_buf.len();
-
+    fn poll_qpack_decoder_events(&mut self, cx: &mut Context<'_>, wake_waiters: bool) {
         while let Poll::Ready(Some(event)) = self.qpack_streams.decoder_events_recv.poll_recv(cx) {
             match event {
                 QpackEvent::HeaderAck(stream_id) => qpack::ack_header(
@@ -1024,13 +1015,15 @@ where
                     &mut self.qpack_streams.decoder_send_buf,
                 ),
                 // Wakers share this channel with decoder-stream instructions, but
-                // must wait until the encoder has updated and released the decoder.
-                QpackEvent::Waker(waker) => self.qpack_streams.decoder_wakers.push(waker),
+                // ordinary flushes must retain them until the next decoder update.
+                QpackEvent::Waker(waker) => {
+                    if wake_waiters {
+                        waker.wake();
+                    } else {
+                        self.qpack_streams.decoder_wakers.push(waker);
+                    }
+                }
             }
-        }
-
-        if self.qpack_streams.decoder_send_buf.len() != before {
-            self.waker().wake();
         }
     }
 }
