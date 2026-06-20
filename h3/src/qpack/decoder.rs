@@ -98,6 +98,11 @@ pub(crate) struct DecoderState {
 }
 
 impl DecoderState {
+    // HPACK Huffman codes use at most 30 bits per decoded octet. Four times
+    // the remaining decoded budget plus representation prefixes is therefore
+    // a conservative ceiling for one incomplete encoded field line.
+    const FIELD_REPRESENTATION_OVERHEAD: u64 = 32;
+
     /// Creates an empty state for one encoded field section.
     ///
     /// The field section prefix is parsed from the first bytes appended with
@@ -126,6 +131,23 @@ impl DecoderState {
             dyn_ref: required_ref > 0,
             mem_size: self.mem_size,
         }
+    }
+
+    fn check_incomplete_field_size(&self, max_size: u64) -> Result<(), DecoderError> {
+        if max_size == u64::MAX {
+            return Ok(());
+        }
+
+        let remaining = max_size.saturating_sub(self.mem_size);
+        let encoded_limit = remaining
+            .saturating_mul(4)
+            .saturating_add(Self::FIELD_REPRESENTATION_OVERHEAD);
+        if self.pending.len() as u64 > encoded_limit {
+            // RFC 9204 permits implementations to bound field-section memory.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4
+            return Err(DecoderError::HeaderTooLong(max_size.saturating_add(1)));
+        }
+        Ok(())
     }
 }
 
@@ -261,7 +283,10 @@ impl Decoder {
             let mut cursor = Cursor::new(&state.pending[..]);
             let field = match Self::parse_header_field(&decoder_table, &mut cursor) {
                 Ok(field) => field,
-                Err(DecoderError::UnexpectedEnd) if !end => return Ok(None),
+                Err(DecoderError::UnexpectedEnd) if !end => {
+                    state.check_incomplete_field_size(max_size)?;
+                    return Ok(None);
+                }
                 Err(error) => return Err(error),
             };
 
@@ -469,7 +494,10 @@ pub(crate) fn decode_stateless_incremental(
         let mut cursor = Cursor::new(&state.pending[..]);
         let field = match parse_stateless_header_field(&mut cursor) {
             Ok(field) => field,
-            Err(DecoderError::UnexpectedEnd) if !end => return Ok(None),
+            Err(DecoderError::UnexpectedEnd) if !end => {
+                state.check_incomplete_field_size(max_size)?;
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
 
@@ -708,6 +736,24 @@ mod tests {
                 HeaderField::new("first", "value"),
                 StaticTable::get(18).unwrap().clone()
             ]
+        );
+    }
+
+    #[test]
+    fn incremental_decode_bounds_incomplete_field_representation() {
+        let mut encoded = Vec::new();
+        HeaderPrefix::new(0, 0, 0, 0).encode(&mut encoded);
+        Literal::new("x".repeat(1024), "value".repeat(128))
+            .encode(&mut encoded)
+            .unwrap();
+        encoded.pop();
+
+        let mut state = DecoderState::new();
+        state.extend(&mut Cursor::new(encoded));
+
+        assert_eq!(
+            decode_stateless_incremental(&mut state, false, 16),
+            Err(DecoderError::HeaderTooLong(17))
         );
     }
 
