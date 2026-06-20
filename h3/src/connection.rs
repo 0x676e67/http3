@@ -1,6 +1,7 @@
 use std::{
     convert::TryFrom,
     marker::PhantomData,
+    ops::{Deref, DerefMut},
     sync::Arc,
     task::{Context, Poll},
 };
@@ -808,23 +809,144 @@ where
 
 #[allow(missing_docs)]
 pub struct RequestStream<S, B> {
-    pub(super) stream: FrameStream<S, B>,
+    pub(super) stream: RequestStreamGuard<S, B>,
     pub(super) trailers: Option<Bytes>,
     pub(super) conn_state: Arc<SharedState>,
     pub(super) max_field_section_size: u64,
     send_grease_frame: bool,
 }
 
-impl<S, B> RequestStream<S, B> {
+type ResetOnDrop<S, B> = fn(&mut FrameStream<S, B>, Code);
+type StopSendingOnDrop<S, B> = fn(&mut FrameStream<S, B>, Code);
+
+pub(super) struct RequestStreamGuard<S, B> {
+    stream: Option<FrameStream<S, B>>,
+    reset_on_drop: Option<ResetOnDrop<S, B>>,
+    stop_sending_on_drop: Option<StopSendingOnDrop<S, B>>,
+}
+
+impl<S, B> RequestStreamGuard<S, B> {
+    fn new(
+        stream: FrameStream<S, B>,
+        reset_on_drop: Option<ResetOnDrop<S, B>>,
+        stop_sending_on_drop: Option<StopSendingOnDrop<S, B>>,
+    ) -> Self {
+        Self {
+            stream: Some(stream),
+            reset_on_drop,
+            stop_sending_on_drop,
+        }
+    }
+
+    fn into_inner(mut self) -> FrameStream<S, B> {
+        self.reset_on_drop = None;
+        self.stop_sending_on_drop = None;
+        self.stream.take().expect("stream is present")
+    }
+
+    fn disarm_reset(&mut self) {
+        self.reset_on_drop = None;
+    }
+
+    fn disarm_stop_sending(&mut self) {
+        self.stop_sending_on_drop = None;
+    }
+}
+
+impl<S, B> Deref for RequestStreamGuard<S, B> {
+    type Target = FrameStream<S, B>;
+
+    fn deref(&self) -> &Self::Target {
+        self.stream.as_ref().expect("stream is present")
+    }
+}
+
+impl<S, B> DerefMut for RequestStreamGuard<S, B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.stream.as_mut().expect("stream is present")
+    }
+}
+
+impl<S, B> Drop for RequestStreamGuard<S, B> {
+    fn drop(&mut self) {
+        let Some(stream) = self.stream.as_mut() else {
+            return;
+        };
+
+        if let Some(reset) = self.reset_on_drop {
+            reset(stream, Code::H3_REQUEST_CANCELLED);
+        }
+        if let Some(stop_sending) = self.stop_sending_on_drop {
+            stop_sending(stream, Code::H3_REQUEST_CANCELLED);
+        }
+    }
+}
+
+impl<S, B> SendStream<B> for RequestStreamGuard<S, B>
+where
+    S: SendStream<B>,
+    B: Buf,
+{
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+        self.deref_mut().poll_ready(cx)
+    }
+
+    fn send_data<D: Into<WriteBuf<B>>>(&mut self, data: D) -> Result<(), StreamErrorIncoming> {
+        self.deref_mut().send_data(data)
+    }
+
+    fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+        self.deref_mut().poll_finish(cx)
+    }
+
+    fn reset(&mut self, reset_code: u64) {
+        self.deref_mut().reset(reset_code);
+    }
+
+    fn send_id(&self) -> quic::StreamId {
+        self.deref().send_id()
+    }
+}
+
+fn reset_on_drop<S, B>(stream: &mut FrameStream<S, B>, code: Code)
+where
+    S: quic::SendStream<B>,
+    B: Buf,
+{
+    stream.reset(code.into());
+}
+
+fn stop_sending_on_drop<S, B>(stream: &mut FrameStream<S, B>, code: Code)
+where
+    S: quic::RecvStream,
+{
+    stream.stop_sending(code);
+}
+
+impl<S, B> RequestStream<S, B>
+where
+    S: quic::SendStream<B> + quic::RecvStream,
+    B: Buf,
+{
     #[allow(missing_docs)]
     pub fn new(
         stream: FrameStream<S, B>,
         max_field_section_size: u64,
         conn_state: Arc<SharedState>,
         grease: bool,
+        cancel_on_drop: bool,
     ) -> Self {
+        let (reset_on_drop, stop_sending_on_drop) = if cancel_on_drop {
+            (
+                Some(reset_on_drop::<S, B> as ResetOnDrop<S, B>),
+                Some(stop_sending_on_drop::<S, B> as StopSendingOnDrop<S, B>),
+            )
+        } else {
+            (None, None)
+        };
+
         Self {
-            stream,
+            stream: RequestStreamGuard::new(stream, reset_on_drop, stop_sending_on_drop),
             conn_state,
             max_field_section_size,
             trailers: None,
@@ -858,7 +980,10 @@ where
                         self.handle_frame_stream_error_on_request_stream(frame_stream_error)
                     ))
                 }
-                Ok(None) => return Poll::Ready(Ok(None)),
+                Ok(None) => {
+                    self.stream.disarm_stop_sending();
+                    return Poll::Ready(Ok(None));
+                }
                 Ok(Some(Frame::Headers(encoded))) => {
                     self.trailers = Some(encoded);
                     // Received trailers, no more data expected
@@ -919,7 +1044,10 @@ where
                         self.handle_frame_stream_error_on_request_stream(frame_stream_error)
                     ))
                 }
-                Ok(None) => return Poll::Ready(Ok(None)),
+                Ok(None) => {
+                    self.stream.disarm_stop_sending();
+                    return Poll::Ready(Ok(None));
+                }
                 Ok(Some(Frame::Headers(encoded))) => encoded,
                 Ok(Some(other_frame)) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
@@ -977,7 +1105,7 @@ where
                     )));
                 }
                 // Stream is finished no problematic frames received
-                Poll::Ready(Ok(None)) => (),
+                Poll::Ready(Ok(None)) => self.stream.disarm_stop_sending(),
                 Poll::Pending => {
                     // save the trailers and try again.
                     self.trailers = Some(trailers);
@@ -1008,22 +1136,23 @@ where
                 }
             };
 
-        Poll::Ready(Ok(Some(
-            Header::try_from(fields)
-                .map_err(|_e| {
-                    self.stop_sending(Code::H3_MESSAGE_ERROR);
-                    StreamError::StreamError {
-                        code: Code::H3_MESSAGE_ERROR,
-                        reason: "malformed request".to_string(),
-                    }
-                })?
-                .into_fields(),
-        )))
+        let fields = Header::try_from(fields)
+            .map_err(|_e| {
+                self.stop_sending(Code::H3_MESSAGE_ERROR);
+                StreamError::StreamError {
+                    code: Code::H3_MESSAGE_ERROR,
+                    reason: "malformed request".to_string(),
+                }
+            })?
+            .into_fields();
+        self.stream.disarm_stop_sending();
+        Poll::Ready(Ok(Some(fields)))
     }
 
     #[allow(missing_docs)]
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_sending(&mut self, err_code: Code) {
+        self.stream.disarm_stop_sending();
         self.stream.stop_sending(err_code);
     }
 }
@@ -1089,6 +1218,7 @@ where
     /// Stops a stream with an error code
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_stream(&mut self, code: Code) {
+        self.stream.disarm_reset();
         self.stream.reset(code.into());
     }
 
@@ -1111,7 +1241,9 @@ where
 
         future::poll_fn(|cx| self.stream.poll_finish(cx))
             .await
-            .map_err(|e| self.handle_quic_stream_error(e))
+            .map_err(|e| self.handle_quic_stream_error(e))?;
+        self.stream.disarm_reset();
+        Ok(())
     }
 }
 
@@ -1127,18 +1259,25 @@ where
         RequestStream<S::SendStream, B>,
         RequestStream<S::RecvStream, B>,
     ) {
-        let (send, recv) = self.stream.split();
+        let reset_on_drop = self
+            .stream
+            .reset_on_drop
+            .map(|_| reset_on_drop::<S::SendStream, B> as ResetOnDrop<S::SendStream, B>);
+        let stop_sending_on_drop = self.stream.stop_sending_on_drop.map(|_| {
+            stop_sending_on_drop::<S::RecvStream, B> as StopSendingOnDrop<S::RecvStream, B>
+        });
+        let (send, recv) = self.stream.into_inner().split();
 
         (
             RequestStream {
-                stream: send,
+                stream: RequestStreamGuard::new(send, reset_on_drop, None),
                 trailers: None,
                 conn_state: self.conn_state.clone(),
                 max_field_section_size: 0,
                 send_grease_frame: self.send_grease_frame,
             },
             RequestStream {
-                stream: recv,
+                stream: RequestStreamGuard::new(recv, None, stop_sending_on_drop),
                 trailers: self.trailers,
                 conn_state: self.conn_state,
                 max_field_section_size: self.max_field_section_size,

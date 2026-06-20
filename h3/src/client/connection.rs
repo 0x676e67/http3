@@ -220,6 +220,7 @@ where
                 self.max_field_section_size,
                 self.conn_state.clone(),
                 self.send_grease_frame,
+                true,
             ),
         };
         // send the grease frame only once
