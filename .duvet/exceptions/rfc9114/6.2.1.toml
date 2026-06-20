@@ -8,5 +8,5 @@ control credit to keep the peer's control stream from becoming
 blocked.
 '''
 reason = '''
-h3 does not handle flow control credit acquiring.
+http3-rs does not handle flow control credit acquiring.
 '''

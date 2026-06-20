@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use h3::{
+use http::Method;
+use http3_quinn_rs::quinn::{self, crypto::rustls::QuicServerConfig};
+use http3_rs::{
     ext::Protocol,
     quic::{self},
     server::Connection,
 };
-use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
-use h3_webtransport::server::{self, WebTransportSession};
-use http::Method;
+use http3_webtransport_rs::server::{self, WebTransportSession};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use structopt::StructOpt;
@@ -111,30 +111,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match new_conn.await {
                 Ok(conn) => {
                     info!("new http3 established");
-                    let h3_conn = h3::server::builder()
+                    let http3_conn = http3_rs::server::builder()
                         .enable_webtransport(true)
                         .enable_extended_connect(true)
                         .enable_datagram(true)
                         .max_webtransport_sessions(1)
                         .send_grease(true)
-                        .build(h3_quinn::Connection::new(conn))
+                        .build(http3_quinn_rs::Connection::new(conn))
                         .await
                         .unwrap();
 
                     // tracing::info!("Establishing WebTransport session");
-                    // // 3. TODO: Conditionally, if the client indicated that this is a webtransport session, we should accept it here, else use regular h3.
-                    // // if this is a webtransport session, then h3 needs to stop handing the datagrams, bidirectional streams, and unidirectional streams and give them
+                    // // 3. TODO: Conditionally, if the client indicated that this is a WebTransport session, accept it here; otherwise use regular HTTP/3.
+                    // // For a WebTransport session, HTTP/3 needs to hand its datagrams and streams
                     // // to the webtransport session.
 
-                    if let Err(err) = handle_connection(h3_conn).await {
+                    if let Err(err) = handle_connection(http3_conn).await {
                         tracing::error!("Failed to handle connection: {err:?}");
                     }
 
                     // let mut session: WebTransportSession<_, Bytes> =
-                    //     WebTransportSession::accept(h3_conn).await.unwrap();
+                    //     WebTransportSession::accept(http3_conn).await.unwrap();
                     // tracing::info!("Finished establishing webtransport session");
                     // // 4. Get datagrams, bidirectional streams, and unidirectional streams and wait for client requests here.
-                    // // h3_conn needs to hand over the datagrams, bidirectional streams, and unidirectional streams to the webtransport session.
+                    // // http3_conn needs to hand over the datagrams and streams to the WebTransport session.
                     // let result = handle.await;
                 }
                 Err(err) => {
@@ -151,9 +151,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn handle_connection(mut conn: Connection<h3_quinn::Connection, Bytes>) -> Result<()> {
-    // 3. TODO: Conditionally, if the client indicated that this is a webtransport session, we should accept it here, else use regular h3.
-    // if this is a webtransport session, then h3 needs to stop handing the datagrams, bidirectional streams, and unidirectional streams and give them
+async fn handle_connection(mut conn: Connection<http3_quinn_rs::Connection, Bytes>) -> Result<()> {
+    // 3. TODO: Conditionally, if the client indicated that this is a WebTransport session, accept it here; otherwise use regular HTTP/3.
+    // For a WebTransport session, HTTP/3 needs to hand its datagrams and streams
     // to the webtransport session.
 
     loop {
@@ -178,7 +178,7 @@ async fn handle_connection(mut conn: Connection<h3_quinn::Connection, Bytes>) ->
                         let session = WebTransportSession::accept(req, stream, conn).await?;
                         tracing::info!("Established webtransport session");
                         // 4. Get datagrams, bidirectional streams, and unidirectional streams and wait for client requests here.
-                        // h3_conn needs to hand over the datagrams, bidirectional streams, and unidirectional streams to the webtransport session.
+                        // The HTTP/3 connection needs to hand its datagrams and streams to the WebTransport session.
                         handle_session_and_echo_all_inbound_messages(session).await?;
 
                         return Ok(());
@@ -262,7 +262,7 @@ where
 
 /// This method will echo all inbound datagrams, unidirectional and bidirectional streams.
 async fn handle_session_and_echo_all_inbound_messages(
-    session: WebTransportSession<h3_quinn::Connection, Bytes>,
+    session: WebTransportSession<http3_quinn_rs::Connection, Bytes>,
 ) -> anyhow::Result<()> {
     let session_id = session.session_id();
 

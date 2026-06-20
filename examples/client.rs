@@ -2,13 +2,13 @@ use std::{path::PathBuf, sync::Arc};
 
 use bytes::{Buf, Bytes};
 use futures::future;
-use h3::error::{Code, ConnectionError, StreamError};
+use http3_rs::error::{Code, ConnectionError, StreamError};
 use rustls::pki_types::CertificateDer;
 use rustls_native_certs::CertificateResult;
 use structopt::StructOpt;
 use tracing::{error, info, Level};
 
-use h3_quinn::quinn;
+use http3_quinn_rs::quinn;
 
 static ALPN: &[u8] = b"h3";
 
@@ -118,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
     }
 
-    let mut client_endpoint = h3_quinn::quinn::Endpoint::client("[::]:0".parse().unwrap())?;
+    let mut client_endpoint = http3_quinn_rs::quinn::Endpoint::client("[::]:0".parse().unwrap())?;
 
     let client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
@@ -129,14 +129,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("QUIC connection established");
 
-    // create h3 client
+    // Create the HTTP/3 client.
 
-    // h3 is designed to work with different QUIC implementations via
+    // http3-rs works with different QUIC implementations via
     // a generic interface, that is, the [`quic::Connection`] trait.
-    // h3_quinn implements the trait w/ quinn to make it work with h3.
-    let quinn_conn = h3_quinn::Connection::new(conn);
+    // http3-quinn-rs implements the transport traits with Quinn.
+    let quinn_conn = http3_quinn_rs::Connection::new(conn);
 
-    let (mut driver, send_request) = h3::client::builder()
+    let (mut driver, send_request) = http3_rs::client::builder()
         .max_field_section_size(262144u64)
         .qpack_max_table_capacity(opt.qpack_max_table_capacity)
         .qpack_blocked_streams(opt.qpack_blocked_streams)
@@ -169,8 +169,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // sending request results in a bidirectional stream,
                 // which is also used for receiving response
-                let mut stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, _> =
-                    send_request.send_request(req).await?;
+                let mut stream: http3_rs::client::RequestStream<
+                    http3_quinn_rs::BidiStream<Bytes>,
+                    _,
+                > = send_request.send_request(req).await?;
 
                 // finish on the sending side
                 stream.finish().await?;

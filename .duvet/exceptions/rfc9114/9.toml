@@ -6,7 +6,7 @@ Extensions that could change the semantics of existing protocol
 components MUST be negotiated before being used.
 '''
 reason = '''
-The user should ensure that the order is correct, as h3 does not
+The user should ensure that the order is correct, as http3-rs does not
 handle protocol negotiations.
 '''
 

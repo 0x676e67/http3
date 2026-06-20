@@ -5,8 +5,8 @@ inputs:
   report-script:
     description: 'Path to script that generates a compliance report'
     required: true
-  h3-dir:
-    description: 'Path to the directory where h3 is cloned'
+  http3-dir:
+    description: 'Path to the directory where http3-rs is cloned'
     required: false
     default: ${{ github.workspace }}
 
@@ -39,23 +39,23 @@ runs:
         git config --local user.email "github-actions[bot]@users.noreply.github.com"
 
         if git ls-remote --exit-code --heads origin gh-pages; then
-          cp -r .duvet .github ci h3 target
+          cp -r .duvet .github ci http3 target
           git switch gh-pages
-          cp -r target/.duvet target/.github target/ci target/h3 .
+          cp -r target/.duvet target/.github target/ci target/http3 .
         else
           git checkout --orphan gh-pages
           git reset
         fi
 
     - name: Generate report
-      working-directory: ${{ inputs.h3-dir }}
+      working-directory: ${{ inputs.http3-dir }}
       shell: bash
       run: |
         ${{ inputs.report-script }}
 
     # commit only when there are changes
     - name: Commit report changes
-      working-directory: ${{ inputs.h3-dir }}
+      working-directory: ${{ inputs.http3-dir }}
       shell: bash
       run: |
         cp .duvet/reports/* ci/compliance/
@@ -63,9 +63,9 @@ runs:
         git diff --staged --quiet || \
         git commit -m "${{ github.triggering_actor }}-${SHA}-${{ github.job }}#${{ github.run_number }}"
 
-    # publish report only when pushing to master
+    # publish report only when pushing to main
     - name: Push to gh-pages
-      if: github.ref == 'refs/heads/master'
+      if: github.ref == 'refs/heads/main'
       uses: ad-m/github-push-action@v1
       with:
         github_token: ${{ github.token }}
