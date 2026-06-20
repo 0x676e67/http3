@@ -47,7 +47,21 @@ impl<S, B, R> FrameStream<S, B, R> {
 
     /// Unwraps the Framed streamer and returns the underlying stream **without** data loss for
     /// partially received/read frames.
-    pub fn into_inner(self) -> BufRecvStream<S, B, R> {
+    pub fn into_inner(mut self) -> BufRecvStream<S, B, R>
+    where
+        S: RecvStream<Buf = R>,
+        R: Buf,
+    {
+        if let Some(buf) = self.buffer.pop_front() {
+            // poll_next stops reading as soon as a frame header is complete, so
+            // only the final QUIC buffer can contain bytes after that header.
+            assert!(
+                self.buffer.is_empty(),
+                "more than one buffer remains after a decoded frame"
+            );
+            debug_assert!(!self.stream.has_remaining());
+            *self.stream.buf_mut() = Some(buf);
+        }
         self.stream
     }
 }
@@ -97,7 +111,10 @@ where
                     Poll::Ready(false) => continue,
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(true) => {
-                        if self.stream.has_remaining() || self.buffer.has_remaining() {
+                        if self.stream.has_remaining()
+                            || self.buffer.has_remaining()
+                            || self.decoder.has_incomplete_frame()
+                        {
                             // Reached the end of receive stream, but there is still some data:
                             // The frame is incomplete.
                             Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
@@ -167,7 +184,10 @@ where
                 Poll::Ready(false) => continue,
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(true) => {
-                    if self.stream.has_remaining() || self.buffer.has_remaining() {
+                    if self.stream.has_remaining()
+                        || self.buffer.has_remaining()
+                        || self.decoder.has_incomplete_frame()
+                    {
                         // Reached the end of receive stream, but there is still some data:
                         // The frame is incomplete.
                         return Poll::Ready(Err(FrameStreamError::UnexpectedEnd));
@@ -372,9 +392,14 @@ where
 #[derive(Default)]
 pub struct FrameDecoder {
     expected: Option<usize>,
+    skip_remaining: usize,
 }
 
 impl FrameDecoder {
+    fn has_incomplete_frame(&self) -> bool {
+        self.expected.is_some() || self.skip_remaining != 0
+    }
+
     fn decode<B: Buf>(
         &mut self,
         src: &mut BufList<B>,
@@ -392,8 +417,48 @@ impl FrameDecoder {
         &mut self,
         src: &mut BufList<B>,
     ) -> Result<Option<DecodedFrame>, FrameStreamError> {
+        if self.skip_remaining != 0 {
+            let skipped = self.skip_remaining.min(src.remaining());
+            src.advance(skipped);
+            self.skip_remaining -= skipped;
+            return if self.skip_remaining == 0 {
+                Ok(Some(DecodedFrame::Ignored))
+            } else {
+                Ok(None)
+            };
+        }
+
         if !src.has_remaining() || self.expected.is_some_and(|min| src.remaining() < min) {
             return Ok(None);
+        }
+
+        let unknown = {
+            let mut cur = src.cursor();
+            let decoded = Frame::decode_unknown_prefix(&mut cur);
+            (cur.position(), decoded)
+        };
+        match unknown {
+            (prefix_len, Ok(Some((_ty, payload_len)))) => {
+                #[cfg(feature = "tracing")]
+                trace!("ignore unknown frame type {:#x}", _ty);
+
+                src.advance(prefix_len);
+                let skipped = payload_len.min(src.remaining());
+                src.advance(skipped);
+                self.skip_remaining = payload_len - skipped;
+                self.expected = None;
+                return if self.skip_remaining == 0 {
+                    Ok(Some(DecodedFrame::Ignored))
+                } else {
+                    Ok(None)
+                };
+            }
+            (_, Err(frame::FrameError::Incomplete(min))) => {
+                self.expected = Some(min);
+                return Ok(None);
+            }
+            (_, Ok(None)) => {}
+            (_, Err(_)) => unreachable!("unknown frame prefix only parses type and length"),
         }
 
         let (pos, decoded) = {
@@ -403,14 +468,8 @@ impl FrameDecoder {
         };
 
         match decoded {
-            Err(frame::FrameError::UnknownFrame(_ty)) => {
-                // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
-                #[cfg(feature = "tracing")]
-                trace!("ignore unknown frame type {:#x}", _ty);
-
-                src.advance(pos);
-                self.expected = None;
-                Ok(Some(DecodedFrame::Ignored))
+            Err(frame::FrameError::UnknownFrame(_)) => {
+                unreachable!("unknown frames are handled from their prefix")
             }
             Err(frame::FrameError::Incomplete(min)) => {
                 self.expected = Some(min);
@@ -837,6 +896,63 @@ mod tests {
         assert_poll_matches!(
             |cx| stream.poll_data_chunk(cx, 16),
             Ok(Some(bytes)) if bytes == b"header"[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_unknown_frame_reports_unexpected_end() {
+        use crate::proto::varint::BufMutExt as _;
+
+        let mut encoded = BytesMut::new();
+        FrameType::RESERVED.encode(&mut encoded);
+        encoded.write_var(10);
+        encoded.put_slice(b"part");
+
+        let mut recv = FakeRecv::default();
+        recv.chunk(encoded.freeze());
+        let mut stream: FrameStream<_, (), _> = FrameStream::new(BufRecvStream::new(recv));
+
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Err(FrameStreamError::UnexpectedEnd)
+        );
+    }
+
+    #[test]
+    fn unknown_frame_payload_is_discarded_incrementally() {
+        use crate::proto::varint::BufMutExt as _;
+
+        let mut encoded = BytesMut::new();
+        FrameType::RESERVED.encode(&mut encoded);
+        encoded.write_var(1_000_000);
+        encoded.put_slice(b"part");
+        let mut buffered = BufList::from(encoded.freeze());
+        let mut decoder = FrameDecoder::default();
+
+        assert_matches!(decoder.decode(&mut buffered), Ok(None));
+        assert_eq!(buffered.remaining(), 0);
+        assert_eq!(decoder.skip_remaining, 999_996);
+    }
+
+    #[tokio::test]
+    async fn into_inner_preserves_webtransport_payload() {
+        let session_id = crate::webtransport::SessionId::try_from(4).unwrap();
+        let mut encoded = BytesMut::new();
+        Frame::<Bytes>::WebTransportStream(session_id).encode(&mut encoded);
+        encoded.put_slice(b"payload");
+
+        let mut recv = FakeRecv::default();
+        recv.chunk(encoded.freeze());
+        let mut stream: FrameStream<_, (), _> = FrameStream::new(BufRecvStream::new(recv));
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Ok(Some(Frame::WebTransportStream(id))) if id == session_id
+        );
+
+        let mut inner = stream.into_inner();
+        assert_poll_matches!(
+            |cx| inner.poll_data(cx),
+            Ok(Some(bytes)) if bytes == b"payload"[..]
         );
     }
 

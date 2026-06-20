@@ -14,6 +14,14 @@ impl<T> BufList<T> {
             bufs: VecDeque::new(),
         }
     }
+
+    pub(crate) fn pop_front(&mut self) -> Option<T> {
+        self.bufs.pop_front()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bufs.is_empty()
+    }
 }
 
 impl<T: Buf> BufList<T> {
