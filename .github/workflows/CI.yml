@@ -10,7 +10,7 @@ env:
   toolchain_style: stable
   toolchain_msrv: "1.85"
   toolchain_http3_quinn_msrv: "1.85"
-  toolchain_doc: nightly-2025-04-02
+  toolchain_doc: nightly
   toolchain_lint: stable
   toolchain_fuzz: nightly
 
@@ -127,7 +127,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.toolchain_doc }}
-      - run: cargo rustdoc -p http3-rs -- -D intra-doc-link-resolution-failure
+      - run: cargo rustdoc -p http3-rs -- -D rustdoc::broken_intra_doc_links -D warnings
 
   fuzz:
     name: Fuzz test

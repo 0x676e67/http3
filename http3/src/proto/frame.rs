@@ -453,21 +453,21 @@ macro_rules! setting_identifiers {
 }
 
 setting_identifiers! {
-    /// https://datatracker.ietf.org/doc/html/rfc9204#section-5
+    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-5>
     QPACK_MAX_TABLE_CAPACITY = 0x1,
-    /// https://datatracker.ietf.org/doc/html/rfc9204#section-5
+    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-5>
     QPACK_MAX_BLOCKED_STREAMS = 0x7,
-    /// https://datatracker.ietf.org/doc/html/rfc9114#section-7.2.4.1
+    /// <https://datatracker.ietf.org/doc/html/rfc9114#section-7.2.4.1>
     MAX_HEADER_LIST_SIZE = 0x6,
-    /// https://datatracker.ietf.org/doc/html/rfc9220#section-5
+    /// <https://datatracker.ietf.org/doc/html/rfc9220#section-5>
     ENABLE_CONNECT_PROTOCOL = 0x8,
-    /// https://datatracker.ietf.org/doc/html/rfc9297#name-http-3-setting
+    /// <https://datatracker.ietf.org/doc/html/rfc9297#name-http-3-setting>
     H3_DATAGRAM = 0x33,
-    /// https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-8.2
+    /// <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-8.2>
     ENABLE_WEBTRANSPORT = 0x2B603742,
-    /// https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-8.2
+    /// <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-8.2>
     H3_SETTING_ENABLE_DATAGRAM_CHROME_SPECIFIC = 0xFFD277,
-    /// https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-8.2
+    /// <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-8.2>
     WEBTRANSPORT_MAX_SESSIONS = 0x2b603743,
 }
 
