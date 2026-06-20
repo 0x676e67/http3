@@ -19,7 +19,7 @@ use crate::{
         frame::{Frame, PayloadLen},
         headers::Header,
     },
-    qpack::{self, QpackEvent},
+    qpack::{self, QpackDecoder},
     quic::{self, SendStream, StreamId},
     shared_state::{ConnectionState, SharedState},
 };
@@ -40,7 +40,7 @@ where
     pub(super) send_grease_frame: bool,
     pub(super) max_field_section_size: u64,
     pub(super) shared: Arc<SharedState>,
-    pub(super) decoder_events: UnboundedSender<QpackEvent>,
+    pub(super) decoder: QpackDecoder,
 }
 
 impl<C, B> ConnectionState for RequestResolver<C, B>
@@ -152,8 +152,8 @@ where
                 self.frame_stream,
                 self.max_field_section_size,
                 self.shared.clone(),
-                self.decoder_events,
                 self.send_grease_frame,
+                self.decoder,
             ),
         };
 

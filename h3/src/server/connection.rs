@@ -150,7 +150,7 @@ where
             send_grease_frame: self.inner.send_grease_frame,
             max_field_section_size: self.max_field_section_size,
             shared: self.inner.shared.clone(),
-            decoder_events: self.inner.decoder_events.clone(),
+            decoder: self.inner.qpack_decoder(),
         }
     }
 

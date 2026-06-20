@@ -128,7 +128,6 @@ impl Builder {
         B: Buf,
     {
         let (sender, receiver) = mpsc::unbounded_channel();
-
         let max_field_section_size = self.config.settings.max_field_section_size;
         Ok(Connection {
             inner: ConnectionInner::new(conn, self.config.clone()).await?,
