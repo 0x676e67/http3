@@ -7,13 +7,8 @@ use std::{
 };
 
 use futures_util::task::AtomicWaker;
-use tokio::sync::mpsc;
 
-use crate::{
-    config::Settings,
-    error::internal_error::ErrorOrigin,
-    qpack::{QpackDecoder, QpackDecoderEvent},
-};
+use crate::{config::Settings, error::internal_error::ErrorOrigin};
 
 /// This struct represents the shared state of the h3 connection and the stream structs
 pub struct SharedState {
@@ -25,10 +20,6 @@ pub struct SharedState {
     closing: AtomicBool,
     /// Waker for the connection
     waker: AtomicWaker,
-    /// Shared QPACK decoder state for the connection.
-    pub(crate) qpack_decoder: QpackDecoder,
-    /// Sender used by streams to enqueue QPACK decoder stream instructions.
-    pub(crate) qpack_decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
 }
 
 impl fmt::Debug for SharedState {
@@ -42,18 +33,13 @@ impl fmt::Debug for SharedState {
     }
 }
 
-impl SharedState {
-    pub(crate) fn new(
-        qpack_decoder: QpackDecoder,
-        qpack_decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
-    ) -> Self {
-        SharedState {
+impl Default for SharedState {
+    fn default() -> Self {
+        Self {
             settings: OnceLock::new(),
             connection_error: OnceLock::new(),
             closing: AtomicBool::new(false),
             waker: AtomicWaker::new(),
-            qpack_decoder,
-            qpack_decoder_events,
         }
     }
 }
