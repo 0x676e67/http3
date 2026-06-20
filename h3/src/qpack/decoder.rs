@@ -124,6 +124,15 @@ impl Decoder {
         self.max_table_capacity > 0
     }
 
+    /// Returns the maximum number of request or push streams the peer encoder
+    /// is permitted to block concurrently.
+    ///
+    /// This is the value advertised in `SETTINGS_QPACK_BLOCKED_STREAMS`. A zero
+    /// value requires the peer to avoid field sections that cannot be decoded
+    /// immediately from the decoder's current dynamic table state.
+    ///
+    /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3)
+    /// and [Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
     pub(crate) fn max_blocked_streams(&self) -> usize {
         self.max_blocked_streams
     }
