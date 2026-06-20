@@ -11,6 +11,7 @@ use futures_util::task::AtomicWaker;
 use crate::{config::Settings, error::internal_error::ErrorOrigin};
 
 /// This struct represents the shared state of the h3 connection and the stream structs
+#[derive(Debug)]
 pub struct SharedState {
     /// The settings, sent by the peer
     settings: OnceLock<Settings>,
