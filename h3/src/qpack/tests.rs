@@ -122,7 +122,7 @@ fn shared_decoder_registers_blocked_header() {
     let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
 
     assert_eq!(
-        decoder.poll_decode_header(&mut cx, &mut block_cur, u64::MAX, true),
+        decoder.poll_decode_header(&mut cx, &mut block_cur, u64::MAX),
         Poll::Ready(Err(DecoderError::MissingRefs(1)))
     );
     assert!(decoder_wakers.try_recv().is_ok());

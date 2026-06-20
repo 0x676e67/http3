@@ -6,7 +6,7 @@ use h3::error::{Code, ConnectionError, StreamError};
 use rustls::pki_types::CertificateDer;
 use rustls_native_certs::CertificateResult;
 use structopt::StructOpt;
-use tracing::{error, info};
+use tracing::{error, info, Level};
 
 use h3_quinn::quinn;
 
@@ -15,6 +15,9 @@ static ALPN: &[u8] = b"h3";
 #[derive(StructOpt, Debug)]
 #[structopt(name = "server")]
 struct Opt {
+    #[structopt(long, help = "Logging level", default_value = "info")]
+    pub log: Level,
+
     #[structopt(
         long,
         short,
@@ -49,18 +52,18 @@ struct Opt {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
-        .with_writer(std::io::stderr)
-        .with_max_level(tracing::Level::INFO)
-        .init();
-
     let opt = Opt::from_args();
 
     if opt.requests == 0 {
         Err("requests must be greater than 0")?;
     }
+
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+        .with_writer(std::io::stderr)
+        .with_max_level(opt.log)
+        .init();
 
     // DNS lookup
 
