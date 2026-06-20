@@ -1045,6 +1045,13 @@ struct DecoderGurad {
 }
 
 impl DecoderGurad {
+    /// Marks this request stream as blocked on missing dynamic table entries.
+    ///
+    /// A stream contributes only once to `SETTINGS_QPACK_BLOCKED_STREAMS`, even
+    /// when its field section is polled repeatedly. Exceeding the advertised
+    /// limit is reported as a QPACK decompression error by the caller.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
     fn block(&mut self) -> Result<(), qpack::DecoderError> {
         if !self.blocked {
             self.decoder.register_blocked_stream()?;
@@ -1053,6 +1060,13 @@ impl DecoderGurad {
         Ok(())
     }
 
+    /// Removes this request stream from the blocked-stream count.
+    ///
+    /// This is called after the field section becomes decodable and when the
+    /// request is dropped. The local flag makes repeated cleanup harmless and
+    /// keeps the connection-wide count paired with a successful `block` call.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
     fn unblock(&mut self) {
         if self.blocked {
             self.decoder.unregister_blocked_stream();
