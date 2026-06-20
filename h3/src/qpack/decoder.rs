@@ -595,6 +595,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn static_field_section_has_no_dynamic_reference() {
+        let mut buf = vec![];
+        HeaderPrefix::new(0, 0, 0, TABLE_SIZE).encode(&mut buf);
+        Indexed::Static(18).encode(&mut buf);
+
+        let decoder = Decoder::from(build_table_with_size(0));
+        let decoded = decoder.decode_header(&mut Cursor::new(buf)).unwrap();
+
+        assert!(!decoded.dyn_ref);
+    }
+
     fn field(n: usize) -> HeaderField {
         HeaderField::new(format!("foo{}", n), "bar")
     }

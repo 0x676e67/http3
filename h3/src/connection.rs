@@ -2,7 +2,7 @@ use std::{
     convert::TryFrom,
     marker::PhantomData,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -66,6 +66,7 @@ where
 {
     decoder_send: Option<C::SendStream>,
     decoder_send_buf: BytesMut,
+    decoder_wakers: Vec<Waker>,
     decoder_events_recv: mpsc::UnboundedReceiver<QpackEvent>,
     decoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
     encoder_send: Option<C::SendStream>,
@@ -84,6 +85,7 @@ where
     control_send: C::SendStream,
     control_recv: Option<FrameStream<C::RecvStream, B>>,
     qpack_streams: QpackStreams<C, B>,
+    pub(crate) decoder_events: mpsc::UnboundedSender<QpackEvent>,
 
     /// Buffers incoming uni/recv streams which have yet to be claimed.
     ///
@@ -298,6 +300,7 @@ where
         let qpack_streams = QpackStreams {
             decoder_send: qpack_decoder.ok(),
             decoder_send_buf: BytesMut::new(),
+            decoder_wakers: Vec::new(),
             decoder_events_recv,
             decoder_recv: None,
             encoder_send: qpack_encoder.ok(),
@@ -324,7 +327,8 @@ where
         );
 
         let mut conn_inner = Self {
-            shared: Arc::new(SharedState::new(qpack_decoder, decoder_events_send)),
+            shared: Arc::new(SharedState::new(qpack_decoder)),
+            decoder_events: decoder_events_send,
             conn,
             control_send,
             control_recv: None,
@@ -576,10 +580,10 @@ where
                     &mut self.qpack_streams.decoder_send_buf,
                 ) {
                     Poll::Ready(Ok(_)) => {
-                        self.poll_qpack_decoder_events(cx);
+                        self.poll_qpack_decoder_wakers(cx);
                     }
                     Poll::Ready(Err(err)) => {
-                        self.poll_qpack_decoder_events(cx);
+                        self.poll_qpack_decoder_wakers(cx);
                         return Poll::Ready(Err(self.handle_connection_error(
                             InternalConnectionError::new(
                                 Code::QPACK_ENCODER_STREAM_ERROR,
@@ -661,7 +665,7 @@ where
     where
         C::SendStream: quic::SendStreamUnframed<B>,
     {
-        self.poll_qpack_decoder_events(cx);
+        self.poll_qpack_decoder_acknowledge(cx);
 
         let Some(decoder_send) = self.qpack_streams.decoder_send.as_mut() else {
             if !self.qpack_streams.decoder_send_buf.has_remaining() {
@@ -996,10 +1000,20 @@ where
         &mut self.accepted_streams
     }
 
-    fn poll_qpack_decoder_events(&mut self, cx: &mut Context<'_>) {
+    fn poll_qpack_decoder_wakers(&mut self, cx: &mut Context<'_>) {
+        // Requests can enqueue a waker while the decoder write lock is held.
+        // Move those events into decoder_wakers before releasing the waiters.
+        self.poll_qpack_decoder_acknowledge(cx);
+
+        while let Some(waker) = self.qpack_streams.decoder_wakers.pop() {
+            waker.wake();
+        }
+    }
+
+    fn poll_qpack_decoder_acknowledge(&mut self, cx: &mut Context<'_>) {
         let before = self.qpack_streams.decoder_send_buf.len();
 
-        if let Poll::Ready(Some(event)) = self.qpack_streams.decoder_events_recv.poll_recv(cx) {
+        while let Poll::Ready(Some(event)) = self.qpack_streams.decoder_events_recv.poll_recv(cx) {
             match event {
                 QpackEvent::HeaderAck(stream_id) => qpack::ack_header(
                     stream_id.into_inner(),
@@ -1009,10 +1023,9 @@ where
                     stream_id.into_inner(),
                     &mut self.qpack_streams.decoder_send_buf,
                 ),
-                // Resume a request stream that was blocked by missing dynamic table references
-                // or decoder lock contention. Spurious wakeups due to network packet fragmentation
-                // are safely resolved by the stream re-registering itself upon re-polling.
-                QpackEvent::Waker(waker) => waker.wake(),
+                // Wakers share this channel with decoder-stream instructions, but
+                // must wait until the encoder has updated and released the decoder.
+                QpackEvent::Waker(waker) => self.qpack_streams.decoder_wakers.push(waker),
             }
         }
 
@@ -1022,19 +1035,20 @@ where
     }
 }
 
-struct RequestStreamGurad {
+struct DecoderGurad {
     stream_id: StreamId,
     shared: Arc<SharedState>,
+    decoder_events: mpsc::UnboundedSender<QpackEvent>,
     cancel_on_drop: bool,
 }
 
-impl RequestStreamGurad {
+impl DecoderGurad {
     fn acknowledge(&mut self, dyn_ref: bool) -> Result<(), qpack::DecoderError> {
-        self.cancel_on_drop = false;
-
+        //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
+        //# After processing an encoded field section whose declared Required
+        //# Insert Count is not zero, the decoder emits a Section Acknowledgment.
         if dyn_ref {
-            self.shared
-                .decoder_events
+            self.decoder_events
                 .send(QpackEvent::HeaderAck(self.stream_id))
                 .map_err(|_| qpack::DecoderError::UnexpectedEnd)?;
             self.shared.waker().wake();
@@ -1043,16 +1057,18 @@ impl RequestStreamGurad {
         Ok(())
     }
 
-    fn cancel_on_drop(&mut self) {
-        self.cancel_on_drop = true;
+    fn finish_reading(&mut self) {
+        self.cancel_on_drop = false;
     }
 }
 
-impl Drop for RequestStreamGurad {
+impl Drop for DecoderGurad {
     fn drop(&mut self) {
         if self.cancel_on_drop {
+            //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2
+            //# When a stream is reset or reading is abandoned, the decoder emits
+            //# a Stream Cancellation instruction.
             if self
-                .shared
                 .decoder_events
                 .send(QpackEvent::StreamCancel(self.stream_id))
                 .is_ok()
@@ -1069,8 +1085,8 @@ pub struct RequestStream<S, B> {
     pub(super) trailers: Option<Bytes>,
     pub(super) conn_state: Arc<SharedState>,
     pub(super) max_field_section_size: u64,
-    qpack_field_section: Option<RequestStreamGurad>,
-    qpack_dynamic_table: bool,
+    decoder_gurad: Option<DecoderGurad>,
+    decoder_dynamic_table: bool,
     send_grease_frame: bool,
 }
 
@@ -1083,12 +1099,14 @@ where
         stream: FrameStream<S, B>,
         max_field_section_size: u64,
         conn_state: Arc<SharedState>,
+        decoder_events: mpsc::UnboundedSender<QpackEvent>,
         grease: bool,
-        qpack_dynamic_table: bool,
+        decoder_dynamic_table: bool,
     ) -> Self {
-        let qpack_field_section = qpack_dynamic_table.then(|| RequestStreamGurad {
+        let decoder_gurad = decoder_dynamic_table.then(|| DecoderGurad {
             stream_id: stream.id(),
             shared: conn_state.clone(),
+            decoder_events,
             // Until the field section is successfully decoded, dropping the guard
             // abandons it and must notify the peer encoder.
             cancel_on_drop: true,
@@ -1099,8 +1117,8 @@ where
             conn_state,
             max_field_section_size,
             trailers: None,
-            qpack_field_section,
-            qpack_dynamic_table,
+            decoder_gurad,
+            decoder_dynamic_table,
             send_grease_frame: grease,
         }
     }
@@ -1131,7 +1149,12 @@ where
                         self.handle_frame_stream_error_on_request_stream(frame_stream_error)
                     ))
                 }
-                Ok(None) => return Poll::Ready(Ok(None)),
+                Ok(None) => {
+                    if let Some(field_section) = self.decoder_gurad.as_mut() {
+                        field_section.finish_reading();
+                    }
+                    return Poll::Ready(Ok(None));
+                }
                 Ok(Some(Frame::Headers(encoded))) => {
                     self.trailers = Some(encoded);
                     // Received trailers, no more data expected
@@ -1192,7 +1215,12 @@ where
                         self.handle_frame_stream_error_on_request_stream(frame_stream_error)
                     ))
                 }
-                Ok(None) => return Poll::Ready(Ok(None)),
+                Ok(None) => {
+                    if let Some(field_section) = self.decoder_gurad.as_mut() {
+                        field_section.finish_reading();
+                    }
+                    return Poll::Ready(Ok(None));
+                }
                 Ok(Some(Frame::Headers(encoded))) => encoded,
                 Ok(Some(other_frame)) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
@@ -1318,15 +1346,22 @@ where
             cx,
             encoded,
             self.max_field_section_size,
-            self.qpack_dynamic_table,
+            self.decoder_dynamic_table,
         ) {
             Poll::Ready(Ok(decoded)) => {
                 if let Some(Err(err)) = self
-                    .qpack_field_section
+                    .decoder_gurad
                     .as_mut()
                     .map(|v| v.acknowledge(decoded.dyn_ref))
                 {
                     return Poll::Ready(Err(err));
+                }
+
+                // EOS proves there can be no later field section on this stream.
+                if self.stream.is_eos() {
+                    if let Some(field_section) = self.decoder_gurad.as_mut() {
+                        field_section.finish_reading();
+                    }
                 }
 
                 self.waker().wake();
@@ -1335,9 +1370,6 @@ where
             Poll::Ready(Err(qpack::DecoderError::MissingRefs(required_ref)))
                 if required_ref > 0 =>
             {
-                if let Some(field_section) = self.qpack_field_section.as_mut() {
-                    field_section.cancel_on_drop();
-                }
                 *encoded = original;
                 Poll::Pending
             }
@@ -1460,8 +1492,8 @@ where
                 trailers: None,
                 conn_state: self.conn_state.clone(),
                 max_field_section_size: 0,
-                qpack_field_section: None,
-                qpack_dynamic_table: false,
+                decoder_gurad: None,
+                decoder_dynamic_table: false,
                 send_grease_frame: self.send_grease_frame,
             },
             RequestStream {
@@ -1469,10 +1501,78 @@ where
                 trailers: self.trailers,
                 conn_state: self.conn_state,
                 max_field_section_size: self.max_field_section_size,
-                qpack_field_section: self.qpack_field_section,
-                qpack_dynamic_table: self.qpack_dynamic_table,
+                decoder_gurad: self.decoder_gurad,
+                decoder_dynamic_table: self.decoder_dynamic_table,
                 send_grease_frame: self.send_grease_frame,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod qpack_field_section_tests {
+    use super::*;
+
+    fn field_section_guard() -> (DecoderGurad, mpsc::UnboundedReceiver<QpackEvent>) {
+        let (events_send, events_recv) = mpsc::unbounded_channel();
+        let decoder = QpackDecoder::new(qpack::Decoder::new(0, 0).unwrap(), events_send.clone());
+        let shared = Arc::new(SharedState::new(decoder));
+
+        (
+            DecoderGurad {
+                stream_id: StreamId(0),
+                shared,
+                decoder_events: events_send,
+                cancel_on_drop: true,
+            },
+            events_recv,
+        )
+    }
+
+    #[test]
+    fn static_field_section_does_not_emit_acknowledgment() {
+        let (mut guard, mut events) = field_section_guard();
+
+        guard.acknowledge(false).unwrap();
+        guard.finish_reading();
+        drop(guard);
+
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn each_dynamic_field_section_emits_an_acknowledgment() {
+        let (mut guard, mut events) = field_section_guard();
+
+        // Response headers and trailers are separate field sections on the same stream.
+        guard.acknowledge(true).unwrap();
+        guard.acknowledge(true).unwrap();
+        guard.finish_reading();
+        drop(guard);
+
+        for _ in 0..2 {
+            assert!(matches!(
+                events.try_recv(),
+                Ok(QpackEvent::HeaderAck(StreamId(0)))
+            ));
+        }
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn abandoning_stream_after_acknowledgment_emits_cancellation() {
+        let (mut guard, mut events) = field_section_guard();
+
+        guard.acknowledge(true).unwrap();
+        drop(guard);
+
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QpackEvent::HeaderAck(StreamId(0)))
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QpackEvent::StreamCancel(StreamId(0)))
+        ));
     }
 }
