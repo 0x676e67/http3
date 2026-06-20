@@ -1,7 +1,7 @@
-Thank you for the interest in contributing to `h3`. All important information are below.
+Thank you for your interest in contributing to `http3-rs`. All important information is below.
 
 # Duvet
-The [`duvet`][] crate is used in `h3` to track [spec][] compliance.
+The [`duvet`][] crate is used in `http3-rs` to track [spec][] compliance.
 `duvet` does that via spec citations in the code, as customized comments.
 The comments should be kept up-to-date with the code.
 
@@ -15,7 +15,7 @@ Duvet sees all citations of each of these paragraphs and their status. At the bo
 
 
 [spec]: https://www.rfc-editor.org/rfc/rfc9114
-[report]: https://hyper.rs/h3/ci/compliance/report.html#/
+[report]: https://0x676e67.github.io/http3-rs/ci/compliance/report.html#/
 
 ## Citations
 

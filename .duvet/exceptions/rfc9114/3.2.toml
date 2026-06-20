@@ -16,7 +16,7 @@ HTTP/3 clients MUST support a mechanism to indicate the
 target host to the server during the TLS handshake.
 '''
 reason = '''
-This pertains to the TLS implementation, as h3 does not inspect TLS
+This pertains to the TLS implementation, as http3-rs does not inspect TLS
 messages.
 '''
 
@@ -28,7 +28,7 @@ Server Name Indication (SNI; [RFC6066]) TLS extension unless an
 alternative mechanism to indicate the target host is used.
 '''
 reason = '''
-This pertains to the TLS implementation, as h3 does not inspect TLS
+This pertains to the TLS implementation, as http3-rs does not inspect TLS
 messages.
 '''
 
@@ -40,5 +40,5 @@ other application-layer protocols MAY be offered in the same
 handshake.
 '''
 reason = '''
-h3 does not handle protocol negotiation.
+http3-rs does not handle protocol negotiation.
 '''

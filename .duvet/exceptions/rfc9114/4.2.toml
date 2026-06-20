@@ -8,5 +8,5 @@ Section 7.6.1 of [HTTP], or their messages will be treated by other
 HTTP/3 endpoints as malformed.
 '''
 reason = '''
-h3 is not meant to be used for intermediaries.
+http3-rs is not meant to be used for intermediaries.
 '''

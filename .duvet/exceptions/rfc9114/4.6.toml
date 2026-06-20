@@ -9,7 +9,7 @@ before sending a request for that origin on the connection; see
 Section 3.3.
 '''
 reason = '''
-h3 is not aware of connection establishment details.
+http3-rs is not aware of connection establishment details.
 '''
 
 [[exception]]
@@ -18,7 +18,7 @@ If this verification fails, the client MUST NOT
 consider the server authoritative for that origin.
 '''
 reason = '''
-h3 is not aware of connection establishment details.
+http3-rs is not aware of connection establishment details.
 '''
 
 [[exception]]
@@ -39,5 +39,5 @@ HTTP cache.  They MAY be made available to the application
 separately.
 '''
 reason = '''
-h3 does not handle caching.
+http3-rs does not handle caching.
 '''

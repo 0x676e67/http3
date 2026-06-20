@@ -8,7 +8,7 @@ so clients SHOULD NOT close a stream for sending while they still
 expect to receive data from the target of the CONNECT.
 '''
 reason = '''
-h3 is not meant to be used for handling proxy.
+http3-rs is not meant to be used for handling proxy.
 '''
 
 [[exception]]
@@ -18,5 +18,5 @@ underlying TCP implementation permits it, the proxy SHOULD send a TCP
 segment with the RST bit set.
 '''
 reason = '''
-h3 is not meant to be used for handling proxy.
+http3-rs is not meant to be used for handling proxy.
 '''

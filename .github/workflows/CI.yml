@@ -3,13 +3,13 @@ on:
   pull_request:
   push:
     branches:
-      - master
+      - main
 
 env:
   RUST_BACKTRACE: 1
   toolchain_style: stable
   toolchain_msrv: 1.74.1
-  toolchain_h3_quinn_msrv: 1.74.1
+  toolchain_http3_quinn_msrv: 1.74.1
   toolchain_doc: nightly-2025-04-02
   toolchain_lint: stable
   toolchain_fuzz: nightly-2025-04-02
@@ -22,7 +22,7 @@ jobs:
       - style
       - lint
       - msrv
-      - msrv_h3_quinn
+      - msrv_http3_quinn
       - test
       - doc
       - fuzz
@@ -65,19 +65,19 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.toolchain_msrv }}
-      - run: cargo check -p h3
+      - run: cargo check -p http3-rs
 
-  msrv_h3_quinn:
-    name: Check MSRV of `h3-quinn`
+  msrv_http3_quinn:
+    name: Check MSRV of `http3-quinn-rs`
     needs: [style]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Install Rust ${{ env.toolchain_h3_quinn_msrv }}
+      - name: Install Rust ${{ env.toolchain_http3_quinn_msrv }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: ${{ env.toolchain_h3_quinn_msrv }}
-      - run: cargo check -p h3-quinn
+          toolchain: ${{ env.toolchain_http3_quinn_msrv }}
+      - run: cargo check -p http3-quinn-rs
 
   test:
     name: Test ${{ matrix.toolchain }} ${{ matrix.os }} ${{ matrix.target }}
@@ -126,7 +126,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.toolchain_doc }}
-      - run: cargo rustdoc -p h3 -- -D intra-doc-link-resolution-failure
+      - run: cargo rustdoc -p http3-rs -- -D intra-doc-link-resolution-failure
 
   fuzz:
     name: Fuzz test

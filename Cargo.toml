@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "h3",
-    "h3-quinn",
-    "h3-webtransport",
-    "h3-datagram",
+    "http3",
+    "http3-quinn",
+    "http3-webtransport",
+    "http3-datagram",
 
     # Internal
     "examples",

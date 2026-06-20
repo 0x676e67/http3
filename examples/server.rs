@@ -7,8 +7,8 @@ use structopt::StructOpt;
 use tokio::{fs::File, io::AsyncReadExt};
 use tracing::{error, info, trace_span};
 
-use h3::server::RequestResolver;
-use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
+use http3_quinn_rs::quinn::{self, crypto::rustls::QuicServerConfig};
+use http3_rs::server::RequestResolver;
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "server")]
@@ -112,12 +112,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(conn) => {
                     info!("new connection established");
 
-                    let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn))
-                        .await
-                        .unwrap();
+                    let mut http3_conn =
+                        http3_rs::server::Connection::new(http3_quinn_rs::Connection::new(conn))
+                            .await
+                            .unwrap();
 
                     loop {
-                        match h3_conn.accept().await {
+                        match http3_conn.accept().await {
                             Ok(Some(resolver)) => {
                                 let root = root.clone();
 
@@ -158,7 +159,7 @@ async fn handle_request<C>(
     serve_root: Arc<Option<PathBuf>>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    C: h3::quic::Connection<Bytes>,
+    C: http3_rs::quic::Connection<Bytes>,
 {
     let (req, mut stream) = resolver.resolve_request().await?;
 
