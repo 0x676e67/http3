@@ -7,5 +7,5 @@ assume that any request that was sent, whether in whole or in part,
 might have been processed.
 '''
 reason = '''
-h3 does not need to do anything specific.
+http3-rs does not need to do anything specific.
 '''

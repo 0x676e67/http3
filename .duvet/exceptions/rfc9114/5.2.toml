@@ -29,7 +29,7 @@ remote peer can know whether or not a request has been partially
 processed.
 '''
 reason = '''
-The user should initiate this, as h3 is unable to anticipate when to
+The user should initiate this, as http3-rs is unable to anticipate when to
 close a connection.
 '''
 
@@ -40,6 +40,6 @@ endpoint can permit the connection to become idle, or it MAY initiate
 an immediate closure of the connection.
 '''
 reason = '''
-The user should decide how to handle this, as h3 should not know
+The user should decide how to handle this, as http3-rs should not know
 anything about message processing.
 '''
