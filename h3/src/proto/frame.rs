@@ -147,6 +147,28 @@ impl Frame<PayloadLen> {
         }
         frame
     }
+
+    /// Decodes only the type and length of a HEADERS frame.
+    ///
+    /// The caller uses a non-consuming cursor and commits the returned byte count
+    /// only when this is a HEADERS frame. Its payload can then remain on the QUIC
+    /// receive path and be processed incrementally.
+    ///
+    /// See [RFC 9114, Section 7.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.2).
+    pub(crate) fn decode_headers_prefix<T: Buf>(
+        buf: &mut T,
+    ) -> Result<Option<PayloadLen>, FrameError> {
+        let remaining = buf.remaining();
+        let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(remaining + 1))?;
+        if ty != FrameType::HEADERS {
+            return Ok(None);
+        }
+
+        let len = buf
+            .get_var()
+            .map_err(|_| FrameError::Incomplete(remaining + 1))?;
+        Ok(Some(PayloadLen(len as usize)))
+    }
 }
 
 impl<B> Encode for Frame<B>

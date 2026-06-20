@@ -7,12 +7,8 @@ use tracing::instrument;
 
 use crate::{
     connection::{self},
-    error::{
-        connection_error_creators::{CloseStream, HandleFrameStreamErrorOnRequestStream},
-        internal_error::InternalConnectionError,
-        Code, StreamError,
-    },
-    proto::{frame::Frame, headers::Header},
+    error::{connection_error_creators::CloseStream, Code, StreamError},
+    proto::headers::Header,
     qpack,
     quic::{self},
     shared_state::{ConnectionState, SharedState},
@@ -97,19 +93,6 @@ where
     /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_response(&mut self) -> Result<Response<()>, StreamError> {
-        let frame = future::poll_fn(|cx| self.inner.stream.poll_next(cx))
-            .await
-            .map_err(|e| self.handle_frame_stream_error_on_request_stream(e))?
-            .ok_or_else(|| {
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-                //# Receipt of an invalid sequence of frames MUST be treated as a
-                //# connection error of type H3_FRAME_UNEXPECTED.
-                self.handle_connection_error_on_stream(InternalConnectionError::new(
-                    Code::H3_FRAME_UNEXPECTED,
-                    "Stream finished without receiving response headers".to_string(),
-                ))
-            })?;
-
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
         //= type=TODO
         //# A client MUST treat
@@ -123,44 +106,7 @@ where
         //# mismatch, it MUST respond with a connection error of type
         //# H3_GENERAL_PROTOCOL_ERROR.
 
-        let decoded = if let Frame::Headers(ref encoded) = frame {
-            loop {
-                // QPACK decoding advances the buffer; MissingRefs must retry from the original block.
-                let mut encoded = encoded.clone();
-                match future::poll_fn(|cx| self.inner.poll_decode_header(cx, &mut encoded)).await {
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
-                    //# An HTTP/3 implementation MAY impose a limit on the maximum size of
-                    //# the message header it will accept on an individual HTTP message.
-                    Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
-                        self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
-                        return Err(StreamError::HeaderTooBig {
-                            actual_size: cancel_size,
-                            max_size: self.inner.max_field_section_size,
-                        });
-                    }
-                    Ok(decoded) => break decoded,
-                    Err(_e) => {
-                        return Err(self.handle_connection_error_on_stream(
-                            InternalConnectionError {
-                                code: Code::QPACK_DECOMPRESSION_FAILED,
-                                message: "Failed to decode headers".to_string(),
-                            },
-                        ))
-                    }
-                }
-            }
-        } else {
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-            //# Receipt of an invalid sequence of frames MUST be treated as a
-            //# connection error of type H3_FRAME_UNEXPECTED.
-
-            return Err(
-                self.handle_connection_error_on_stream(InternalConnectionError::new(
-                    Code::H3_FRAME_UNEXPECTED,
-                    "First response frame is not headers".to_string(),
-                )),
-            );
-        };
+        let decoded = future::poll_fn(|cx| self.inner.poll_recv_response_headers(cx)).await?;
 
         let qpack::Decoded { fields, .. } = decoded;
 

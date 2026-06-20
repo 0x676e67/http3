@@ -27,6 +27,13 @@ pub struct FrameStream<S, B> {
     remaining_data: usize,
 }
 
+/// A request-stream frame whose HEADERS payload has not been buffered yet.
+#[derive(Debug)]
+pub(crate) enum RequestFrame {
+    Headers,
+    Frame(Frame<PayloadLen>),
+}
+
 impl<S, B> FrameStream<S, B> {
     pub fn new(stream: BufRecvStream<S, B>) -> Self {
         Self {
@@ -99,6 +106,55 @@ where
         }
     }
 
+    /// Polls the next request-stream frame without buffering a HEADERS payload.
+    ///
+    /// RFC 9114 defines HEADERS as an encoded field section. Returning its length
+    /// here lets QPACK consume the payload through `poll_data` as transport chunks
+    /// arrive instead of waiting for the complete frame.
+    ///
+    /// See [RFC 9114, Section 7.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.2).
+    pub(crate) fn poll_next_request(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<RequestFrame>, FrameStreamError>> {
+        assert!(
+            self.remaining_data == 0,
+            "There is still data to read, please call poll_data() until it returns None."
+        );
+
+        loop {
+            let headers = {
+                let mut cursor = self.stream.buf_mut().cursor();
+                let decoded = Frame::decode_headers_prefix(&mut cursor);
+                (cursor.position(), decoded)
+            };
+
+            match headers {
+                (consumed, Ok(Some(PayloadLen(len)))) => {
+                    self.stream.buf_mut().advance(consumed);
+                    self.remaining_data = len;
+                    return Poll::Ready(Ok(Some(RequestFrame::Headers)));
+                }
+                (_, Err(frame::FrameError::Incomplete(_))) => {}
+                (_, Err(_)) => unreachable!("HEADERS prefix decoding only reports incomplete data"),
+                (_, Ok(None)) => {
+                    return self
+                        .poll_next(cx)
+                        .map(|result| result.map(|frame| frame.map(RequestFrame::Frame)));
+                }
+            }
+
+            match self.try_recv(cx)? {
+                Poll::Ready(false) => continue,
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(true) if self.stream.buf_mut().has_remaining() => {
+                    return Poll::Ready(Err(FrameStreamError::UnexpectedEnd));
+                }
+                Poll::Ready(true) => return Poll::Ready(Ok(None)),
+            }
+        }
+    }
+
     /// Retrieves the next piece of data in an incoming data packet or webtransport stream
     ///
     ///
@@ -109,7 +165,7 @@ where
     ) -> Poll<Result<Option<impl Buf>, FrameStreamError>> {
         if self.remaining_data == 0 {
             return Poll::Ready(Ok(None));
-        };
+        }
 
         let end = match self.try_recv(cx) {
             Poll::Ready(Ok(end)) => end,
@@ -117,6 +173,61 @@ where
             Poll::Pending => false,
         };
         let data = self.stream.buf_mut().take_chunk(self.remaining_data);
+
+        match (data, end) {
+            (None, true) => Poll::Ready(Ok(None)),
+            (None, false) => Poll::Pending,
+            (Some(d), true)
+                if d.remaining() < self.remaining_data
+                    && !self.stream.buf_mut().has_remaining() =>
+            {
+                Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
+            }
+            (Some(d), _) => {
+                self.remaining_data -= d.remaining();
+                Poll::Ready(Ok(Some(d)))
+            }
+        }
+    }
+
+    /// Retrieves at most `max_len` payload bytes from the current frame.
+    ///
+    /// Incremental HEADERS decoding uses a bounded chunk so a transport buffer
+    /// containing the complete frame is not copied into the QPACK scratch buffer
+    /// in one operation.
+    ///
+    /// See [RFC 9114, Section 4.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2).
+    pub(crate) fn poll_data_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<Result<Option<impl Buf>, FrameStreamError>> {
+        debug_assert!(max_len > 0);
+        if self.remaining_data == 0 {
+            return Poll::Ready(Ok(None));
+        };
+
+        // Consume buffered payload before polling QUIC again. Besides preserving
+        // receive-side backpressure, this keeps the transport RecvStream available
+        // for an immediate STOP_SENDING if header decoding rejects the section.
+        if let Some(data) = self
+            .stream
+            .buf_mut()
+            .take_chunk(self.remaining_data.min(max_len))
+        {
+            self.remaining_data -= data.remaining();
+            return Poll::Ready(Ok(Some(data)));
+        }
+
+        let end = match self.try_recv(cx) {
+            Poll::Ready(Ok(end)) => end,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => false,
+        };
+        let data = self
+            .stream
+            .buf_mut()
+            .take_chunk(self.remaining_data.min(max_len));
 
         match (data, end) {
             (None, true) => Poll::Ready(Ok(None)),
@@ -613,6 +724,29 @@ mod tests {
 
         assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
         assert_eq!(reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn request_headers_payload_is_read_in_bounded_chunks() {
+        let mut recv = FakeRecv::default();
+        let mut encoded = BytesMut::new();
+        Frame::headers(&b"header-payload"[..]).encode_with_payload(&mut encoded);
+        recv.chunk(encoded.freeze());
+
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+        assert_poll_matches!(
+            |cx| stream.poll_next_request(cx),
+            Ok(Some(RequestFrame::Headers))
+        );
+        assert_poll_matches!(
+            |cx| to_bytes(stream.poll_data_chunk(cx, 3)),
+            Ok(Some(bytes)) if bytes == b"hea"[..]
+        );
+        assert_poll_matches!(
+            |cx| to_bytes(stream.poll_data_chunk(cx, 3)),
+            Ok(Some(bytes)) if bytes == b"der"[..]
+        );
+        assert!(stream.has_data());
     }
 
     // Helpers

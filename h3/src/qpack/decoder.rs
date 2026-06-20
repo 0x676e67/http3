@@ -1,4 +1,4 @@
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, BytesMut};
 use std::{convert::TryInto, fmt, io::Cursor, num::TryFromIntError};
 
 #[cfg(feature = "tracing")]
@@ -82,6 +82,51 @@ pub struct Decoded {
     pub dyn_ref: bool,
     /// Decoded size, calculated as stated in "4.1.1.3. Header Size Constraints"
     pub mem_size: u64,
+}
+
+/// In-progress decoding state for one encoded field section.
+///
+/// Complete field lines are decoded and removed from `pending` as data arrives.
+/// Only an incomplete field representation remains buffered between polls.
+///
+/// See [RFC 9204, Section 4.5](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5).
+pub(crate) struct DecoderState {
+    pending: BytesMut,
+    prefix: Option<(usize, usize)>,
+    fields: Vec<HeaderField>,
+    mem_size: u64,
+}
+
+impl DecoderState {
+    /// Creates an empty state for one encoded field section.
+    ///
+    /// The field section prefix is parsed from the first bytes appended with
+    /// [`Self::extend`], as defined by RFC 9204.
+    ///
+    /// See [RFC 9204, Section 4.5.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1).
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: BytesMut::new(),
+            prefix: None,
+            fields: Vec::new(),
+            mem_size: 0,
+        }
+    }
+
+    /// Appends the next transport chunk to the incomplete field representation.
+    ///
+    /// See [RFC 9204, Section 4.5](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5).
+    pub(crate) fn extend<T: Buf>(&mut self, data: &mut T) {
+        self.pending.put(data);
+    }
+
+    fn finish(&mut self, required_ref: usize) -> Decoded {
+        Decoded {
+            fields: std::mem::take(&mut self.fields),
+            dyn_ref: required_ref > 0,
+            mem_size: self.mem_size,
+        }
+    }
 }
 
 pub struct Decoder {
@@ -174,6 +219,65 @@ impl Decoder {
             mem_size,
             dyn_ref: required_ref > 0,
         })
+    }
+
+    /// Advances decoding using the bytes currently stored in `state`.
+    ///
+    /// `Ok(None)` means the current prefix or field representation needs more
+    /// bytes. When `end` is true, incomplete input is a decompression error.
+    ///
+    /// See [RFC 9204, Section 2.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2)
+    /// and [Section 4.5](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5).
+    pub(crate) fn decode_header_incremental(
+        &self,
+        state: &mut DecoderState,
+        end: bool,
+        max_size: u64,
+    ) -> Result<Option<Decoded>, DecoderError> {
+        if state.prefix.is_none() {
+            let mut cursor = Cursor::new(&state.pending[..]);
+            let prefix = match HeaderPrefix::decode(&mut cursor) {
+                Ok(prefix) => prefix,
+                Err(error) => {
+                    let error = DecoderError::from(error);
+                    if error == DecoderError::UnexpectedEnd && !end {
+                        return Ok(None);
+                    }
+                    return Err(error);
+                }
+            };
+            let prefix = prefix.get(self.table.total_inserted(), self.max_table_capacity)?;
+            state.pending.advance(cursor.position() as usize);
+            state.prefix = Some(prefix);
+        }
+
+        let (required_ref, base) = state.prefix.expect("field section prefix is initialized");
+        if required_ref > self.table.total_inserted() {
+            return Err(DecoderError::MissingRefs(required_ref));
+        }
+
+        while state.pending.has_remaining() {
+            let decoder_table = self.table.decoder(base, required_ref);
+            let mut cursor = Cursor::new(&state.pending[..]);
+            let field = match Self::parse_header_field(&decoder_table, &mut cursor) {
+                Ok(field) => field,
+                Err(DecoderError::UnexpectedEnd) if !end => return Ok(None),
+                Err(error) => return Err(error),
+            };
+
+            state.pending.advance(cursor.position() as usize);
+            state.mem_size += field.mem_size() as u64;
+            if state.mem_size > max_size {
+                return Err(DecoderError::HeaderTooLong(state.mem_size));
+            }
+            state.fields.push(field);
+        }
+
+        if end {
+            Ok(Some(state.finish(required_ref)))
+        } else {
+            Ok(None)
+        }
     }
 
     // The receiving side of encoder stream
@@ -335,6 +439,79 @@ pub fn decode_stateless<T: Buf>(buf: &mut T, max_size: u64) -> Result<Decoded, D
     })
 }
 
+/// Incrementally decodes a field section when dynamic references are disabled.
+///
+/// See [RFC 9204, Section 4.5](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5).
+pub(crate) fn decode_stateless_incremental(
+    state: &mut DecoderState,
+    end: bool,
+    max_size: u64,
+) -> Result<Option<Decoded>, DecoderError> {
+    if state.prefix.is_none() {
+        let mut cursor = Cursor::new(&state.pending[..]);
+        let prefix = match HeaderPrefix::decode(&mut cursor) {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                let error = DecoderError::from(error);
+                if error == DecoderError::UnexpectedEnd && !end {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+        };
+        let prefix = prefix.get(0, 0)?;
+        state.pending.advance(cursor.position() as usize);
+        state.prefix = Some(prefix);
+    }
+
+    let (required_ref, _) = state.prefix.expect("field section prefix is initialized");
+    while state.pending.has_remaining() {
+        let mut cursor = Cursor::new(&state.pending[..]);
+        let field = match parse_stateless_header_field(&mut cursor) {
+            Ok(field) => field,
+            Err(DecoderError::UnexpectedEnd) if !end => return Ok(None),
+            Err(error) => return Err(error),
+        };
+
+        state.pending.advance(cursor.position() as usize);
+        state.mem_size += field.mem_size() as u64;
+        if state.mem_size > max_size {
+            return Err(DecoderError::HeaderTooLong(state.mem_size));
+        }
+        state.fields.push(field);
+    }
+
+    if end {
+        Ok(Some(state.finish(required_ref)))
+    } else {
+        Ok(None)
+    }
+}
+
+fn parse_stateless_header_field<R: Buf>(buf: &mut R) -> Result<HeaderField, DecoderError> {
+    let field = match HeaderBlockField::decode(buf.chunk()[0]) {
+        HeaderBlockField::IndexedWithPostBase | HeaderBlockField::LiteralWithPostBaseNameRef => {
+            return Err(DecoderError::MissingRefs(0));
+        }
+        HeaderBlockField::Indexed => match Indexed::decode(buf)? {
+            Indexed::Static(index) => StaticTable::get(index)?.clone(),
+            Indexed::Dynamic(_) => return Err(DecoderError::MissingRefs(0)),
+        },
+        HeaderBlockField::LiteralWithNameRef => match LiteralWithNameRef::decode(buf)? {
+            LiteralWithNameRef::Dynamic { .. } => return Err(DecoderError::MissingRefs(0)),
+            LiteralWithNameRef::Static { index, value } => {
+                StaticTable::get(index)?.with_value(value)
+            }
+        },
+        HeaderBlockField::Literal => {
+            let literal = Literal::decode(buf)?;
+            HeaderField::new(literal.name, literal.value)
+        }
+        _ => return Err(DecoderError::UnknownPrefix(buf.chunk()[0])),
+    };
+    Ok(field)
+}
+
 #[cfg(test)]
 impl From<DynamicTable> for Decoder {
     fn from(table: DynamicTable) -> Self {
@@ -405,8 +582,8 @@ impl From<DynamicTableError> for DecoderError {
 impl From<ParseError> for DecoderError {
     fn from(e: ParseError) -> Self {
         match e {
-            ParseError::Integer(x) => DecoderError::InvalidInteger(x),
-            ParseError::String(x) => DecoderError::InvalidString(x),
+            ParseError::Integer(x) => x.into(),
+            ParseError::String(x) => x.into(),
             ParseError::InvalidPrefix(p) => DecoderError::UnknownPrefix(p),
             ParseError::InvalidBase(b) => DecoderError::BadBaseIndex(b),
             ParseError::InvalidRequiredInsertCount(i) => {
@@ -504,6 +681,64 @@ mod tests {
                 DynamicTableError::BadRelativeIndex(0)
             ))
         );
+    }
+
+    #[test]
+    fn incremental_stateless_decode_accepts_single_byte_chunks() {
+        let mut encoded = Vec::new();
+        HeaderPrefix::new(0, 0, 0, 0).encode(&mut encoded);
+        Literal::new("first", "value").encode(&mut encoded).unwrap();
+        Indexed::Static(18).encode(&mut encoded);
+
+        let mut state = DecoderState::new();
+        for byte in encoded {
+            state.extend(&mut Cursor::new([byte]));
+            assert_eq!(
+                decode_stateless_incremental(&mut state, false, u64::MAX),
+                Ok(None)
+            );
+        }
+
+        let decoded = decode_stateless_incremental(&mut state, true, u64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decoded.fields,
+            vec![
+                HeaderField::new("first", "value"),
+                StaticTable::get(18).unwrap().clone()
+            ]
+        );
+    }
+
+    #[test]
+    fn incremental_dynamic_decode_resumes_after_missing_reference() {
+        let mut field_section = Vec::new();
+        HeaderPrefix::new(1, 1, 1, TABLE_SIZE).encode(&mut field_section);
+        Indexed::Dynamic(0).encode(&mut field_section);
+
+        let mut state = DecoderState::new();
+        state.extend(&mut Cursor::new(field_section));
+        let mut decoder = Decoder::new(TABLE_SIZE as u64, 1).unwrap();
+        assert_eq!(
+            decoder.decode_header_incremental(&mut state, true, u64::MAX),
+            Err(DecoderError::MissingRefs(1))
+        );
+
+        let mut encoder_stream = Vec::new();
+        DynamicTableSizeUpdate(TABLE_SIZE).encode(&mut encoder_stream);
+        InsertWithoutNameRef::new("dynamic", "value")
+            .encode(&mut encoder_stream)
+            .unwrap();
+        decoder
+            .on_encoder_recv(&mut Cursor::new(encoder_stream), &mut Vec::new())
+            .unwrap();
+
+        let decoded = decoder
+            .decode_header_incremental(&mut state, true, u64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.fields, vec![HeaderField::new("dynamic", "value")]);
     }
 
     /**
