@@ -1783,17 +1783,17 @@ mod qpack_field_section_tests {
     fn blocked_stream_limit_counts_each_stream_once() {
         let (events_send, _events_recv) = mpsc::unbounded_channel();
         let decoder = QpackDecoder::new(qpack::Decoder::new(128, 1).unwrap(), events_send);
-        let shared = Arc::new(SharedState::default());
+        let conn_state = Arc::new(SharedState::default());
         let mut first = DecoderGurad {
             stream_id: StreamId(0),
-            shared: shared.clone(),
+            conn_state: conn_state.clone(),
             cancel_on_drop: false,
             blocked: false,
             decoder: decoder.clone(),
         };
         let mut second = DecoderGurad {
             stream_id: StreamId(4),
-            shared,
+            conn_state,
             cancel_on_drop: false,
             blocked: false,
             decoder,
