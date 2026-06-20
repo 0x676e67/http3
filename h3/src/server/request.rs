@@ -154,7 +154,6 @@ where
                 self.shared.clone(),
                 self.decoder_events,
                 self.send_grease_frame,
-                false,
             ),
         };
 

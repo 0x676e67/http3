@@ -1089,7 +1089,6 @@ pub struct RequestStream<S, B> {
     pub(super) conn_state: Arc<SharedState>,
     pub(super) max_field_section_size: u64,
     send_grease_frame: bool,
-    decoder_dynamic_table: bool,
     decoder_gurad: Option<DecoderGurad>,
 }
 
@@ -1104,16 +1103,18 @@ where
         conn_state: Arc<SharedState>,
         decoder_events: mpsc::UnboundedSender<QpackEvent>,
         grease: bool,
-        decoder_dynamic_table: bool,
     ) -> Self {
-        let decoder_gurad = decoder_dynamic_table.then(|| DecoderGurad {
-            stream_id: stream.id(),
-            shared: conn_state.clone(),
-            // Until the field section is successfully decoded, dropping the guard
-            // abandons it and must notify the peer encoder.
-            cancel_on_drop: true,
-            decoder_events,
-        });
+        let decoder_gurad = conn_state
+            .decoder
+            .dynamic_table_enabled()
+            .then(|| DecoderGurad {
+                stream_id: stream.id(),
+                shared: conn_state.clone(),
+                // Until the field section is successfully decoded, dropping the guard
+                // abandons it and must notify the peer encoder.
+                cancel_on_drop: true,
+                decoder_events,
+            });
 
         Self {
             stream,
@@ -1121,7 +1122,6 @@ where
             max_field_section_size,
             trailers: None,
             send_grease_frame: grease,
-            decoder_dynamic_table,
             decoder_gurad,
         }
     }
@@ -1345,12 +1345,11 @@ where
     ) -> Poll<Result<qpack::Decoded, qpack::DecoderError>> {
         // QPACK decoding advances the cursor; Pending retries must restart from the original block.
         let original = encoded.clone();
-        match self.conn_state.decoder.poll_decode_header(
-            cx,
-            encoded,
-            self.max_field_section_size,
-            self.decoder_dynamic_table,
-        ) {
+        match self
+            .conn_state
+            .decoder
+            .poll_decode_header(cx, encoded, self.max_field_section_size)
+        {
             Poll::Ready(Ok(decoded)) => {
                 if let Some(Err(err)) = self
                     .decoder_gurad
@@ -1496,7 +1495,6 @@ where
                 conn_state: self.conn_state.clone(),
                 max_field_section_size: 0,
                 decoder_gurad: None,
-                decoder_dynamic_table: false,
                 send_grease_frame: self.send_grease_frame,
             },
             RequestStream {
@@ -1505,7 +1503,6 @@ where
                 conn_state: self.conn_state,
                 max_field_section_size: self.max_field_section_size,
                 decoder_gurad: self.decoder_gurad,
-                decoder_dynamic_table: self.decoder_dynamic_table,
                 send_grease_frame: self.send_grease_frame,
             },
         )

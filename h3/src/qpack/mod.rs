@@ -65,6 +65,7 @@ pub(crate) enum QpackEvent {
 /// decodes release their read guards.
 pub(crate) struct QpackDecoder {
     decoder: RwLock<Decoder>,
+    decoder_dynamic_table: bool,
     /// Request wakers consumed by the connection driver after an encoder update.
     events_send: mpsc::UnboundedSender<QpackEvent>,
     /// Connection-driver waker used while a request holds a read guard.
@@ -79,10 +80,20 @@ impl QpackDecoder {
     #[inline(always)]
     pub(crate) fn new(decoder: Decoder, events_send: mpsc::UnboundedSender<QpackEvent>) -> Self {
         QpackDecoder {
+            decoder_dynamic_table: decoder.dynamic_table_enabled(),
             decoder: RwLock::new(decoder),
             events_send,
             write_waker: AtomicWaker::new(),
         }
+    }
+
+    /// Returns whether the peer is permitted to use dynamic table references.
+    ///
+    /// This is fixed from the advertised maximum table capacity when the
+    /// connection is created. It does not indicate whether the table currently
+    /// contains entries or whether its current capacity was later reduced to zero.
+    pub(crate) fn dynamic_table_enabled(&self) -> bool {
+        self.decoder_dynamic_table
     }
 
     /// Applies instructions received on the peer QPACK encoder stream.
@@ -166,9 +177,8 @@ impl QpackDecoder {
         cx: &mut Context<'_>,
         encoded: &mut T,
         max_size: u64,
-        dynamic_table: bool,
     ) -> Poll<Result<Decoded, DecoderError>> {
-        if !dynamic_table {
+        if !self.decoder_dynamic_table {
             return Poll::Ready(decode_stateless(encoded, max_size));
         }
 
