@@ -9,7 +9,7 @@ What would be the goals of this effort, and what wouldn't be.
 
 - Provide a standalone HTTP/3 crate.
     - This is similar to what we did with `h2`. This allows folks that want more control over HTTP/3 specifically to be able to do so. Or people may wish to reduce their dependencies to the bare minimum, and thus don’t want to include crates supporting HTTP/1 and 2 (like `hyper` does).
-    - We have the `h3` crate name already reserved, as one option.
+    - The implementation is published as the `http3-rs` crate.
     - It shouldn’t decide on synchronization or runtime needs.
 - Allow users to provide their own QUIC implementation.
     - There are several QUIC implementations already, and new ones could appear in kernels instead of user-space. 
@@ -18,9 +18,9 @@ What would be the goals of this effort, and what wouldn't be.
 - Performance and correctness are paramount.
     - We should have a good way to frequently measure performance.
 - Collaborative with the community.
-    - All current HTTP/3 Rust implementations have hard dependencies on their QUIC implementations. By making `h3` generic over any QUIC-like interface, we allow people to plug in to existing stacks. Meanwhile, `h3` providing the HTTP/3-level details can focus effort and attention.
+    - All current HTTP/3 Rust implementations have hard dependencies on their QUIC implementations. By making `http3-rs` generic over any QUIC-like interface, we allow people to plug in to existing stacks. Meanwhile, `http3-rs` providing the HTTP/3-level details can focus effort and attention.
     - The hyper brand has recognition as an open source HTTP project.
-        - Using the `h3` crate name removes some confusion about if it is specifically tied a certain QUIC library.
+        - Using a transport-neutral crate name removes confusion about whether it is tied to a certain QUIC library.
 
 
 ## 2. Overview
@@ -43,7 +43,7 @@ HTTP/3 is a new networking protocol that defines HTTP semantics specifically ove
                 +--------------------------------+
                 |                                |
                 |                                |
-            ->  |               h3               |  <-
+            ->  |           http3-rs             |  <-
                 |                                |
                 |                                |
                 +--------------------------------+
@@ -59,8 +59,8 @@ HTTP/3 is a new networking protocol that defines HTTP semantics specifically ove
 ```
 
 - **hyper::proto::h3** - The module integrating hyper with the `h3` crate. This includes connection management, runtime integration, `Service` and `HttpBody` usage.
-- **h3** - The bulk of this proposal. This implements HTTP/3 data structures and futures, without managing connections or spawning tasks.
-- **QUIC** - The underlying transport library. This proposal assumes other libraries will implement QUIC. In Section 5, this proposal outlines how to plug `h3` together with different QUIC libraries.
+- **http3-rs** - The bulk of this proposal. This implements HTTP/3 data structures and futures, without managing connections or spawning tasks.
+- **QUIC** - The underlying transport library. This proposal assumes other libraries will implement QUIC. In Section 5, this proposal outlines how to plug `http3-rs` together with different QUIC libraries.
 
 
 ## 3. Features
@@ -181,7 +181,7 @@ This part of the API can be contained in a module, as opposed to the top level, 
 - `quic` (assumed in this document)
 - `transport`
 
-Since establishing and accepting QUIC connections is out of scope for the crate, these concepts are not built into `h3`. A user could create their QUIC implementation’s concept of a `Connection`, and then pass that to `h3`. This is a similar design to `h2`, which asks users to do any transport building before handing it to `server::handshake(conn)` or `client::handshake(conn)`.
+Since establishing and accepting QUIC connections is out of scope for the crate, these concepts are not built into `http3-rs`. A user could create their QUIC implementation’s concept of a `Connection`, and then pass that to `http3-rs`. This is a similar design to `h2`, which asks users to do any transport building before handing it to `server::handshake(conn)` or `client::handshake(conn)`.
 
 Some **unresolved questions** related to these traits are:
 
@@ -245,7 +245,7 @@ Streams over a single connection can be used to send data, receive data, or both
 - `io::AsyncRead` and `io::AsyncWrite`
 - Defining our own custom `SendStream` and `ReceiveStream` traits
     - We can add new methods (with default implementations) if we control the traits.
-    - The trait names can be clearer (`h3::transport::SendStream` vs `Stream<Item = Result<Bytes, Error>>`)
+    - The trait names can be clearer (`http3_rs::transport::SendStream` vs `Stream<Item = Result<Bytes, Error>>`)
     - It can cause more boilerplate when integrating with other libraries that may provide their streams implemented with the more generic traits
         - To compensate, we can provide `wrap_stream` or `wrap_io` versions
 
