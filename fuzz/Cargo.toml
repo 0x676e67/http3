@@ -1,5 +1,5 @@
 [package]
-name = "http3-rs-fuzz"
+name = "http3-fuzz-rs"
 version = "0.0.0"
 authors = ["Automatically generated"]
 publish = false

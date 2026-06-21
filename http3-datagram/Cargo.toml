@@ -5,7 +5,7 @@ rust-version = { workspace = true }
 edition = { workspace = true }
 documentation = "https://docs.rs/http3-datagram-rs"
 repository = { workspace = true }
-readme = "readme.md"
+readme = "README.md"
 description = "RFC 9297 datagram extension for http3-rs"
 keywords = ["http3", "quic", "rfc9297"]
 categories = ["network-programming", "web-programming"]
