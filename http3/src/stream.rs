@@ -120,7 +120,6 @@ where
     }
 }
 
-// Keep SETTINGS inline to avoid allocating while opening every control stream.
 #[allow(clippy::large_enum_variant)]
 pub enum UniStreamHeader {
     Control(Settings),
