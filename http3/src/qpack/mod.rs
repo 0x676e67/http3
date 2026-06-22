@@ -90,15 +90,14 @@ impl Clone for QpackDecoder {
 impl Drop for QpackDecoder {
     fn drop(&mut self) {
         if let Some(stream_state) = &self.stream_state {
-            if stream_state.cancel_on_drop {
-                if self
+            if stream_state.cancel_on_drop
+                && self
                     .inner
                     .decoder_events
                     .send(QpackDecoderEvent::StreamCancel(stream_state.stream_id))
                     .is_ok()
-                {
-                    stream_state.shared.waker().wake();
-                }
+            {
+                stream_state.shared.waker().wake();
             }
         }
     }
