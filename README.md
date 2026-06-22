@@ -14,9 +14,10 @@ More information about this crate can be found in the [crate documentation][docs
 ## Features
 
 - Client [HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html) implementation.
-- Implements the full [HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html) and [QPACK](https://www.rfc-editor.org/rfc/rfc9204.html) specifications.
+- Implements the full [HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html) specifications.
 - Works with different QUIC transport implementations.
 - Focus on performance, interoperability, and correctness.
+- Built on [Tokio](https://tokio.rs).
 
 ## Usage
 
