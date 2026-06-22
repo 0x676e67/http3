@@ -6,6 +6,7 @@
 // concerned, but QUIC traits would not match between the `http3-rs` crate that
 // comes before http3_quinn_rs and the one that comes after and runs the tests
 #[path = "../../../http3-quinn/src/lib.rs"]
+#[allow(unexpected_cfgs)]
 mod http3_quinn_rs;
 
 mod connection;

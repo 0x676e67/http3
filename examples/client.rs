@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut driver, mut send_request) = http3_rs::client::new(quinn_conn).await?;
 
     let drive = async move {
-        return Err::<(), ConnectionError>(future::poll_fn(|cx| driver.poll_close(cx)).await);
+        Err::<(), ConnectionError>(future::poll_fn(|cx| driver.poll_close(cx)).await)
     };
 
     // In the following block, we want to take ownership of `send_request`:
