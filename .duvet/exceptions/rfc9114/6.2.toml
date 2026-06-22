@@ -13,5 +13,5 @@ unidirectional stream.
 '''
 reason = '''
 The user should ensure that the transport parameters satisfy the
-requirements, as h3 does not handle connection establishment.
+requirements, as http3-rs does not handle connection establishment.
 '''

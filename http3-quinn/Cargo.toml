@@ -1,0 +1,26 @@
+[package]
+name = "http3-quinn-rs"
+version = "0.0.10"
+rust-version = { workspace = true }
+authors = ["Jean-Christophe BEGUE <jc.begue@pm.me>"]
+edition = { workspace = true }
+documentation = "https://docs.rs/http3-quinn-rs"
+repository = { workspace = true }
+readme = "README.md"
+description = "QUIC transport implementation based on Quinn."
+keywords = ["http3", "quic"]
+categories = ["network-programming", "web-programming"]
+license = "MIT"
+
+[dependencies]
+http3-rs = { version = "0.0.8", path = "../http3" }
+bytes = "1"
+quinn = { version = "0.11", default-features = false, features = ["futures-io"] }
+tokio-util = { version = "0.7.9" }
+futures-util = { version = "0.3.28", default-features = false }
+http3-datagram-rs = { version = "0.0.2", path = "../http3-datagram", optional = true }
+tracing = { version = "0.1.40", optional = true }
+
+[features]
+tracing = ["dep:tracing"]
+datagram = ["dep:http3-datagram-rs"]

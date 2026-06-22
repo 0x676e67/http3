@@ -2,7 +2,9 @@
 name = "examples"
 version = "0.0.0"
 publish = false
-edition = "2021"
+rust-version = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
 
 # If you copy one of the examples into a new project, you should be using
 # [dependencies] instead.
@@ -10,16 +12,17 @@ edition = "2021"
 anyhow = "1.0"
 bytes = "1"
 futures = "0.3"
-h3 = { path = "../h3", features = ["tracing"] }
-h3-quinn = { path = "../h3-quinn", features = ["tracing", "datagram"] }
-h3-webtransport = { path = "../h3-webtransport" }
+http3-rs = { path = "../http3", features = ["tracing"] }
+http3-quinn-rs = { path = "../http3-quinn", features = ["tracing", "datagram"] }
+http3-webtransport-rs = { path = "../http3-webtransport" }
 http = "1"
 quinn = { version = "0.11", default-features = false, features = [
     "runtime-tokio",
     "rustls",
     "ring",
 ] }
-rcgen = { version = "0.14" }
+rcgen = { workspace = true }
+time = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = [
     "logging",
     "ring",
@@ -39,7 +42,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 octets = "0.3.0"
 
 tracing-tree = { version = "0.4" }
-h3-datagram = { path = "../h3-datagram" }
+http3-datagram-rs = { path = "../http3-datagram" }
 
 [features]
 tree = []

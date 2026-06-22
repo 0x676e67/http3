@@ -1,0 +1,26 @@
+[package]
+name = "http3-datagram-rs"
+version = "0.0.2"
+rust-version = { workspace = true }
+edition = { workspace = true }
+documentation = "https://docs.rs/http3-datagram-rs"
+repository = { workspace = true }
+readme = "README.md"
+description = "RFC 9297 datagram extension for http3-rs"
+keywords = ["http3", "quic", "rfc9297"]
+categories = ["network-programming", "web-programming"]
+license = "MIT"
+
+
+[dependencies]
+# http3-rs = { path = "../http3" }
+bytes = "1.4"
+tracing = { version = "0.1.40", optional = true }
+
+[features]
+tracing = ["dep:tracing"]
+
+[dependencies.http3-rs]
+version = "0.0.8"
+path = "../http3"
+features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"]

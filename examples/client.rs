@@ -1,14 +1,14 @@
 use std::{path::PathBuf, sync::Arc};
 
 use futures::future;
-use h3::error::{ConnectionError, StreamError};
+use http3_rs::error::{ConnectionError, StreamError};
 use rustls::pki_types::CertificateDer;
 use rustls_native_certs::CertificateResult;
 use structopt::StructOpt;
 use tokio::io::AsyncWriteExt;
 use tracing::{error, info};
 
-use h3_quinn::quinn;
+use http3_quinn_rs::quinn;
 
 static ALPN: &[u8] = b"h3";
 
@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
     }
 
-    let mut client_endpoint = h3_quinn::quinn::Endpoint::client("[::]:0".parse().unwrap())?;
+    let mut client_endpoint = http3_quinn_rs::quinn::Endpoint::client("[::]:0".parse().unwrap())?;
 
     let client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
@@ -105,14 +105,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("QUIC connection established");
 
-    // create h3 client
+    // Create the HTTP/3 client.
 
-    // h3 is designed to work with different QUIC implementations via
+    // http3-rs works with different QUIC implementations via
     // a generic interface, that is, the [`quic::Connection`] trait.
-    // h3_quinn implements the trait w/ quinn to make it work with h3.
-    let quinn_conn = h3_quinn::Connection::new(conn);
+    // http3-quinn-rs implements the transport traits with Quinn.
+    let quinn_conn = http3_quinn_rs::Connection::new(conn);
 
-    let (mut driver, mut send_request) = h3::client::new(quinn_conn).await?;
+    let (mut driver, mut send_request) = http3_rs::client::new(quinn_conn).await?;
 
     let drive = async move {
         return Err::<(), ConnectionError>(future::poll_fn(|cx| driver.poll_close(cx)).await);
