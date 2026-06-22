@@ -6,7 +6,7 @@ use http3_rs::error::{Code, ConnectionError, StreamError};
 use rustls::pki_types::CertificateDer;
 use rustls_native_certs::CertificateResult;
 use structopt::StructOpt;
-use tracing::{error, info, Level};
+use tracing::{Level, error, info};
 
 use http3_quinn_rs::quinn;
 

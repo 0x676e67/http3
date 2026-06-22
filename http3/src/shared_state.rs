@@ -2,7 +2,7 @@
 
 use std::{
     borrow::Cow,
-    sync::{atomic::AtomicBool, OnceLock},
+    sync::{OnceLock, atomic::AtomicBool},
 };
 
 use futures_util::task::AtomicWaker;
