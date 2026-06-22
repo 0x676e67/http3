@@ -9,3 +9,13 @@ members = [
     "examples",
 ]
 resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/0x676e67/http3-rs"
+
+[workspace.dependencies]
+rcgen = "=0.14.5"
+# rcgen accepts any time 0.3 release; newer releases require Rust 1.88.
+time = "=0.3.45"
