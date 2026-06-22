@@ -29,6 +29,7 @@ pub struct FrameStream<S, B> {
 
 /// A request-stream frame whose HEADERS payload has not been buffered yet.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RequestFrame {
     Headers,
     Frame(Frame<PayloadLen>),

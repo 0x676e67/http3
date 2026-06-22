@@ -1195,9 +1195,9 @@ where
                     )));
                 }
                 Err(error) => {
-                    return Poll::Ready(
-                        Err(self.handle_frame_stream_error_on_request_stream(error)),
-                    );
+                    return Poll::Ready(Err(
+                        self.handle_frame_stream_error_on_request_stream(error)
+                    ));
                 }
             };
 
@@ -1305,9 +1305,9 @@ where
                 }
                 Poll::Ready(Ok(None)) => {}
                 Poll::Ready(Err(error)) => {
-                    return Poll::Ready(
-                        Err(self.handle_frame_stream_error_on_request_stream(error)),
-                    );
+                    return Poll::Ready(Err(
+                        self.handle_frame_stream_error_on_request_stream(error)
+                    ));
                 }
                 Poll::Pending => return Poll::Pending,
             }
