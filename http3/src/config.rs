@@ -56,13 +56,13 @@ pub struct Settings {
 
     /// QPACK dynamic table capacity the encoder is permitted to use, in bytes.
     /// Sent as SETTINGS_QPACK_MAX_TABLE_CAPACITY (0x1).
-    /// A value of 0 (the default) means the encoder must not use the dynamic table.
-    pub(crate) qpack_max_table_capacity: u64,
+    /// When unset, the setting is omitted and the protocol default of 0 applies.
+    pub(crate) qpack_max_table_capacity: Option<u64>,
 
     /// Maximum number of blocked streams the decoder is willing to tolerate.
     /// Sent as SETTINGS_QPACK_BLOCKED_STREAMS (0x7).
-    /// A value of 0 (the default) means the decoder does not support blocking.
-    pub(crate) qpack_blocked_streams: u64,
+    /// When unset, the setting is omitted and the protocol default of 0 applies.
+    pub(crate) qpack_blocked_streams: Option<u64>,
 }
 
 impl From<&frame::Settings> for Settings {
@@ -87,12 +87,8 @@ impl From<&frame::Settings> for Settings {
                 .get(frame::SettingId::ENABLE_CONNECT_PROTOCOL)
                 .map(|value| value != 0)
                 .unwrap_or(defaults.enable_extended_connect),
-            qpack_max_table_capacity: settings
-                .get(frame::SettingId::QPACK_MAX_TABLE_CAPACITY)
-                .unwrap_or(defaults.qpack_max_table_capacity),
-            qpack_blocked_streams: settings
-                .get(frame::SettingId::QPACK_MAX_BLOCKED_STREAMS)
-                .unwrap_or(defaults.qpack_blocked_streams),
+            qpack_max_table_capacity: settings.get(frame::SettingId::QPACK_MAX_TABLE_CAPACITY),
+            qpack_blocked_streams: settings.get(frame::SettingId::QPACK_MAX_BLOCKED_STREAMS),
         }
     }
 }
@@ -111,12 +107,8 @@ impl Config {
             frame::SettingId::WEBTRANSPORT_MAX_SESSIONS => {
                 Some(self.settings.max_webtransport_sessions)
             }
-            frame::SettingId::QPACK_MAX_TABLE_CAPACITY => {
-                Some(self.settings.qpack_max_table_capacity)
-            }
-            frame::SettingId::QPACK_MAX_BLOCKED_STREAMS => {
-                Some(self.settings.qpack_blocked_streams)
-            }
+            frame::SettingId::QPACK_MAX_TABLE_CAPACITY => self.settings.qpack_max_table_capacity,
+            frame::SettingId::QPACK_MAX_BLOCKED_STREAMS => self.settings.qpack_blocked_streams,
             _ => self
                 .extra_settings
                 .iter()
@@ -160,14 +152,12 @@ impl TryFrom<Config> for frame::Settings {
                 frame::SettingId::WEBTRANSPORT_MAX_SESSIONS,
                 value.settings.max_webtransport_sessions,
             )?;
-            settings.insert(
-                frame::SettingId::QPACK_MAX_TABLE_CAPACITY,
-                value.settings.qpack_max_table_capacity,
-            )?;
-            settings.insert(
-                frame::SettingId::QPACK_MAX_BLOCKED_STREAMS,
-                value.settings.qpack_blocked_streams,
-            )?;
+            if let Some(value) = value.settings.qpack_max_table_capacity {
+                settings.insert(frame::SettingId::QPACK_MAX_TABLE_CAPACITY, value)?;
+            }
+            if let Some(value) = value.settings.qpack_blocked_streams {
+                settings.insert(frame::SettingId::QPACK_MAX_BLOCKED_STREAMS, value)?;
+            }
 
             // Append extra settings at the end in default mode
             for (id, val) in &value.extra_settings {
@@ -217,8 +207,8 @@ impl Default for Settings {
             enable_extended_connect: false,
             enable_datagram: false,
             max_webtransport_sessions: 0,
-            qpack_max_table_capacity: 0,
-            qpack_blocked_streams: 0,
+            qpack_max_table_capacity: None,
+            qpack_blocked_streams: None,
         }
     }
 }

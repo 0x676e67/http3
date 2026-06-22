@@ -9,6 +9,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{future, ready};
 use http::HeaderMap;
 use stream::WriteBuf;
+use tokio::sync::mpsc;
 
 #[cfg(feature = "tracing")]
 use tracing::{instrument, warn};
@@ -30,7 +31,8 @@ use crate::{
         varint::VarInt,
     },
     qpack,
-    quic::{self, RecvStream, SendStream, StreamErrorIncoming},
+    qpack::{QpackDecoder, QpackDecoderEvent},
+    quic::{self, RecvStream, SendStream, SendStreamUnframed, StreamErrorIncoming},
     shared_state::{ConnectionState, SharedState},
     stream::{self, AcceptRecvStream, AcceptedRecvStream, BufRecvStream, UniStreamHeader},
     webtransport::SessionId,
@@ -64,6 +66,8 @@ where
     B: Buf,
 {
     decoder_send: Option<C::SendStream>,
+    decoder_send_buf: BytesMut,
+    decoder_events_recv: mpsc::UnboundedReceiver<QpackDecoderEvent>,
     decoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
     encoder_send: Option<C::SendStream>,
     encoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
@@ -81,6 +85,10 @@ where
     control_send: C::SendStream,
     control_recv: Option<FrameStream<C::RecvStream, B>>,
     qpack_streams: QpackStreams<C, B>,
+
+    /// QPACK decoder state for field sections that reference the dynamic table.
+    qpack_decoder: QpackDecoder,
+
     /// Buffers incoming uni/recv streams which have yet to be claimed.
     ///
     /// This is opposed to discarding them by returning in `poll_accept_recv`, which may cause them to be missed by something else polling.
@@ -193,6 +201,11 @@ where
         let mut decoder_send = Option::take(&mut self.qpack_streams.decoder_send);
         let mut encoder_send = Option::take(&mut self.qpack_streams.encoder_send);
 
+        //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+        //# Each endpoint
+        //# MUST initiate, at most, one encoder stream and, at most, one decoder
+        //# stream.
+
         let (control, ..) = future::join3(
             stream::write(
                 &mut self.control_send,
@@ -289,8 +302,11 @@ where
             Ok(control_send) => control_send,
         };
 
+        let (decoder_events_send, decoder_events_recv) = mpsc::unbounded_channel();
         let qpack_streams = QpackStreams {
             decoder_send: qpack_decoder.ok(),
+            decoder_send_buf: BytesMut::new(),
+            decoder_events_recv,
             decoder_recv: None,
             encoder_send: qpack_encoder.ok(),
             encoder_recv: None,
@@ -301,12 +317,27 @@ where
         //# The
         //# sender MUST NOT close the control stream, and the receiver MUST NOT
         //# request that the sender close the control stream.
+        let qpack_decoder = QpackDecoder::new(
+            qpack::Decoder::new(
+                config.settings.qpack_max_table_capacity.unwrap_or(0),
+                config.settings.qpack_blocked_streams.unwrap_or(0),
+            )
+            .map_err(|err| {
+                conn.close_raw_connection_with_h3_error(InternalConnectionError::new(
+                    Code::QPACK_DECOMPRESSION_FAILED,
+                    format!("invalid QPACK decoder configuration: {}", err),
+                ))
+            })?,
+            decoder_events_send,
+        );
+
         let mut conn_inner = Self {
             shared,
             conn,
             control_send,
             control_recv: None,
             qpack_streams,
+            qpack_decoder,
             handled_connection_error: None,
             pending_recv_streams: Vec::with_capacity(3),
             got_peer_settings: false,
@@ -405,7 +436,7 @@ where
             .map_err(|e| self.handle_connection_error(e))?
         {
             self.pending_recv_streams
-                .push(Some(AcceptRecvStream::new(stream)))
+                .push(Some(AcceptRecvStream::new(stream)));
         }
 
         for stream in self.pending_recv_streams.iter_mut().filter(|s| s.is_some()) {
@@ -446,6 +477,14 @@ where
                 }
                 enc @ AcceptedRecvStream::Encoder(_) => {
                     if let Some(_prev) = self.qpack_streams.encoder_recv.replace(enc) {
+                        //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+                        //# Receipt of a second instance of either stream type MUST be
+                        //# treated as a connection error of type H3_STREAM_CREATION_ERROR.
+
+                        //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+                        //# An endpoint MUST allow its peer to create an encoder stream and a
+                        //# decoder stream even if the connection's settings prevent their use.
+
                         return Err(self.handle_connection_error(InternalConnectionError::new(
                             Code::H3_STREAM_CREATION_ERROR,
                             "got two encoder streams".to_string(),
@@ -454,6 +493,14 @@ where
                 }
                 dec @ AcceptedRecvStream::Decoder(_) => {
                     if let Some(_prev) = self.qpack_streams.decoder_recv.replace(dec) {
+                        //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+                        //# Receipt of a second instance of either stream type MUST be
+                        //# treated as a connection error of type H3_STREAM_CREATION_ERROR.
+
+                        //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+                        //# An endpoint MUST allow its peer to create an encoder stream and a
+                        //# decoder stream even if the connection's settings prevent their use.
+
                         return Err(self.handle_connection_error(InternalConnectionError::new(
                             Code::H3_STREAM_CREATION_ERROR,
                             "got two decoder streams".to_string(),
@@ -500,6 +547,190 @@ where
         Ok(())
     }
 
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_qpack_encoder_stream(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectionError>>
+    where
+        C::SendStream: quic::SendStreamUnframed<B>,
+    {
+        let _ = self.poll_connection_error(cx)?;
+
+        match self.poll_flush_qpack_decoder(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        }
+
+        let Some(accepted) = self.qpack_streams.encoder_recv.take() else {
+            return Poll::Pending;
+        };
+
+        let mut encoder_recv = match accepted {
+            AcceptedRecvStream::Encoder(stream) => stream,
+            other => {
+                self.qpack_streams.encoder_recv = Some(other);
+                return Poll::Pending;
+            }
+        };
+
+        loop {
+            while encoder_recv.has_remaining() {
+                let before = encoder_recv.buf().remaining();
+                let decoder_send_before = self.qpack_streams.decoder_send_buf.len();
+                let decoder = self.qpack_decoder.clone();
+
+                match decoder.poll_on_recv_encoder(
+                    cx,
+                    encoder_recv.buf_mut(),
+                    &mut self.qpack_streams.decoder_send_buf,
+                ) {
+                    Poll::Ready(Ok(_)) => (),
+                    Poll::Ready(Err(err)) => {
+                        return Poll::Ready(Err(self.handle_connection_error(
+                            InternalConnectionError::new(
+                                Code::QPACK_ENCODER_STREAM_ERROR,
+                                format!("invalid QPACK encoder stream instruction: {err}"),
+                            ),
+                        )));
+                    }
+                    Poll::Pending => {
+                        self.qpack_streams.encoder_recv =
+                            Some(AcceptedRecvStream::Encoder(encoder_recv));
+                        return Poll::Pending;
+                    }
+                };
+
+                let after = encoder_recv.buf().remaining();
+                let made_progress = after != before
+                    || self.qpack_streams.decoder_send_buf.len() != decoder_send_before;
+                if made_progress {
+                    self.waker().wake();
+                }
+
+                if after == before {
+                    break;
+                }
+            }
+
+            match self.poll_flush_qpack_decoder(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => {
+                    self.qpack_streams.encoder_recv =
+                        Some(AcceptedRecvStream::Encoder(encoder_recv));
+                    return Poll::Pending;
+                }
+            }
+
+            match encoder_recv.poll_read(cx) {
+                Poll::Ready(Ok(false)) => continue,
+                Poll::Ready(Ok(true)) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            "QPACK encoder stream closed".to_string(),
+                        ),
+                    )));
+                }
+                Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error,
+                })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
+                Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            format!("QPACK encoder stream reset with error code {}", error_code),
+                        ),
+                    )));
+                }
+                Poll::Ready(Err(StreamErrorIncoming::Unknown(error))) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            format!("QPACK encoder stream error: {}", error),
+                        ),
+                    )));
+                }
+                Poll::Pending => {
+                    self.qpack_streams.encoder_recv =
+                        Some(AcceptedRecvStream::Encoder(encoder_recv));
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+
+    fn poll_flush_qpack_decoder(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectionError>>
+    where
+        C::SendStream: quic::SendStreamUnframed<B>,
+    {
+        self.drain_qpack_decoder_events();
+
+        let Some(decoder_send) = self.qpack_streams.decoder_send.as_mut() else {
+            if !self.qpack_streams.decoder_send_buf.has_remaining() {
+                return Poll::Ready(Ok(()));
+            }
+            return Poll::Ready(Err(self.handle_connection_error(
+                InternalConnectionError::new(
+                    Code::QPACK_DECODER_STREAM_ERROR,
+                    "QPACK decoder stream is unavailable".to_string(),
+                ),
+            )));
+        };
+
+        while self.qpack_streams.decoder_send_buf.has_remaining() {
+            match decoder_send.poll_send(cx, &mut self.qpack_streams.decoder_send_buf) {
+                Poll::Ready(Ok(0)) | Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error,
+                })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
+                Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::QPACK_DECODER_STREAM_ERROR,
+                            format!("QPACK decoder stream reset with error code {}", error_code),
+                        ),
+                    )));
+                }
+                Poll::Ready(Err(StreamErrorIncoming::Unknown(error))) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::QPACK_DECODER_STREAM_ERROR,
+                            format!("QPACK decoder stream error: {}", error),
+                        ),
+                    )));
+                }
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    fn drain_qpack_decoder_events(&mut self) {
+        let before = self.qpack_streams.decoder_send_buf.len();
+
+        while let Ok(event) = self.qpack_streams.decoder_events_recv.try_recv() {
+            match event {
+                QpackDecoderEvent::HeaderAck(stream_id) => {
+                    qpack::ack_header(stream_id, &mut self.qpack_streams.decoder_send_buf)
+                }
+                QpackDecoderEvent::StreamCancel(stream_id) => {
+                    qpack::stream_canceled(stream_id, &mut self.qpack_streams.decoder_send_buf)
+                }
+            }
+        }
+
+        if self.qpack_streams.decoder_send_buf.len() != before {
+            self.waker().wake();
+        }
+    }
+
     /// Waits for the control stream to be received and reads subsequent frames.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_control(
@@ -526,13 +757,7 @@ where
             })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
             Err(FrameStreamError::Quic(StreamErrorIncoming::StreamTerminated {
                 error_code: err,
-            })) =>
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
-            //# If either control
-            //# stream is closed at any point, this MUST be treated as a connection
-            //# error of type H3_CLOSED_CRITICAL_STREAM.
-            // TODO: Add Test, that reset also triggers this
-            {
+            })) => {
                 return Poll::Ready(Err(self.handle_connection_error(
                     InternalConnectionError::new(
                         Code::H3_CLOSED_CRITICAL_STREAM,
@@ -548,12 +773,7 @@ where
                     ),
                 )));
             }
-            Err(FrameStreamError::UnexpectedEnd) =>
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.1
-            //# When a stream terminates cleanly, if the last frame on the stream was
-            //# truncated, this MUST be treated as a connection error of type
-            //# H3_FRAME_ERROR.
-            {
+            Err(FrameStreamError::UnexpectedEnd) => {
                 return Poll::Ready(Err(self.handle_connection_error(
                     InternalConnectionError::new(
                         Code::H3_FRAME_ERROR,
@@ -665,35 +885,33 @@ where
         T: From<VarInt> + Copy,
         VarInt: From<T>,
     {
-        {
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
-            //# An endpoint MAY send multiple GOAWAY frames indicating different
-            //# identifiers, but the identifier in each frame MUST NOT be greater
-            //# than the identifier in any previous frame, since clients might
-            //# already have retried unprocessed requests on another HTTP connection.
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
+        //# An endpoint MAY send multiple GOAWAY frames indicating different
+        //# identifiers, but the identifier in each frame MUST NOT be greater
+        //# than the identifier in any previous frame, since clients might
+        //# already have retried unprocessed requests on another HTTP connection.
 
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
-            //# Like the server,
-            //# the client MAY send subsequent GOAWAY frames so long as the specified
-            //# push ID is no greater than any previously sent value.
-            if let Some(prev_id) = recv_closing.map(VarInt::from) {
-                if prev_id < id {
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
-                    //# Receiving a GOAWAY containing a larger identifier than previously
-                    //# received MUST be treated as a connection error of type H3_ID_ERROR.
-                    return Err(self.handle_connection_error(InternalConnectionError::new(
-                        Code::H3_ID_ERROR,
-                        format!(
-                            "received a GoAway ({}) greater than the former one ({})",
-                            id, prev_id
-                        ),
-                    )));
-                }
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
+        //# Like the server,
+        //# the client MAY send subsequent GOAWAY frames so long as the specified
+        //# push ID is no greater than any previously sent value.
+        if let Some(prev_id) = recv_closing.map(VarInt::from) {
+            if prev_id < id {
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
+                //# Receiving a GOAWAY containing a larger identifier than previously
+                //# received MUST be treated as a connection error of type H3_ID_ERROR.
+                return Err(self.handle_connection_error(InternalConnectionError::new(
+                    Code::H3_ID_ERROR,
+                    format!(
+                        "received a GoAway ({}) greater than the former one ({})",
+                        id, prev_id
+                    ),
+                )));
             }
-            *recv_closing = Some(id.into());
-            self.set_closing();
-            Ok(())
         }
+        *recv_closing = Some(id.into());
+        self.set_closing();
+        Ok(())
     }
 
     // start grease stream and send data
@@ -804,6 +1022,11 @@ where
     pub fn accepted_streams_mut(&mut self) -> &mut AcceptedStreams<C, B> {
         &mut self.accepted_streams
     }
+
+    #[inline(always)]
+    pub(crate) fn qpack_decoder(&self) -> QpackDecoder {
+        self.qpack_decoder.clone()
+    }
 }
 
 #[allow(missing_docs)]
@@ -812,22 +1035,37 @@ pub struct RequestStream<S, B> {
     pub(super) trailers: Option<Bytes>,
     pub(super) conn_state: Arc<SharedState>,
     pub(super) max_field_section_size: u64,
+    pub(super) qpack_decoder: QpackDecoder,
+    use_qpack_dynamic_table: bool,
     send_grease_frame: bool,
 }
 
-impl<S, B> RequestStream<S, B> {
+impl<S, B> RequestStream<S, B>
+where
+    S: quic::RecvStream,
+{
     #[allow(missing_docs)]
-    pub fn new(
+    pub(crate) fn new(
         stream: FrameStream<S, B>,
         max_field_section_size: u64,
         conn_state: Arc<SharedState>,
         grease: bool,
+        qpack_decoder: QpackDecoder,
+        use_qpack_dynamic_table: bool,
     ) -> Self {
+        let qpack_decoder = if use_qpack_dynamic_table {
+            qpack_decoder.track_stream(stream.id().into_inner(), conn_state.clone())
+        } else {
+            qpack_decoder
+        };
+
         Self {
             stream,
             conn_state,
             max_field_section_size,
             trailers: None,
+            qpack_decoder,
+            use_qpack_dynamic_table,
             send_grease_frame: grease,
         }
     }
@@ -960,15 +1198,14 @@ where
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
             //# Receipt of an invalid sequence of frames MUST be treated as a
             //# connection error of type H3_FRAME_UNEXPECTED.
-
             match self.stream.poll_next(cx) {
                 Poll::Ready(Err(frame_stream_error)) => {
                     return Poll::Ready(Err(
                         self.handle_frame_stream_error_on_request_stream(frame_stream_error)
                     ));
                 }
+                // Received a known frame after trailers -> fail.
                 Poll::Ready(Ok(Some(trailing_frame))) => {
-                    // Received a known frame after trailers -> fail.
                     return Poll::Ready(Err(self.handle_connection_error_on_stream(
                         InternalConnectionError::new(
                             Code::H3_FRAME_UNEXPECTED,
@@ -978,35 +1215,50 @@ where
                 }
                 // Stream is finished no problematic frames received
                 Poll::Ready(Ok(None)) => (),
+                // Save the trailers and try again.
                 Poll::Pending => {
-                    // save the trailers and try again.
                     self.trailers = Some(trailers);
                     return Poll::Pending;
                 }
             }
         }
 
-        let qpack::Decoded { fields, .. } =
-            match qpack::decode_stateless(&mut trailers, self.max_field_section_size) {
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
-                //# An HTTP/3 implementation MAY impose a limit on the maximum size of
-                //# the message header it will accept on an individual HTTP message.
-                Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
-                    return Poll::Ready(Err(StreamError::HeaderTooBig {
-                        actual_size: cancel_size,
-                        max_size: self.max_field_section_size,
-                    }));
-                }
-                Ok(decoded) => decoded,
-                Err(_e) => {
-                    return Poll::Ready(Err(self.handle_connection_error_on_stream(
-                        InternalConnectionError {
-                            code: Code::QPACK_DECOMPRESSION_FAILED,
-                            message: "Failed to decode trailers".to_string(),
-                        },
-                    )));
-                }
-            };
+        // QPACK decoding advances the buffer; retry paths must keep the original block.
+        let encoded_trailers = trailers.clone();
+        let decode_result = match self.poll_decode_header(cx, &mut trailers) {
+            Poll::Ready(decode_result) => decode_result,
+            Poll::Pending => {
+                self.trailers = Some(encoded_trailers);
+                return Poll::Pending;
+            }
+        };
+
+        let qpack::Decoded { fields, .. } = match decode_result {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+            //# An HTTP/3 implementation MAY impose a limit on the maximum size of
+            //# the message header it will accept on an individual HTTP message.
+            Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
+                return Poll::Ready(Err(StreamError::HeaderTooBig {
+                    actual_size: cancel_size,
+                    max_size: self.max_field_section_size,
+                }));
+            }
+            Err(qpack::DecoderError::MissingRefs(_)) => {
+                // QPACK decoding advances the buffer; MissingRefs must retry from the original block.
+                self.trailers = Some(encoded_trailers);
+                self.waker().register(cx.waker());
+                return Poll::Pending;
+            }
+            Ok(decoded) => decoded,
+            Err(_e) => {
+                return Poll::Ready(Err(self.handle_connection_error_on_stream(
+                    InternalConnectionError {
+                        code: Code::QPACK_DECOMPRESSION_FAILED,
+                        message: "Failed to decode trailers".to_string(),
+                    },
+                )));
+            }
+        };
 
         Poll::Ready(Ok(Some(
             Header::try_from(fields)
@@ -1025,6 +1277,20 @@ where
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_sending(&mut self, err_code: Code) {
         self.stream.stop_sending(err_code);
+    }
+
+    #[inline(always)]
+    pub(crate) fn poll_decode_header(
+        &mut self,
+        cx: &mut Context<'_>,
+        encoded: &mut Bytes,
+    ) -> Poll<Result<qpack::Decoded, qpack::DecoderError>> {
+        self.qpack_decoder.poll_decode_header(
+            cx,
+            encoded,
+            self.max_field_section_size,
+            self.use_qpack_dynamic_table,
+        )
     }
 }
 
@@ -1135,6 +1401,8 @@ where
                 trailers: None,
                 conn_state: self.conn_state.clone(),
                 max_field_section_size: 0,
+                qpack_decoder: self.qpack_decoder.clone(),
+                use_qpack_dynamic_table: false,
                 send_grease_frame: self.send_grease_frame,
             },
             RequestStream {
@@ -1142,6 +1410,8 @@ where
                 trailers: self.trailers,
                 conn_state: self.conn_state,
                 max_field_section_size: self.max_field_section_size,
+                qpack_decoder: self.qpack_decoder,
+                use_qpack_dynamic_table: self.use_qpack_dynamic_table,
                 send_grease_frame: self.send_grease_frame,
             },
         )

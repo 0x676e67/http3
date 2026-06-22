@@ -83,9 +83,28 @@ pub struct Decoder {
 }
 
 impl Decoder {
+    pub(crate) fn new(
+        max_table_capacity: u64,
+        max_blocked_streams: u64,
+    ) -> Result<Self, DecoderError> {
+        let mut table = DynamicTable::new();
+        table.set_max_size(max_table_capacity.try_into()?)?;
+        table.set_max_blocked(max_blocked_streams.try_into()?)?;
+        Ok(Self { table })
+    }
+
     // Decode field lines received on Request of Push stream.
     // https://www.rfc-editor.org/rfc/rfc9204.html#name-field-line-representations
+    #[inline(always)]
     pub fn decode_header<T: Buf>(&self, buf: &mut T) -> Result<Decoded, DecoderError> {
+        self.decode_header_limited(buf, u64::MAX)
+    }
+
+    pub(crate) fn decode_header_limited<T: Buf>(
+        &self,
+        buf: &mut T,
+        max_size: u64,
+    ) -> Result<Decoded, DecoderError> {
         let (required_ref, base) = HeaderPrefix::decode(buf)?
             .get(self.table.total_inserted(), self.table.max_mem_size())?;
 
@@ -100,6 +119,9 @@ impl Decoder {
         while buf.has_remaining() {
             let field = Self::parse_header_field(&decoder_table, buf)?;
             mem_size += field.mem_size() as u64;
+            if mem_size > max_size {
+                return Err(DecoderError::HeaderTooLong(mem_size));
+            }
             fields.push(field);
         }
 

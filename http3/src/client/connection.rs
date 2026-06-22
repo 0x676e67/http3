@@ -21,7 +21,7 @@ use crate::{
     },
     frame::FrameStream,
     proto::{frame::Frame, headers::Header, push::PushId},
-    qpack,
+    qpack::{self, QpackDecoder},
     quic::{self, StreamId},
     shared_state::{ConnectionState, SharedState},
     stream::{self, BufRecvStream},
@@ -113,6 +113,8 @@ where
 {
     pub(super) open: T,
     pub(super) conn_state: Arc<SharedState>,
+    pub(super) qpack_decoder: QpackDecoder,
+    pub(super) use_qpack_dynamic_table: bool,
     pub(super) max_field_section_size: u64, // maximum size for a header we receive
     // counts instances of SendRequest to close the connection when the last is dropped.
     pub(super) sender_count: Arc<AtomicUsize>,
@@ -220,6 +222,8 @@ where
                 self.max_field_section_size,
                 self.conn_state.clone(),
                 self.send_grease_frame,
+                self.qpack_decoder.clone(),
+                self.use_qpack_dynamic_table,
             ),
         };
         // send the grease frame only once
@@ -239,6 +243,8 @@ where
 
         Self {
             conn_state: self.conn_state.clone(),
+            qpack_decoder: self.qpack_decoder.clone(),
+            use_qpack_dynamic_table: self.use_qpack_dynamic_table,
             open: self.open.clone(),
             max_field_section_size: self.max_field_section_size,
             sender_count: self.sender_count.clone(),
@@ -292,6 +298,7 @@ where
 /// #    -> JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>
 /// # where
 /// #    C: quic::Connection<B> + Send + 'static,
+/// #    C::SendStream: quic::SendStreamUnframed<B>,
 /// #    C::SendStream: Send + 'static,
 /// #    C::RecvStream: Send + 'static,
 /// #    B: Buf + Send + 'static,
@@ -317,6 +324,7 @@ where
 /// #    -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 /// # where
 /// #    C: quic::Connection<B> + Send + 'static,
+/// #    C::SendStream: quic::SendStreamUnframed<B>,
 /// #    C::SendStream: Send + 'static,
 /// #    C::RecvStream: Send + 'static,
 /// #    B: Buf + Send + 'static,
@@ -377,6 +385,7 @@ where
 impl<C, B> Connection<C, B>
 where
     C: quic::Connection<B>,
+    C::SendStream: quic::SendStreamUnframed<B>,
     B: Buf,
 {
     /// Initiate a graceful shutdown, accepting `max_push` potentially in-flight server pushes
@@ -395,6 +404,14 @@ where
     /// Maintain the connection state until it is closed
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ConnectionError> {
+        if let Err(err) = self.inner.poll_accept_recv(cx) {
+            return Poll::Ready(err);
+        }
+
+        if let Poll::Ready(Err(err)) = self.inner.poll_qpack_encoder_stream(cx) {
+            return Poll::Ready(err);
+        }
+
         while let Poll::Ready(result) = self.inner.poll_control(cx) {
             match result {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2

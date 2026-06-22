@@ -70,8 +70,7 @@ where
         );
 
         loop {
-            let end = self.try_recv(cx)?;
-
+            // Decode buffered frames before reading more from the transport.
             return match self.decoder.decode(self.stream.buf_mut())? {
                 Some(Frame::Data(PayloadLen(len))) => {
                     self.remaining_data = len;
@@ -82,7 +81,7 @@ where
                     Poll::Ready(Ok(frame))
                 }
                 Some(frame) => Poll::Ready(Ok(Some(frame))),
-                None => match end {
+                None => match self.try_recv(cx)? {
                     // Received a chunk but frame is incomplete, poll until we get `Pending`.
                     Poll::Ready(false) => continue,
                     Poll::Pending => Poll::Pending,
@@ -320,7 +319,13 @@ mod tests {
     use assert_matches::assert_matches;
     use bytes::{BufMut, Bytes, BytesMut};
     use futures_util::future::poll_fn;
-    use std::collections::VecDeque;
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use crate::proto::{coding::Encode, frame::FrameType, varint::VarInt};
 
@@ -590,17 +595,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn poll_next_consumes_buffered_frame_before_reading_more() {
+        let mut recv = FakeRecv::default();
+        let reads = recv.reads();
+        let mut buf = BytesMut::with_capacity(64);
+
+        Frame::headers(&b"header"[..]).encode_with_payload(&mut buf);
+        Frame::headers(&b"trailer"[..]).encode_with_payload(&mut buf);
+        recv.chunk(buf.freeze());
+        recv.chunk(Bytes::from_static(b"unused"));
+
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+
+        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+
+        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+    }
+
     // Helpers
 
     #[derive(Default)]
     struct FakeRecv {
         chunks: VecDeque<Bytes>,
+        reads: Arc<AtomicUsize>,
     }
 
     impl FakeRecv {
         fn chunk(&mut self, buf: Bytes) -> &mut Self {
             self.chunks.push_back(buf);
             self
+        }
+
+        fn reads(&self) -> Arc<AtomicUsize> {
+            self.reads.clone()
         }
     }
 
@@ -611,6 +641,7 @@ mod tests {
             &mut self,
             _: &mut Context<'_>,
         ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
             Poll::Ready(Ok(self.chunks.pop_front()))
         }
 
