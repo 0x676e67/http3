@@ -8,14 +8,14 @@ use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
-    task::{self, ready, Poll},
+    task::{self, Poll, ready},
 };
 
 use bytes::{Buf, Bytes};
 
 use futures_util::{
-    stream::{self},
     Stream, StreamExt,
+    stream::{self},
 };
 
 use quinn::ReadError;

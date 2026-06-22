@@ -7,23 +7,23 @@ use std::{
 };
 
 use bytes::Buf;
-use futures_util::{future::poll_fn, ready, Future};
+use futures_util::{Future, future::poll_fn, ready};
 use http::{Method, Request, Response, StatusCode};
 use http3_datagram_rs::{
     datagram_handler::{DatagramReader, DatagramSender, HandleDatagramsExt},
     quic_traits,
 };
 use http3_rs::{
+    ConnectionState, SharedState,
     error::{
-        connection_error_creators::CloseStream, internal_error::InternalConnectionError, Code,
-        ConnectionError, StreamError,
+        Code, ConnectionError, StreamError, connection_error_creators::CloseStream,
+        internal_error::InternalConnectionError,
     },
     ext::Protocol,
     frame::FrameStream,
     proto::frame::Frame,
     quic::{self, OpenStreams, WriteBuf},
     server::{Connection, RequestStream},
-    ConnectionState, SharedState,
 };
 use http3_rs::{
     quic::SendStreamUnframed,

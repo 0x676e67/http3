@@ -17,11 +17,11 @@ use tracing::{instrument, warn};
 use crate::{
     config::Config,
     error::{
+        Code, ConnectionError, StreamError,
         connection_error_creators::{
             CloseRawQuicConnection, CloseStream, HandleFrameStreamErrorOnRequestStream,
         },
         internal_error::InternalConnectionError,
-        Code, ConnectionError, StreamError,
     },
     frame::{FrameStream, FrameStreamError, RequestFrame},
     proto::{
@@ -1192,12 +1192,12 @@ where
                             Code::H3_FRAME_UNEXPECTED,
                             "stream finished without response headers".to_string(),
                         ),
-                    )))
+                    )));
                 }
                 Err(error) => {
                     return Poll::Ready(
                         Err(self.handle_frame_stream_error_on_request_stream(error)),
-                    )
+                    );
                 }
             };
 
@@ -1220,7 +1220,7 @@ where
                             Code::H3_FRAME_UNEXPECTED,
                             format!("first response frame is not headers: {:?}", frame),
                         ),
-                    )))
+                    )));
                 }
             }
         }
@@ -1288,7 +1288,7 @@ where
                             Code::QPACK_DECOMPRESSION_FAILED,
                             format!("failed to decode response headers: {}", error),
                         ),
-                    )))
+                    )));
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -1307,7 +1307,7 @@ where
                 Poll::Ready(Err(error)) => {
                     return Poll::Ready(
                         Err(self.handle_frame_stream_error_on_request_stream(error)),
-                    )
+                    );
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -1319,13 +1319,13 @@ where
     pub fn poll_recv_data(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<impl Buf>, StreamError>> {
+    ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
         if !self.stream.has_data() {
             match ready!(self.stream.poll_next_request(cx)) {
                 Err(frame_stream_error) => {
                     return Poll::Ready(Err(
                         self.handle_frame_stream_error_on_request_stream(frame_stream_error)
-                    ))
+                    ));
                 }
                 Ok(None) => {
                     if let Some(field_section) = self.decoder_gurad.as_mut() {
@@ -1397,7 +1397,7 @@ where
                 Err(frame_stream_error) => {
                     return Poll::Ready(Err(
                         self.handle_frame_stream_error_on_request_stream(frame_stream_error)
-                    ))
+                    ));
                 }
                 Ok(None) => {
                     if let Some(field_section) = self.decoder_gurad.as_mut() {
@@ -1499,7 +1499,7 @@ where
                                 Code::QPACK_DECOMPRESSION_FAILED,
                                 format!("failed to decode trailers: {}", error),
                             ),
-                        )))
+                        )));
                     }
                     Poll::Pending => {
                         self.trailers = Some(trailers);
@@ -1516,7 +1516,7 @@ where
                     Poll::Ready(Err(error)) => {
                         return Poll::Ready(Err(
                             self.handle_frame_stream_error_on_request_stream(error)
-                        ))
+                        ));
                     }
                     Poll::Pending => {
                         self.trailers = Some(trailers);
@@ -1536,7 +1536,7 @@ where
                 Poll::Ready(Err(frame_stream_error)) => {
                     return Poll::Ready(Err(
                         self.handle_frame_stream_error_on_request_stream(frame_stream_error)
-                    ))
+                    ));
                 }
                 // Received a known frame after trailers -> fail.
                 Poll::Ready(Ok(Some(trailing_frame))) => {

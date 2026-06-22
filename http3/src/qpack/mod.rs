@@ -2,15 +2,15 @@ use crate::quic::StreamId;
 
 pub(crate) use self::decoder::DecoderState;
 pub use self::{
-    decoder::{ack_header, decode_stateless, stream_canceled, Decoded, Decoder, DecoderError},
-    encoder::{encode_stateless, EncoderError},
+    decoder::{Decoded, Decoder, DecoderError, ack_header, decode_stateless, stream_canceled},
+    encoder::{EncoderError, encode_stateless},
     field::HeaderField,
 };
 
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, RwLock, RwLockReadGuard, TryLockError,
+        atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
 };

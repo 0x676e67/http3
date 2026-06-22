@@ -162,7 +162,7 @@ where
     pub fn poll_data(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<impl Buf>, FrameStreamError>> {
+    ) -> Poll<Result<Option<impl Buf + use<S, B>>, FrameStreamError>> {
         if self.remaining_data == 0 {
             return Poll::Ready(Ok(None));
         }
@@ -201,7 +201,7 @@ where
         &mut self,
         cx: &mut Context<'_>,
         max_len: usize,
-    ) -> Poll<Result<Option<impl Buf>, FrameStreamError>> {
+    ) -> Poll<Result<Option<impl Buf + use<S, B>>, FrameStreamError>> {
         debug_assert!(max_len > 0);
         if self.remaining_data == 0 {
             return Poll::Ready(Ok(None));
@@ -433,8 +433,8 @@ mod tests {
     use std::{
         collections::VecDeque,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         },
     };
 

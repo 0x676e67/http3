@@ -1,11 +1,11 @@
 [package]
 name = "http3-quinn-rs"
 version = "0.0.10"
-rust-version = "1.74"
+rust-version = { workspace = true }
 authors = ["Jean-Christophe BEGUE <jc.begue@pm.me>"]
-edition = "2021"
+edition = { workspace = true }
 documentation = "https://docs.rs/http3-quinn-rs"
-repository = "https://github.com/0x676e67/http3-rs"
+repository = { workspace = true }
 readme = "README.md"
 description = "QUIC transport implementation based on Quinn."
 keywords = ["http3", "quic"]
