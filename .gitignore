@@ -20,3 +20,5 @@ localhost.crt
 localhost.key
 localhost.pem
 DATA.md
+AGENTS.md
+.agents/
