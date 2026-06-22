@@ -127,8 +127,13 @@ impl QpackDecoder {
     }
 
     pub(crate) fn unregister_blocked_stream(&self) {
-        let previous = self.0.blocked_streams.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(previous > 0, "QPACK blocked-stream counter underflow");
+        let result =
+            self.0
+                .blocked_streams
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_sub(1)
+                });
+        debug_assert!(result.is_ok(), "QPACK blocked-stream counter underflow");
     }
 
     /// Queues a Section Acknowledgment for the connection driver to send.
