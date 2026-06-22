@@ -148,7 +148,12 @@ impl HeaderPrefix {
                 ParseError::InvalidRequiredInsertCount(self.encoded_insert_count),
             )?;
             let max_wrapped = (max_value / full_range) * full_range;
-            let mut required = max_wrapped + self.encoded_insert_count - 1;
+            let mut required = max_wrapped
+                .checked_add(self.encoded_insert_count)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or(ParseError::InvalidRequiredInsertCount(
+                    self.encoded_insert_count,
+                ))?;
 
             if required > max_value {
                 if required <= full_range {
@@ -526,6 +531,20 @@ mod test {
         assert_eq!(
             prefix.get(0, 32),
             Err(ParseError::InvalidRequiredInsertCount(3))
+        );
+    }
+
+    #[test]
+    fn required_insert_count_reconstruction_rejects_overflow() {
+        let prefix = HeaderPrefix {
+            encoded_insert_count: 2,
+            sign_negative: false,
+            delta_base: 0,
+        };
+
+        assert_eq!(
+            prefix.get(usize::MAX - 1, 32),
+            Err(ParseError::InvalidRequiredInsertCount(2))
         );
     }
 
