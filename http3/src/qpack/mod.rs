@@ -1,8 +1,8 @@
 use crate::quic::StreamId;
 
 pub use self::{
-    decoder::{ack_header, decode_stateless, stream_canceled, Decoded, Decoder, DecoderError},
-    encoder::{encode_stateless, EncoderError},
+    decoder::{Decoded, Decoder, DecoderError, ack_header, decode_stateless, stream_canceled},
+    encoder::{EncoderError, encode_stateless},
     field::HeaderField,
 };
 

@@ -52,8 +52,8 @@ mod connection;
 mod request;
 mod stream;
 
-pub use builder::builder;
 pub use builder::Builder;
+pub use builder::builder;
 pub use connection::Connection;
 pub use request::RequestResolver;
 pub use stream::RequestStream;

@@ -1,9 +1,10 @@
 [package]
 name = "http3-webtransport-rs"
 version = "0.1.2"
-edition = "2021"
+rust-version = { workspace = true }
+edition = { workspace = true }
 documentation = "https://docs.rs/http3-webtransport-rs"
-repository = "https://github.com/0x676e67/http3-rs"
+repository = { workspace = true }
 readme = "readme.md"
 description = "WebTransport extension for http3-rs"
 keywords = ["http3", "quic", "webtransport"]

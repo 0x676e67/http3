@@ -17,11 +17,11 @@ use tracing::{instrument, warn};
 use crate::{
     config::Config,
     error::{
+        Code, ConnectionError, StreamError,
         connection_error_creators::{
             CloseRawQuicConnection, CloseStream, HandleFrameStreamErrorOnRequestStream,
         },
         internal_error::InternalConnectionError,
-        Code, ConnectionError, StreamError,
     },
     frame::{FrameStream, FrameStreamError},
     proto::{
@@ -1132,13 +1132,13 @@ where
     pub fn poll_recv_data(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<impl Buf>, StreamError>> {
+    ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
         if !self.stream.has_data() {
             match ready!(self.stream.poll_next(cx)) {
                 Err(frame_stream_error) => {
                     return Poll::Ready(Err(
                         self.handle_frame_stream_error_on_request_stream(frame_stream_error)
-                    ))
+                    ));
                 }
                 Ok(None) => {
                     if let Some(field_section) = self.decoder_gurad.as_mut() {
@@ -1204,7 +1204,7 @@ where
                 Err(frame_stream_error) => {
                     return Poll::Ready(Err(
                         self.handle_frame_stream_error_on_request_stream(frame_stream_error)
-                    ))
+                    ));
                 }
                 Ok(None) => {
                     if let Some(field_section) = self.decoder_gurad.as_mut() {
@@ -1256,7 +1256,7 @@ where
                 Poll::Ready(Err(frame_stream_error)) => {
                     return Poll::Ready(Err(
                         self.handle_frame_stream_error_on_request_stream(frame_stream_error)
-                    ))
+                    ));
                 }
                 // Received a known frame after trailers -> fail.
                 Poll::Ready(Ok(Some(trailing_frame))) => {
@@ -1302,7 +1302,7 @@ where
                         code: Code::QPACK_DECOMPRESSION_FAILED,
                         message: "Failed to decode trailers".to_string(),
                     },
-                )))
+                )));
             }
         };
 
