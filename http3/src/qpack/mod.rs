@@ -1,3 +1,5 @@
+use crate::quic::StreamId;
+
 pub use self::{
     decoder::{Decoded, Decoder, DecoderError, ack_header, decode_stateless, stream_canceled},
     encoder::{EncoderError, encode_stateless},
@@ -5,15 +7,13 @@ pub use self::{
 };
 
 use std::{
-    sync::{Arc, RwLock, TryLockError},
-    task::{Context, Poll},
+    sync::{Arc, RwLock, RwLockReadGuard, TryLockError},
+    task::{Context, Poll, Waker},
 };
 
 use bytes::{Buf, BufMut};
 use futures_util::task::AtomicWaker;
 use tokio::sync::mpsc;
-
-use crate::shared_state::{ConnectionState, SharedState};
 
 mod block;
 mod dynamic;
@@ -50,208 +50,218 @@ impl std::fmt::Display for Error {
 }
 
 /// Event emitted by request streams for QPACK decoder stream instructions.
-pub(crate) enum QpackDecoderEvent {
-    HeaderAck(u64),
-    StreamCancel(u64),
+#[derive(Debug)]
+pub(crate) enum QpackEvent {
+    HeaderAck(StreamId),
+    StreamCancel(StreamId),
+    Waker(Waker),
 }
 
 struct QpackDecoderInner {
     decoder: RwLock<Decoder>,
-    decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
-    read_waker: AtomicWaker,
+    decoder_dynamic_table: bool,
+    decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
+    /// Connection-driver waker used while a request holds a read guard.
     write_waker: AtomicWaker,
 }
 
 /// Shared QPACK decoder state for a single HTTP/3 connection.
 ///
 /// The decoder is read-mostly: header blocks decode through read guards, while the
-/// peer encoder stream updates the dynamic table through a write guard.
-pub(crate) struct QpackDecoder {
-    inner: Arc<QpackDecoderInner>,
-    stream_state: Option<QpackDecoderStreamState>,
-}
-
-/// Per-stream QPACK decoder state used to emit decoder stream instructions.
-struct QpackDecoderStreamState {
-    stream_id: u64,
-    shared: Arc<SharedState>,
-    cancel_on_drop: bool,
-}
-
-impl Clone for QpackDecoder {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            stream_state: None,
-        }
-    }
-}
-
-impl Drop for QpackDecoder {
-    fn drop(&mut self) {
-        if let Some(stream_state) = &self.stream_state {
-            if stream_state.cancel_on_drop
-                && self
-                    .inner
-                    .decoder_events
-                    .send(QpackDecoderEvent::StreamCancel(stream_state.stream_id))
-                    .is_ok()
-            {
-                stream_state.shared.waker().wake();
-            }
-        }
-    }
-}
+/// connection driver updates the dynamic table through a write guard. Request wakers
+/// wait for dynamic-table updates; the writer waker lets the driver resume after active
+/// decodes release their read guards.
+#[derive(Clone)]
+pub(crate) struct QpackDecoder(Arc<QpackDecoderInner>);
 
 impl QpackDecoder {
-    /// Creates a new [`QpackDecoder`] instance.
+    /// Creates the connection's shared decoder.
+    ///
+    /// `decoder_waker` sends blocked request wakers to the connection driver. The
+    /// receiving side is kept with the connection's QPACK streams.
     #[inline(always)]
     pub(crate) fn new(
         decoder: Decoder,
-        decoder_events: mpsc::UnboundedSender<QpackDecoderEvent>,
+        decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
     ) -> Self {
-        Self {
-            inner: Arc::new(QpackDecoderInner {
-                decoder: RwLock::new(decoder),
-                decoder_events,
-                read_waker: AtomicWaker::new(),
-                write_waker: AtomicWaker::new(),
-            }),
-            stream_state: None,
-        }
+        QpackDecoder(Arc::new(QpackDecoderInner {
+            decoder_dynamic_table: decoder.dynamic_table_enabled(),
+            decoder: RwLock::new(decoder),
+            decoder_events_send,
+            write_waker: AtomicWaker::new(),
+        }))
     }
 
-    /// Returns a stream-scoped decoder handle that tracks decoder stream instructions.
-    #[inline(always)]
-    pub(crate) fn track_stream(mut self, stream_id: u64, shared: Arc<SharedState>) -> Self {
-        self.stream_state = Some(QpackDecoderStreamState {
-            stream_id,
-            shared,
-            // Until the header block is successfully decoded, dropping the tracked
-            // stream abandons it and must notify the peer encoder.
-            cancel_on_drop: true,
-        });
-        self
-    }
-
-    /// Processes bytes received from the peer QPACK encoder stream.
+    /// Returns whether the peer is permitted to use dynamic table references.
     ///
-    /// Returns `Poll::Pending` when a header decode currently holds a read lock;
-    /// the provided waker is registered and will be woken once a write may make progress.
+    /// This is fixed from the advertised maximum table capacity when the
+    /// connection is created. It does not indicate whether the table currently
+    /// contains entries or whether its current capacity was later reduced to zero.
+    pub(crate) fn dynamic_table_enabled(&self) -> bool {
+        self.0.decoder_dynamic_table
+    }
+
+    /// Queues a Section Acknowledgment for the connection driver to send.
+    ///
+    /// The caller uses this after successfully processing a field section whose
+    /// Required Insert Count is non-zero. The driver serializes the instruction
+    /// onto the connection's QPACK decoder stream.
+    ///
+    /// See [RFC 9204, Section 4.4.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1).
+    pub(crate) fn queue_section_acknowledgment(
+        &self,
+        stream_id: StreamId,
+    ) -> Result<(), DecoderError> {
+        self.0
+            .decoder_events_send
+            .send(QpackEvent::HeaderAck(stream_id))
+            .map_err(|_| DecoderError::UnexpectedEnd)?;
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            stream_id = ?stream_id,
+            "queued QPACK section acknowledgment"
+        );
+        Ok(())
+    }
+
+    /// Queues a Stream Cancellation for the connection driver to send.
+    ///
+    /// This is used when a request stream is reset or its remaining field
+    /// sections are no longer being read. Returns `true` when the event was
+    /// accepted by the driver channel.
+    ///
+    /// See [RFC 9204, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
+    pub(crate) fn queue_stream_cancellation(&self, stream_id: StreamId) -> bool {
+        let queued = self
+            .0
+            .decoder_events_send
+            .send(QpackEvent::StreamCancel(stream_id))
+            .is_ok();
+        #[cfg(feature = "tracing")]
+        if queued {
+            tracing::debug!(
+                stream_id = ?stream_id,
+                "queued QPACK stream cancellation"
+            );
+        }
+        queued
+    }
+
+    /// Applies instructions received on the peer QPACK encoder stream.
+    ///
+    /// Updating the dynamic table requires exclusive access to the decoder. If a
+    /// request is decoding a field section, this registers the connection driver
+    /// and returns [`Poll::Pending`]. The second lock attempt closes the gap between
+    /// the failed first attempt and waker registration.
     pub(crate) fn poll_on_recv_encoder<R: Buf, W: BufMut>(
         &self,
         cx: &mut Context<'_>,
         read: &mut R,
         write: &mut W,
     ) -> Poll<Result<usize, DecoderError>> {
-        match self.inner.decoder.try_write() {
-            Ok(mut decoder) => {
-                let result = decoder.on_encoder_recv(read, write);
-                drop(decoder);
-                self.inner.read_waker.wake();
-                Poll::Ready(result)
-            }
-            Err(TryLockError::WouldBlock) => {
-                // A header decode is holding a read lock. Register before retrying
-                // so a read-lock release cannot be missed between attempts.
-                self.inner.write_waker.register(cx.waker());
-                match self.inner.decoder.try_write() {
-                    Ok(mut decoder) => {
-                        // The read lock was released after registration; process now
-                        // instead of returning Pending and waiting for another wake.
-                        let result = decoder.on_encoder_recv(read, write);
-                        drop(decoder);
-                        self.inner.read_waker.wake();
-                        Poll::Ready(result)
-                    }
-                    Err(TryLockError::WouldBlock) => {
-                        // Still blocked. The registered waker will be notified when
-                        // the current readers release the decoder.
-                        Poll::Pending
-                    }
-                    Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
-                }
-            }
-            Err(TryLockError::Poisoned(_)) => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+        match self.0.decoder.try_write() {
+            Ok(mut decoder) => return Poll::Ready(decoder.on_encoder_recv(read, write)),
+            Err(TryLockError::WouldBlock) => {}
+            _ => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+        }
+
+        // A reader may finish between the first attempt and registration.
+        self.0.write_waker.register(cx.waker());
+
+        match self.0.decoder.try_write() {
+            Ok(mut decoder) => Poll::Ready(decoder.on_encoder_recv(read, write)),
+            Err(TryLockError::WouldBlock) => Poll::Pending,
+            _ => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
         }
     }
 
-    /// Decodes a header block and tracks decoder stream instructions for it.
+    /// Releases a decode guard and wakes a driver waiting to update the table.
     ///
-    /// When `use_dynamic_table` is `false`, no lock is acquired and dynamic table
-    /// references are rejected by `decode_stateless`.
-    pub(crate) fn poll_decode_header<T: Buf>(
-        &mut self,
-        cx: &mut Context<'_>,
-        encoded: &mut T,
-        max_size: u64,
-        use_dynamic_table: bool,
+    /// A field section with missing references must also register its request task.
+    /// `waiter_registered` is true when registration already happened while waiting
+    /// for the read lock.
+    fn finish_decode(
+        &self,
+        cx: &Context<'_>,
+        decoder: RwLockReadGuard<'_, Decoder>,
+        decoded: Result<Decoded, DecoderError>,
+        waiter_registered: bool,
     ) -> Poll<Result<Decoded, DecoderError>> {
-        if !use_dynamic_table {
-            return Poll::Ready(decode_stateless(encoded, max_size));
-        }
-
-        let decoded = match self.inner.decoder.try_read() {
-            Ok(decoder) => {
-                let decoded = decoder.decode_header_limited(encoded, max_size);
-                drop(decoder);
-                self.inner.write_waker.wake();
-                decoded
-            }
-            Err(TryLockError::WouldBlock) => {
-                // The encoder stream is updating the dynamic table. Register before
-                // retrying so a write-lock release cannot be missed between attempts.
-                self.inner.read_waker.register(cx.waker());
-                match self.inner.decoder.try_read() {
-                    Ok(decoder) => {
-                        // The write lock was released after registration; decode now
-                        // instead of returning Pending and waiting for another wake.
-                        let decoded = decoder.decode_header_limited(encoded, max_size);
-                        drop(decoder);
-                        self.inner.write_waker.wake();
-                        decoded
-                    }
-                    Err(TryLockError::WouldBlock) => {
-                        // Still blocked. The registered waker will be notified when
-                        // the writer releases the decoder.
-                        return Poll::Pending;
-                    }
-                    Err(TryLockError::Poisoned(_)) => {
-                        return Poll::Ready(Err(DecoderError::UnexpectedEnd));
-                    }
-                }
-            }
-            Err(TryLockError::Poisoned(_)) => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
-        };
-
-        let decoded = match decoded {
-            Ok(decoded) => decoded,
-            Err(error @ DecoderError::MissingRefs(required_ref)) => {
-                if required_ref > 0 {
-                    if let Some(stream_state) = &mut self.stream_state {
-                        stream_state.cancel_on_drop = true;
-                    }
-                }
-                return Poll::Ready(Err(error));
-            }
-            Err(error) => return Poll::Ready(Err(error)),
-        };
-
-        if let Some(stream_state) = &mut self.stream_state {
-            stream_state.cancel_on_drop = false;
-            if decoded.dyn_ref {
+        if !waiter_registered {
+            if let Err(DecoderError::MissingRefs(_required_ref)) = &decoded {
+                // Register while the read guard still prevents an encoder update. This
+                // keeps the driver from updating the table before the waiter is visible.
                 if self
-                    .inner
-                    .decoder_events
-                    .send(QpackDecoderEvent::HeaderAck(stream_state.stream_id))
+                    .0
+                    .decoder_events_send
+                    .send(QpackEvent::Waker(cx.waker().clone()))
                     .is_err()
                 {
                     return Poll::Ready(Err(DecoderError::UnexpectedEnd));
                 }
-                stream_state.shared.waker().wake();
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    required_ref = *_required_ref,
+                    "queued QPACK decoder waiter for missing references"
+                );
             }
         }
 
-        Poll::Ready(Ok(decoded))
+        // A writer blocked in poll_on_recv_encoder can continue once the guard drops.
+        drop(decoder);
+        self.0.write_waker.wake();
+        Poll::Ready(decoded)
+    }
+
+    /// Decodes one QPACK field section.
+    ///
+    /// Stateless decoding is used when dynamic-table support is disabled. Otherwise
+    /// the decoder is read-locked so request tasks can decode concurrently while the
+    /// connection driver is idle.
+    ///
+    /// [`DecoderError::MissingRefs`] is returned after the request waker has been
+    /// queued. The caller turns that result into [`Poll::Pending`] and restores the
+    /// encoded input, since decoding may advance it before reporting the missing
+    /// references. A direct [`Poll::Pending`] means the encoder stream currently owns
+    /// the write lock.
+    pub(crate) fn poll_decode_header<T: Buf>(
+        &self,
+        cx: &mut Context<'_>,
+        encoded: &mut T,
+        max_size: u64,
+    ) -> Poll<Result<Decoded, DecoderError>> {
+        if !self.0.decoder_dynamic_table {
+            return Poll::Ready(decode_stateless(encoded, max_size));
+        }
+
+        match self.0.decoder.try_read() {
+            Ok(decoder) => {
+                let decoded = decoder.decode_header_limited(encoded, max_size);
+                return self.finish_decode(cx, decoder, decoded, false);
+            }
+            Err(TryLockError::WouldBlock) => {}
+            _ => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+        }
+
+        // Register before retrying; the writer drains this queue after its update.
+        if self
+            .0
+            .decoder_events_send
+            .send(QpackEvent::Waker(cx.waker().clone()))
+            .is_err()
+        {
+            return Poll::Ready(Err(DecoderError::UnexpectedEnd));
+        }
+        #[cfg(feature = "tracing")]
+        tracing::debug!("queued QPACK decoder waiter for decoder write lock");
+
+        match self.0.decoder.try_read() {
+            Ok(decoder) => {
+                let decoded = decoder.decode_header_limited(encoded, max_size);
+                self.finish_decode(cx, decoder, decoded, true)
+            }
+            Err(TryLockError::WouldBlock) => Poll::Pending,
+            _ => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+        }
     }
 }

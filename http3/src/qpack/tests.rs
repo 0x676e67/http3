@@ -1,7 +1,10 @@
 use crate::qpack::decoder::Decoder;
 use crate::qpack::encoder::Encoder;
-use crate::qpack::{Decoded, DecoderError, HeaderField, dynamic::DynamicTable};
-use std::io::Cursor;
+use crate::qpack::{Decoded, DecoderError, HeaderField, QpackDecoder, dynamic::DynamicTable};
+use std::{
+    io::Cursor,
+    task::{Context, Poll},
+};
 
 pub mod helpers {
     use crate::qpack::{HeaderField, dynamic::DynamicTable};
@@ -89,6 +92,40 @@ fn blocked_header() {
         decoder.decode_header(&mut block_cur),
         Err(DecoderError::MissingRefs(1))
     );
+}
+
+#[test]
+fn shared_decoder_registers_blocked_header() {
+    let mut enc_table = DynamicTable::new();
+    enc_table.set_max_size(TABLE_SIZE).unwrap();
+    enc_table.set_max_blocked(100).unwrap();
+    let mut encoder = Encoder::from(enc_table);
+
+    let mut dec_table = DynamicTable::new();
+    dec_table.set_max_size(TABLE_SIZE).unwrap();
+    dec_table.set_max_blocked(100).unwrap();
+
+    let mut block_buf = vec![];
+    let mut enc_buf = vec![];
+    encoder
+        .encode(
+            42,
+            &mut block_buf,
+            &mut enc_buf,
+            &[HeaderField::new("foo", "bar")],
+        )
+        .unwrap();
+
+    let (decoder_waker, mut decoder_wakers) = tokio::sync::mpsc::unbounded_channel();
+    let decoder = QpackDecoder::new(Decoder::from(dec_table), decoder_waker);
+    let mut block_cur = Cursor::new(&mut block_buf);
+    let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+
+    assert_eq!(
+        decoder.poll_decode_header(&mut cx, &mut block_cur, u64::MAX),
+        Poll::Ready(Err(DecoderError::MissingRefs(1)))
+    );
+    assert!(decoder_wakers.try_recv().is_ok());
 }
 
 #[test]

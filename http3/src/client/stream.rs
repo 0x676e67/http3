@@ -124,42 +124,28 @@ where
         //# H3_GENERAL_PROTOCOL_ERROR.
 
         let decoded = if let Frame::Headers(ref encoded) = frame {
-            loop {
-                // QPACK decoding advances the buffer; MissingRefs must retry from the original block.
-                let mut encoded = encoded.clone();
-                match future::poll_fn(|cx| self.inner.poll_decode_header(cx, &mut encoded)).await {
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
-                    //# An HTTP/3 implementation MAY impose a limit on the maximum size of
-                    //# the message header it will accept on an individual HTTP message.
-                    Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
-                        self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
-                        return Err(StreamError::HeaderTooBig {
-                            actual_size: cancel_size,
-                            max_size: self.inner.max_field_section_size,
-                        });
-                    }
-                    Ok(decoded) => break decoded,
-                    Err(qpack::DecoderError::MissingRefs(_)) => {
-                        let mut registered = false;
-                        future::poll_fn(|cx| {
-                            if registered {
-                                Poll::Ready(())
-                            } else {
-                                self.waker().register(cx.waker());
-                                registered = true;
-                                Poll::Pending
-                            }
-                        })
-                        .await;
-                    }
-                    Err(_e) => {
-                        return Err(self.handle_connection_error_on_stream(
-                            InternalConnectionError {
-                                code: Code::QPACK_DECOMPRESSION_FAILED,
-                                message: "Failed to decode headers".to_string(),
-                            },
-                        ));
-                    }
+            // QPACK decoding advances the buffer, so keep the frame intact while
+            // `poll_decode_header` waits for missing dynamic-table references.
+            let mut encoded = encoded.clone();
+            match future::poll_fn(|cx| self.inner.poll_decode_header(cx, &mut encoded)).await {
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+                //# An HTTP/3 implementation MAY impose a limit on the maximum size of
+                //# the message header it will accept on an individual HTTP message.
+                Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
+                    self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
+                    return Err(StreamError::HeaderTooBig {
+                        actual_size: cancel_size,
+                        max_size: self.inner.max_field_section_size,
+                    });
+                }
+                Ok(decoded) => decoded,
+                Err(_e) => {
+                    return Err(
+                        self.handle_connection_error_on_stream(InternalConnectionError {
+                            code: Code::QPACK_DECOMPRESSION_FAILED,
+                            message: "Failed to decode headers".to_string(),
+                        }),
+                    );
                 }
             }
         } else {

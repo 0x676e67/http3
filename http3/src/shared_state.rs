@@ -9,8 +9,8 @@ use futures_util::task::AtomicWaker;
 
 use crate::{config::Settings, error::internal_error::ErrorOrigin};
 
-#[derive(Debug)]
 /// State shared by an HTTP/3 connection and its streams.
+#[derive(Debug)]
 pub struct SharedState {
     /// The settings, sent by the peer
     settings: OnceLock<Settings>,
