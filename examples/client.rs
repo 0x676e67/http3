@@ -146,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let drive = async move {
-        return Err::<(), ConnectionError>(future::poll_fn(|cx| driver.poll_close(cx)).await);
+        Err::<(), ConnectionError>(future::poll_fn(|cx| driver.poll_close(cx)).await)
     };
 
     // In the following block, we want to take ownership of `send_request`:
