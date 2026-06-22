@@ -3,6 +3,7 @@ use std::{cmp, io::Cursor};
 use bytes::{Buf, BufMut};
 
 use super::{
+    HeaderField,
     block::{
         HeaderPrefix, Indexed, IndexedWithPostBase, Literal, LiteralWithNameRef,
         LiteralWithPostBaseNameRef,
@@ -19,7 +20,6 @@ use super::{
         DecoderInstruction, Duplicate, DynamicTableSizeUpdate, HeaderAck, InsertCountIncrement,
         InsertWithNameRef, InsertWithoutNameRef, StreamCancel,
     },
-    HeaderField,
 };
 
 #[derive(Debug, PartialEq)]
@@ -239,7 +239,7 @@ impl Action {
         let first = buf.chunk()[0];
         let instruction = match DecoderInstruction::decode(first) {
             DecoderInstruction::Unknown => {
-                return Err(EncoderError::UnknownDecoderInstruction(first))
+                return Err(EncoderError::UnknownDecoderInstruction(first));
             }
             DecoderInstruction::InsertCountIncrement => InsertCountIncrement::decode(&mut buf)?
                 .map(|x| Action::ReceivedRefIncrement(x.0 as usize)),
@@ -297,7 +297,7 @@ impl From<ParseError> for EncoderError {
 mod tests {
     use super::*;
 
-    use crate::qpack::tests::helpers::{build_table, TABLE_SIZE};
+    use crate::qpack::tests::helpers::{TABLE_SIZE, build_table};
 
     #[allow(clippy::type_complexity)]
     fn check_encode_field(

@@ -9,9 +9,9 @@ use crate::{
 };
 use bytes::Buf;
 use http3_rs::{
-    error::{connection_error_creators::CloseStream, ConnectionError, StreamError},
-    quic::{self, StreamId},
     ConnectionState, SharedState,
+    error::{ConnectionError, StreamError, connection_error_creators::CloseStream},
+    quic::{self, StreamId},
 };
 
 /// Gives the ability to send datagrams.
@@ -104,7 +104,7 @@ where
 {
     /// Sends a datagram
     fn get_datagram_sender(&self, stream_id: StreamId)
-        -> DatagramSender<C::SendDatagramHandler, B>;
+    -> DatagramSender<C::SendDatagramHandler, B>;
     /// Reads an incoming datagram
     fn get_datagram_reader(&self) -> DatagramReader<C::RecvDatagramHandler>;
 }

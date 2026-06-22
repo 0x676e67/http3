@@ -12,9 +12,9 @@ use crate::{
 };
 
 use super::{
+    ConnectionError, LocalError, StreamError,
     codes::Code,
     internal_error::{ErrorOrigin, InternalConnectionError},
-    ConnectionError, LocalError, StreamError,
 };
 
 /// This trait is implemented for all types which can close the connection

@@ -1,6 +1,6 @@
 use bytes::Buf;
 use http3_rs::{
-    error::{internal_error::InternalConnectionError, Code},
+    error::{Code, internal_error::InternalConnectionError},
     proto::varint::VarInt,
     quic::StreamId,
 };

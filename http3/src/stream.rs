@@ -11,7 +11,7 @@ use tokio::io::ReadBuf;
 
 use crate::{
     buf::BufList,
-    error::{internal_error::InternalConnectionError, Code},
+    error::{Code, internal_error::InternalConnectionError},
     frame::FrameStream,
     proto::{
         coding::Encode,
@@ -120,6 +120,7 @@ where
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum UniStreamHeader {
     Control(Settings),
     WebTransportUni(SessionId),

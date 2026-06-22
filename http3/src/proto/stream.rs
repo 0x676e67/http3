@@ -131,11 +131,7 @@ impl StreamId {
 
     /// Which directions data flows in
     fn dir(self) -> Dir {
-        if self.0 & 0x2 == 0 {
-            Dir::Bi
-        } else {
-            Dir::Uni
-        }
+        if self.0 & 0x2 == 0 { Dir::Bi } else { Dir::Uni }
     }
 
     #[allow(missing_docs)]

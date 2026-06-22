@@ -1,10 +1,10 @@
 use crate::qpack::decoder::Decoder;
 use crate::qpack::encoder::Encoder;
-use crate::qpack::{dynamic::DynamicTable, Decoded, DecoderError, HeaderField};
+use crate::qpack::{Decoded, DecoderError, HeaderField, dynamic::DynamicTable};
 use std::io::Cursor;
 
 pub mod helpers {
-    use crate::qpack::{dynamic::DynamicTable, HeaderField};
+    use crate::qpack::{HeaderField, dynamic::DynamicTable};
 
     pub const TABLE_SIZE: usize = 4096;
 

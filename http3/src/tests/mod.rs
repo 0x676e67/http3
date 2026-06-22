@@ -24,7 +24,7 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::quic;
-use http3_quinn_rs::{quinn::TransportConfig, Connection};
+use http3_quinn_rs::{Connection, quinn::TransportConfig};
 
 pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -147,7 +147,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub async fn next(&mut self) -> impl quic::Connection<Bytes> {
+    pub async fn next(&mut self) -> impl quic::Connection<Bytes> + use<> {
         Connection::new(self.endpoint.accept().await.unwrap().await.unwrap())
     }
 }

@@ -6,9 +6,9 @@ use std::{
 };
 
 use http::{
+    Extensions, HeaderMap, Method, StatusCode,
     header::{self, HeaderName, HeaderValue},
     uri::{self, Authority, Parts, PathAndQuery, Scheme, Uri},
-    Extensions, HeaderMap, Method, StatusCode,
 };
 use smallvec::SmallVec;
 
@@ -96,11 +96,9 @@ impl PseudoOrderBuilder {
     /// Pushes a pseudo-header ID to the order, ignoring duplicates.
     pub fn push(mut self, id: PseudoId) -> Self {
         let mask_id = id.mask_id();
-        if mask_id != 0 {
-            if self.mask & mask_id == 0 {
-                self.mask |= mask_id;
-                self.ids.push(id);
-            }
+        if mask_id != 0 && self.mask & mask_id == 0 {
+            self.mask |= mask_id;
+            self.ids.push(id);
         }
         self
     }
@@ -196,7 +194,7 @@ impl Header {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
             //# If both fields are present, they MUST contain the same value.
             (Some(a), Some(h)) if a.as_str() != h => {
-                return Err(HeaderError::ContradictedAuthority)
+                return Err(HeaderError::ContradictedAuthority);
             }
             (Some(_), Some(h)) => uri = uri.authority(h.as_bytes()),
         }
@@ -317,7 +315,7 @@ impl Iterator for HeaderIter {
             if let Some(new) = new_header_name {
                 self.last_header_name = Some(new);
             }
-            if let (Some(ref n), v) = (&self.last_header_name, header_value) {
+            if let (Some(n), v) = (&self.last_header_name, header_value) {
                 return Some((n.as_str(), v.as_bytes()).into());
             }
         }

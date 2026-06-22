@@ -2,7 +2,9 @@
 name = "examples"
 version = "0.0.0"
 publish = false
-edition = "2021"
+rust-version = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
 
 # If you copy one of the examples into a new project, you should be using
 # [dependencies] instead.
@@ -19,7 +21,8 @@ quinn = { version = "0.11", default-features = false, features = [
     "rustls",
     "ring",
 ] }
-rcgen = { version = "0.14" }
+rcgen = { workspace = true }
+time = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = [
     "logging",
     "ring",

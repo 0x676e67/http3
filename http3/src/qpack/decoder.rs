@@ -228,7 +228,7 @@ pub fn decode_stateless<T: Buf>(buf: &mut T, max_size: u64) -> Result<Decoded, D
         let field = match HeaderBlockField::decode(buf.chunk()[0]) {
             HeaderBlockField::IndexedWithPostBase => return Err(DecoderError::MissingRefs(0)),
             HeaderBlockField::LiteralWithPostBaseNameRef => {
-                return Err(DecoderError::MissingRefs(0))
+                return Err(DecoderError::MissingRefs(0));
             }
             HeaderBlockField::Indexed => match Indexed::decode(buf)? {
                 Indexed::Static(index) => StaticTable::get(index)?.clone(),
@@ -343,7 +343,7 @@ impl From<TryFromIntError> for DecoderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qpack::tests::helpers::{build_table_with_size, TABLE_SIZE};
+    use crate::qpack::tests::helpers::{TABLE_SIZE, build_table_with_size};
 
     #[test]
     fn test_header_too_long() {

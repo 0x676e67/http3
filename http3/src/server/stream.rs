@@ -4,8 +4,8 @@ use bytes::Buf;
 
 use crate::{
     error::{
-        connection_error_creators::CloseStream, internal_error::InternalConnectionError, Code,
-        StreamError,
+        Code, StreamError, connection_error_creators::CloseStream,
+        internal_error::InternalConnectionError,
     },
     quic::{self},
     shared_state::{ConnectionState, SharedState},
@@ -22,7 +22,7 @@ use std::{
 
 use bytes::BytesMut;
 use futures_util::future;
-use http::{response, HeaderMap, Response};
+use http::{HeaderMap, Response, response};
 
 use quic::StreamId;
 
@@ -67,7 +67,7 @@ where
 {
     /// Receive data sent from the client
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub async fn recv_data(&mut self) -> Result<Option<impl Buf>, StreamError> {
+    pub async fn recv_data(&mut self) -> Result<Option<impl Buf + use<S, B>>, StreamError> {
         future::poll_fn(|cx| self.poll_recv_data(cx)).await
     }
 
@@ -76,7 +76,7 @@ where
     pub fn poll_recv_data(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<impl Buf>, StreamError>> {
+    ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
         self.inner.poll_recv_data(cx)
     }
 

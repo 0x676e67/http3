@@ -107,7 +107,7 @@ where
     pub fn poll_data(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<impl Buf>, FrameStreamError>> {
+    ) -> Poll<Result<Option<impl Buf + use<S, B>>, FrameStreamError>> {
         if self.remaining_data == 0 {
             return Poll::Ready(Ok(None));
         };

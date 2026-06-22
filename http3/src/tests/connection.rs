@@ -13,7 +13,7 @@ use crate::client::SendRequest;
 use crate::error::{Code, ConnectionError, LocalError, StreamError};
 use crate::quic::ConnectionErrorIncoming;
 use crate::tests::get_stream_blocking;
-use crate::{client, server, ConnectionState};
+use crate::{ConnectionState, client, server};
 use crate::{
     proto::{
         coding::Encode as _,
@@ -26,7 +26,7 @@ use crate::{
 };
 
 use super::http3_quinn_rs;
-use super::{init_tracing, Pair};
+use super::{Pair, init_tracing};
 
 #[tokio::test]
 async fn connect() {

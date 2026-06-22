@@ -2,7 +2,7 @@
 
 use std::{
     marker::PhantomData,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{Arc, atomic::AtomicUsize},
     task::{Context, Poll},
 };
 
@@ -16,8 +16,8 @@ use tracing::{info, instrument, trace};
 use crate::{
     connection::{self, ConnectionInner},
     error::{
-        connection_error_creators::CloseStream, internal_error::InternalConnectionError, Code,
-        ConnectionError, StreamError,
+        Code, ConnectionError, StreamError, connection_error_creators::CloseStream,
+        internal_error::InternalConnectionError,
     },
     frame::FrameStream,
     proto::{frame::Frame, headers::Header, push::PushId},

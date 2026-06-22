@@ -1,15 +1,15 @@
 [package]
 name = "http3-rs"
 version = "0.0.8"
-rust-version = "1.74"
+rust-version = { workspace = true }
 authors = [
     "Sean McArthur <sean@seanmonstar.com>",
     "Jean-Christophe BEGUE <jc.begue@pm.me>",
 ]
 license = "MIT"
-edition = "2021"
+edition = { workspace = true }
 documentation = "https://docs.rs/http3-rs"
-repository = "https://github.com/0x676e67/http3-rs"
+repository = { workspace = true }
 readme = "../README.md"
 description = "An async HTTP/3 implementation."
 keywords = ["http3", "quic"]
@@ -43,7 +43,8 @@ quinn = { version = "0.11", default-features = false, features = [
     "ring",
 ] }
 quinn-proto = { version = "0.11", default-features = false }
-rcgen = "0.14"
+rcgen = { workspace = true }
+time = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std"] }
 tokio = { version = "1", features = ["rt", "macros", "io-util", "io-std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = [
