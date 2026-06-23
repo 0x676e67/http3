@@ -126,6 +126,15 @@ impl QpackDecoder {
             .map_err(|_| DecoderError::TooManyBlockedStreams)
     }
 
+    /// Unregisters a request stream that was previously counted as blocked.
+    ///
+    /// This must be paired with a successful [`Self::register_blocked_stream`]
+    /// call. Dropped or newly decoded field sections release their slot so the
+    /// peer can keep using the advertised blocked-stream budget. The debug
+    /// assertion catches local accounting bugs without turning cleanup into a
+    /// connection-level error path.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
     pub(crate) fn unregister_blocked_stream(&self) {
         let result =
             self.0

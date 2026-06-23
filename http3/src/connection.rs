@@ -1074,10 +1074,14 @@ impl DecoderGurad {
         }
     }
 
+    /// Queues a Section Acknowledgment after a dynamic field section is decoded.
+    ///
+    /// The decoder sends this only for field sections whose Required Insert
+    /// Count is not zero. Static-table and literal-only sections do not need an
+    /// acknowledgment.
+    ///
+    /// See [RFC 9204, Section 4.4.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1).
     fn acknowledge(&mut self, dyn_ref: bool) -> Result<(), qpack::DecoderError> {
-        //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
-        //# After processing an encoded field section whose declared Required
-        //# Insert Count is not zero, the decoder emits a Section Acknowledgment.
         if dyn_ref {
             self.decoder.queue_section_acknowledgment(self.stream_id)?;
             self.shared.waker().wake();
