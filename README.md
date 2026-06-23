@@ -16,6 +16,7 @@ More information about this crate can be found in the [crate documentation][docs
 - Client [HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html) implementation.
 - Implements the full [HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html) specifications.
 - Works with different QUIC transport implementations.
+- Passes HTTP/3 interoperability tests.
 - Focus on performance, interoperability, and correctness.
 - Built on [Tokio](https://tokio.rs).
 

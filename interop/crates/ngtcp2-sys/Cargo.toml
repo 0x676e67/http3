@@ -1,0 +1,31 @@
+[package]
+name = "ngtcp2-sys"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+build = "build.rs"
+links = "ngtcp2"
+publish = false
+
+# Metadata used only by build.rs when building the bundled external library.
+[package.metadata.external-dependencies]
+ngtcp2 = { git = "https://github.com/ngtcp2/ngtcp2", branch = "webtransport" }
+
+[lib]
+doctest = false
+
+[dependencies]
+aws-lc-sys = { version = "0.41", features = ["ssl"] }
+libc = "0.2"
+
+[build-dependencies]
+# Used only by the overwrite feature; normal builds use checked-in bindings.
+bindgen = { version = "0.72", optional = true }
+cmake = "0.1"
+toml = "0.9"
+
+[features]
+# Regenerate bindings.rs after updating the bundled ngtcp2 source.
+# Normal builds use the checked-in bindings and do not need libclang.
+# Usage: cargo build -p ngtcp2-sys --features overwrite
+overwrite = ["dep:bindgen"]

@@ -1,0 +1,17 @@
+[package]
+name = "tokio-ngtcp2"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ngtcp2 = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+serial_test = "3.4"

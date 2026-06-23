@@ -1,0 +1,23 @@
+[package]
+name = "ngtcp2"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+[lib]
+name = "ngtcp2"
+path = "src/lib.rs"
+
+[dependencies]
+aws-lc-rs = "1.17"
+aws-lc-sys = { version = "0.41", features = ["ssl"] }
+libc = "0.2"
+nghttp3-sys = { workspace = true }
+ngtcp2-sys = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
+[dev-dependencies]
+rcgen = { workspace = true }

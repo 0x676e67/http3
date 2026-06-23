@@ -1,0 +1,105 @@
+# ngtcp2
+
+Rust wrapper library for ngtcp2 and nghttp3.
+
+## Overview
+
+Wraps the low-level FFI bindings from ngtcp2-sys and nghttp3-sys and exposes a
+more idiomatic Rust API.
+
+## Features
+
+- Integrates ngtcp2 (QUIC) with nghttp3 (HTTP/3).
+- Uses aws-lc as the TLS backend.
+- Provides a memory-safe Rust API.
+
+## Dependencies
+
+- `ngtcp2-sys` - ngtcp2 FFI bindings.
+- `nghttp3-sys` - nghttp3 FFI bindings.
+- `aws-lc-rs` - TLS cryptography.
+
+## Usage
+
+This crate is mainly used for:
+
+- interoperability tests with the local HTTP/3 client;
+- reference QUIC/HTTP/3 code built on ngtcp2/nghttp3.
+
+## ngtcp2 License
+
+<https://github.com/ngtcp2/ngtcp2/blob/main/COPYING>
+
+```text
+The MIT License
+
+Copyright (c) 2019 nghttp3 contributors
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+## nghttp3 License
+
+<https://github.com/ngtcp2/nghttp3/blob/main/COPYING>
+
+```text
+The MIT License
+
+Copyright (c) 2019 nghttp3 contributors
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+## License
+
+Apache License 2.0
+
+```text
+Copyright 2026-2026, Shiguredo Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
