@@ -10,7 +10,7 @@
     clippy::all
 )]
 
-include!("bindings.rs");
+include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 // Implement Send/Sync for nghttp3_vec.
 // SAFETY: nghttp3_vec is used only during writev_stream calls, and pointer

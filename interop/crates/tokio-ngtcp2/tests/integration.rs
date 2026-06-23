@@ -1,6 +1,6 @@
-//! 統合テスト
+//! Integration tests
 //!
-//! HTTP/3 および WebTransport の統合テスト
+//! Integration tests for HTTP/3 and WebTransport
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -9,7 +9,7 @@ use ngtcp2::{Header, Http3SettingsExt, TransportParamsExt};
 use rcgen::generate_simple_self_signed;
 use tokio_ngtcp2::{Client, ClientWebTransportSession, Server, ServerWebTransportSession};
 
-/// テスト用の証明書を動的に生成
+/// Generate a certificate for tests
 fn generate_test_certificate() -> (PathBuf, PathBuf) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -19,7 +19,7 @@ fn generate_test_certificate() -> (PathBuf, PathBuf) {
     let cert_pem = certified_key.cert.pem();
     let key_pem = certified_key.signing_key.serialize_pem();
 
-    // テストごとにユニークなディレクトリを作成
+    // Create a unique directory for each test
     let unique_id = COUNTER.fetch_add(1, Ordering::SeqCst);
     let thread_id = std::thread::current().id();
     let cert_dir =
@@ -37,10 +37,10 @@ fn generate_test_certificate() -> (PathBuf, PathBuf) {
 
 #[tokio::test]
 async fn test_client_creation() {
-    // クライアントを作成できることを確認
+    // Check that a client can be created
     let result = Client::connect("127.0.0.1:14433".parse().unwrap(), "localhost", None, None).await;
 
-    // ソケットバインドは成功するはず
+    // Socket binding should succeed
     assert!(result.is_ok());
 
     let client = result.unwrap();
@@ -51,7 +51,7 @@ async fn test_client_creation() {
 async fn test_server_creation() {
     let (cert_path, key_path) = generate_test_certificate();
 
-    // サーバーを作成
+    // Create the server
     let result = Server::bind(
         "127.0.0.1:0".parse().unwrap(),
         &cert_path,
@@ -64,13 +64,13 @@ async fn test_server_creation() {
     assert!(result.is_ok());
 
     let server = result.unwrap();
-    // エフェメラルポートにバインドされているはず
+    // The server should be bound to an ephemeral port
     assert_ne!(server.local_addr().port(), 0);
 }
 
 #[tokio::test]
 async fn test_webtransport_client_creation() {
-    // WebTransport クライアントを作成できることを確認
+    // Check that a WebTransport client can be created
     let result = ClientWebTransportSession::connect(
         "127.0.0.1:14434".parse().unwrap(),
         "localhost",
@@ -82,14 +82,14 @@ async fn test_webtransport_client_creation() {
 
     let session = result.unwrap();
     assert_eq!(session.remote_addr(), "127.0.0.1:14434".parse().unwrap());
-    assert!(session.session_id().is_none()); // セッションはまだ確立されていない
+    assert!(session.session_id().is_none()); // The session has not been established yet
 }
 
 #[tokio::test]
 async fn test_webtransport_server_creation() {
     let (cert_path, key_path) = generate_test_certificate();
 
-    // WebTransport サーバーを作成
+    // Create the WebTransport server
     let result =
         ServerWebTransportSession::bind("127.0.0.1:0".parse().unwrap(), &cert_path, &key_path)
             .await;
@@ -104,7 +104,7 @@ async fn test_webtransport_server_creation() {
 async fn test_transport_params_webtransport() {
     use ngtcp2::ngtcp2_transport_params;
 
-    // WebTransport 用のトランスポートパラメータを確認
+    // Check WebTransport transport parameters
     let params = ngtcp2_transport_params::default_params().with_datagram(65535);
 
     assert_eq!(params.max_datagram_frame_size, 65535);
@@ -116,7 +116,7 @@ async fn test_transport_params_webtransport() {
 async fn test_h3_settings_webtransport() {
     use ngtcp2::nghttp3_settings;
 
-    // WebTransport 用の HTTP/3 設定を確認
+    // Check WebTransport HTTP/3 settings
     let settings = nghttp3_settings::default_settings().with_webtransport();
 
     assert_eq!(settings.enable_connect_protocol, 1);
@@ -126,7 +126,7 @@ async fn test_h3_settings_webtransport() {
 
 #[test]
 fn test_header_creation() {
-    // HTTP/3 ヘッダーの作成を確認
+    // Check HTTP/3 header creation
     let headers = [
         Header::method("CONNECT"),
         Header::new(b":protocol", b"webtransport"),
@@ -146,7 +146,7 @@ fn test_header_creation() {
 async fn test_client_server_handshake() {
     let (cert_path, key_path) = generate_test_certificate();
 
-    // サーバーを起動
+    // Start the server
     let mut server = Server::bind(
         "127.0.0.1:0".parse().unwrap(),
         &cert_path,
@@ -159,43 +159,43 @@ async fn test_client_server_handshake() {
 
     let server_addr = server.local_addr();
 
-    // サーバーをバックグラウンドで実行 (Send を実装しているので tokio::spawn で実行可能)
+    // Run the server in the background. It implements Send, so tokio::spawn can move it
     let server_handle = tokio::spawn(async move {
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             server.run(|_addr, _event| {
-                // リクエストに応答しない
+                // Do not respond to requests
                 None
             }),
         )
         .await;
 
-        // タイムアウトは OK (テスト終了)
+        // Timeout is OK here because the test is done
         match result {
             Ok(r) => r,
-            Err(_) => Ok(()), // タイムアウト
+            Err(_) => Ok(()), // timeout
         }
     });
 
-    // クライアントを作成
+    // Create the client
     let mut client = Client::connect(server_addr, "localhost", None, None)
         .await
         .expect("client creation failed");
 
-    // ハンドシェイクを実行 (タイムアウトを設定)
+    // Run the handshake with a timeout
     let handshake_result = tokio::time::timeout(Duration::from_secs(5), client.handshake()).await;
 
-    // サーバータスクを終了
+    // Stop the server task
     server_handle.abort();
 
-    // ハンドシェイクの結果を確認
-    // 自己署名証明書なのでハンドシェイクは失敗する可能性がある
+    // Check the handshake result
+    // The handshake may fail with the self-signed certificate
     match handshake_result {
         Ok(Ok(())) => {
             println!("Handshake successful");
         }
         Ok(Err(e)) => {
-            // TLS エラーなど (自己署名証明書では期待される動作)
+            // TLS errors are expected with the self-signed certificate
             println!("Handshake error (expected with self-signed cert): {:?}", e);
         }
         Err(_) => {
@@ -208,7 +208,7 @@ async fn test_client_server_handshake() {
 async fn test_server_is_send() {
     let (cert_path, key_path) = generate_test_certificate();
 
-    // Server が Send であることを確認するテスト
+    // Test that Server is Send
     let server = Server::bind(
         "127.0.0.1:0".parse().unwrap(),
         &cert_path,
@@ -219,10 +219,10 @@ async fn test_server_is_send() {
     .await
     .expect("server creation failed");
 
-    // tokio::spawn で別スレッドに移動できることを確認
+    // Check that it can be moved to another thread with tokio::spawn
     let handle = tokio::spawn(async move {
         let _addr = server.local_addr();
-        // サーバーを移動できたことを確認
+        // Check that the server was moved
         true
     });
 
@@ -232,15 +232,15 @@ async fn test_server_is_send() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_client_is_send() {
-    // Client が Send であることを確認するテスト
+    // Test that Client is Send
     let client = Client::connect("127.0.0.1:14435".parse().unwrap(), "localhost", None, None)
         .await
         .expect("client creation failed");
 
-    // tokio::spawn で別スレッドに移動できることを確認
+    // Check that it can be moved to another thread with tokio::spawn
     let handle = tokio::spawn(async move {
         let _addr = client.local_addr();
-        // クライアントを移動できたことを確認
+        // Check that the client was moved
         true
     });
 

@@ -961,6 +961,7 @@ fn create_callbacks() -> nghttp3_callbacks {
         recv_settings2: None,
         recv_wt_data: Some(on_recv_wt_data),
         wt_data_stream_open: Some(on_wt_data_stream_open),
+        recv_wt_close_session: None,
     }
 }
 
