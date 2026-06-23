@@ -43,3 +43,6 @@ jobs:
 
       - name: Run interop tests
         run: cargo test -p interop
+
+      - name: Run real public interop tests
+        run: cargo test -p interop --test client -- --ignored --nocapture --test-threads=1
