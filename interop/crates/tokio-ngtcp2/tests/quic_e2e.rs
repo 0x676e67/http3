@@ -1,6 +1,6 @@
-//! QUIC クライアント/サーバー I/O テスト
+//! QUIC client/server I/O tests
 //!
-//! 実際のネットワーク I/O を使用した QUIC ハンドシェイクテスト
+//! QUIC handshake tests using real network I/O
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -10,45 +10,47 @@ use tokio::time::timeout;
 
 use tokio_ngtcp2::{Client, Server};
 
-/// テスト用の証明書と秘密鍵を動的に生成
+/// Generate a certificate and private key for tests
 fn generate_test_certs() -> (PathBuf, PathBuf) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let unique_id = COUNTER.fetch_add(1, Ordering::SeqCst);
     let temp_dir =
         std::env::temp_dir().join(format!("quic_test_{}_{}", std::process::id(), unique_id));
-    std::fs::create_dir_all(&temp_dir).expect("一時ディレクトリ作成失敗");
+    std::fs::create_dir_all(&temp_dir).expect("failed to create temporary directory");
 
     let cert_path = temp_dir.join("cert.pem");
     let key_path = temp_dir.join("key.pem");
 
-    // 証明書パラメータを設定
-    let mut params =
-        CertificateParams::new(vec!["localhost".to_string()]).expect("CertificateParams 作成失敗");
+    // Set certificate parameters
+    let mut params = CertificateParams::new(vec!["localhost".to_string()])
+        .expect("failed to create CertificateParams");
     params.distinguished_name.push(
         rcgen::DnType::CommonName,
         rcgen::DnValue::Utf8String("localhost".to_string()),
     );
 
-    // 鍵ペアを生成
-    let key_pair = KeyPair::generate().expect("鍵ペア生成失敗");
+    // Generate a key pair
+    let key_pair = KeyPair::generate().expect("failed to generate key pair");
 
-    // 自己署名証明書を生成
-    let cert = params.self_signed(&key_pair).expect("証明書生成失敗");
+    // Generate a self-signed certificate
+    let cert = params
+        .self_signed(&key_pair)
+        .expect("failed to generate certificate");
 
-    // PEM 形式で保存
-    std::fs::write(&cert_path, cert.pem()).expect("証明書ファイル書き込み失敗");
-    std::fs::write(&key_path, key_pair.serialize_pem()).expect("秘密鍵ファイル書き込み失敗");
+    // Save in PEM format
+    std::fs::write(&cert_path, cert.pem()).expect("failed to write certificate file");
+    std::fs::write(&key_path, key_pair.serialize_pem()).expect("failed to write private key file");
 
     (cert_path, key_path)
 }
 
-/// QUIC ハンドシェイクテスト (証明書検証なし)
+/// QUIC handshake test without certificate validation
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_quic_handshake_insecure() {
     let (cert_path, key_path) = generate_test_certs();
 
-    // サーバーを起動
+    // Start the server
     let mut server = Server::bind(
         "127.0.0.1:0".parse().unwrap(),
         &cert_path,
@@ -57,18 +59,18 @@ async fn test_quic_handshake_insecure() {
         None,
     )
     .await
-    .expect("サーバー作成失敗");
+    .expect("failed to create server");
 
     let server_addr = server.local_addr();
-    eprintln!("[test] サーバー起動: {}", server_addr);
+    eprintln!("[test] server started: {}", server_addr);
 
-    // サーバータスク
+    // Server task
     let server_task = tokio::spawn(async move {
         let result = timeout(
             Duration::from_secs(10),
             server.run(|addr, event| {
                 eprintln!(
-                    "[server] イベント受信: addr = {}, event = {:?}",
+                    "[server] event received: addr = {}, event = {:?}",
                     addr, event
                 );
                 None
@@ -79,28 +81,28 @@ async fn test_quic_handshake_insecure() {
         match result {
             Ok(r) => r,
             Err(_) => {
-                eprintln!("[server] タイムアウト");
+                eprintln!("[server] timeout");
                 Ok(())
             }
         }
     });
 
-    // クライアントを作成 (証明書検証なし)
+    // Create the client (without certificate verification)
     let client_result = timeout(Duration::from_secs(10), async {
         let mut client = Client::connect_insecure_default(server_addr, "localhost")
             .await
-            .expect("クライアント作成失敗");
+            .expect("failed to create client");
 
-        eprintln!("[client] ハンドシェイク開始");
+        eprintln!("[client] handshake started");
 
-        // ハンドシェイクを実行
+        // Run the handshake
         match client.handshake().await {
             Ok(()) => {
-                eprintln!("[client] ハンドシェイク成功");
+                eprintln!("[client] handshake succeeded");
                 true
             }
             Err(e) => {
-                eprintln!("[client] ハンドシェイクエラー: {:?}", e);
+                eprintln!("[client] handshake error: {:?}", e);
                 false
             }
         }
@@ -111,21 +113,21 @@ async fn test_quic_handshake_insecure() {
 
     match client_result {
         Ok(success) => {
-            assert!(success, "ハンドシェイクが成功するべき");
-            eprintln!("[test] QUIC ハンドシェイクテスト成功");
+            assert!(success, "handshake should succeed");
+            eprintln!("[test] QUIC handshake test succeeded");
         }
         Err(_) => {
-            panic!("テストタイムアウト");
+            panic!("test timed out");
         }
     }
 }
 
-/// 複数クライアントの同時接続テスト
+/// Concurrent multi-client connection test
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_quic_multiple_clients() {
     let (cert_path, key_path) = generate_test_certs();
 
-    // サーバーを起動
+    // Start the server
     let mut server = Server::bind(
         "127.0.0.1:0".parse().unwrap(),
         &cert_path,
@@ -134,18 +136,18 @@ async fn test_quic_multiple_clients() {
         None,
     )
     .await
-    .expect("サーバー作成失敗");
+    .expect("failed to create server");
 
     let server_addr = server.local_addr();
-    eprintln!("[test] サーバー起動: {}", server_addr);
+    eprintln!("[test] server started: {}", server_addr);
 
-    // サーバータスク
+    // Server task
     let server_task = tokio::spawn(async move {
         let result = timeout(
             Duration::from_secs(10),
             server.run(|addr, event| {
                 eprintln!(
-                    "[server] イベント受信: addr = {}, event = {:?}",
+                    "[server] event received: addr = {}, event = {:?}",
                     addr, event
                 );
                 None
@@ -159,7 +161,7 @@ async fn test_quic_multiple_clients() {
         }
     });
 
-    // 複数クライアントを並行して接続
+    // Connect multiple clients concurrently
     let client_count = 3;
     let mut handles = Vec::new();
 
@@ -168,21 +170,21 @@ async fn test_quic_multiple_clients() {
         let handle = tokio::spawn(async move {
             let mut client = Client::connect_insecure_default(addr, "localhost")
                 .await
-                .expect("クライアント作成失敗");
+                .expect("failed to create client");
 
-            eprintln!("[client {}] ハンドシェイク開始", i);
+            eprintln!("[client {}] handshake started", i);
 
             match timeout(Duration::from_secs(5), client.handshake()).await {
                 Ok(Ok(())) => {
-                    eprintln!("[client {}] ハンドシェイク成功", i);
+                    eprintln!("[client {}] handshake succeeded", i);
                     true
                 }
                 Ok(Err(e)) => {
-                    eprintln!("[client {}] ハンドシェイクエラー: {:?}", i, e);
+                    eprintln!("[client {}] handshake error: {:?}", i, e);
                     false
                 }
                 Err(_) => {
-                    eprintln!("[client {}] タイムアウト", i);
+                    eprintln!("[client {}] timeout", i);
                     false
                 }
             }
@@ -190,7 +192,7 @@ async fn test_quic_multiple_clients() {
         handles.push(handle);
     }
 
-    // 全クライアントの結果を待つ
+    // Wait for all client results
     let mut success_count = 0;
     for handle in handles {
         if handle.await.unwrap_or(false) {
@@ -201,21 +203,18 @@ async fn test_quic_multiple_clients() {
     server_task.abort();
 
     eprintln!(
-        "[test] 成功したクライアント: {}/{}",
+        "[test] successful clients: {}/{}",
         success_count, client_count
     );
-    assert!(
-        success_count >= 1,
-        "少なくとも 1 クライアントが成功するべき"
-    );
+    assert!(success_count >= 1, "at least one client should succeed");
 }
 
-/// クライアント/サーバーの正常終了テスト
+/// Client/server clean shutdown test
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_quic_connection_close() {
     let (cert_path, key_path) = generate_test_certs();
 
-    // サーバーを起動
+    // Start the server
     let mut server = Server::bind(
         "127.0.0.1:0".parse().unwrap(),
         &cert_path,
@@ -224,32 +223,29 @@ async fn test_quic_connection_close() {
         None,
     )
     .await
-    .expect("サーバー作成失敗");
+    .expect("failed to create server");
 
     let server_addr = server.local_addr();
 
-    // サーバータスク
+    // Server task
     let server_task = tokio::spawn(async move {
         let _ = timeout(Duration::from_secs(5), server.run(|_addr, _event| None)).await;
     });
 
-    // クライアントを作成してハンドシェイク
+    // Create the clienthandshake
     let mut client = Client::connect_insecure_default(server_addr, "localhost")
         .await
-        .expect("クライアント作成失敗");
+        .expect("failed to create client");
 
-    // ハンドシェイク
+    // handshake
     let handshake_result = timeout(Duration::from_secs(5), client.handshake()).await;
-    assert!(
-        handshake_result.is_ok(),
-        "ハンドシェイクがタイムアウトしないこと"
-    );
+    assert!(handshake_result.is_ok(), "handshake should not time out");
 
-    // クライアントをドロップ (接続クローズ)
+    // Drop the client to close the connection
     drop(client);
 
-    // サーバーを終了
+    // Stop the server
     server_task.abort();
 
-    eprintln!("[test] 接続クローズテスト完了");
+    eprintln!("[test] connection close test completed");
 }

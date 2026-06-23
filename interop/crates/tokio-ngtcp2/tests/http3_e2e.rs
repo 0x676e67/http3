@@ -1,6 +1,6 @@
-//! HTTP/3 クライアント/サーバー I/O テスト
+//! HTTP/3 client/server I/O tests
 //!
-//! 実際のネットワーク I/O を使用した HTTP/3 リクエスト/レスポンステスト
+//! HTTP/3 request/response tests using real network I/O
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,40 +14,42 @@ use tokio::time::timeout;
 use ngtcp2::{Header, Http3Event};
 use tokio_ngtcp2::{Client, Server};
 
-/// テスト用の証明書と秘密鍵を動的に生成
+/// Generate a certificate and private key for tests
 fn generate_test_certs() -> (PathBuf, PathBuf) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let unique_id = COUNTER.fetch_add(1, Ordering::SeqCst);
     let temp_dir =
         std::env::temp_dir().join(format!("http3_test_{}_{}", std::process::id(), unique_id));
-    std::fs::create_dir_all(&temp_dir).expect("一時ディレクトリ作成失敗");
+    std::fs::create_dir_all(&temp_dir).expect("failed to create temporary directory");
 
     let cert_path = temp_dir.join("cert.pem");
     let key_path = temp_dir.join("key.pem");
 
-    // 証明書パラメータを設定
-    let mut params =
-        CertificateParams::new(vec!["localhost".to_string()]).expect("CertificateParams 作成失敗");
+    // Set certificate parameters
+    let mut params = CertificateParams::new(vec!["localhost".to_string()])
+        .expect("failed to create CertificateParams");
     params.distinguished_name.push(
         rcgen::DnType::CommonName,
         rcgen::DnValue::Utf8String("localhost".to_string()),
     );
 
-    // 鍵ペアを生成
-    let key_pair = KeyPair::generate().expect("鍵ペア生成失敗");
+    // Generate a key pair
+    let key_pair = KeyPair::generate().expect("failed to generate key pair");
 
-    // 自己署名証明書を生成
-    let cert = params.self_signed(&key_pair).expect("証明書生成失敗");
+    // Generate a self-signed certificate
+    let cert = params
+        .self_signed(&key_pair)
+        .expect("failed to generate certificate");
 
-    // PEM 形式で保存
-    std::fs::write(&cert_path, cert.pem()).expect("証明書ファイル書き込み失敗");
-    std::fs::write(&key_path, key_pair.serialize_pem()).expect("秘密鍵ファイル書き込み失敗");
+    // Save in PEM format
+    std::fs::write(&cert_path, cert.pem()).expect("failed to write certificate file");
+    std::fs::write(&key_path, key_pair.serialize_pem()).expect("failed to write private key file");
 
     (cert_path, key_path)
 }
 
-/// HTTP/3 GET リクエスト/レスポンステスト
+/// HTTP/3 GET request/response test
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_http3_get_request() {
@@ -56,7 +58,7 @@ async fn test_http3_get_request() {
     let request_received = Arc::new(AtomicBool::new(false));
     let request_received_clone = request_received.clone();
 
-    // サーバーを起動
+    // Start the server
     let mut server = Server::bind(
         "127.0.0.1:0".parse().unwrap(),
         &cert_path,
@@ -65,17 +67,17 @@ async fn test_http3_get_request() {
         None,
     )
     .await
-    .expect("サーバー作成失敗");
+    .expect("failed to create server");
 
     let server_addr = server.local_addr();
-    eprintln!("[test] サーバー起動: {}", server_addr);
+    eprintln!("[test] server started: {}", server_addr);
 
-    // サーバータスク
+    // Server task
     let server_task = tokio::spawn(async move {
         let result = timeout(
             Duration::from_secs(10),
             server.run(move |addr, event| {
-                eprintln!("[server] イベント受信: addr = {}", addr);
+                eprintln!("[server] event received: addr = {}", addr);
                 match event {
                     Http3Event::HeadersBegin { stream_id } => {
                         eprintln!("[server] HeadersBegin: stream_id = {}", stream_id);
@@ -96,7 +98,7 @@ async fn test_http3_get_request() {
                             stream_id, fin
                         );
                         request_received_clone.store(true, Ordering::SeqCst);
-                        // 200 OK レスポンスを返す
+                        // 200 OK response
                         Some((vec![Header::status(200)], Vec::new()))
                     }
                     Http3Event::Data { stream_id, data } => {
@@ -119,23 +121,23 @@ async fn test_http3_get_request() {
         match result {
             Ok(r) => r,
             Err(_) => {
-                eprintln!("[server] タイムアウト");
+                eprintln!("[server] timeout");
                 Ok(())
             }
         }
     });
 
-    // クライアントを作成
+    // Create the client
     let client_result = timeout(Duration::from_secs(10), async {
         let mut client = Client::connect_insecure_default(server_addr, "localhost")
             .await
-            .expect("クライアント作成失敗");
+            .expect("failed to create client");
 
-        // ハンドシェイク
-        client.handshake().await.expect("ハンドシェイク失敗");
-        eprintln!("[client] ハンドシェイク完了");
+        // handshake
+        client.handshake().await.expect("handshake failed");
+        eprintln!("[client] handshake completed");
 
-        // GET リクエストを送信
+        // Send a GET request
         let headers = vec![
             Header::method("GET"),
             Header::scheme("https"),
@@ -143,13 +145,15 @@ async fn test_http3_get_request() {
             Header::path("/"),
         ];
 
-        let stream_id = client.send_request(&headers).expect("リクエスト送信失敗");
-        eprintln!("[client] リクエスト送信: stream_id = {}", stream_id);
+        let stream_id = client
+            .send_request(&headers)
+            .expect("failed to send request");
+        eprintln!("[client] request sent: stream_id = {}", stream_id);
 
-        // HTTP/3 データを送信
-        client.flush().await.expect("フラッシュ失敗");
+        // Send HTTP/3 data
+        client.flush().await.expect("flush failed");
 
-        // レスポンスを待つ (簡易実装: 少し待機)
+        // Wait for the response with a short sleep
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         stream_id
@@ -161,21 +165,21 @@ async fn test_http3_get_request() {
     match client_result {
         Ok(stream_id) => {
             eprintln!(
-                "[test] HTTP/3 GET リクエストテスト完了: stream_id = {}",
+                "[test] HTTP/3 GET request test completed: stream_id = {}",
                 stream_id
             );
             assert!(
                 request_received.load(Ordering::SeqCst),
-                "サーバーがリクエストを受信するべき"
+                "server should receive the request"
             );
         }
         Err(_) => {
-            panic!("テストタイムアウト");
+            panic!("test timed out");
         }
     }
 }
 
-/// HTTP/3 POST リクエストテスト
+/// HTTP/3 POST request test
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_http3_post_request() {
@@ -184,7 +188,7 @@ async fn test_http3_post_request() {
     let request_received = Arc::new(AtomicBool::new(false));
     let request_received_clone = request_received.clone();
 
-    // サーバーを起動
+    // Start the server
     let mut server = Server::bind(
         "127.0.0.1:0".parse().unwrap(),
         &cert_path,
@@ -193,17 +197,17 @@ async fn test_http3_post_request() {
         None,
     )
     .await
-    .expect("サーバー作成失敗");
+    .expect("failed to create server");
 
     let server_addr = server.local_addr();
 
-    // サーバータスク
+    // Server task
     let server_task = tokio::spawn(async move {
         let _ = timeout(
             Duration::from_secs(10),
             server.run(move |_addr, event| match event {
                 Http3Event::HeadersEnd { stream_id, .. } => {
-                    eprintln!("[server] POST リクエスト受信: stream_id = {}", stream_id);
+                    eprintln!("[server] POST request received: stream_id = {}", stream_id);
                     request_received_clone.store(true, Ordering::SeqCst);
                     Some((vec![Header::status(201)], Vec::new()))
                 }
@@ -213,16 +217,16 @@ async fn test_http3_post_request() {
         .await;
     });
 
-    // クライアントを作成
+    // Create the client
     let client_result = timeout(Duration::from_secs(10), async {
         let mut client = Client::connect_insecure_default(server_addr, "localhost")
             .await
-            .expect("クライアント作成失敗");
+            .expect("failed to create client");
 
-        // ハンドシェイク
-        client.handshake().await.expect("ハンドシェイク失敗");
+        // handshake
+        client.handshake().await.expect("handshake failed");
 
-        // POST リクエストを送信
+        // Send a POST request
         let headers = vec![
             Header::method("POST"),
             Header::scheme("https"),
@@ -231,11 +235,13 @@ async fn test_http3_post_request() {
             Header::new(b"content-type", b"application/json"),
         ];
 
-        let stream_id = client.send_request(&headers).expect("リクエスト送信失敗");
-        eprintln!("[client] POST リクエスト送信: stream_id = {}", stream_id);
+        let stream_id = client
+            .send_request(&headers)
+            .expect("failed to send request");
+        eprintln!("[client] POST request sent: stream_id = {}", stream_id);
 
-        // HTTP/3 データを送信
-        client.flush().await.expect("フラッシュ失敗");
+        // Send HTTP/3 data
+        client.flush().await.expect("flush failed");
 
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -245,16 +251,16 @@ async fn test_http3_post_request() {
 
     server_task.abort();
 
-    assert!(client_result.is_ok(), "テストがタイムアウトしないこと");
+    assert!(client_result.is_ok(), "test should not time out");
     assert!(
         request_received.load(Ordering::SeqCst),
-        "サーバーがリクエストを受信するべき"
+        "server should receive the request"
     );
 
-    eprintln!("[test] HTTP/3 POST リクエストテスト完了");
+    eprintln!("[test] HTTP/3 POST request test completed");
 }
 
-/// 複数リクエストの並行処理テスト
+/// Concurrent request handling test
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_http3_concurrent_requests() {
@@ -264,7 +270,7 @@ async fn test_http3_concurrent_requests() {
     let request_count = Arc::new(AtomicUsize::new(0));
     let request_count_clone = request_count.clone();
 
-    // サーバーを起動
+    // Start the server
     let mut server = Server::bind(
         "127.0.0.1:0".parse().unwrap(),
         &cert_path,
@@ -273,11 +279,11 @@ async fn test_http3_concurrent_requests() {
         None,
     )
     .await
-    .expect("サーバー作成失敗");
+    .expect("failed to create server");
 
     let server_addr = server.local_addr();
 
-    // サーバータスク
+    // Server task
     let server_task = tokio::spawn(async move {
         let _ = timeout(
             Duration::from_secs(10),
@@ -285,7 +291,7 @@ async fn test_http3_concurrent_requests() {
                 if let Http3Event::HeadersEnd { stream_id, .. } = event {
                     let count = request_count_clone.fetch_add(1, Ordering::SeqCst) + 1;
                     eprintln!(
-                        "[server] リクエスト {} 受信: stream_id = {}",
+                        "[server] request {} received: stream_id = {}",
                         count, stream_id
                     );
                     Some((vec![Header::status(200)], Vec::new()))
@@ -297,16 +303,16 @@ async fn test_http3_concurrent_requests() {
         .await;
     });
 
-    // クライアントを作成して複数リクエストを送信
+    // Create the client and send multiple requests
     let client_result = timeout(Duration::from_secs(10), async {
         let mut client = Client::connect_insecure_default(server_addr, "localhost")
             .await
-            .expect("クライアント作成失敗");
+            .expect("failed to create client");
 
-        // ハンドシェイク
-        client.handshake().await.expect("ハンドシェイク失敗");
+        // handshake
+        client.handshake().await.expect("handshake failed");
 
-        // 複数のリクエストを送信
+        // Send multiple requests
         let request_paths = ["/", "/api/users", "/api/data"];
         let mut stream_ids = Vec::new();
 
@@ -318,16 +324,18 @@ async fn test_http3_concurrent_requests() {
                 Header::path(path),
             ];
 
-            let stream_id = client.send_request(&headers).expect("リクエスト送信失敗");
+            let stream_id = client
+                .send_request(&headers)
+                .expect("failed to send request");
             stream_ids.push(stream_id);
             eprintln!(
-                "[client] リクエスト送信: path = {}, stream_id = {}",
+                "[client] request sent: path = {}, stream_id = {}",
                 path, stream_id
             );
         }
 
-        // HTTP/3 データを送信
-        client.flush().await.expect("フラッシュ失敗");
+        // Send HTTP/3 data
+        client.flush().await.expect("flush failed");
 
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -339,20 +347,20 @@ async fn test_http3_concurrent_requests() {
 
     match client_result {
         Ok(stream_ids) => {
-            eprintln!("[test] 送信したリクエスト数: {}", stream_ids.len());
+            eprintln!("[test] requests sent: {}", stream_ids.len());
             let received = request_count.load(Ordering::SeqCst);
-            eprintln!("[test] サーバーが受信したリクエスト数: {}", received);
-            assert!(received >= 1, "少なくとも 1 リクエストが受信されるべき");
+            eprintln!("[test] requests received by server: {}", received);
+            assert!(received >= 1, "at least one request should be received");
         }
         Err(_) => {
-            panic!("テストタイムアウト");
+            panic!("test timed out");
         }
     }
 
-    eprintln!("[test] HTTP/3 並行リクエストテスト完了");
+    eprintln!("[test] HTTP/3 concurrentrequest test completed");
 }
 
-/// HTTP/3 POST リクエスト + JSON ボディ送信テスト
+/// HTTP/3 POST request with JSON body test
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_http3_request_with_body() {
@@ -363,7 +371,7 @@ async fn test_http3_request_with_body() {
     let received_body = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let received_body_clone = received_body.clone();
 
-    // サーバーを起動
+    // Start the server
     let mut server = Server::bind(
         "127.0.0.1:0".parse().unwrap(),
         &cert_path,
@@ -372,12 +380,12 @@ async fn test_http3_request_with_body() {
         None,
     )
     .await
-    .expect("サーバー作成失敗");
+    .expect("failed to create server");
 
     let server_addr = server.local_addr();
-    eprintln!("[test] サーバー起動: {}", server_addr);
+    eprintln!("[test] server started: {}", server_addr);
 
-    // サーバータスク
+    // Server task
     let server_task = tokio::spawn(async move {
         let _ = timeout(
             Duration::from_secs(10),
@@ -385,7 +393,7 @@ async fn test_http3_request_with_body() {
                 match event {
                     Http3Event::Data { stream_id, data } => {
                         eprintln!(
-                            "[server] Data 受信: stream_id = {}, data = {:?}",
+                            "[server] Data received: stream_id = {}, data = {:?}",
                             stream_id,
                             String::from_utf8_lossy(&data)
                         );
@@ -395,12 +403,12 @@ async fn test_http3_request_with_body() {
                     }
                     Http3Event::HeadersEnd { stream_id, .. } => {
                         eprintln!("[server] HeadersEnd: stream_id = {}", stream_id);
-                        // Data を受信するまでレスポンスを遅延
+                        // Delay the response until Data is received
                         None
                     }
                     Http3Event::StreamEnd { stream_id } => {
                         eprintln!("[server] StreamEnd: stream_id = {}", stream_id);
-                        // ストリーム終了時にレスポンスを返す
+                        // Return the response when the stream ends
                         Some((vec![Header::status(200)], Vec::new()))
                     }
                     _ => None,
@@ -410,18 +418,18 @@ async fn test_http3_request_with_body() {
         .await;
     });
 
-    // クライアントを作成
+    // Create the client
     let client_result = timeout(Duration::from_secs(10), async {
         let mut client = Client::connect_insecure_default(server_addr, "localhost")
             .await
-            .expect("クライアント作成失敗");
+            .expect("failed to create client");
 
-        // ハンドシェイク
-        client.handshake().await.expect("ハンドシェイク失敗");
-        eprintln!("[client] ハンドシェイク完了");
+        // handshake
+        client.handshake().await.expect("handshake failed");
+        eprintln!("[client] handshake completed");
 
-        // POST リクエストをボディ付きで送信
-        let body = br#"{"name": "test", "value": 123}"#.to_vec();
+        // Send a POST request with a body
+        let body = br#"{"name":"test","value": 123}"#.to_vec();
         let headers = vec![
             Header::method("POST"),
             Header::scheme("https"),
@@ -433,13 +441,13 @@ async fn test_http3_request_with_body() {
 
         let stream_id = client
             .send_request_with_body(&headers, body)
-            .expect("リクエスト送信失敗");
-        eprintln!("[client] POST リクエスト送信: stream_id = {}", stream_id);
+            .expect("failed to send request");
+        eprintln!("[client] POST request sent: stream_id = {}", stream_id);
 
-        // HTTP/3 データを送信
-        client.flush().await.expect("フラッシュ失敗");
+        // Send HTTP/3 data
+        client.flush().await.expect("flush failed");
 
-        // サーバーがデータを処理する時間を確保
+        // Give the server time to process data
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         stream_id
@@ -448,23 +456,23 @@ async fn test_http3_request_with_body() {
 
     server_task.abort();
 
-    assert!(client_result.is_ok(), "テストがタイムアウトしないこと");
+    assert!(client_result.is_ok(), "test should not time out");
     assert!(
         body_received.load(Ordering::SeqCst),
-        "サーバーがリクエストボディを受信するべき"
+        "server should receive the request body"
     );
 
     let body_data = received_body.lock().unwrap();
-    assert!(!body_data.is_empty(), "受信したボディが空でないこと");
+    assert!(!body_data.is_empty(), "received body should not be empty");
     eprintln!(
-        "[test] 受信したボディ: {:?}",
+        "[test] received body: {:?}",
         String::from_utf8_lossy(&body_data)
     );
 
-    eprintln!("[test] HTTP/3 POST リクエスト + ボディ送信テスト完了");
+    eprintln!("[test] HTTP/3 POST request + body send test completed");
 }
 
-/// HTTP/3 レスポンスボディ受信テスト
+/// HTTP/3 response body receive test
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_http3_response_body() {
@@ -473,7 +481,7 @@ async fn test_http3_response_body() {
     let response_body = b"Hello, HTTP/3 World!".to_vec();
     let expected_body = response_body.clone();
 
-    // サーバーを起動
+    // Start the server
     let mut server = Server::bind(
         "127.0.0.1:0".parse().unwrap(),
         &cert_path,
@@ -482,19 +490,19 @@ async fn test_http3_response_body() {
         None,
     )
     .await
-    .expect("サーバー作成失敗");
+    .expect("failed to create server");
 
     let server_addr = server.local_addr();
-    eprintln!("[test] サーバー起動: {}", server_addr);
+    eprintln!("[test] server started: {}", server_addr);
 
-    // サーバータスク (ボディ付きレスポンスを返す)
+    // Server task (Return a response with a body)
     let server_task = tokio::spawn(async move {
         let _ = timeout(
             Duration::from_secs(10),
             server.run(move |_addr, event| {
                 if let Http3Event::HeadersEnd { stream_id, .. } = event {
-                    eprintln!("[server] リクエスト受信: stream_id = {}", stream_id);
-                    // ボディ付きレスポンスを返す
+                    eprintln!("[server] request received: stream_id = {}", stream_id);
+                    // Return a response with a body
                     let headers = vec![
                         Header::status(200),
                         Header::new(b"content-type", b"text/plain"),
@@ -507,17 +515,17 @@ async fn test_http3_response_body() {
         .await;
     });
 
-    // クライアントを作成してレスポンスボディを受信
+    // Create a client and receive the response body
     let client_result = timeout(Duration::from_secs(10), async {
         let mut client = Client::connect_insecure_default(server_addr, "localhost")
             .await
-            .expect("クライアント作成失敗");
+            .expect("failed to create client");
 
-        // ハンドシェイク
-        client.handshake().await.expect("ハンドシェイク失敗");
-        eprintln!("[client] ハンドシェイク完了");
+        // handshake
+        client.handshake().await.expect("handshake failed");
+        eprintln!("[client] handshake completed");
 
-        // GET リクエストを送信
+        // Send a GET request
         let headers = vec![
             Header::method("GET"),
             Header::scheme("https"),
@@ -525,13 +533,15 @@ async fn test_http3_response_body() {
             Header::path("/"),
         ];
 
-        let stream_id = client.send_request(&headers).expect("リクエスト送信失敗");
-        eprintln!("[client] リクエスト送信: stream_id = {}", stream_id);
+        let stream_id = client
+            .send_request(&headers)
+            .expect("failed to send request");
+        eprintln!("[client] request sent: stream_id = {}", stream_id);
 
-        // HTTP/3 データを送信
-        client.flush().await.expect("フラッシュ失敗");
+        // Send HTTP/3 data
+        client.flush().await.expect("flush failed");
 
-        // レスポンスを受信
+        // Receive responses
         let mut received_body = Vec::new();
         let mut response_received = false;
 
@@ -539,20 +549,23 @@ async fn test_http3_response_body() {
             client
                 .recv(Duration::from_millis(100))
                 .await
-                .expect("受信失敗");
+                .expect("receive failed");
 
             while let Some(event) = client.poll() {
                 match event {
                     Http3Event::Data { data, .. } => {
-                        eprintln!("[client] Data 受信: {:?}", String::from_utf8_lossy(&data));
+                        eprintln!(
+                            "[client] Data received: {:?}",
+                            String::from_utf8_lossy(&data)
+                        );
                         received_body.extend_from_slice(&data);
                     }
                     Http3Event::HeadersEnd { .. } => {
-                        eprintln!("[client] HeadersEnd 受信");
+                        eprintln!("[client] HeadersEnd received");
                         response_received = true;
                     }
                     Http3Event::StreamEnd { .. } => {
-                        eprintln!("[client] StreamEnd 受信");
+                        eprintln!("[client] StreamEnd received");
                     }
                     _ => {}
                 }
@@ -572,23 +585,23 @@ async fn test_http3_response_body() {
     match client_result {
         Ok(received_body) => {
             eprintln!(
-                "[test] 受信したボディ: {:?}",
+                "[test] received body: {:?}",
                 String::from_utf8_lossy(&received_body)
             );
             assert_eq!(
                 received_body, expected_body,
-                "受信したボディが期待値と一致するべき"
+                "received body should match the expected value"
             );
         }
         Err(_) => {
-            panic!("テストタイムアウト");
+            panic!("test timed out");
         }
     }
 
-    eprintln!("[test] HTTP/3 レスポンスボディ受信テスト完了");
+    eprintln!("[test] HTTP/3 response body receive test completed");
 }
 
-/// HTTP/3 ストリーム多重化テスト
+/// HTTP/3 stream multiplexing test
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_http3_stream_multiplexing() {
@@ -598,7 +611,7 @@ async fn test_http3_stream_multiplexing() {
     let request_count = Arc::new(AtomicUsize::new(0));
     let request_count_clone = request_count.clone();
 
-    // サーバーを起動
+    // Start the server
     let mut server = Server::bind(
         "127.0.0.1:0".parse().unwrap(),
         &cert_path,
@@ -607,12 +620,12 @@ async fn test_http3_stream_multiplexing() {
         None,
     )
     .await
-    .expect("サーバー作成失敗");
+    .expect("failed to create server");
 
     let server_addr = server.local_addr();
-    eprintln!("[test] サーバー起動: {}", server_addr);
+    eprintln!("[test] server started: {}", server_addr);
 
-    // サーバータスク
+    // Server task
     let server_task = tokio::spawn(async move {
         let _ = timeout(
             Duration::from_secs(10),
@@ -620,10 +633,10 @@ async fn test_http3_stream_multiplexing() {
                 if let Http3Event::HeadersEnd { stream_id, .. } = event {
                     let count = request_count_clone.fetch_add(1, Ordering::SeqCst) + 1;
                     eprintln!(
-                        "[server] リクエスト {} 受信: stream_id = {}",
+                        "[server] request {} received: stream_id = {}",
                         count, stream_id
                     );
-                    // 各リクエストに対してユニークなレスポンスを返す
+                    // Return a unique response for each request
                     let body = format!("Response for stream {}", stream_id).into_bytes();
                     let headers = vec![
                         Header::status(200),
@@ -637,17 +650,17 @@ async fn test_http3_stream_multiplexing() {
         .await;
     });
 
-    // クライアントを作成して複数のストリームを同時に開く
+    // Create a client and open multiple streams concurrently
     let client_result = timeout(Duration::from_secs(10), async {
         let mut client = Client::connect_insecure_default(server_addr, "localhost")
             .await
-            .expect("クライアント作成失敗");
+            .expect("failed to create client");
 
-        // ハンドシェイク
-        client.handshake().await.expect("ハンドシェイク失敗");
-        eprintln!("[client] ハンドシェイク完了");
+        // handshake
+        client.handshake().await.expect("handshake failed");
+        eprintln!("[client] handshake completed");
 
-        // 3 つのリクエストを同時に送信
+        // Send three requests concurrently
         let paths = ["/stream1", "/stream2", "/stream3"];
         let mut stream_ids = Vec::new();
 
@@ -659,18 +672,20 @@ async fn test_http3_stream_multiplexing() {
                 Header::path(path),
             ];
 
-            let stream_id = client.send_request(&headers).expect("リクエスト送信失敗");
+            let stream_id = client
+                .send_request(&headers)
+                .expect("failed to send request");
             stream_ids.push(stream_id);
             eprintln!(
-                "[client] リクエスト送信: path = {}, stream_id = {}",
+                "[client] request sent: path = {}, stream_id = {}",
                 path, stream_id
             );
         }
 
-        // HTTP/3 データを送信
-        client.flush().await.expect("フラッシュ失敗");
+        // Send HTTP/3 data
+        client.flush().await.expect("flush failed");
 
-        // レスポンスを受信
+        // Receive responses
         let mut responses_received = 0;
         let mut bodies_received = std::collections::HashMap::new();
 
@@ -678,13 +693,13 @@ async fn test_http3_stream_multiplexing() {
             client
                 .recv(Duration::from_millis(100))
                 .await
-                .expect("受信失敗");
+                .expect("receive failed");
 
             while let Some(event) = client.poll() {
                 match event {
                     Http3Event::Data { stream_id, data } => {
                         eprintln!(
-                            "[client] Data 受信: stream_id = {}, data = {:?}",
+                            "[client] Data received: stream_id = {}, data = {:?}",
                             stream_id,
                             String::from_utf8_lossy(&data)
                         );
@@ -694,7 +709,7 @@ async fn test_http3_stream_multiplexing() {
                             .extend_from_slice(&data);
                     }
                     Http3Event::HeadersEnd { stream_id, .. } => {
-                        eprintln!("[client] HeadersEnd 受信: stream_id = {}", stream_id);
+                        eprintln!("[client] HeadersEnd received: stream_id = {}", stream_id);
                         responses_received += 1;
                     }
                     _ => {}
@@ -715,31 +730,31 @@ async fn test_http3_stream_multiplexing() {
     match client_result {
         Ok((stream_ids, responses_received, bodies_received)) => {
             eprintln!(
-                "[test] 送信したストリーム数: {}, 受信したレスポンス数: {}, ボディ受信数: {}",
+                "[test] streams sent: {}, responses received: {}, bodies received: {}",
                 stream_ids.len(),
                 responses_received,
                 bodies_received.len()
             );
-            assert_eq!(stream_ids.len(), 3, "3 つのストリームを開くべき");
-            assert!(responses_received >= 3, "3 つのレスポンスを受信するべき");
-            assert!(bodies_received.len() >= 3, "3 つのボディを受信するべき");
+            assert_eq!(stream_ids.len(), 3, "should open three streams");
+            assert!(responses_received >= 3, "should receive three responses");
+            assert!(bodies_received.len() >= 3, "should receive three bodies");
 
-            // 各ストリームに対して正しいレスポンスを受信したことを確認
+            // Check that each stream received the right response
             for stream_id in &stream_ids {
                 if let Some(body) = bodies_received.get(stream_id) {
                     let body_str = String::from_utf8_lossy(body);
                     assert!(
                         body_str.contains(&stream_id.to_string()),
-                        "ストリーム {} のボディにストリーム ID が含まれるべき",
+                        "body for stream {} should contain the stream ID",
                         stream_id
                     );
                 }
             }
         }
         Err(_) => {
-            panic!("テストタイムアウト");
+            panic!("test timed out");
         }
     }
 
-    eprintln!("[test] HTTP/3 ストリーム多重化テスト完了");
+    eprintln!("[test] HTTP/3 stream multiplexing test completed");
 }

@@ -1,80 +1,11 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Reads external dependency metadata from Cargo.toml.
-fn read_external_dependency(name: &str) -> toml::Table {
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let cargo_toml = std::fs::read_to_string(manifest_dir.join("Cargo.toml"))
-        .expect("Failed to read Cargo.toml");
-    let parsed = toml::from_str::<toml::Table>(&cargo_toml).expect("Failed to parse Cargo.toml");
-
-    parsed
-        .get("package")
-        .and_then(|p| p.get("metadata"))
-        .and_then(|m| m.get("external-dependencies"))
-        .and_then(|e| e.get(name))
-        .and_then(|d| d.as_table())
-        .cloned()
-        .unwrap_or_else(|| panic!("Missing [package.metadata.external-dependencies.{name}]"))
-}
-
 fn main() {
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-
-    // Read metadata from Cargo.toml.
-    let dep = read_external_dependency("nghttp3");
-    let git_url = dep
-        .get("git")
-        .and_then(|v| v.as_str())
-        .expect("Missing 'git' field in nghttp3 dependency");
-    // Switch nghttp3 to a version tag once the WebTransport branch is released.
-    let branch = dep.get("branch").and_then(|v| v.as_str());
-    let version = dep.get("version").and_then(|v| v.as_str());
-
-    // Clone nghttp3.
-    let nghttp3_dir = out_dir.join("nghttp3");
-    if !nghttp3_dir.exists() {
-        // git clone
-        let status = Command::new("git")
-            .args(["clone", git_url, nghttp3_dir.to_str().unwrap()])
-            .status()
-            .expect("Failed to execute git clone");
-        if !status.success() {
-            panic!("Failed to clone nghttp3");
-        }
-
-        // Check out the branch or version tag.
-        if let Some(branch_name) = branch {
-            let status = Command::new("git")
-                .current_dir(&nghttp3_dir)
-                .args(["checkout", branch_name])
-                .status()
-                .expect("Failed to execute git checkout");
-            if !status.success() {
-                panic!("Failed to checkout branch {branch_name}");
-            }
-        } else if let Some(ver) = version {
-            let tag = format!("v{ver}");
-            let status = Command::new("git")
-                .current_dir(&nghttp3_dir)
-                .args(["checkout", &tag])
-                .status()
-                .expect("Failed to execute git checkout");
-            if !status.success() {
-                panic!("Failed to checkout tag {tag}");
-            }
-        }
-
-        // Initialize and update submodules.
-        let status = Command::new("git")
-            .current_dir(&nghttp3_dir)
-            .args(["submodule", "update", "--init", "--recursive"])
-            .status()
-            .expect("Failed to execute git submodule update");
-        if !status.success() {
-            panic!("Failed to update submodules");
-        }
-    }
+    let nghttp3_dir = prepare_submodule_source("nghttp3", &manifest_dir, &out_dir);
 
     patch_nghttp3_for_msvc(&nghttp3_dir);
 
@@ -99,8 +30,104 @@ fn main() {
     // Pass metadata to dependent crates.
     println!("cargo:include={}/include", nghttp3_dst.display());
 
-    #[cfg(feature = "overwrite")]
-    overwrite_bindgen(&out_dir);
+    generate_bindings(
+        &nghttp3_dst.join("include"),
+        &nghttp3_dir.join("lib/includes"),
+        &out_dir.join("bindings.rs"),
+    );
+}
+
+fn prepare_submodule_source(name: &str, manifest_dir: &Path, out_dir: &Path) -> PathBuf {
+    let submodule_dir = manifest_dir.join("deps").join(name);
+
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../../..").join(".gitmodules").display()
+    );
+    println!("cargo:rerun-if-changed={}", submodule_dir.display());
+
+    ensure_submodule_initialized(&submodule_dir, manifest_dir);
+
+    let build_dir = out_dir.join(name);
+    if build_dir.exists() {
+        fs::remove_dir_all(&build_dir).expect("Failed to remove old nghttp3 build source");
+    }
+    copy_dir_all(&submodule_dir, &build_dir).expect("Failed to copy nghttp3 submodule");
+    build_dir
+}
+
+fn ensure_submodule_initialized(submodule_dir: &Path, manifest_dir: &Path) {
+    if submodule_source_ready(submodule_dir) {
+        return;
+    }
+
+    let relative = submodule_dir
+        .strip_prefix(manifest_dir)
+        .expect("submodule path should be under manifest dir")
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let status = Command::new("git")
+        .current_dir(manifest_dir)
+        .args([
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+            "--",
+            &relative,
+        ])
+        .status()
+        .expect("Failed to execute git submodule update");
+    if !status.success() {
+        panic!("Failed to initialize {relative} submodule");
+    }
+}
+
+fn submodule_source_ready(submodule_dir: &Path) -> bool {
+    // Match boring-sys' cheap top-level submodule check, then add the nested
+    // submodule check nghttp3 needs for lib/sfparse.
+    submodule_dir.join("CMakeLists.txt").exists() && nested_submodules_ready(submodule_dir)
+}
+
+fn nested_submodules_ready(submodule_dir: &Path) -> bool {
+    let gitmodules = submodule_dir.join(".gitmodules");
+    if !gitmodules.exists() {
+        return true;
+    }
+
+    let contents = fs::read_to_string(gitmodules).expect("Failed to read nested .gitmodules");
+    contents
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("path ="))
+        .map(str::trim)
+        .all(|path| {
+            let dir = submodule_dir.join(path);
+            dir.is_dir()
+                && fs::read_dir(dir)
+                    .map(|mut entries| entries.next().is_some())
+                    .unwrap_or(false)
+        })
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if file_name == ".git" {
+            continue;
+        }
+
+        let src_path = entry.path();
+        let dst_path = dst.join(file_name);
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn patch_nghttp3_for_msvc(nghttp3_dir: &std::path::Path) {
@@ -146,23 +173,31 @@ fn patch_nghttp3_for_msvc(nghttp3_dir: &std::path::Path) {
     std::fs::write(macro_path, contents).expect("Failed to patch nghttp3_macro.h");
 }
 
-#[cfg(feature = "overwrite")]
-fn overwrite_bindgen(out_dir: &PathBuf) {
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    // Build include directory where version.h is generated.
-    let nghttp3_installed_include = out_dir.join("include");
-    // Source include directory where nghttp3.h lives.
-    let nghttp3_source_include = out_dir.join("nghttp3/lib/includes");
+fn generate_bindings(
+    installed_include: &std::path::Path,
+    source_include: &std::path::Path,
+    output: &std::path::Path,
+) {
+    let target = std::env::var("TARGET").expect("TARGET not set by Cargo");
 
+    // Bindings are generated for the Cargo target, not the build host. This
+    // matters for 32-bit CI where bindgen layout tests would otherwise use
+    // x86_64 sizes.
     bindgen::Builder::default()
-        .header(manifest_dir.join("src/wrapper.h").to_str().unwrap())
-        .clang_arg(format!("-I{}", nghttp3_installed_include.display()))
-        .clang_arg(format!("-I{}", nghttp3_source_include.display()))
+        .header(
+            installed_include
+                .join("nghttp3/nghttp3.h")
+                .to_str()
+                .unwrap(),
+        )
+        .clang_arg(format!("--target={target}"))
+        .clang_arg(format!("-I{}", installed_include.display()))
+        .clang_arg(format!("-I{}", source_include.display()))
         .allowlist_function("nghttp3_.*")
         .allowlist_type("nghttp3_.*")
         .allowlist_var("NGHTTP3_.*")
         .generate()
         .expect("Failed to generate nghttp3 bindings")
-        .write_to_file(manifest_dir.join("src/bindings.rs"))
+        .write_to_file(output)
         .expect("Failed to write nghttp3 bindings");
 }

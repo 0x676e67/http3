@@ -9,26 +9,17 @@ crate builds ngtcp2 and exposes low-level FFI bindings for Rust.
 
 ## Features
 
-- Automatically clones and builds the ngtcp2 source.
+- Builds ngtcp2 from the bundled git submodule.
 - Cross-platform build through CMake.
 - Uses aws-lc as the TLS backend.
-- Includes generated bindings, so libclang is not needed for normal builds.
+- Generates Rust bindings for the current Cargo target.
 
 ## Build Requirements
 
 - CMake
 - C compiler such as gcc or clang
+- libclang, required by bindgen
 - Go, required to build aws-lc
-
-## Regenerating Bindings
-
-Regenerate bindings after updating the ngtcp2 version:
-
-```bash
-cargo build -p ngtcp2-sys --features overwrite
-```
-
-Note: the `overwrite` feature requires libclang.
 
 ## ngtcp2 License
 

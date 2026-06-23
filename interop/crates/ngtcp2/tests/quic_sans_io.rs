@@ -1,8 +1,8 @@
-//! QUIC Sans I/O テスト
+//! QUIC Sans I/O
 //!
-//! Connection の read_pkt / write_pkt を直接テストする。
-//! ネットワーク I/O を介さずにパケット交換をシミュレートし、
-//! ハンドシェイクの動作を検証する。
+//! Directly tests Connection read_pkt / write_pkt.
+//! Packets are exchanged without real network I/O,
+//! then the handshake state is verified.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ use ngtcp2::{Connection, ConnectionId, PacketInfo, TlsContext, TransportParamsEx
 use ngtcp2_sys::ngtcp2_transport_params;
 use rcgen::{CertificateParams, KeyPair};
 
-/// テスト用の証明書と秘密鍵を動的に生成
+/// Generate a certificate and private key for tests
 fn generate_test_certs() -> (PathBuf, PathBuf) {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let unique_id = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -21,28 +21,30 @@ fn generate_test_certs() -> (PathBuf, PathBuf) {
         std::process::id(),
         unique_id
     ));
-    std::fs::create_dir_all(&temp_dir).expect("一時ディレクトリ作成失敗");
+    std::fs::create_dir_all(&temp_dir).expect("failed to create temporary directory");
 
     let cert_path = temp_dir.join("cert.pem");
     let key_path = temp_dir.join("key.pem");
 
-    let mut params =
-        CertificateParams::new(vec!["localhost".to_string()]).expect("CertificateParams 作成失敗");
+    let mut params = CertificateParams::new(vec!["localhost".to_string()])
+        .expect("failed to create CertificateParams");
     params.distinguished_name.push(
         rcgen::DnType::CommonName,
         rcgen::DnValue::Utf8String("localhost".to_string()),
     );
 
-    let key_pair = KeyPair::generate().expect("鍵ペア生成失敗");
-    let cert = params.self_signed(&key_pair).expect("証明書生成失敗");
+    let key_pair = KeyPair::generate().expect("failed to generate key pair");
+    let cert = params
+        .self_signed(&key_pair)
+        .expect("failed to generate certificate");
 
-    std::fs::write(&cert_path, cert.pem()).expect("証明書ファイル書き込み失敗");
-    std::fs::write(&key_path, key_pair.serialize_pem()).expect("秘密鍵ファイル書き込み失敗");
+    std::fs::write(&cert_path, cert.pem()).expect("failed to write certificate file");
+    std::fs::write(&key_path, key_pair.serialize_pem()).expect("failed to write private key file");
 
     (cert_path, key_path)
 }
 
-/// テスト用のタイムスタンプを取得 (ナノ秒)
+/// Return a test timestamp in nanoseconds
 fn timestamp() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -51,7 +53,7 @@ fn timestamp() -> u64 {
         .as_nanos() as u64
 }
 
-/// クライアント接続を作成し、Initial パケットを生成する
+/// create client, generate Initial packet
 #[test]
 fn test_client_initial_packet_generation() {
     let dcid = ConnectionId::random(16).unwrap();
@@ -59,17 +61,19 @@ fn test_client_initial_packet_generation() {
     let local_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
     let remote_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
 
-    // TLS コンテキストを作成 (証明書検証なし)
+    // create TLS context (without certificate verification)
     let tls_ctx =
-        TlsContext::new_client_with_options(&[b"h3"], false).expect("TLS コンテキスト作成失敗");
-    let tls_session = tls_ctx.create_session().expect("TLS セッション作成失敗");
+        TlsContext::new_client_with_options(&[b"h3"], false).expect("TLS contextcreation failed");
+    let tls_session = tls_ctx
+        .create_session()
+        .expect("failed to create TLS session");
 
-    // トランスポートパラメータを設定
+    // transport parameters
     let params = ngtcp2_transport_params::default_params().with_datagram(65535);
 
     let ts = timestamp();
 
-    // クライアント接続を作成
+    // create client
     let mut client = Connection::client_new(
         &dcid,
         &scid,
@@ -80,51 +84,55 @@ fn test_client_initial_packet_generation() {
         &params,
         ts,
     )
-    .expect("クライアント接続作成失敗");
+    .expect("failed to create client connection");
 
-    // Initial パケットを生成
+    // generate Initial packet
     let mut buf = vec![0u8; 1350];
-    let (written, _pkt_info) = client.write_pkt(&mut buf, ts).expect("パケット生成失敗");
+    let (written, _pkt_info) = client
+        .write_pkt(&mut buf, ts)
+        .expect("packet generation failed");
 
-    // パケットが生成されたことを確認
-    assert!(written > 0, "Initial パケットが生成されるべき");
-    eprintln!("Initial パケットサイズ: {} bytes", written);
+    // generatecheck
+    assert!(written > 0, "Initial packet should be generated");
+    eprintln!("Initial: {} bytes", written);
 
-    // QUIC パケットのヘッダーを確認
-    // Long Header Format: 最初のビットが 1
-    assert!(buf[0] & 0x80 != 0, "Long Header であるべき");
+    // QUIC headercheck
+    // Long Header Format: bit 1
+    assert!(buf[0] & 0x80 != 0, "Long Header should");
 
-    // ハンドシェイクはまだ完了していない
+    // handshake completed
     assert!(
         !client.is_handshake_completed(),
-        "ハンドシェイクは未完了であるべき"
+        "handshake should not be completed yet"
     );
 }
 
-/// サーバー接続を作成する
+/// create server
 #[test]
 fn test_server_connection_creation() {
     let (cert_path, key_path) = generate_test_certs();
 
-    // クライアントの DCID をサーバーの SCID として使用
+    // client DCID server SCID for
     let client_dcid = ConnectionId::random(16).unwrap();
     let server_scid = ConnectionId::random(16).unwrap();
     let local_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
     let remote_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
-    // TLS コンテキストを作成
-    let tls_ctx =
-        TlsContext::new_server(&cert_path, &key_path, &[b"h3"]).expect("TLS コンテキスト作成失敗");
-    let tls_session = tls_ctx.create_session().expect("TLS セッション作成失敗");
+    // create TLS context
+    let tls_ctx = TlsContext::new_server(&cert_path, &key_path, &[b"h3"])
+        .expect("TLS contextcreation failed");
+    let tls_session = tls_ctx
+        .create_session()
+        .expect("failed to create TLS session");
 
-    // トランスポートパラメータを設定
+    // transport parameters
     let params = ngtcp2_transport_params::default_params()
         .with_datagram(65535)
         .with_original_dcid(&client_dcid);
 
     let ts = timestamp();
 
-    // サーバー接続を作成
+    // create server
     let server = Connection::server_new(
         &client_dcid,
         &server_scid,
@@ -134,21 +142,21 @@ fn test_server_connection_creation() {
         &params,
         ts,
     )
-    .expect("サーバー接続作成失敗");
+    .expect("failed to create server connection");
 
-    // ハンドシェイクはまだ完了していない
+    // handshake completed
     assert!(
         !server.is_handshake_completed(),
-        "ハンドシェイクは未完了であるべき"
+        "handshake should not be completed yet"
     );
 }
 
-/// クライアント/サーバー間でパケットを交換してハンドシェイクを完了する
+/// client/serverhandshake completed
 #[test]
 fn test_quic_handshake() {
     let (cert_path, key_path) = generate_test_certs();
 
-    // 接続 ID を生成
+    // Generate connection IDs
     let client_dcid = ConnectionId::random(16).unwrap();
     let client_scid = ConnectionId::random(16).unwrap();
     let server_scid = ConnectionId::random(16).unwrap();
@@ -158,12 +166,12 @@ fn test_quic_handshake() {
 
     let ts = timestamp();
 
-    // クライアント接続を作成
+    // create client
     let client_tls_ctx = TlsContext::new_client_with_options(&[b"h3"], false)
-        .expect("クライアント TLS コンテキスト作成失敗");
+        .expect("failed to create client TLS context");
     let client_tls_session = client_tls_ctx
         .create_session()
-        .expect("クライアント TLS セッション作成失敗");
+        .expect("client failed to create TLS session");
 
     let client_params = ngtcp2_transport_params::default_params().with_datagram(65535);
 
@@ -177,18 +185,18 @@ fn test_quic_handshake() {
         &client_params,
         ts,
     )
-    .expect("クライアント接続作成失敗");
+    .expect("failed to create client connection");
 
-    // サーバー TLS コンテキストを作成
+    // server create TLS context
     let server_tls_ctx = TlsContext::new_server(&cert_path, &key_path, &[b"h3"])
-        .expect("サーバー TLS コンテキスト作成失敗");
+        .expect("failed to create server TLS context");
 
     let pkt_info = PacketInfo::default();
     let mut buf = vec![0u8; 1350];
     let mut round = 0;
     const MAX_ROUNDS: usize = 10;
 
-    // サーバー接続はまだ作成されていない (Initial パケット受信後に作成)
+    // create server (Initial receivedcreate)
     let mut server: Option<Connection> = None;
 
     while round < MAX_ROUNDS {
@@ -196,18 +204,18 @@ fn test_quic_handshake() {
         let current_ts = timestamp();
         eprintln!("--- Round {} ---", round);
 
-        // クライアントからパケットを生成
+        // clientgenerate
         let (client_written, _) = client
             .write_pkt(&mut buf, current_ts)
             .unwrap_or((0, pkt_info));
         if client_written > 0 {
-            eprintln!("クライアント -> サーバー: {} bytes", client_written);
+            eprintln!("client -> server: {} bytes", client_written);
 
-            // サーバーがまだ作成されていない場合は作成
+            // Create the server after receiving Initial
             if server.is_none() {
                 let server_tls_session = server_tls_ctx
                     .create_session()
-                    .expect("サーバー TLS セッション作成失敗");
+                    .expect("server failed to create TLS session");
 
                 let server_params = ngtcp2_transport_params::default_params()
                     .with_datagram(65535)
@@ -223,11 +231,11 @@ fn test_quic_handshake() {
                         &server_params,
                         current_ts,
                     )
-                    .expect("サーバー接続作成失敗"),
+                    .expect("failed to create server connection"),
                 );
             }
 
-            // サーバーがパケットを処理
+            // server
             if let Some(ref mut s) = server {
                 let result = s.read_pkt(
                     &server_addr,
@@ -237,26 +245,26 @@ fn test_quic_handshake() {
                     current_ts,
                 );
                 match result {
-                    Ok(()) => eprintln!("サーバー: パケット処理成功"),
+                    Ok(()) => eprintln!("server: succeeded"),
                     Err(e) => {
-                        eprintln!("サーバー: パケット処理エラー: {:?}", e);
-                        // エラーコードを確認
+                        eprintln!("server: error: {:?}", e);
+                        // errorcheck
                         if format!("{:?}", e).contains("-225") {
-                            eprintln!("ERR_TRANSPORT_PARAM (-225) が発生");
-                            eprintln!("トランスポートパラメータの不一致の可能性");
+                            eprintln!("ERR_TRANSPORT_PARAM (-225)");
+                            eprintln!("transport parameters");
                         }
                     }
                 }
             }
         }
 
-        // サーバーからパケットを生成
+        // servergenerate
         if let Some(ref mut s) = server {
             let (server_written, _) = s.write_pkt(&mut buf, current_ts).unwrap_or((0, pkt_info));
             if server_written > 0 {
-                eprintln!("サーバー -> クライアント: {} bytes", server_written);
+                eprintln!("server -> client: {} bytes", server_written);
 
-                // クライアントがパケットを処理
+                // client
                 let result = client.read_pkt(
                     &client_addr,
                     &server_addr,
@@ -265,44 +273,44 @@ fn test_quic_handshake() {
                     current_ts,
                 );
                 match result {
-                    Ok(()) => eprintln!("クライアント: パケット処理成功"),
-                    Err(e) => eprintln!("クライアント: パケット処理エラー: {:?}", e),
+                    Ok(()) => eprintln!("client: succeeded"),
+                    Err(e) => eprintln!("client: error: {:?}", e),
                 }
             }
         }
 
-        // ハンドシェイク完了を確認
+        // handshake completedcheck
         let client_done = client.is_handshake_completed();
         let server_done = server.as_ref().is_some_and(|s| s.is_handshake_completed());
 
         eprintln!(
-            "ハンドシェイク状態: クライアント={}, サーバー={}",
+            "handshakestate: client={}, server={}",
             client_done, server_done
         );
 
         if client_done && server_done {
-            eprintln!("ハンドシェイク完了!");
+            eprintln!("handshake completed!");
             break;
         }
     }
 
-    // ハンドシェイクが完了したことを確認
+    // check handshake completion
     assert!(
         client.is_handshake_completed(),
-        "クライアントのハンドシェイクが完了するべき"
+        "clienthandshake should not be completed yet"
     );
     assert!(
         server.as_ref().is_some_and(|s| s.is_handshake_completed()),
-        "サーバーのハンドシェイクが完了するべき"
+        "serverhandshake should not be completed yet"
     );
 }
 
-/// ストリームオープンと接続状態の確認テスト
+/// streamstatecheck
 #[test]
 fn test_stream_open_after_handshake() {
     let (cert_path, key_path) = generate_test_certs();
 
-    // 接続 ID を生成
+    // Generate connection IDs
     let client_dcid = ConnectionId::random(16).unwrap();
     let client_scid = ConnectionId::random(16).unwrap();
     let server_scid = ConnectionId::random(16).unwrap();
@@ -312,12 +320,12 @@ fn test_stream_open_after_handshake() {
 
     let ts = timestamp();
 
-    // クライアント接続を作成
+    // create client
     let client_tls_ctx = TlsContext::new_client_with_options(&[b"h3"], false)
-        .expect("クライアント TLS コンテキスト作成失敗");
+        .expect("failed to create client TLS context");
     let client_tls_session = client_tls_ctx
         .create_session()
-        .expect("クライアント TLS セッション作成失敗");
+        .expect("client failed to create TLS session");
 
     let client_params = ngtcp2_transport_params::default_params().with_datagram(65535);
 
@@ -331,21 +339,21 @@ fn test_stream_open_after_handshake() {
         &client_params,
         ts,
     )
-    .expect("クライアント接続作成失敗");
+    .expect("failed to create client connection");
 
-    // サーバー TLS コンテキストを作成
+    // server create TLS context
     let server_tls_ctx = TlsContext::new_server(&cert_path, &key_path, &[b"h3"])
-        .expect("サーバー TLS コンテキスト作成失敗");
+        .expect("failed to create server TLS context");
 
     let pkt_info = PacketInfo::default();
     let mut buf = vec![0u8; 1350];
     let mut server: Option<Connection> = None;
 
-    // まずハンドシェイクを完了させる
+    // handshake completed
     for _round in 0..10 {
         let current_ts = timestamp();
 
-        // クライアントからパケットを生成
+        // clientgenerate
         let (client_written, _) = client
             .write_pkt(&mut buf, current_ts)
             .unwrap_or((0, pkt_info));
@@ -353,7 +361,7 @@ fn test_stream_open_after_handshake() {
             if server.is_none() {
                 let server_tls_session = server_tls_ctx
                     .create_session()
-                    .expect("サーバー TLS セッション作成失敗");
+                    .expect("server failed to create TLS session");
 
                 let server_params = ngtcp2_transport_params::default_params()
                     .with_datagram(65535)
@@ -369,7 +377,7 @@ fn test_stream_open_after_handshake() {
                         &server_params,
                         current_ts,
                     )
-                    .expect("サーバー接続作成失敗"),
+                    .expect("failed to create server connection"),
                 );
             }
 
@@ -404,47 +412,47 @@ fn test_stream_open_after_handshake() {
         }
     }
 
-    // ハンドシェイクが完了していることを確認
+    // check handshake completion
     assert!(
         client.is_handshake_completed(),
-        "クライアントのハンドシェイクが完了するべき"
+        "clienthandshake should not be completed yet"
     );
     assert!(
         server.as_ref().is_some_and(|s| s.is_handshake_completed()),
-        "サーバーのハンドシェイクが完了するべき"
+        "serverhandshake should not be completed yet"
     );
 
-    eprintln!("ハンドシェイク完了");
+    eprintln!("handshake completed");
 
-    // クライアントから双方向ストリームを開く
-    let stream_id = client.open_bidi_stream().expect("ストリームオープン失敗");
-    eprintln!("双方向ストリーム ID: {}", stream_id);
-    assert_eq!(stream_id, 0, "最初の双方向ストリームは ID 0");
+    // client bidirectional stream
+    let stream_id = client.open_bidi_stream().expect("failed to open stream");
+    eprintln!("bidirectional stream ID: {}", stream_id);
+    assert_eq!(stream_id, 0, "bidirectional stream ID 0");
 
-    // 単方向ストリームを開く
+    // unidirectional stream
     let uni_stream_id = client
         .open_uni_stream()
-        .expect("単方向ストリームオープン失敗");
-    eprintln!("単方向ストリーム ID: {}", uni_stream_id);
-    assert_eq!(uni_stream_id, 2, "最初の単方向ストリームは ID 2");
+        .expect("failed to open unidirectional stream");
+    eprintln!("unidirectional stream ID: {}", uni_stream_id);
+    assert_eq!(uni_stream_id, 2, "unidirectional stream ID 2");
 
-    // 残りのストリーム数を確認
+    // streamcheck
     let bidi_left = client.get_streams_bidi_left();
     let uni_left = client.get_streams_uni_left();
     eprintln!(
-        "残り双方向ストリーム: {}, 残り単方向ストリーム: {}",
+        "bidirectional stream: {}, unidirectional stream: {}",
         bidi_left, uni_left
     );
-    assert!(bidi_left > 0, "双方向ストリームがまだ開ける");
-    assert!(uni_left > 0, "単方向ストリームがまだ開ける");
+    assert!(bidi_left > 0, "bidirectional stream");
+    assert!(uni_left > 0, "unidirectional stream");
 }
 
-/// 接続状態の確認テスト
+/// statecheck
 #[test]
 fn test_connection_state() {
     let (cert_path, key_path) = generate_test_certs();
 
-    // 接続 ID を生成
+    // Generate connection IDs
     let client_dcid = ConnectionId::random(16).unwrap();
     let client_scid = ConnectionId::random(16).unwrap();
     let server_scid = ConnectionId::random(16).unwrap();
@@ -454,12 +462,12 @@ fn test_connection_state() {
 
     let ts = timestamp();
 
-    // クライアント接続を作成
+    // create client
     let client_tls_ctx = TlsContext::new_client_with_options(&[b"h3"], false)
-        .expect("クライアント TLS コンテキスト作成失敗");
+        .expect("failed to create client TLS context");
     let client_tls_session = client_tls_ctx
         .create_session()
-        .expect("クライアント TLS セッション作成失敗");
+        .expect("client failed to create TLS session");
 
     let client_params = ngtcp2_transport_params::default_params().with_datagram(65535);
 
@@ -473,17 +481,17 @@ fn test_connection_state() {
         &client_params,
         ts,
     )
-    .expect("クライアント接続作成失敗");
+    .expect("failed to create client connection");
 
-    // サーバー TLS コンテキストを作成
+    // server create TLS context
     let server_tls_ctx = TlsContext::new_server(&cert_path, &key_path, &[b"h3"])
-        .expect("サーバー TLS コンテキスト作成失敗");
+        .expect("failed to create server TLS context");
 
     let pkt_info = PacketInfo::default();
     let mut buf = vec![0u8; 1350];
     let mut server: Option<Connection> = None;
 
-    // まずハンドシェイクを完了させる
+    // handshake completed
     for _round in 0..10 {
         let current_ts = timestamp();
 
@@ -494,7 +502,7 @@ fn test_connection_state() {
             if server.is_none() {
                 let server_tls_session = server_tls_ctx
                     .create_session()
-                    .expect("サーバー TLS セッション作成失敗");
+                    .expect("server failed to create TLS session");
 
                 let server_params = ngtcp2_transport_params::default_params()
                     .with_datagram(65535)
@@ -510,7 +518,7 @@ fn test_connection_state() {
                         &server_params,
                         current_ts,
                     )
-                    .expect("サーバー接続作成失敗"),
+                    .expect("failed to create server connection"),
                 );
             }
 
@@ -545,34 +553,31 @@ fn test_connection_state() {
         }
     }
 
-    // ハンドシェイクが完了していることを確認
+    // check handshake completion
     assert!(
         client.is_handshake_completed(),
-        "クライアントのハンドシェイクが完了するべき"
+        "clienthandshake should not be completed yet"
     );
 
-    // 接続状態を確認
-    assert!(!client.is_in_closing_period(), "クローズ中ではないべき");
-    assert!(!client.is_in_draining_period(), "ドレイン中ではないべき");
+    // statecheck
+    assert!(!client.is_in_closing_period(), "should");
+    assert!(!client.is_in_draining_period(), "should");
 
-    // 接続のリソース確認
+    // check
     let max_data_left = client.get_max_data_left();
     eprintln!("max_data_left: {}", max_data_left);
-    assert!(max_data_left > 0, "データ送信可能量があるべき");
+    assert!(max_data_left > 0, "data should be sent");
 
-    // DATAGRAM キューの確認
-    assert!(!client.has_datagram(), "初期状態ではDATAGRAMがないべき");
-    assert!(client.poll_datagram().is_none(), "DATAGRAMがないべき");
+    // DATAGRAM check
+    assert!(!client.has_datagram(), "stateDATAGRAMshould");
+    assert!(client.poll_datagram().is_none(), "DATAGRAMshould");
 
-    // ストリームデータキューの確認
-    assert!(
-        !client.has_stream_data(),
-        "初期状態ではストリームデータがないべき"
-    );
+    // stream datacheck
+    assert!(!client.has_stream_data(), "statestream data should match");
     assert!(
         client.poll_stream_data().is_none(),
-        "ストリームデータがないべき"
+        "stream data should match"
     );
 
-    eprintln!("接続状態テスト完了");
+    eprintln!("statecompleted");
 }

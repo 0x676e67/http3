@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Detects the aws-lc-sys links name from Cargo-provided environment variables.
@@ -20,69 +21,10 @@ fn detect_aws_lc_links_name() -> String {
     panic!("DEP_AWS_LC_*_INCLUDE not found - aws-lc-sys dependency required");
 }
 
-/// Reads external dependency metadata from Cargo.toml.
-fn read_external_dependency(name: &str) -> toml::Table {
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let cargo_toml = std::fs::read_to_string(manifest_dir.join("Cargo.toml"))
-        .expect("Failed to read Cargo.toml");
-    let parsed = toml::from_str::<toml::Table>(&cargo_toml).expect("Failed to parse Cargo.toml");
-
-    parsed
-        .get("package")
-        .and_then(|p| p.get("metadata"))
-        .and_then(|m| m.get("external-dependencies"))
-        .and_then(|e| e.get(name))
-        .and_then(|d| d.as_table())
-        .cloned()
-        .unwrap_or_else(|| panic!("Missing [package.metadata.external-dependencies.{name}]"))
-}
-
 fn main() {
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-
-    // Read metadata from Cargo.toml.
-    let dep = read_external_dependency("ngtcp2");
-    let git_url = dep
-        .get("git")
-        .and_then(|v| v.as_str())
-        .expect("Missing 'git' field in ngtcp2 dependency");
-    let branch = dep.get("branch").and_then(|v| v.as_str());
-    let version = dep.get("version").and_then(|v| v.as_str());
-
-    // Clone ngtcp2.
-    let ngtcp2_dir = out_dir.join("ngtcp2");
-    if !ngtcp2_dir.exists() {
-        // git clone
-        let status = Command::new("git")
-            .args(["clone", git_url, ngtcp2_dir.to_str().unwrap()])
-            .status()
-            .expect("Failed to execute git clone");
-        if !status.success() {
-            panic!("Failed to clone ngtcp2");
-        }
-
-        // Check out the branch or version tag.
-        if let Some(branch_name) = branch {
-            let status = Command::new("git")
-                .current_dir(&ngtcp2_dir)
-                .args(["checkout", branch_name])
-                .status()
-                .expect("Failed to execute git checkout");
-            if !status.success() {
-                panic!("Failed to checkout branch {branch_name}");
-            }
-        } else if let Some(ver) = version {
-            let tag = format!("v{ver}");
-            let status = Command::new("git")
-                .current_dir(&ngtcp2_dir)
-                .args(["checkout", &tag])
-                .status()
-                .expect("Failed to execute git checkout");
-            if !status.success() {
-                panic!("Failed to checkout tag {tag}");
-            }
-        }
-    }
+    let ngtcp2_dir = prepare_submodule_source("ngtcp2", &manifest_dir, &out_dir);
 
     patch_ngtcp2_for_msvc(&ngtcp2_dir);
 
@@ -146,8 +88,105 @@ fn main() {
     // Pass metadata to dependent crates.
     println!("cargo:include={}/include", ngtcp2_dst.display());
 
-    #[cfg(feature = "overwrite")]
-    overwrite_bindgen(&out_dir);
+    generate_bindings(
+        &ngtcp2_dst.join("include"),
+        &ngtcp2_dir.join("lib/includes"),
+        &PathBuf::from(&aws_lc_include),
+        &out_dir.join("bindings.rs"),
+    );
+}
+
+fn prepare_submodule_source(name: &str, manifest_dir: &Path, out_dir: &Path) -> PathBuf {
+    let submodule_dir = manifest_dir.join("deps").join(name);
+
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("../../..").join(".gitmodules").display()
+    );
+    println!("cargo:rerun-if-changed={}", submodule_dir.display());
+
+    ensure_submodule_initialized(&submodule_dir, manifest_dir);
+
+    let build_dir = out_dir.join(name);
+    if build_dir.exists() {
+        fs::remove_dir_all(&build_dir).expect("Failed to remove old ngtcp2 build source");
+    }
+    copy_dir_all(&submodule_dir, &build_dir).expect("Failed to copy ngtcp2 submodule");
+    build_dir
+}
+
+fn ensure_submodule_initialized(submodule_dir: &Path, manifest_dir: &Path) {
+    if submodule_source_ready(submodule_dir) {
+        return;
+    }
+
+    let relative = submodule_dir
+        .strip_prefix(manifest_dir)
+        .expect("submodule path should be under manifest dir")
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let status = Command::new("git")
+        .current_dir(manifest_dir)
+        .args([
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+            "--",
+            &relative,
+        ])
+        .status()
+        .expect("Failed to execute git submodule update");
+    if !status.success() {
+        panic!("Failed to initialize {relative} submodule");
+    }
+}
+
+fn submodule_source_ready(submodule_dir: &Path) -> bool {
+    // Match boring-sys' cheap top-level submodule check, then add the nested
+    // submodule check ngtcp2 needs for its third-party sources.
+    submodule_dir.join("CMakeLists.txt").exists() && nested_submodules_ready(submodule_dir)
+}
+
+fn nested_submodules_ready(submodule_dir: &Path) -> bool {
+    let gitmodules = submodule_dir.join(".gitmodules");
+    if !gitmodules.exists() {
+        return true;
+    }
+
+    let contents = fs::read_to_string(gitmodules).expect("Failed to read nested .gitmodules");
+    contents
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("path ="))
+        .map(str::trim)
+        .all(|path| {
+            let dir = submodule_dir.join(path);
+            dir.is_dir()
+                && fs::read_dir(dir)
+                    .map(|mut entries| entries.next().is_some())
+                    .unwrap_or(false)
+        })
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if file_name == ".git" {
+            continue;
+        }
+
+        let src_path = entry.path();
+        let dst_path = dst.join(file_name);
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn patch_ngtcp2_for_msvc(ngtcp2_dir: &std::path::Path) {
@@ -225,29 +264,39 @@ fn patch_ngtcp2_format_for_msvc(ngtcp2_dir: &std::path::Path) {
     }
 }
 
-#[cfg(feature = "overwrite")]
-fn overwrite_bindgen(out_dir: &PathBuf) {
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    // Build include directory where version.h is generated.
-    let ngtcp2_installed_include = out_dir.join("include");
-    // Source include directory where ngtcp2.h lives.
-    let ngtcp2_source_include = out_dir.join("ngtcp2/lib/includes");
-    // aws-lc include directory where openssl/ssl.h lives.
-    let aws_lc_links = detect_aws_lc_links_name();
-    let include_env = format!("DEP_{}_INCLUDE", aws_lc_links.to_uppercase());
-    let aws_lc_include =
-        std::env::var(&include_env).unwrap_or_else(|_| panic!("{include_env} not set"));
+fn generate_bindings(
+    installed_include: &std::path::Path,
+    source_include: &std::path::Path,
+    aws_lc_include: &std::path::Path,
+    output: &std::path::Path,
+) {
+    let target = std::env::var("TARGET").expect("TARGET not set by Cargo");
 
+    // Bindings are generated for the Cargo target, not the build host. This
+    // keeps bindgen layout tests correct for 32-bit CI targets.
     bindgen::Builder::default()
-        .header(manifest_dir.join("src/wrapper.h").to_str().unwrap())
-        .clang_arg(format!("-I{}", ngtcp2_installed_include.display()))
-        .clang_arg(format!("-I{}", ngtcp2_source_include.display()))
-        .clang_arg(format!("-I{}", aws_lc_include))
+        .header(installed_include.join("ngtcp2/ngtcp2.h").to_str().unwrap())
+        .header(
+            installed_include
+                .join("ngtcp2/ngtcp2_crypto.h")
+                .to_str()
+                .unwrap(),
+        )
+        .header(
+            installed_include
+                .join("ngtcp2/ngtcp2_crypto_boringssl.h")
+                .to_str()
+                .unwrap(),
+        )
+        .clang_arg(format!("--target={target}"))
+        .clang_arg(format!("-I{}", installed_include.display()))
+        .clang_arg(format!("-I{}", source_include.display()))
+        .clang_arg(format!("-I{}", aws_lc_include.display()))
         .allowlist_function("ngtcp2_.*")
         .allowlist_type("ngtcp2_.*")
         .allowlist_var("NGTCP2_.*")
         .generate()
         .expect("Failed to generate ngtcp2 bindings")
-        .write_to_file(manifest_dir.join("src/bindings.rs"))
+        .write_to_file(output)
         .expect("Failed to write ngtcp2 bindings");
 }

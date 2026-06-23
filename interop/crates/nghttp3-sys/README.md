@@ -9,24 +9,15 @@ This crate builds nghttp3 and exposes low-level FFI bindings for Rust.
 
 ## Features
 
-- Automatically clones and builds the nghttp3 source.
+- Builds nghttp3 from the bundled git submodule.
 - Cross-platform build through CMake.
-- Includes generated bindings, so libclang is not needed for normal builds.
+- Generates Rust bindings for the current Cargo target.
 
 ## Build Requirements
 
 - CMake
 - C compiler such as gcc or clang
-
-## Regenerating Bindings
-
-Regenerate bindings after updating the nghttp3 version:
-
-```bash
-cargo build -p nghttp3-sys --features overwrite
-```
-
-Note: the `overwrite` feature requires libclang.
+- libclang, required by bindgen
 
 ## nghttp3 License
 

@@ -7,11 +7,6 @@ build = "build.rs"
 links = "nghttp3"
 publish = false
 
-# Metadata used only by build.rs when building the bundled external library.
-[package.metadata.external-dependencies]
-# Switch to a released version tag once the WebTransport branch is released.
-nghttp3 = { git = "https://github.com/ngtcp2/nghttp3", branch = "webtransport" }
-
 [lib]
 doctest = false
 path = "src/lib.rs"
@@ -20,13 +15,5 @@ path = "src/lib.rs"
 libc = "0.2"
 
 [build-dependencies]
-# Used only by the overwrite feature; normal builds use checked-in bindings.
-bindgen = { version = "0.72", optional = true }
+bindgen = "0.72"
 cmake = "0.1"
-toml = "0.9"
-
-[features]
-# Regenerate bindings.rs after updating the bundled nghttp3 source.
-# Normal builds use the checked-in bindings and do not need libclang.
-# Usage: cargo build -p nghttp3-sys --features overwrite
-overwrite = ["dep:bindgen"]
