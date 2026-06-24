@@ -7,8 +7,9 @@ use std::{
 };
 
 use interop::{
-    BoxError, ClientInteropConfig, DEFAULT_INTEROP_CASE, INTEROP_TEST_TIMEOUT,
-    generate_test_certificate, install_crypto_provider, interop_body, interop_case_from_path,
+    BoxError, ClientInteropConfig, DEFAULT_INTEROP_CASE, INTEROP_PADDING_HEADER_NAME,
+    INTEROP_TEST_TIMEOUT, generate_test_certificate, install_crypto_provider, interop_body,
+    interop_case_from_path, interop_response_header_value,
     run_local_quinn_client_interop_matrix_with_config,
 };
 use tquic::h3::NameValue;
@@ -141,15 +142,20 @@ impl ServerHandler {
                     let body = interop_body(case);
                     let status = case.status.to_string();
                     let content_length = body.len().to_string();
+                    let padding = interop_response_header_value(case);
 
                     // RFC 9114 Section 4.1: once the request stream is
                     // complete, the server responds on that same stream.
                     // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
-                    let response_headers = vec![
+                    let mut response_headers = vec![
                         tquic::h3::Header::new(b":status", status.as_bytes()),
                         tquic::h3::Header::new(b"content-type", b"application/octet-stream"),
                         tquic::h3::Header::new(b"content-length", content_length.as_bytes()),
                     ];
+                    if let Some(padding) = padding.as_ref() {
+                        response_headers
+                            .push(tquic::h3::Header::new(INTEROP_PADDING_HEADER_NAME, padding));
+                    }
                     let headers_blocked = match self.h3_conn.as_mut().unwrap().send_headers(
                         conn,
                         stream_id,

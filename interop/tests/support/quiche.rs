@@ -3,9 +3,11 @@ use std::{path::PathBuf, time::Duration};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use interop::{
-    BoxError, ClientInteropConfig, DEFAULT_INTEROP_CASE, INTEROP_TEST_TIMEOUT,
-    generate_test_certificate, install_crypto_provider, interop_body, interop_case_from_path,
+    BoxError, ClientInteropConfig, DEFAULT_INTEROP_CASE, INTEROP_PADDING_HEADER_NAME,
+    INTEROP_TEST_TIMEOUT, generate_test_certificate, install_crypto_provider, interop_body,
+    interop_case_from_path, interop_response_header_value,
     run_local_quinn_client_interop_matrix_with_config,
+    run_local_quinn_client_max_field_section_size_limit,
 };
 use tokio::{net::UdpSocket, sync::mpsc};
 use tokio_quiche::{
@@ -88,6 +90,44 @@ pub async fn run_client_interop(
     let client_result = tokio::time::timeout(
         INTEROP_TEST_TIMEOUT,
         run_local_quinn_client_interop_matrix_with_config(server_addr, &cert, client_config),
+    )
+    .await;
+
+    let _ = shutdown_tx.send(()).await;
+    server_task.abort();
+    let _ = server_task.await;
+    client_result??;
+    Ok(())
+}
+
+pub async fn run_max_field_section_size_limit(
+    server_config: ServerConfig,
+    client_config: ClientInteropConfig,
+) -> Result<(), BoxError> {
+    install_crypto_provider();
+
+    let cert = generate_test_certificate()?;
+    let cert_files = CertificateFiles::new(&cert)?;
+
+    let (port_tx, port_rx) = std::sync::mpsc::channel();
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    let cert_path = cert_files.cert_path.clone();
+    let key_path = cert_files.key_path.clone();
+
+    let server_task = tokio::spawn(async move {
+        if let Err(err) =
+            start_server(cert_path, key_path, port_tx, shutdown_rx, server_config).await
+        {
+            eprintln!("[tokio-quiche server] failed: {err:?}");
+        }
+    });
+
+    let port = port_rx.recv_timeout(Duration::from_secs(5))?;
+    let server_addr = format!("127.0.0.1:{port}").parse()?;
+
+    let client_result = tokio::time::timeout(
+        INTEROP_TEST_TIMEOUT,
+        run_local_quinn_client_max_field_section_size_limit(server_addr, &cert, client_config),
     )
     .await;
 
@@ -218,15 +258,19 @@ async fn send_response(incoming_headers: IncomingH3Headers) -> Result<(), BoxErr
     let body = interop_body(case);
     let status = case.status.to_string();
     let content_length = body.len().to_string();
+    let padding = interop_response_header_value(case);
 
     // RFC 9114 Section 4.1: response HEADERS and DATA are sent on the same
     // client-initiated bidirectional stream as the request.
     // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
-    let response_headers = vec![
+    let mut response_headers = vec![
         Header::new(b":status", status.as_bytes()),
         Header::new(b"content-type", b"application/octet-stream"),
         Header::new(b"content-length", content_length.as_bytes()),
     ];
+    if let Some(padding) = padding.as_ref() {
+        response_headers.push(Header::new(INTEROP_PADDING_HEADER_NAME, padding));
+    }
 
     frame_sender
         .send(OutboundFrame::Headers(response_headers, None))
