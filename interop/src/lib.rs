@@ -20,7 +20,29 @@ pub const INTEROP_PADDING_HEADER_NAME: &[u8] = b"x-interop-padding";
 pub struct InteropCase {
     pub status: u16,
     pub body_len: usize,
-    pub response_header_value_len: usize,
+    pub response_header_value_len: Option<usize>,
+}
+
+impl InteropCase {
+    pub const fn new(status: u16, body_len: usize) -> Self {
+        Self {
+            status,
+            body_len,
+            response_header_value_len: None,
+        }
+    }
+
+    pub const fn with_response_header_value_len(
+        status: u16,
+        body_len: usize,
+        response_header_value_len: usize,
+    ) -> Self {
+        Self {
+            status,
+            body_len,
+            response_header_value_len: Some(response_header_value_len),
+        }
+    }
 }
 
 // Keep this table intentionally mixed: small bodies catch header-only and
@@ -29,99 +51,28 @@ pub struct InteropCase {
 // FIN delivery have shown up before.
 // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.1
 pub const INTEROP_CASES: &[InteropCase] = &[
-    InteropCase {
-        status: 200,
-        body_len: 0,
-        response_header_value_len: 0,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 1,
-        response_header_value_len: 0,
-    },
-    InteropCase {
-        status: 201,
-        body_len: 1024,
-        response_header_value_len: 0,
-    },
-    InteropCase {
-        status: 204,
-        body_len: 0,
-        response_header_value_len: 0,
-    },
-    InteropCase {
-        status: 404,
-        body_len: 128,
-        response_header_value_len: 0,
-    },
-    InteropCase {
-        status: 503,
-        body_len: 16 * 1024,
-        response_header_value_len: 0,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 32 * 1024,
-        response_header_value_len: 0,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 64 * 1024,
-        response_header_value_len: 0,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 128 * 1024,
-        response_header_value_len: 0,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 256 * 1024,
-        response_header_value_len: 0,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 512 * 1024,
-        response_header_value_len: 0,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 1024 * 1024,
-        response_header_value_len: 0,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 2 * 1024 * 1024,
-        response_header_value_len: 0,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 4 * 1024 * 1024,
-        response_header_value_len: 0,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 8 * 1024 * 1024,
-        response_header_value_len: 0,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 16 * 1024 * 1024,
-        response_header_value_len: 0,
-    },
+    InteropCase::new(200, 0),
+    InteropCase::new(200, 1),
+    InteropCase::new(201, 1024),
+    InteropCase::new(204, 0),
+    InteropCase::new(404, 128),
+    InteropCase::new(503, 16 * 1024),
+    InteropCase::new(200, 32 * 1024),
+    InteropCase::new(200, 64 * 1024),
+    InteropCase::new(200, 128 * 1024),
+    InteropCase::new(200, 256 * 1024),
+    InteropCase::new(200, 512 * 1024),
+    InteropCase::new(200, 1024 * 1024),
+    InteropCase::new(200, 2 * 1024 * 1024),
+    InteropCase::new(200, 4 * 1024 * 1024),
+    InteropCase::new(200, 8 * 1024 * 1024),
+    InteropCase::new(200, 16 * 1024 * 1024),
 ];
 
-pub const DEFAULT_INTEROP_CASE: InteropCase = InteropCase {
-    status: 200,
-    body_len: DEFAULT_BODY_LEN,
-    response_header_value_len: 0,
-};
+pub const DEFAULT_INTEROP_CASE: InteropCase = InteropCase::new(200, DEFAULT_BODY_LEN);
 
-pub const FIELD_SECTION_LIMIT_TEST_CASE: InteropCase = InteropCase {
-    status: 200,
-    body_len: 0,
-    response_header_value_len: FIELD_SECTION_LIMIT_TEST_HEADER_VALUE_LEN,
-};
+pub const FIELD_SECTION_LIMIT_TEST_CASE: InteropCase =
+    InteropCase::with_response_header_value_len(200, 0, FIELD_SECTION_LIMIT_TEST_HEADER_VALUE_LEN);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ClientInteropConfig {
@@ -185,10 +136,10 @@ pub fn interop_request_path(case: InteropCase, round: usize, index: usize) -> St
         case.status, case.body_len
     );
 
-    if case.response_header_value_len > 0 {
+    if let Some(response_header_value_len) = case.response_header_value_len {
         path.push_str(&format!(
             "/response-header-value/{}",
-            case.response_header_value_len
+            response_header_value_len
         ));
     }
 
@@ -216,12 +167,14 @@ pub fn interop_case_from_path(path: &str) -> Option<InteropCase> {
     }
 }
 
-fn response_header_value_len<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<usize> {
-    let mut len = 0;
+fn response_header_value_len<'a>(
+    mut parts: impl Iterator<Item = &'a str>,
+) -> Option<Option<usize>> {
+    let mut len = None;
 
     while let Some(part) = parts.next() {
         if part == "response-header-value" {
-            len = parts.next()?.parse().ok()?;
+            len = Some(parts.next()?.parse().ok()?);
         }
     }
 
@@ -235,7 +188,7 @@ pub fn interop_body(case: InteropCase) -> Vec<u8> {
 }
 
 pub fn interop_response_header_value(case: InteropCase) -> Option<Vec<u8>> {
-    (case.response_header_value_len > 0).then(|| vec![b'x'; case.response_header_value_len])
+    case.response_header_value_len.map(|len| vec![b'x'; len])
 }
 
 pub fn interop_requests() -> Vec<(InteropCase, String)> {
