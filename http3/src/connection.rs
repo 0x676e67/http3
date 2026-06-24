@@ -23,7 +23,7 @@ use crate::{
         },
         internal_error::InternalConnectionError,
     },
-    frame::{FrameStream, FrameStreamError, RequestFrame},
+    frame::{FrameStream, FrameStreamError, Frames},
     proto::{
         frame::{self, Frame, PayloadLen},
         headers::Header,
@@ -1090,6 +1090,13 @@ impl DecoderGurad {
         Ok(())
     }
 
+    /// Marks the stream as fully read so dropping it does not emit cancellation.
+    ///
+    /// A normal end of the response stream is not abandoned reading; cancellation
+    /// is reserved for reset streams or field sections the application stops
+    /// reading.
+    ///
+    /// See [RFC 9204, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
     fn finish_reading(&mut self) {
         self.cancel_on_drop = false;
     }
@@ -1188,7 +1195,7 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<qpack::Decoded, StreamError>> {
         if self.response_headers.is_none() {
-            let frame = match ready!(self.stream.poll_next_request(cx)) {
+            let frame = match ready!(self.stream.poll_next_frame(cx)) {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
                     return Poll::Ready(Err(self.handle_connection_error_on_stream(
@@ -1206,19 +1213,19 @@ where
             };
 
             match frame {
-                RequestFrame::Headers => {
+                Frames::Headers => {
                     self.response_headers = Some(qpack::DecoderState::new());
                 }
                 // FrameDecoder can skip an unknown frame and reach a buffered
                 // HEADERS frame in the same pass. Accept that legacy result so
                 // RFC 9114's unknown-frame handling remains transparent.
                 // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
-                RequestFrame::Frame(Frame::Headers(mut encoded)) => {
+                Frames::Frame(Frame::Headers(mut encoded)) => {
                     let mut state = qpack::DecoderState::new();
                     state.extend(&mut encoded);
                     self.response_headers = Some(state);
                 }
-                RequestFrame::Frame(frame) => {
+                Frames::Frame(frame) => {
                     return Poll::Ready(Err(self.handle_connection_error_on_stream(
                         InternalConnectionError::new(
                             Code::H3_FRAME_UNEXPECTED,
@@ -1230,18 +1237,18 @@ where
         }
 
         loop {
+            // `end` is scoped to the current HEADERS frame payload, not to the
+            // request stream. QPACK can finish this field section as soon as the
+            // HEADERS payload is drained.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5
             let end = !self.stream.has_data();
             let decoded = {
                 let state = self
                     .response_headers
                     .as_mut()
                     .expect("response header state is initialized");
-                self.decoder.poll_decode_header_incremental(
-                    cx,
-                    state,
-                    end,
-                    self.max_field_section_size,
-                )
+                self.decoder
+                    .poll_decode_header(cx, state, end, self.max_field_section_size)
             };
 
             match decoded {
@@ -1325,7 +1332,7 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
         if !self.stream.has_data() {
-            match ready!(self.stream.poll_next_request(cx)) {
+            match ready!(self.stream.poll_next_frame(cx)) {
                 Err(frame_stream_error) => {
                     return Poll::Ready(Err(
                         self.handle_frame_stream_error_on_request_stream(frame_stream_error)
@@ -1337,19 +1344,19 @@ where
                     }
                     return Poll::Ready(Ok(None));
                 }
-                Ok(Some(RequestFrame::Headers)) => {
+                Ok(Some(Frames::Headers)) => {
                     self.trailers = Some(TrailersState::Decoding(qpack::DecoderState::new()));
                     // Received trailers, no more data expected
                     return Poll::Ready(Ok(None));
                 }
-                Ok(Some(RequestFrame::Frame(Frame::Headers(mut encoded)))) => {
+                Ok(Some(Frames::Frame(Frame::Headers(mut encoded)))) => {
                     let mut state = qpack::DecoderState::new();
                     state.extend(&mut encoded);
                     self.trailers = Some(TrailersState::Decoding(state));
                     return Poll::Ready(Ok(None));
                 }
-                Ok(Some(RequestFrame::Frame(Frame::Data { .. }))) => (),
-                Ok(Some(RequestFrame::Frame(other_frame))) => {
+                Ok(Some(Frames::Frame(Frame::Data { .. }))) => (),
+                Ok(Some(Frames::Frame(other_frame))) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                     //# Receipt of an invalid sequence of frames MUST be treated as a
                     //# connection error of type H3_FRAME_UNEXPECTED.
@@ -1397,7 +1404,7 @@ where
         let mut trailers = if let Some(state) = self.trailers.take() {
             state
         } else {
-            match ready!(self.stream.poll_next_request(cx)) {
+            match ready!(self.stream.poll_next_frame(cx)) {
                 Err(frame_stream_error) => {
                     return Poll::Ready(Err(
                         self.handle_frame_stream_error_on_request_stream(frame_stream_error)
@@ -1409,15 +1416,13 @@ where
                     }
                     return Poll::Ready(Ok(None));
                 }
-                Ok(Some(RequestFrame::Headers)) => {
-                    TrailersState::Decoding(qpack::DecoderState::new())
-                }
-                Ok(Some(RequestFrame::Frame(Frame::Headers(mut encoded)))) => {
+                Ok(Some(Frames::Headers)) => TrailersState::Decoding(qpack::DecoderState::new()),
+                Ok(Some(Frames::Frame(Frame::Headers(mut encoded)))) => {
                     let mut state = qpack::DecoderState::new();
                     state.extend(&mut encoded);
                     TrailersState::Decoding(state)
                 }
-                Ok(Some(RequestFrame::Frame(other_frame))) => {
+                Ok(Some(Frames::Frame(other_frame))) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                     //# Receipt of an invalid sequence of frames MUST be treated as a
                     //# connection error of type H3_FRAME_UNEXPECTED.
@@ -1452,13 +1457,14 @@ where
 
         if let TrailersState::Decoding(state) = &mut trailers {
             loop {
+                // Trailers are another encoded field section, so they get their
+                // own incremental QPACK state and acknowledgment decision.
+                // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
                 let end = !self.stream.has_data();
-                match self.decoder.poll_decode_header_incremental(
-                    cx,
-                    state,
-                    end,
-                    self.max_field_section_size,
-                ) {
+                match self
+                    .decoder
+                    .poll_decode_header(cx, state, end, self.max_field_section_size)
+                {
                     Poll::Ready(Ok(Some(decoded))) => {
                         if let Some(guard) = self.decoder_gurad.as_mut() {
                             guard.unblock();
@@ -1536,7 +1542,7 @@ where
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
             //# Receipt of an invalid sequence of frames MUST be treated as a
             //# connection error of type H3_FRAME_UNEXPECTED.
-            match self.stream.poll_next_request(cx) {
+            match self.stream.poll_next_frame(cx) {
                 Poll::Ready(Err(frame_stream_error)) => {
                     return Poll::Ready(Err(
                         self.handle_frame_stream_error_on_request_stream(frame_stream_error)

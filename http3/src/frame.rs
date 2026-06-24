@@ -19,7 +19,7 @@ use crate::{
     quic::{BidiStream, RecvStream, SendStream},
 };
 
-/// Decodes Frames from the underlying QUIC stream
+/// Decodes HTTP/3 frames from the underlying QUIC stream.
 pub struct FrameStream<S, B> {
     pub stream: BufRecvStream<S, B>,
     // Already read data from the stream
@@ -27,10 +27,10 @@ pub struct FrameStream<S, B> {
     remaining_data: usize,
 }
 
-/// A request-stream frame whose HEADERS payload has not been buffered yet.
+/// A stream frame whose HEADERS payload has not been buffered yet.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum RequestFrame {
+pub(crate) enum Frames {
     Headers,
     Frame(Frame<PayloadLen>),
 }
@@ -107,17 +107,17 @@ where
         }
     }
 
-    /// Polls the next request-stream frame without buffering a HEADERS payload.
+    /// Polls the next stream frame without buffering a HEADERS payload.
     ///
     /// RFC 9114 defines HEADERS as an encoded field section. Returning its length
     /// here lets QPACK consume the payload through `poll_data` as transport chunks
     /// arrive instead of waiting for the complete frame.
     ///
     /// See [RFC 9114, Section 7.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.2).
-    pub(crate) fn poll_next_request(
+    pub(crate) fn poll_next_frame(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<RequestFrame>, FrameStreamError>> {
+    ) -> Poll<Result<Option<Frames>, FrameStreamError>> {
         assert!(
             self.remaining_data == 0,
             "There is still data to read, please call poll_data() until it returns None."
@@ -134,14 +134,16 @@ where
                 (consumed, Ok(Some(PayloadLen(len)))) => {
                     self.stream.buf_mut().advance(consumed);
                     self.remaining_data = len;
-                    return Poll::Ready(Ok(Some(RequestFrame::Headers)));
+                    return Poll::Ready(Ok(Some(Frames::Headers)));
                 }
                 (_, Err(frame::FrameError::Incomplete(_))) => {}
-                (_, Err(_)) => unreachable!("HEADERS prefix decoding only reports incomplete data"),
+                // A malformed HEADERS prefix violates the HTTP/3 frame layout.
+                // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+                (_, Err(error)) => return Poll::Ready(Err(map_headers_prefix_error(error))),
                 (_, Ok(None)) => {
                     return self
                         .poll_next(cx)
-                        .map(|result| result.map(|frame| frame.map(RequestFrame::Frame)));
+                        .map(|result| result.map(|frame| frame.map(Frames::Frame)));
                 }
             }
 
@@ -197,7 +199,8 @@ where
     /// containing the complete frame is not copied into the QPACK scratch buffer
     /// in one operation.
     ///
-    /// See [RFC 9114, Section 4.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2).
+    /// See [RFC 9114, Section 4.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2)
+    /// and [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
     pub(crate) fn poll_data_chunk(
         &mut self,
         cx: &mut Context<'_>,
@@ -402,6 +405,29 @@ impl FrameDecoder {
                 }
             }
         }
+    }
+}
+
+fn map_headers_prefix_error(error: frame::FrameError) -> FrameStreamError {
+    match error {
+        frame::FrameError::Incomplete(_) => FrameStreamError::UnexpectedEnd,
+        frame::FrameError::UnknownFrame(_) => {
+            FrameStreamError::Proto(FrameProtocolError::Malformed)
+        }
+        frame::FrameError::InvalidStreamId(e) => {
+            FrameStreamError::Proto(FrameProtocolError::InvalidStreamId(e))
+        }
+        frame::FrameError::InvalidPushId(e) => {
+            FrameStreamError::Proto(FrameProtocolError::InvalidPushId(e))
+        }
+        frame::FrameError::Settings(e) => FrameStreamError::Proto(FrameProtocolError::Settings(e)),
+        frame::FrameError::UnsupportedFrame(ty) => {
+            FrameStreamError::Proto(FrameProtocolError::ForbiddenFrame(ty))
+        }
+        frame::FrameError::InvalidFrameValue => {
+            FrameStreamError::Proto(FrameProtocolError::InvalidFrameValue)
+        }
+        frame::FrameError::Malformed => FrameStreamError::Proto(FrameProtocolError::Malformed),
     }
 }
 
@@ -735,10 +761,7 @@ mod tests {
         recv.chunk(encoded.freeze());
 
         let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
-        assert_poll_matches!(
-            |cx| stream.poll_next_request(cx),
-            Ok(Some(RequestFrame::Headers))
-        );
+        assert_poll_matches!(|cx| stream.poll_next_frame(cx), Ok(Some(Frames::Headers)));
         assert_poll_matches!(
             |cx| to_bytes(stream.poll_data_chunk(cx, 3)),
             Ok(Some(bytes)) if bytes == b"hea"[..]

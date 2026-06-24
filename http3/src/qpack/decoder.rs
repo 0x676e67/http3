@@ -36,6 +36,7 @@ pub enum DecoderError {
     MissingRefs(usize),
     BadBaseIndex(isize),
     InvalidRequiredInsertCount(usize),
+    MalformedFieldSection,
     TooManyBlockedStreams,
     UnexpectedEnd,
     HeaderTooLong(u64),
@@ -58,6 +59,7 @@ impl std::fmt::Display for DecoderError {
             DecoderError::InvalidRequiredInsertCount(i) => {
                 write!(f, "invalid required insert count: {}", i)
             }
+            DecoderError::MalformedFieldSection => write!(f, "malformed field section"),
             DecoderError::TooManyBlockedStreams => write!(f, "too many blocked streams"),
             DecoderError::UnexpectedEnd => write!(f, "unexpected end"),
             DecoderError::HeaderTooLong(_) => write!(f, "header too long"),
@@ -88,6 +90,8 @@ pub struct Decoded {
 ///
 /// Complete field lines are decoded and removed from `pending` as data arrives.
 /// Only an incomplete field representation remains buffered between polls.
+/// Headers and trailers use separate states because each HEADERS frame carries
+/// one encoded field section.
 ///
 /// See [RFC 9204, Section 4.5](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5).
 pub(crate) struct DecoderState {
@@ -104,6 +108,7 @@ impl DecoderState {
     /// [`Self::extend`], as defined by RFC 9204.
     ///
     /// See [RFC 9204, Section 4.5.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1).
+    #[inline(always)]
     pub(crate) fn new() -> Self {
         Self {
             pending: BytesMut::new(),
@@ -116,15 +121,34 @@ impl DecoderState {
     /// Appends the next transport chunk to the incomplete field representation.
     ///
     /// See [RFC 9204, Section 4.5](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5).
+    #[inline(always)]
     pub(crate) fn extend<T: Buf>(&mut self, data: &mut T) {
         self.pending.put(data);
     }
 
+    fn push_field(&mut self, field: HeaderField, max_size: u64) -> Result<(), DecoderError> {
+        let field_size = field.mem_size().try_into()?;
+        self.mem_size = self
+            .mem_size
+            .checked_add(field_size)
+            .ok_or(DecoderError::HeaderTooLong(u64::MAX))?;
+        if self.mem_size > max_size {
+            return Err(DecoderError::HeaderTooLong(self.mem_size));
+        }
+        self.fields.push(field);
+        Ok(())
+    }
+
     fn finish(&mut self, required_ref: usize) -> Decoded {
+        let mem_size = self.mem_size;
+        self.prefix = None;
+        self.mem_size = 0;
+        self.pending.clear();
+
         Decoded {
             fields: std::mem::take(&mut self.fields),
             dyn_ref: required_ref > 0,
-            mem_size: self.mem_size,
+            mem_size,
         }
     }
 }
@@ -182,51 +206,12 @@ impl Decoder {
         self.max_blocked_streams
     }
 
-    // Decode field lines received on Request of Push stream.
-    // https://www.rfc-editor.org/rfc/rfc9204.html#name-field-line-representations
-    #[inline(always)]
-    pub fn decode_header<T: Buf>(&self, buf: &mut T) -> Result<Decoded, DecoderError> {
-        self.decode_header_limited(buf, u64::MAX)
-    }
-
-    pub(crate) fn decode_header_limited<T: Buf>(
-        &self,
-        buf: &mut T,
-        max_size: u64,
-    ) -> Result<Decoded, DecoderError> {
-        let (required_ref, base) =
-            HeaderPrefix::decode(buf)?.get(self.table.total_inserted(), self.max_table_capacity)?;
-
-        if required_ref > self.table.total_inserted() {
-            return Err(DecoderError::MissingRefs(required_ref));
-        }
-
-        let decoder_table = self.table.decoder(base, required_ref);
-
-        let mut mem_size = 0;
-        let mut fields = Vec::new();
-        while buf.has_remaining() {
-            let field = Self::parse_header_field(&decoder_table, buf)?;
-            mem_size += field.mem_size() as u64;
-            if mem_size > max_size {
-                return Err(DecoderError::HeaderTooLong(mem_size));
-            }
-            fields.push(field);
-        }
-
-        Ok(Decoded {
-            fields,
-            mem_size,
-            dyn_ref: required_ref > 0,
-        })
-    }
-
     /// Advances decoding using the bytes currently stored in `state`.
     ///
     /// `Ok(None)` means the current prefix or field representation needs more
     /// bytes. When `end` is true, incomplete input is a decompression error.
     ///
-    /// See [RFC 9204, Section 2.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2)
+    /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1)
     /// and [Section 4.5](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5).
     pub(crate) fn decode_header_incremental(
         &self,
@@ -235,6 +220,9 @@ impl Decoder {
         max_size: u64,
     ) -> Result<Option<Decoded>, DecoderError> {
         if state.prefix.is_none() {
+            // The prefix is decoded once. Its Required Insert Count decides
+            // whether the rest of this field section can be touched yet.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1
             let mut cursor = Cursor::new(&state.pending[..]);
             let prefix = match HeaderPrefix::decode(&mut cursor) {
                 Ok(prefix) => prefix,
@@ -251,13 +239,19 @@ impl Decoder {
             state.prefix = Some(prefix);
         }
 
-        let (required_ref, base) = state.prefix.expect("field section prefix is initialized");
+        let (required_ref, base) = state.prefix.ok_or(DecoderError::MalformedFieldSection)?;
         if required_ref > self.table.total_inserted() {
+            // Keep the field representations buffered until encoder-stream
+            // instructions bring the decoder insert count up to the requirement.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1
             return Err(DecoderError::MissingRefs(required_ref));
         }
 
+        let decoder_table = self.table.decoder(base, required_ref);
         while state.pending.has_remaining() {
-            let decoder_table = self.table.decoder(base, required_ref);
+            // Parse through a cursor first so an incomplete representation stays
+            // in `pending` and can be finished by the next transport chunk.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5
             let mut cursor = Cursor::new(&state.pending[..]);
             let field = match Self::parse_header_field(&decoder_table, &mut cursor) {
                 Ok(field) => field,
@@ -266,11 +260,7 @@ impl Decoder {
             };
 
             state.pending.advance(cursor.position() as usize);
-            state.mem_size += field.mem_size() as u64;
-            if state.mem_size > max_size {
-                return Err(DecoderError::HeaderTooLong(state.mem_size));
-            }
-            state.fields.push(field);
+            state.push_field(field, max_size)?;
         }
 
         if end {
@@ -441,13 +431,21 @@ pub fn decode_stateless<T: Buf>(buf: &mut T, max_size: u64) -> Result<Decoded, D
 
 /// Incrementally decodes a field section when dynamic references are disabled.
 ///
-/// See [RFC 9204, Section 4.5](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5).
+/// With a zero maximum dynamic table capacity, the peer encoder cannot use the
+/// dynamic table. Static references and literals can still be decoded chunk by
+/// chunk.
+///
+/// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3)
+/// and [Section 4.5](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5).
 pub(crate) fn decode_stateless_incremental(
     state: &mut DecoderState,
     end: bool,
     max_size: u64,
 ) -> Result<Option<Decoded>, DecoderError> {
     if state.prefix.is_none() {
+        // `get(0, 0)` reconstructs the prefix using a decoder insert count and
+        // maximum dynamic table capacity of zero, rejecting non-zero RIC values.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
         let mut cursor = Cursor::new(&state.pending[..]);
         let prefix = match HeaderPrefix::decode(&mut cursor) {
             Ok(prefix) => prefix,
@@ -464,8 +462,11 @@ pub(crate) fn decode_stateless_incremental(
         state.prefix = Some(prefix);
     }
 
-    let (required_ref, _) = state.prefix.expect("field section prefix is initialized");
+    let (required_ref, _) = state.prefix.ok_or(DecoderError::MalformedFieldSection)?;
     while state.pending.has_remaining() {
+        // Keep incomplete literals or strings buffered instead of treating them
+        // as malformed before the HEADERS frame payload is complete.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5
         let mut cursor = Cursor::new(&state.pending[..]);
         let field = match parse_stateless_header_field(&mut cursor) {
             Ok(field) => field,
@@ -474,11 +475,7 @@ pub(crate) fn decode_stateless_incremental(
         };
 
         state.pending.advance(cursor.position() as usize);
-        state.mem_size += field.mem_size() as u64;
-        if state.mem_size > max_size {
-            return Err(DecoderError::HeaderTooLong(state.mem_size));
-        }
-        state.fields.push(field);
+        state.push_field(field, max_size)?;
     }
 
     if end {
@@ -491,6 +488,8 @@ pub(crate) fn decode_stateless_incremental(
 fn parse_stateless_header_field<R: Buf>(buf: &mut R) -> Result<HeaderField, DecoderError> {
     let field = match HeaderBlockField::decode(buf.chunk()[0]) {
         HeaderBlockField::IndexedWithPostBase | HeaderBlockField::LiteralWithPostBaseNameRef => {
+            // Post-base references are always dynamic-table references.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.6
             return Err(DecoderError::MissingRefs(0));
         }
         HeaderBlockField::Indexed => match Indexed::decode(buf)? {
@@ -604,6 +603,26 @@ mod tests {
     use super::*;
     use crate::qpack::tests::helpers::{TABLE_SIZE, build_table_with_size};
 
+    fn decode_incremental(
+        decoder: &Decoder,
+        buf: impl AsRef<[u8]>,
+    ) -> Result<Decoded, DecoderError> {
+        decode_incremental_limited(decoder, buf, u64::MAX)
+    }
+
+    fn decode_incremental_limited(
+        decoder: &Decoder,
+        buf: impl AsRef<[u8]>,
+        max_size: u64,
+    ) -> Result<Decoded, DecoderError> {
+        let mut state = DecoderState::new();
+        state.extend(&mut Cursor::new(buf.as_ref()));
+        match decoder.decode_header_incremental(&mut state, true, max_size)? {
+            Some(decoded) => Ok(decoded),
+            None => Err(DecoderError::UnexpectedEnd),
+        }
+    }
+
     #[test]
     fn test_header_too_long() {
         let mut trailers = http::HeaderMap::new();
@@ -663,7 +682,7 @@ mod tests {
         let decoder = Decoder::new(TABLE_SIZE as u64, 0).unwrap();
 
         assert_eq!(
-            decoder.decode_header(&mut Cursor::new(field_section)),
+            decode_incremental(&decoder, field_section),
             Err(DecoderError::MissingRefs(8))
         );
     }
@@ -676,7 +695,7 @@ mod tests {
         let decoder = Decoder::from(build_table_with_size(4));
 
         assert_eq!(
-            decoder.decode_header(&mut Cursor::new(field_section)),
+            decode_incremental(&decoder, field_section),
             Err(DecoderError::DynamicTable(
                 DynamicTableError::BadRelativeIndex(0)
             ))
@@ -739,6 +758,81 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(decoded.fields, vec![HeaderField::new("dynamic", "value")]);
+    }
+
+    #[test]
+    fn incremental_dynamic_decode_accepts_single_byte_chunks() {
+        let mut encoded = Vec::new();
+        HeaderPrefix::new(2, 2, 2, TABLE_SIZE).encode(&mut encoded);
+        Indexed::Dynamic(0).encode(&mut encoded);
+        Indexed::Dynamic(1).encode(&mut encoded);
+
+        let mut state = DecoderState::new();
+        let decoder = Decoder::from(build_table_with_size(2));
+        for byte in encoded {
+            state.extend(&mut Cursor::new([byte]));
+            assert_eq!(
+                decoder.decode_header_incremental(&mut state, false, u64::MAX),
+                Ok(None)
+            );
+        }
+
+        let decoded = decoder
+            .decode_header_incremental(&mut state, true, u64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.fields, vec![field(2), field(1)]);
+        assert!(decoded.dyn_ref);
+    }
+
+    #[test]
+    fn incremental_dynamic_decode_waits_for_incomplete_field() {
+        let mut field_section = Vec::new();
+        HeaderPrefix::new(0, 0, 0, TABLE_SIZE).encode(&mut field_section);
+        Literal::new("name", "value")
+            .encode(&mut field_section)
+            .unwrap();
+        let _ = field_section.pop();
+
+        let mut state = DecoderState::new();
+        state.extend(&mut Cursor::new(field_section));
+        let decoder = Decoder::from(build_table_with_size(0));
+
+        assert_eq!(
+            decoder.decode_header_incremental(&mut state, false, u64::MAX),
+            Ok(None)
+        );
+        assert_eq!(
+            decoder.decode_header_incremental(&mut state, true, u64::MAX),
+            Err(DecoderError::UnexpectedEnd)
+        );
+    }
+
+    #[test]
+    fn incremental_dynamic_decode_rejects_empty_field_section() {
+        let mut state = DecoderState::new();
+        let decoder = Decoder::from(build_table_with_size(0));
+
+        assert_eq!(
+            decoder.decode_header_incremental(&mut state, true, u64::MAX),
+            Err(DecoderError::UnexpectedEnd)
+        );
+    }
+
+    #[test]
+    fn incremental_dynamic_decode_enforces_header_limit() {
+        let header = HeaderField::new("name", "value");
+        let mut field_section = Vec::new();
+        HeaderPrefix::new(0, 0, 0, TABLE_SIZE).encode(&mut field_section);
+        Literal::new("name", "value")
+            .encode(&mut field_section)
+            .unwrap();
+        let decoder = Decoder::from(build_table_with_size(0));
+
+        assert_eq!(
+            decode_incremental_limited(&decoder, &field_section, 1),
+            Err(DecoderError::HeaderTooLong(header.mem_size() as u64))
+        );
     }
 
     /**
@@ -948,9 +1042,8 @@ mod tests {
         let mut buf = vec![];
         HeaderPrefix::new(8, 8, 10, TABLE_SIZE).encode(&mut buf);
 
-        let mut read = Cursor::new(&buf);
         assert_eq!(
-            decoder.decode_header(&mut read),
+            decode_incremental(&decoder, &buf),
             Err(DecoderError::MissingRefs(8))
         );
     }
@@ -962,7 +1055,7 @@ mod tests {
         Indexed::Static(18).encode(&mut buf);
 
         let decoder = Decoder::from(build_table_with_size(0));
-        let decoded = decoder.decode_header(&mut Cursor::new(buf)).unwrap();
+        let decoded = decode_incremental(&decoder, buf).unwrap();
 
         assert!(!decoded.dyn_ref);
     }
@@ -989,11 +1082,10 @@ mod tests {
         Indexed::Dynamic(1).encode(&mut buf);
         Indexed::Static(18).encode(&mut buf);
 
-        let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(2));
         let Decoded {
             fields, dyn_ref, ..
-        } = decoder.decode_header(&mut read).unwrap();
+        } = decode_incremental(&decoder, &buf).unwrap();
         assert!(dyn_ref);
         assert_eq!(
             fields,
@@ -1021,11 +1113,10 @@ mod tests {
         IndexedWithPostBase(0).encode(&mut buf);
         IndexedWithPostBase(1).encode(&mut buf);
 
-        let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(4));
         let Decoded {
             fields, dyn_ref, ..
-        } = decoder.decode_header(&mut read).unwrap();
+        } = decode_incremental(&decoder, &buf).unwrap();
         assert!(dyn_ref);
         assert_eq!(fields, &[field(2), field(3), field(4)])
     }
@@ -1041,11 +1132,10 @@ mod tests {
             .encode(&mut buf)
             .unwrap();
 
-        let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(4));
         let Decoded {
             fields, dyn_ref, ..
-        } = decoder.decode_header(&mut read).unwrap();
+        } = decode_incremental(&decoder, &buf).unwrap();
         assert!(dyn_ref);
         assert_eq!(
             fields,
@@ -1064,9 +1154,8 @@ mod tests {
             .encode(&mut buf)
             .unwrap();
 
-        let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(4));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decode_incremental(&decoder, &buf).unwrap();
         assert_eq!(fields, &[field(3).with_value("new bar3")]);
     }
 
@@ -1076,9 +1165,8 @@ mod tests {
         HeaderPrefix::new(0, 0, 0, TABLE_SIZE).encode(&mut buf);
         Literal::new("foo", "bar").encode(&mut buf).unwrap();
 
-        let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(0));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decode_incremental(&decoder, &buf).unwrap();
         assert_eq!(
             fields,
             &[HeaderField::new(b"foo".to_vec(), b"bar".to_vec())]
@@ -1106,9 +1194,8 @@ mod tests {
         IndexedWithPostBase(2).encode(&mut buf);
         IndexedWithPostBase(3).encode(&mut buf);
 
-        let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(4));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decode_incremental(&decoder, &buf).unwrap();
         assert_eq!(fields, &[field(1), field(2), field(3), field(4)]);
     }
 
@@ -1129,9 +1216,8 @@ mod tests {
         .encode(&mut buf);
         Indexed::Dynamic(10).encode(&mut buf);
 
-        let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(max_entries + 10));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).expect("decode");
+        let Decoded { fields, .. } = decode_incremental(&decoder, &buf).expect("decode");
         assert_eq!(fields, &[field(max_entries - 5)]);
 
         let mut buf = vec![];
@@ -1147,9 +1233,8 @@ mod tests {
         IndexedWithPostBase(0).encode(&mut buf);
         IndexedWithPostBase(4).encode(&mut buf);
 
-        let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(table);
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decode_incremental(&decoder, &buf).unwrap();
         assert_eq!(fields, &[field(max_entries + 6), field(max_entries + 10)]);
     }
 }
