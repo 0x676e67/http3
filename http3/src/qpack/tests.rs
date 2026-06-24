@@ -1,10 +1,21 @@
 use crate::qpack::decoder::Decoder;
 use crate::qpack::encoder::Encoder;
-use crate::qpack::{Decoded, DecoderError, HeaderField, QpackDecoder, dynamic::DynamicTable};
+use crate::qpack::{
+    Decoded, DecoderError, DecoderState, HeaderField, QpackDecoder, dynamic::DynamicTable,
+};
 use std::{
     io::Cursor,
     task::{Context, Poll},
 };
+
+fn decode_incremental(decoder: &Decoder, buf: impl AsRef<[u8]>) -> Result<Decoded, DecoderError> {
+    let mut state = DecoderState::new();
+    state.extend(&mut Cursor::new(buf.as_ref()));
+    match decoder.decode_header_incremental(&mut state, true, u64::MAX)? {
+        Some(decoded) => Ok(decoded),
+        None => Err(DecoderError::UnexpectedEnd),
+    }
+}
 
 pub mod helpers {
     use crate::qpack::{HeaderField, dynamic::DynamicTable};
@@ -55,8 +66,7 @@ fn codec_basic_get() {
     let mut enc_cur = Cursor::new(&mut enc_buf);
     decoder.on_encoder_recv(&mut enc_cur, &mut dec_buf).unwrap();
 
-    let mut block_cur = Cursor::new(&mut block_buf);
-    let Decoded { fields, .. } = decoder.decode_header(&mut block_cur).unwrap();
+    let Decoded { fields, .. } = decode_incremental(&decoder, &block_buf).unwrap();
     assert_eq!(fields, header);
 
     let mut dec_cur = Cursor::new(&mut dec_buf);
@@ -87,15 +97,14 @@ fn blocked_header() {
         )
         .unwrap();
 
-    let mut block_cur = Cursor::new(&mut block_buf);
     assert_eq!(
-        decoder.decode_header(&mut block_cur),
+        decode_incremental(&decoder, &block_buf),
         Err(DecoderError::MissingRefs(1))
     );
 }
 
 #[test]
-fn shared_decoder_registers_blocked_header() {
+fn shared_decoder_registers_blocked_incremental_header() {
     let mut enc_table = DynamicTable::new();
     enc_table.set_max_size(TABLE_SIZE).unwrap();
     enc_table.set_max_blocked(100).unwrap();
@@ -119,10 +128,12 @@ fn shared_decoder_registers_blocked_header() {
     let (decoder_waker, mut decoder_wakers) = tokio::sync::mpsc::unbounded_channel();
     let decoder = QpackDecoder::new(Decoder::from(dec_table), decoder_waker);
     let mut block_cur = Cursor::new(&mut block_buf);
+    let mut state = DecoderState::new();
+    state.extend(&mut block_cur);
     let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
 
     assert_eq!(
-        decoder.poll_decode_header(&mut cx, &mut block_cur, u64::MAX),
+        decoder.poll_decode_header(&mut cx, &mut state, true, u64::MAX),
         Poll::Ready(Err(DecoderError::MissingRefs(1)))
     );
     assert!(decoder_wakers.try_recv().is_ok());
@@ -156,8 +167,7 @@ fn codec_table_size_0() {
     let mut enc_cur = Cursor::new(&mut enc_buf);
     decoder.on_encoder_recv(&mut enc_cur, &mut dec_buf).unwrap();
 
-    let mut block_cur = Cursor::new(&mut block_buf);
-    let Decoded { fields, .. } = decoder.decode_header(&mut block_cur).unwrap();
+    let Decoded { fields, .. } = decode_incremental(&decoder, &block_buf).unwrap();
     assert_eq!(fields, header);
 
     let mut dec_cur = Cursor::new(&mut dec_buf);
@@ -189,10 +199,8 @@ fn codec_table_full() {
         .unwrap();
 
     let mut enc_cur = Cursor::new(&mut enc_buf);
-    let mut block_cur = Cursor::new(&mut block_buf);
-
     decoder.on_encoder_recv(&mut enc_cur, &mut dec_buf).unwrap();
-    let Decoded { fields, .. } = decoder.decode_header(&mut block_cur).unwrap();
+    let Decoded { fields, .. } = decode_incremental(&decoder, &block_buf).unwrap();
     assert_eq!(fields, header);
 
     let mut dec_cur = Cursor::new(&mut dec_buf);

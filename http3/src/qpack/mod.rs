@@ -106,6 +106,7 @@ impl QpackDecoder {
     /// This is fixed from the advertised maximum table capacity when the
     /// connection is created. It does not indicate whether the table currently
     /// contains entries or whether its current capacity was later reduced to zero.
+    #[inline(always)]
     pub(crate) fn dynamic_table_enabled(&self) -> bool {
         self.0.decoder_dynamic_table
     }
@@ -225,6 +226,8 @@ impl QpackDecoder {
     /// A field section with missing references must also register its request task.
     /// `waiter_registered` is true when registration already happened while waiting
     /// for the read lock.
+    ///
+    /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
     fn finish_decode<T>(
         &self,
         cx: &Context<'_>,
@@ -258,66 +261,15 @@ impl QpackDecoder {
         Poll::Ready(decoded)
     }
 
-    /// Decodes one QPACK field section.
-    ///
-    /// Stateless decoding is used when dynamic-table support is disabled. Otherwise
-    /// the decoder is read-locked so request tasks can decode concurrently while the
-    /// connection driver is idle.
-    ///
-    /// [`DecoderError::MissingRefs`] is returned after the request waker has been
-    /// queued. The caller turns that result into [`Poll::Pending`] and restores the
-    /// encoded input, since decoding may advance it before reporting the missing
-    /// references. A direct [`Poll::Pending`] means the encoder stream currently owns
-    /// the write lock.
-    pub(crate) fn poll_decode_header<T: Buf>(
-        &self,
-        cx: &mut Context<'_>,
-        encoded: &mut T,
-        max_size: u64,
-    ) -> Poll<Result<Decoded, DecoderError>> {
-        if !self.0.decoder_dynamic_table {
-            return Poll::Ready(decode_stateless(encoded, max_size));
-        }
-
-        match self.0.decoder.try_read() {
-            Ok(decoder) => {
-                let decoded = decoder.decode_header_limited(encoded, max_size);
-                return self.finish_decode(cx, decoder, decoded, false);
-            }
-            Err(TryLockError::WouldBlock) => {}
-            _ => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
-        }
-
-        // Register before retrying; the writer drains this queue after its update.
-        if self
-            .0
-            .decoder_events_send
-            .send(QpackEvent::Waker(cx.waker().clone()))
-            .is_err()
-        {
-            return Poll::Ready(Err(DecoderError::UnexpectedEnd));
-        }
-        #[cfg(feature = "tracing")]
-        tracing::debug!("queued QPACK decoder waiter for decoder write lock");
-
-        match self.0.decoder.try_read() {
-            Ok(decoder) => {
-                let decoded = decoder.decode_header_limited(encoded, max_size);
-                self.finish_decode(cx, decoder, decoded, true)
-            }
-            Err(TryLockError::WouldBlock) => Poll::Pending,
-            _ => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
-        }
-    }
-
     /// Advances an encoded field section without requiring its complete payload.
     ///
     /// The request stream appends transport chunks to `state`. A successful
     /// `None` result asks for more payload bytes; `Poll::Pending` waits for decoder
     /// table access or missing dynamic references.
     ///
-    /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
-    pub(crate) fn poll_decode_header_incremental(
+    /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1)
+    /// and [Section 4.5](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5).
+    pub(crate) fn poll_decode_header(
         &self,
         cx: &mut Context<'_>,
         state: &mut DecoderState,
