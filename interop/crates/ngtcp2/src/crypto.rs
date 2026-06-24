@@ -39,9 +39,9 @@ pub struct TlsContext {
     alpn_data: Option<*mut Vec<u8>>,
 }
 
-// SAFETY: SSL_CTX is used through thread-safe library APIs.
+// SAFETY: TlsContext owns an SSL_CTX and may be moved with its owner. Shared
+// cross-thread access is not required by the interop drivers.
 unsafe impl Send for TlsContext {}
-unsafe impl Sync for TlsContext {}
 
 impl TlsContext {
     /// Creates a client TLS context.
@@ -242,9 +242,9 @@ pub struct TlsSession {
     is_server: bool,
 }
 
-// SAFETY: SSL is used through the library's synchronization expectations.
+// SAFETY: TlsSession owns one SSL object and moves with its QUIC connection.
+// The wrapper does not promise shared cross-thread access to SSL.
 unsafe impl Send for TlsSession {}
-unsafe impl Sync for TlsSession {}
 
 impl TlsSession {
     /// Sets SNI (Server Name Indication).
@@ -328,14 +328,23 @@ unsafe extern "C" fn alpn_select_callback(
     const SSL_TLSEXT_ERR_OK: i32 = 0;
     const SSL_TLSEXT_ERR_NOACK: i32 = 3;
 
-    if arg.is_null() {
+    if arg.is_null()
+        || out.is_null()
+        || outlen.is_null()
+        || (client_alpn.is_null() && client_alpn_len > 0)
+    {
         return SSL_TLSEXT_ERR_NOACK;
     }
 
     // SAFETY: arg is the Vec<u8> pointer created by TlsContext::new_server.
     let server_alpn = unsafe { &*(arg as *const Vec<u8>) };
-    let client_alpn_slice =
-        unsafe { std::slice::from_raw_parts(client_alpn, client_alpn_len as usize) };
+    let client_alpn_slice = if client_alpn_len == 0 {
+        &[][..]
+    } else {
+        // SAFETY: non-empty client ALPN input has a non-null pointer checked
+        // above and is owned by the TLS library for this callback.
+        unsafe { std::slice::from_raw_parts(client_alpn, client_alpn_len as usize) }
+    };
 
     // Parse the server ALPN list.
     let mut server_pos = 0;

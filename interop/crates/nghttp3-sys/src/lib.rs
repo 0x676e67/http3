@@ -12,9 +12,8 @@
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
-// Implement Send/Sync for nghttp3_vec.
-// SAFETY: nghttp3_vec is used only during writev_stream calls, and pointer
-// lifetimes end within that call. Async callers copy the data and then discard
-// the pointer, so moving the value between threads is safe.
+// Implement Send for nghttp3_vec.
+// SAFETY: nghttp3_vec is only moved as an owned value while driving one
+// connection. Shared cross-thread access would require stronger guarantees from
+// the pointed-to storage, so this crate intentionally does not implement Sync.
 unsafe impl Send for nghttp3_vec {}
-unsafe impl Sync for nghttp3_vec {}

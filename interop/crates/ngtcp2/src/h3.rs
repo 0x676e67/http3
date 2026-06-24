@@ -62,9 +62,33 @@ struct StreamBodyData {
     offset: usize,
 }
 
-// SAFETY: Http3Connection is used internally in a thread-safe manner.
+// SAFETY: Http3Connection owns the nghttp3 state machine and is only moved
+// between tasks with exclusive access. nghttp3_conn itself is not exposed as
+// Sync.
 unsafe impl Send for Http3Connection {}
-unsafe impl Sync for Http3Connection {}
+
+unsafe fn copy_ffi_bytes(ptr: *const u8, len: usize) -> Option<Vec<u8>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    if ptr.is_null() {
+        return None;
+    }
+
+    // SAFETY: the caller provided a non-null buffer pointer and length. The
+    // bytes are copied immediately so no reference escapes the callback.
+    Some(unsafe { std::slice::from_raw_parts(ptr, len).to_vec() })
+}
+
+unsafe fn copy_rcbuf_bytes(rcbuf: *mut nghttp3_rcbuf) -> Option<Vec<u8>> {
+    if rcbuf.is_null() {
+        return None;
+    }
+
+    // SAFETY: nghttp3 owns rcbuf for the duration of the callback.
+    let vec = unsafe { nghttp3_rcbuf_get_buf(rcbuf) };
+    unsafe { copy_ffi_bytes(vec.base, vec.len) }
+}
 
 impl Http3Connection {
     /// Creates a client connection.
@@ -1020,18 +1044,17 @@ unsafe extern "C" fn on_recv_data(
     conn_user_data: *mut c_void,
     _stream_user_data: *mut c_void,
 ) -> c_int {
-    if conn_user_data.is_null() {
+    if conn_user_data.is_null() || (data.is_null() && datalen > 0) {
         return 0;
     }
 
     unsafe {
         let user_data = &*(conn_user_data as *const Http3UserData);
         if !user_data.events.is_null() {
-            let data_slice = std::slice::from_raw_parts(data, datalen);
-            (*user_data.events).push_back(Http3Event::Data {
-                stream_id,
-                data: data_slice.to_vec(),
-            });
+            let Some(data) = copy_ffi_bytes(data, datalen) else {
+                return 0;
+            };
+            (*user_data.events).push_back(Http3Event::Data { stream_id, data });
         }
     }
 
@@ -1068,22 +1091,23 @@ unsafe extern "C" fn on_recv_header(
     conn_user_data: *mut c_void,
     _stream_user_data: *mut c_void,
 ) -> c_int {
-    if conn_user_data.is_null() {
+    if conn_user_data.is_null() || name.is_null() || value.is_null() {
         return 0;
     }
 
     unsafe {
         let user_data = &*(conn_user_data as *const Http3UserData);
         if !user_data.events.is_null() {
-            let name_vec = nghttp3_rcbuf_get_buf(name);
-            let value_vec = nghttp3_rcbuf_get_buf(value);
-
-            let name_slice = std::slice::from_raw_parts(name_vec.base, name_vec.len);
-            let value_slice = std::slice::from_raw_parts(value_vec.base, value_vec.len);
+            let Some(name) = copy_rcbuf_bytes(name) else {
+                return 0;
+            };
+            let Some(value) = copy_rcbuf_bytes(value) else {
+                return 0;
+            };
 
             (*user_data.events).push_back(Http3Event::Header {
                 stream_id,
-                header: Header::new(name_slice.to_vec(), value_slice.to_vec()),
+                header: Header::new(name, value),
             });
         }
     }
@@ -1145,22 +1169,23 @@ unsafe extern "C" fn on_recv_trailer(
     conn_user_data: *mut c_void,
     _stream_user_data: *mut c_void,
 ) -> c_int {
-    if conn_user_data.is_null() {
+    if conn_user_data.is_null() || name.is_null() || value.is_null() {
         return 0;
     }
 
     unsafe {
         let user_data = &*(conn_user_data as *const Http3UserData);
         if !user_data.events.is_null() {
-            let name_vec = nghttp3_rcbuf_get_buf(name);
-            let value_vec = nghttp3_rcbuf_get_buf(value);
-
-            let name_slice = std::slice::from_raw_parts(name_vec.base, name_vec.len);
-            let value_slice = std::slice::from_raw_parts(value_vec.base, value_vec.len);
+            let Some(name) = copy_rcbuf_bytes(name) else {
+                return 0;
+            };
+            let Some(value) = copy_rcbuf_bytes(value) else {
+                return 0;
+            };
 
             (*user_data.events).push_back(Http3Event::Trailer {
                 stream_id,
-                header: Header::new(name_slice.to_vec(), value_slice.to_vec()),
+                header: Header::new(name, value),
             });
         }
     }
@@ -1253,18 +1278,20 @@ unsafe extern "C" fn on_recv_wt_data(
     conn_user_data: *mut c_void,
     _stream_user_data: *mut c_void,
 ) -> c_int {
-    if conn_user_data.is_null() {
+    if conn_user_data.is_null() || (data.is_null() && datalen > 0) {
         return 0;
     }
 
     unsafe {
         let user_data = &*(conn_user_data as *const Http3UserData);
         if !user_data.events.is_null() {
-            let data_slice = std::slice::from_raw_parts(data, datalen);
+            let Some(data) = copy_ffi_bytes(data, datalen) else {
+                return 0;
+            };
             (*user_data.events).push_back(Http3Event::WebTransportData {
                 session_id,
                 stream_id,
-                data: data_slice.to_vec(),
+                data,
             });
         }
     }
