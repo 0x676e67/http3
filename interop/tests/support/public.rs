@@ -26,6 +26,33 @@ struct PublicServerResponse {
     content_type: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct PublicClientRun {
+    target: PublicServerTarget,
+    qpack_name: &'static str,
+    qpack_config: ClientInteropConfig,
+    grease: GreaseMode,
+    concurrency: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct GreaseMode {
+    name: &'static str,
+    send: bool,
+}
+
+impl GreaseMode {
+    pub const OFF: Self = Self {
+        name: "grease-off",
+        send: false,
+    };
+
+    pub const ON: Self = Self {
+        name: "grease-on",
+        send: true,
+    };
+}
+
 const CONCURRENCY_1: &[usize] = &[1];
 const CONCURRENCY_1_5_10: &[usize] = &[1, 5, 10];
 
@@ -55,27 +82,34 @@ const PUBLIC_SERVER_TARGETS: &[PublicServerTarget] = &[
 pub async fn run_client_interop(
     qpack_name: &'static str,
     qpack_config: ClientInteropConfig,
+    grease: GreaseMode,
 ) -> Result<(), BoxError> {
     install_crypto_provider();
 
     for target in PUBLIC_SERVER_TARGETS {
         for concurrency in target.concurrency {
             println!(
-                "public interop start target={} qpack={} requests={} uri={}",
-                target.name, qpack_name, concurrency, target.uri
+                "public interop start target={} qpack={} grease={} requests={} uri={}",
+                target.name, qpack_name, grease.name, concurrency, target.uri
             );
 
             tokio::time::timeout(
                 REAL_INTEROP_TIMEOUT,
-                run_public_server_requests(*target, qpack_name, qpack_config, *concurrency),
+                run_public_server_requests(PublicClientRun {
+                    target: *target,
+                    qpack_name,
+                    qpack_config,
+                    grease,
+                    concurrency: *concurrency,
+                }),
             )
             .await
             .map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
-                        "timed out public server interop target={} qpack={} concurrency={} after {:?}",
-                        target.name, qpack_name, concurrency, REAL_INTEROP_TIMEOUT
+                        "timed out public server interop target={} qpack={} grease={} concurrency={} after {:?}",
+                        target.name, qpack_name, grease.name, concurrency, REAL_INTEROP_TIMEOUT
                     ),
                 )
             })??;
@@ -85,13 +119,8 @@ pub async fn run_client_interop(
     Ok(())
 }
 
-async fn run_public_server_requests(
-    target: PublicServerTarget,
-    qpack_name: &'static str,
-    qpack_config: ClientInteropConfig,
-    concurrency: usize,
-) -> Result<(), BoxError> {
-    let uri = target.uri.parse::<http::Uri>()?;
+async fn run_public_server_requests(run: PublicClientRun) -> Result<(), BoxError> {
+    let uri = run.target.uri.parse::<http::Uri>()?;
     let auth = uri.authority().ok_or("uri must have a host")?.clone();
     let host = auth.host().to_owned();
     let port = auth.port_u16().unwrap_or(443);
@@ -100,22 +129,12 @@ async fn run_public_server_requests(
     let mut last_error = None;
 
     for addr in addrs {
-        match run_public_server_requests_at_addr(
-            target,
-            qpack_name,
-            qpack_config,
-            concurrency,
-            uri.clone(),
-            &host,
-            addr,
-        )
-        .await
-        {
+        match run_public_server_requests_at_addr(run, uri.clone(), &host, addr).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 eprintln!(
-                    "public server interop: target={} addr={} failed: {err}",
-                    target.name, addr
+                    "public server interop: target={} qpack={} grease={} addr={} failed: {err}",
+                    run.target.name, run.qpack_name, run.grease.name, addr
                 );
                 last_error = Some(err);
             }
@@ -126,10 +145,7 @@ async fn run_public_server_requests(
 }
 
 async fn run_public_server_requests_at_addr(
-    target: PublicServerTarget,
-    qpack_name: &'static str,
-    qpack_config: ClientInteropConfig,
-    concurrency: usize,
+    run: PublicClientRun,
     uri: http::Uri,
     host: &str,
     addr: SocketAddr,
@@ -171,16 +187,23 @@ async fn run_public_server_requests_at_addr(
     builder
         .max_field_section_size(262_144)
         .enable_datagram(true)
-        .send_grease(true);
+        .send_grease(run.grease.send);
+
+    // RFC 9114 reserves frame, stream, and SETTINGS codepoints so peers keep
+    // ignoring values that are unknown today. Public deployments are worth
+    // testing both ways because GREASE often exposes strict parsers.
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.3
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1
 
     // RFC 9204 Section 5 is the SETTINGS contract for QPACK dynamic-table use.
     // These public-server tests run both zero SETTINGS and an explicit dynamic
     // table offer because deployments choose different paths.
     // https://www.rfc-editor.org/rfc/rfc9204.html#section-5
-    if let Some(capacity) = qpack_config.qpack_max_table_capacity {
+    if let Some(capacity) = run.qpack_config.qpack_max_table_capacity {
         builder.qpack_max_table_capacity(capacity);
     }
-    if let Some(blocked_streams) = qpack_config.qpack_blocked_streams {
+    if let Some(blocked_streams) = run.qpack_config.qpack_blocked_streams {
         builder.qpack_blocked_streams(blocked_streams);
     }
 
@@ -188,8 +211,8 @@ async fn run_public_server_requests_at_addr(
     let driver_task: JoinHandle<_> =
         tokio::spawn(async move { future::poll_fn(|cx| driver.poll_close(cx)).await });
 
-    let mut handles = Vec::with_capacity(concurrency);
-    for request_id in 0..concurrency {
+    let mut handles = Vec::with_capacity(run.concurrency);
+    for request_id in 0..run.concurrency {
         let send_request = send_request.clone();
         let request_uri = uri.clone();
 
@@ -204,9 +227,10 @@ async fn run_public_server_requests_at_addr(
         })??;
 
         println!(
-            "public interop response target={} qpack={} request={} status={} body_bytes={} content_length={} content_length_match={} content_type={}",
-            target.name,
-            qpack_name,
+            "public interop response target={} qpack={} grease={} request={} status={} body_bytes={} content_length={} content_length_match={} content_type={}",
+            run.target.name,
+            run.qpack_name,
+            run.grease.name,
             response.request_id,
             response.status,
             response.body_len,
