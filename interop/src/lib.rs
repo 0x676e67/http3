@@ -102,7 +102,7 @@ impl ClientInteropConfig {
     /// <https://www.rfc-editor.org/rfc/rfc9204.html#section-5>
     pub fn qpack_dynamic_table() -> Self {
         Self {
-            qpack_max_table_capacity: Some(4096),
+            qpack_max_table_capacity: Some(65535),
             qpack_blocked_streams: Some(100),
         }
     }
@@ -476,10 +476,21 @@ async fn read_response(
 
     let mut body = Vec::new();
     while let Some(chunk) = stream.recv_data().await? {
-        // Buf::chunk() may expose only the current contiguous slice. Copy every
-        // chunk so the assertion below catches truncation and ordering bugs.
-        body.extend_from_slice(chunk.chunk());
+        extend_body_from_buf(&mut body, chunk);
     }
 
     Ok(body)
+}
+
+fn extend_body_from_buf<B: Buf>(body: &mut Vec<u8>, mut buf: B) {
+    // Buf::chunk() only exposes the current contiguous slice. Drain the whole
+    // buffer so vectored receive implementations are checked the same way.
+    while buf.has_remaining() {
+        let chunk = buf.chunk();
+        if chunk.is_empty() {
+            break;
+        }
+        body.extend_from_slice(chunk);
+        buf.advance(chunk.len());
+    }
 }

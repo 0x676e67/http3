@@ -7,5 +7,8 @@ pub mod ngtcp2;
 #[path = "support/quiche.rs"]
 pub mod quiche;
 
+#[path = "support/public.rs"]
+pub mod public;
+
 #[path = "support/tquic.rs"]
 pub mod tquic;
