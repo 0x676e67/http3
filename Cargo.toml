@@ -30,10 +30,10 @@ http3-rs = { version = "0.0.8", path = "http3" }
 http3-webtransport-rs = { version = "0.1.2", path = "http3-webtransport" }
 
 # Internal
-ngtcp2-sys = { path = "interop/crates/ngtcp2-sys" }
-nghttp3-sys = { path = "interop/crates/nghttp3-sys" }
-ngtcp2 = { path = "interop/crates/ngtcp2" }
-tokio-ngtcp2 = { path = "interop/crates/tokio-ngtcp2" }
+ngtcp2-sys = { version = "0.0.0", path = "interop/crates/ngtcp2-sys" }
+nghttp3-sys = { version = "0.0.0", path = "interop/crates/nghttp3-sys" }
+ngtcp2 = { version = "0.0.0", path = "interop/crates/ngtcp2" }
+tokio-ngtcp2 = { version = "0.0.0", path = "interop/crates/tokio-ngtcp2" }
 
 # External crates
 anyhow = "1.0"
