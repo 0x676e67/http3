@@ -1,0 +1,47 @@
+[package]
+name = "nghttp3-sys"
+version = "0.0.0"
+description = "nghttp3 FFI bindings used by http3-rs interoperability tests"
+edition = "2024"
+rust-version = "1.96"
+build = "build.rs"
+links = "nghttp3"
+publish = false
+repository = { workspace = true }
+readme = "README.md"
+license-file = "LICENSE"
+include = [
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE",
+    "/build.rs",
+    "/src/**",
+    "/deps/nghttp3/AUTHORS",
+    "/deps/nghttp3/CMakeLists.txt",
+    "/deps/nghttp3/CMakeOptions.txt",
+    "/deps/nghttp3/COPYING",
+    "/deps/nghttp3/README.rst",
+    "/deps/nghttp3/cmake/**",
+    "/deps/nghttp3/cmakeconfig.h.in",
+    "/deps/nghttp3/examples/CMakeLists.txt",
+    "/deps/nghttp3/lib/*.c",
+    "/deps/nghttp3/lib/*.h",
+    "/deps/nghttp3/lib/CMakeLists.txt",
+    "/deps/nghttp3/lib/config.cmake.in",
+    "/deps/nghttp3/lib/includes/**",
+    "/deps/nghttp3/lib/libnghttp3.pc.in",
+    "/deps/nghttp3/lib/sfparse/COPYING",
+    "/deps/nghttp3/lib/sfparse/sfparse.c",
+    "/deps/nghttp3/lib/sfparse/sfparse.h",
+]
+
+[lib]
+doctest = false
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+bindgen = "0.72"
+cmake = "0.1"
