@@ -20,7 +20,8 @@ cargo test -p interop --test client -- --ignored --nocapture --test-threads=1
 
 Each backend runs the same response matrix: several status codes, empty and
 large bodies, bounded concurrent requests, and QPACK SETTINGS combinations with
-client/server dynamic tables enabled and disabled.
+client/server dynamic tables enabled and disabled. The local matrix also runs
+with HTTP/3 GREASE disabled and enabled.
 
 The server helpers are expected to work on Windows and Unix-like hosts. The
 vendored ngtcp2/nghttp3 build applies small MSVC patches in `build.rs` while
