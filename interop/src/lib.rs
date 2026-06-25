@@ -377,6 +377,8 @@ async fn read_response(
 }
 
 fn extend_body_from_buf<B: Buf>(body: &mut Vec<u8>, mut buf: B) {
+    // Buf::chunk() only exposes the current contiguous slice. Drain the whole
+    // buffer so vectored receive implementations are checked the same way.
     while buf.has_remaining() {
         let chunk = buf.chunk();
         if chunk.is_empty() {

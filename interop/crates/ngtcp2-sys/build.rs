@@ -144,29 +144,22 @@ fn ensure_submodule_initialized(submodule_dir: &Path, manifest_dir: &Path) {
 }
 
 fn submodule_source_ready(submodule_dir: &Path) -> bool {
-    // Match boring-sys' cheap top-level submodule check, then add the nested
-    // submodule check ngtcp2 needs for its third-party sources.
-    submodule_dir.join("CMakeLists.txt").exists() && nested_submodules_ready(submodule_dir)
+    // The crates.io package carries only the lib-only CMake inputs. Check the
+    // paths used by this build instead of every upstream test submodule.
+    submodule_dir.join("CMakeLists.txt").exists()
+        && required_paths_ready(
+            submodule_dir,
+            &[
+                "crypto/boringssl/CMakeLists.txt",
+                "crypto/includes/CMakeLists.txt",
+                "lib/CMakeLists.txt",
+                "third-party/CMakeLists.txt",
+            ],
+        )
 }
 
-fn nested_submodules_ready(submodule_dir: &Path) -> bool {
-    let gitmodules = submodule_dir.join(".gitmodules");
-    if !gitmodules.exists() {
-        return true;
-    }
-
-    let contents = fs::read_to_string(gitmodules).expect("Failed to read nested .gitmodules");
-    contents
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("path ="))
-        .map(str::trim)
-        .all(|path| {
-            let dir = submodule_dir.join(path);
-            dir.is_dir()
-                && fs::read_dir(dir)
-                    .map(|mut entries| entries.next().is_some())
-                    .unwrap_or(false)
-        })
+fn required_paths_ready(submodule_dir: &Path, paths: &[&str]) -> bool {
+    paths.iter().all(|path| submodule_dir.join(path).exists())
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {

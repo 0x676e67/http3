@@ -85,29 +85,18 @@ fn ensure_submodule_initialized(submodule_dir: &Path, manifest_dir: &Path) {
 }
 
 fn submodule_source_ready(submodule_dir: &Path) -> bool {
-    // Match boring-sys' cheap top-level submodule check, then add the nested
-    // submodule check nghttp3 needs for lib/sfparse.
-    submodule_dir.join("CMakeLists.txt").exists() && nested_submodules_ready(submodule_dir)
+    // The crates.io package carries the lib-only CMake inputs, not nghttp3's
+    // test submodules. Keep this check focused on files the build actually
+    // needs, so published builds do not try to run git.
+    submodule_dir.join("CMakeLists.txt").exists()
+        && required_paths_ready(
+            submodule_dir,
+            &["lib/sfparse/sfparse.c", "lib/sfparse/sfparse.h"],
+        )
 }
 
-fn nested_submodules_ready(submodule_dir: &Path) -> bool {
-    let gitmodules = submodule_dir.join(".gitmodules");
-    if !gitmodules.exists() {
-        return true;
-    }
-
-    let contents = fs::read_to_string(gitmodules).expect("Failed to read nested .gitmodules");
-    contents
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("path ="))
-        .map(str::trim)
-        .all(|path| {
-            let dir = submodule_dir.join(path);
-            dir.is_dir()
-                && fs::read_dir(dir)
-                    .map(|mut entries| entries.next().is_some())
-                    .unwrap_or(false)
-        })
+fn required_paths_ready(submodule_dir: &Path, paths: &[&str]) -> bool {
+    paths.iter().all(|path| submodule_dir.join(path).exists())
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
