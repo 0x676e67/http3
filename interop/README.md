@@ -11,6 +11,13 @@ build time.
 cargo test -p interop
 ```
 
+The interop workflow also runs the real public-server checks. They are ignored
+by default for local `cargo test` because they need external network access:
+
+```bash
+cargo test -p interop --test client -- --ignored --nocapture --test-threads=1
+```
+
 Each backend runs the same response matrix: several status codes, empty and
 large bodies, bounded concurrent requests, and QPACK SETTINGS combinations with
 client/server dynamic tables enabled and disabled.

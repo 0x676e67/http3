@@ -109,3 +109,17 @@ async fn tquic_qpack_client_on_server_on() -> Result<(), BoxError> {
     )
     .await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real HTTP/3 interop tests need public network access"]
+async fn public_servers_qpack_stateless() -> Result<(), BoxError> {
+    support::public::run_client_interop("qpack-stateless", ClientInteropConfig::stateless_qpack())
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real HTTP/3 interop tests need public network access"]
+async fn public_servers_qpack_dynamic() -> Result<(), BoxError> {
+    support::public::run_client_interop("qpack-dynamic", ClientInteropConfig::qpack_dynamic_table())
+        .await
+}
