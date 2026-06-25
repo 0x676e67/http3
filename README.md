@@ -1,6 +1,6 @@
 # http3-rs
 
-A Tokio aware, [HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html) implementation for Rust.
+A Tokio aware, HTTP/3 implementation for Rust.
 
 [![CI](https://github.com/0x676e67/http3-rs/actions/workflows/CI.yml/badge.svg)](https://github.com/0x676e67/http3-rs/actions/workflows/CI.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
