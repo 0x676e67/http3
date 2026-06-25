@@ -15,6 +15,7 @@ More information about this crate can be found in the [crate documentation][docs
 
 - Client [HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html) implementation.
 - Implements the full [HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html) specifications.
+- Implements [RFC 9204](https://www.rfc-editor.org/rfc/rfc9204.html) QPACK. It supports dynamic table.
 - Works with different QUIC transport implementations.
 - Focus on performance, interoperability, and correctness.
 - Built on [Tokio](https://tokio.rs).
