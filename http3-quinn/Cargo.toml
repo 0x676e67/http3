@@ -13,13 +13,13 @@ categories = ["network-programming", "web-programming"]
 license = "MIT"
 
 [dependencies]
-http3-rs = { version = "0.0.8", path = "../http3" }
-bytes = "1"
-quinn = { version = "0.11", default-features = false, features = ["futures-io"] }
-tokio-util = { version = "0.7.9" }
-futures-util = { version = "0.3.28", default-features = false }
-http3-datagram-rs = { version = "0.0.2", path = "../http3-datagram", optional = true }
-tracing = { version = "0.1.40", optional = true }
+http3-rs = { workspace = true }
+bytes = { workspace = true }
+quinn = { workspace = true, features = ["futures-io"] }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+http3-datagram-rs = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [features]
 tracing = ["dep:tracing"]
