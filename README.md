@@ -1,9 +1,9 @@
 # http3-rs
 
-A Tokio aware, [HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html) implementation for Rust.
+A Tokio aware, HTTP/3 implementation for Rust.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/0x676e67/http3-rs/actions/workflows/CI.yml/badge.svg)](https://github.com/0x676e67/http3-rs/actions/workflows/CI.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/http3-rs.svg)](https://crates.io/crates/http3-rs)
 [![Documentation](https://docs.rs/http3-rs/badge.svg)][docs]
 
@@ -15,7 +15,9 @@ More information about this crate can be found in the [crate documentation][docs
 
 - Client [HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html) implementation.
 - Implements the full [HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html) specifications.
+- Implements [RFC 9204](https://www.rfc-editor.org/rfc/rfc9204.html) QPACK. It supports dynamic table.
 - Works with different QUIC transport implementations.
+- Passes HTTP/3 interoperability tests.
 - Focus on performance, interoperability, and correctness.
 - Built on [Tokio](https://tokio.rs).
 

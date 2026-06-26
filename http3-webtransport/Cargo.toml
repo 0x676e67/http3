@@ -14,15 +14,14 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bytes = "1"
-futures-util = { version = "0.3", default-features = false }
-http = "1"
-pin-project-lite = { version = "0.2", default-features = false }
-tracing = "0.1.37"
-tokio = { version = "1.28", default-features = false }
-http3-datagram-rs = { version = "0.0.2", path = "../http3-datagram" }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+http = { workspace = true }
+pin-project-lite = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+http3-datagram-rs = { workspace = true }
 
 [dependencies.http3-rs]
-version = "0.0.8"
-path = "../http3"
+workspace = true
 features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"]

@@ -1,0 +1,21 @@
+[package]
+name = "tokio-ngtcp2"
+version = "0.0.0"
+description = "Tokio ngtcp2/nghttp3 integration used by http3-rs interoperability tests"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+repository = { workspace = true }
+readme = "README.md"
+license-file = "LICENSE"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ngtcp2 = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+serial_test = "3.4"

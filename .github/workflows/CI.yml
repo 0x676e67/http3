@@ -7,6 +7,13 @@ on:
 
 env:
   RUST_BACKTRACE: 1
+  core_package_args: >-
+    --workspace
+    --exclude interop
+    --exclude nghttp3-sys
+    --exclude ngtcp2
+    --exclude ngtcp2-sys
+    --exclude tokio-ngtcp2
   toolchain_style: stable
   toolchain_msrv: "1.85"
   toolchain_http3_quinn_msrv: "1.85"
@@ -54,7 +61,7 @@ jobs:
         with:
           toolchain: ${{ env.toolchain_lint }}
           components: clippy
-      - run: cargo clippy
+      - run: cargo clippy ${{ env.core_package_args }}
 
   msrv:
     name: Check MSRV
@@ -104,13 +111,13 @@ jobs:
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y gcc-multilib libc6-dev-i386
+          sudo apt-get install -y gcc-multilib libc6-dev-i386 libclang-dev
       - name: Install Rust ${{ matrix.toolchain }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ matrix.toolchain }}
           target: ${{ matrix.target }}
-      - run: cargo test --features ${{ matrix.features }} --target ${{ matrix.target }}
+      - run: cargo test ${{ env.core_package_args }} --features ${{ matrix.features }} --target ${{ matrix.target }}
         env:  #[cfg(feature = "datagram")] unexpected `cfg` condition value: `datagram`
           RUSTFLAGS: "-A unexpected_cfgs"
       - name: h3Spec
