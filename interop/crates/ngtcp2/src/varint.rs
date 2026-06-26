@@ -5,6 +5,15 @@
 
 use nghttp3_sys;
 
+/// Error returned when a varint output buffer is too short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeError {
+    /// Required encoded length in bytes.
+    pub required: usize,
+    /// Provided buffer length in bytes.
+    pub actual: usize,
+}
+
 /// Returns the number of bytes needed to encode the value.
 pub fn encoded_len(n: u64) -> usize {
     unsafe { nghttp3_sys::nghttp3_put_uvarintlen(n) }
@@ -14,17 +23,19 @@ pub fn encoded_len(n: u64) -> usize {
 ///
 /// `buf` must be at least `encoded_len(n)` bytes long. Returns the number of
 /// bytes written.
-///
-/// # Panics
-///
-/// Panics if `buf` is too short.
-pub fn encode(buf: &mut [u8], n: u64) -> usize {
+pub fn encode(buf: &mut [u8], n: u64) -> Result<usize, EncodeError> {
     let len = encoded_len(n);
-    assert!(buf.len() >= len, "varint encode: buffer too short");
+    if buf.len() < len {
+        return Err(EncodeError {
+            required: len,
+            actual: buf.len(),
+        });
+    }
+
     unsafe {
         nghttp3_sys::nghttp3_put_uvarint(buf.as_mut_ptr(), n);
     }
-    len
+    Ok(len)
 }
 
 /// Appends a variable-length integer to a `Vec<u8>`.
@@ -32,7 +43,7 @@ pub fn encode_to_vec(n: u64, buf: &mut Vec<u8>) {
     let len = encoded_len(n);
     let start = buf.len();
     buf.resize(start + len, 0);
-    encode(&mut buf[start..], n);
+    let _ = encode(&mut buf[start..], n);
 }
 
 /// Decodes a variable-length integer.
@@ -89,5 +100,12 @@ mod tests {
     fn test_varint_decode_truncated() {
         // This encoding needs 2 bytes, but only 1 byte is present.
         assert!(decode(&[0x40]).is_none());
+    }
+
+    #[test]
+    fn test_varint_encode_short_buffer() {
+        let err = encode(&mut [0], 64).unwrap_err();
+        assert_eq!(err.required, 2);
+        assert_eq!(err.actual, 1);
     }
 }

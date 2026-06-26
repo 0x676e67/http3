@@ -78,6 +78,7 @@ pub const FIELD_SECTION_LIMIT_TEST_CASE: InteropCase =
 pub struct ClientInteropConfig {
     pub qpack_max_table_capacity: Option<u64>,
     pub qpack_blocked_streams: Option<u64>,
+    pub send_grease: bool,
 }
 
 impl ClientInteropConfig {
@@ -93,6 +94,7 @@ impl ClientInteropConfig {
         Self {
             qpack_max_table_capacity: Some(0),
             qpack_blocked_streams: Some(0),
+            send_grease: false,
         }
     }
 
@@ -104,7 +106,23 @@ impl ClientInteropConfig {
         Self {
             qpack_max_table_capacity: Some(65535),
             qpack_blocked_streams: Some(100),
+            send_grease: false,
         }
+    }
+
+    /// Enables HTTP/3 GREASE codepoints for this client run.
+    ///
+    /// RFC 9114 reserves frame, stream, and SETTINGS codepoints so peers keep
+    /// ignoring unknown values. Local interop runs use this to catch strict
+    /// server parsers before the public-server suite is run.
+    ///
+    /// See RFC 9114:
+    /// <https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8>
+    /// <https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.3>
+    /// <https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1>
+    pub fn with_grease(mut self) -> Self {
+        self.send_grease = true;
+        self
     }
 }
 
@@ -229,7 +247,9 @@ pub async fn run_local_quinn_client_interop_matrix_with_config(
     let quinn_conn = http3_quinn_rs::Connection::new(conn);
 
     let mut builder = http3_rs::client::builder();
-    builder.max_field_section_size(16 * 1024).send_grease(false);
+    builder
+        .max_field_section_size(16 * 1024)
+        .send_grease(config.send_grease);
 
     // RFC 9204 Section 5 defines the QPACK SETTINGS parameters that permit
     // dynamic-table use. Leaving them unset, or setting them to zero, keeps the

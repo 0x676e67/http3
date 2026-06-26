@@ -30,10 +30,9 @@ pub struct Client {
     control_streams_bound: bool,
 }
 
-// SAFETY: All fields are Send/Sync. Connection and Http3Connection provide
-// unsafe Send/Sync impls.
+// SAFETY: Client is driven through &mut self, so moving it to another task keeps
+// exclusive access to the underlying ngtcp2/nghttp3 state machines.
 unsafe impl Send for Client {}
-unsafe impl Sync for Client {}
 
 impl Client {
     /// Creates a new client.
