@@ -66,9 +66,9 @@ struct ConnRef {
     inner: ngtcp2_crypto_conn_ref,
 }
 
-// SAFETY: Connection is used internally in a thread-safe manner.
+// SAFETY: Connection owns the ngtcp2 state machine and is only moved between
+// tasks with exclusive access. ngtcp2_conn itself is not exposed as Sync.
 unsafe impl Send for Connection {}
-unsafe impl Sync for Connection {}
 
 impl Connection {
     /// Creates a client connection using the low-level API.
@@ -1182,7 +1182,11 @@ fn create_server_callbacks() -> ngtcp2_callbacks {
 
 /// Randomness callback.
 unsafe extern "C" fn rand_callback(buf: *mut u8, buflen: usize, _rand_ctx: *const ngtcp2_rand_ctx) {
-    // SAFETY: buf is a valid pointer provided by the caller.
+    if buf.is_null() || buflen == 0 {
+        return;
+    }
+
+    // SAFETY: buf is a non-null caller-provided buffer with buflen bytes.
     let slice = unsafe { std::slice::from_raw_parts_mut(buf, buflen) };
     let _ = aws_lc_rs::rand::fill(slice);
 }
@@ -1195,7 +1199,11 @@ unsafe extern "C" fn get_new_connection_id_callback(
     cidlen: usize,
     _user_data: *mut c_void,
 ) -> c_int {
-    // SAFETY: cid and token are valid pointers provided by the caller.
+    if cid.is_null() || token.is_null() || cidlen > NGTCP2_MAX_CIDLEN as usize {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+
+    // SAFETY: cid and token are non-null caller-provided output buffers.
     unsafe {
         // Generate the connection ID.
         let cid_slice = std::slice::from_raw_parts_mut((*cid).data.as_mut_ptr(), cidlen);
