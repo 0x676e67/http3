@@ -282,7 +282,7 @@ impl QpackDecoder {
 
         match self.0.decoder.try_read() {
             Ok(decoder) => {
-                let decoded = decoder.decode_header_incremental(state, end, max_size);
+                let decoded = decoder.decode_header(state, end, max_size);
                 return self.finish_decode(cx, decoder, decoded, false);
             }
             Err(TryLockError::WouldBlock) => {}
@@ -296,7 +296,7 @@ impl QpackDecoder {
 
         match self.0.decoder.try_read() {
             Ok(decoder) => {
-                let decoded = decoder.decode_header_incremental(state, end, max_size);
+                let decoded = decoder.decode_header(state, end, max_size);
                 self.finish_decode(cx, decoder, decoded, true)
             }
             Err(TryLockError::WouldBlock) => Poll::Pending,

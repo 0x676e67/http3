@@ -11,7 +11,7 @@ use std::{
 fn decode_incremental(decoder: &Decoder, buf: impl AsRef<[u8]>) -> Result<Decoded, DecoderError> {
     let mut state = DecoderState::new();
     state.extend(&mut Cursor::new(buf.as_ref()));
-    match decoder.decode_header_incremental(&mut state, true, u64::MAX)? {
+    match decoder.decode_header(&mut state, true, u64::MAX)? {
         Some(decoded) => Ok(decoded),
         None => Err(DecoderError::UnexpectedEnd),
     }
