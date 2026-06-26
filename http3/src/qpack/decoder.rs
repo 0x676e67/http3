@@ -824,6 +824,11 @@ mod tests {
     #[test]
     fn decode_post_base_name_ref_header_field() {
         let mut buf = vec![];
+        // Base=2 and post-base index 0 refers to absolute entry 3.  The
+        // Required Insert Count has to cover that entry before this field
+        // section is valid.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.5
         HeaderPrefix::new(3, 2, 4, TABLE_SIZE).encode(&mut buf);
         LiteralWithPostBaseNameRef::new(0, "new bar3")
             .encode(&mut buf)
@@ -833,6 +838,29 @@ mod tests {
         let decoder = Decoder::from(build_table_with_size(4));
         let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
         assert_eq!(fields, &[field(3).with_value("new bar3")]);
+    }
+
+    #[test]
+    fn reject_post_base_name_ref_past_required_insert_count() {
+        let mut buf = vec![];
+        // This is the old fixture kept as the invalid case: it declares
+        // Required Insert Count 2, while post-base index 0 from Base=2 names
+        // absolute entry 3.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.5
+        HeaderPrefix::new(2, 2, 4, TABLE_SIZE).encode(&mut buf);
+        LiteralWithPostBaseNameRef::new(0, "new bar3")
+            .encode(&mut buf)
+            .unwrap();
+
+        let mut read = Cursor::new(&buf);
+        let decoder = Decoder::from(build_table_with_size(4));
+        assert_eq!(
+            decoder.decode_header(&mut read),
+            Err(DecoderError::DynamicTable(
+                DynamicTableError::BadPostbaseIndex(0)
+            ))
+        );
     }
 
     #[test]
