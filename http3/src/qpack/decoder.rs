@@ -1177,10 +1177,9 @@ mod tests {
             .encode(&mut buf)
             .unwrap();
 
-        let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(4));
         assert_eq!(
-            decoder.decode_header(&mut read),
+            decode_incremental(&decoder, &buf),
             Err(DecoderError::DynamicTable(
                 DynamicTableError::BadPostbaseIndex(0)
             ))
