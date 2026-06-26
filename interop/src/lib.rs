@@ -309,41 +309,53 @@ async fn wait_for_interop_tasks(
     mut handles: Vec<(String, JoinHandle<Result<(), BoxError>>)>,
 ) -> Result<(), BoxError> {
     let timeout = interop_batch_timeout(batch);
-    let deadline = tokio::time::Instant::now() + timeout;
 
-    while let Some((path, mut handle)) = handles.pop() {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(remaining, &mut handle).await {
-            Ok(Ok(result)) => result?,
-            Ok(Err(err)) => {
-                abort_interop_tasks(handles);
-                return Err(std::io::Error::other(format!(
-                    "interop request task failed for {path}: {err}"
-                ))
-                .into());
+    let result = {
+        let wait_all = future::try_join_all(handles.iter_mut().map(|(path, handle)| {
+            let path = path.clone();
+            async move {
+                match handle.await {
+                    Ok(result) => result.map_err(|err| -> BoxError {
+                        std::io::Error::other(format!(
+                            "interop request task failed for {path}: {err}"
+                        ))
+                        .into()
+                    }),
+                    Err(err) => Err(std::io::Error::other(format!(
+                        "interop request task failed for {path}: {err}"
+                    ))
+                    .into()),
+                }
             }
-            Err(_) => {
-                handle.abort();
-                abort_interop_tasks(handles);
-                let paths = batch
-                    .iter()
-                    .map(|(_, path)| path.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "timed out waiting for interop response batch of {} after {:?}: {paths}",
-                        batch.len(),
-                        timeout,
-                    ),
-                )
-                .into());
-            }
+        }));
+
+        tokio::time::timeout(timeout, wait_all).await
+    };
+
+    match result {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => {
+            abort_interop_tasks(handles);
+            Err(err)
+        }
+        Err(_) => {
+            abort_interop_tasks(handles);
+            let paths = batch
+                .iter()
+                .map(|(_, path)| path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for interop response batch of {} after {:?}: {paths}",
+                    batch.len(),
+                    timeout,
+                ),
+            )
+            .into())
         }
     }
-
-    Ok(())
 }
 
 fn abort_interop_tasks(handles: Vec<(String, JoinHandle<Result<(), BoxError>>)>) {
