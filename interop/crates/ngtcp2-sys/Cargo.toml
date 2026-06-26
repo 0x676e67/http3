@@ -1,0 +1,55 @@
+[package]
+name = "ngtcp2-sys"
+version = "0.0.0"
+description = "ngtcp2 FFI bindings used by http3-rs interoperability tests"
+edition = "2024"
+rust-version = "1.96"
+build = "build.rs"
+links = "ngtcp2"
+publish = false
+repository = { workspace = true }
+readme = "README.md"
+license-file = "LICENSE"
+include = [
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE",
+    "/build.rs",
+    "/src/**",
+    "/deps/ngtcp2/AUTHORS",
+    "/deps/ngtcp2/CMakeLists.txt",
+    "/deps/ngtcp2/CMakeOptions.txt",
+    "/deps/ngtcp2/COPYING",
+    "/deps/ngtcp2/README.rst",
+    "/deps/ngtcp2/cmake/**",
+    "/deps/ngtcp2/cmakeconfig.h.in",
+    "/deps/ngtcp2/crypto/CMakeLists.txt",
+    "/deps/ngtcp2/crypto/boringssl/CMakeLists.txt",
+    "/deps/ngtcp2/crypto/boringssl/boringssl.c",
+    "/deps/ngtcp2/crypto/boringssl/libngtcp2_crypto_boringssl.pc.in",
+    "/deps/ngtcp2/crypto/includes/**",
+    "/deps/ngtcp2/crypto/shared.c",
+    "/deps/ngtcp2/crypto/shared.h",
+    "/deps/ngtcp2/lib/*.c",
+    "/deps/ngtcp2/lib/*.h",
+    "/deps/ngtcp2/lib/CMakeLists.txt",
+    "/deps/ngtcp2/lib/config.cmake.in",
+    "/deps/ngtcp2/lib/includes/**",
+    "/deps/ngtcp2/lib/libngtcp2.pc.in",
+    "/deps/ngtcp2/third-party/CMakeLists.txt",
+    "/deps/ngtcp2/third-party/http-parser/http_parser.c",
+    "/deps/ngtcp2/third-party/http-parser/http_parser.h",
+    "/deps/ngtcp2/third-party/urlparse/urlparse.c",
+    "/deps/ngtcp2/third-party/urlparse/urlparse.h",
+]
+
+[lib]
+doctest = false
+
+[dependencies]
+aws-lc-sys = { version = "0.41", features = ["ssl"] }
+libc = "0.2"
+
+[build-dependencies]
+bindgen = "0.72"
+cmake = "0.1"

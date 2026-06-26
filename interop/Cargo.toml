@@ -1,0 +1,35 @@
+[package]
+name = "interop"
+version = "0.0.0"
+publish = false
+rust-version = "1.96"
+edition = { workspace = true }
+repository = { workspace = true }
+
+[dependencies]
+bytes = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+http3-rs = { workspace = true, features = ["tracing"] }
+http3-quinn-rs = { workspace = true, features = ["tracing"] }
+quinn = { workspace = true, features = [
+    "runtime-tokio",
+    "rustls",
+    "ring",
+] }
+rcgen = { workspace = true }
+rustls = { workspace = true, features = [
+    "logging",
+    "ring",
+    "std",
+] }
+rustls-native-certs = { workspace = true }
+rustls-pki-types = { version = "1", features = ["std"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["full"] }
+
+# QUIC/HTTP3 Server backends
+tokio-quiche = { version = "0.19", default-features = false }
+tquic = "1.6"
+ngtcp2 = { workspace = true }
+tokio-ngtcp2 = { workspace = true }

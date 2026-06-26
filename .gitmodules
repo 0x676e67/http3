@@ -1,0 +1,8 @@
+[submodule "interop/crates/ngtcp2-sys/deps/ngtcp2"]
+	path = interop/crates/ngtcp2-sys/deps/ngtcp2
+	url = https://github.com/ngtcp2/ngtcp2
+	branch = webtransport
+[submodule "interop/crates/nghttp3-sys/deps/nghttp3"]
+	path = interop/crates/nghttp3-sys/deps/nghttp3
+	url = https://github.com/ngtcp2/nghttp3
+	branch = webtransport
