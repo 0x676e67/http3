@@ -30,6 +30,7 @@ use super::cert::CertificateFiles;
 pub struct ServerConfig {
     qpack_max_table_capacity: Option<u64>,
     qpack_blocked_streams: Option<u64>,
+    send_grease: bool,
 }
 
 impl ServerConfig {
@@ -37,6 +38,7 @@ impl ServerConfig {
         Self {
             qpack_max_table_capacity: Some(0),
             qpack_blocked_streams: Some(0),
+            send_grease: false,
         }
     }
 
@@ -44,7 +46,23 @@ impl ServerConfig {
         Self {
             qpack_max_table_capacity: Some(4096),
             qpack_blocked_streams: Some(100),
+            send_grease: false,
         }
+    }
+
+    /// Enables server-side HTTP/3 GREASE for this tokio-quiche run.
+    ///
+    /// tokio-quiche forwards `QuicSettings::grease` into quiche. quiche then
+    /// emits reserved SETTINGS, stream types, and frames from the server side,
+    /// which is exactly the HTTP/3 extension-point behavior we want to test.
+    ///
+    /// See RFC 9114:
+    /// <https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8>
+    /// <https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.3>
+    /// <https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1>
+    pub fn with_grease(mut self) -> Self {
+        self.send_grease = true;
+        self
     }
 
     fn h3_settings(self) -> Http3Settings {
@@ -121,6 +139,7 @@ async fn start_server(
     quic_settings.initial_max_streams_bidi = 100;
     quic_settings.initial_max_streams_uni = 100;
     quic_settings.disable_active_migration = true;
+    quic_settings.grease = config.send_grease;
 
     let mut listeners = listen(
         [socket],

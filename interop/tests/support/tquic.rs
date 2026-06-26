@@ -20,11 +20,13 @@ use super::cert::CertificateFiles;
 // still forcing multi-frame DATA paths in the large-body cases.
 // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.1
 const BODY_CHUNK_SIZE: usize = 64 * 1024;
+const GREASE_FRAME: &[u8] = b"\x21\x06GREASE";
 
 #[derive(Clone, Copy, Debug)]
 pub struct ServerConfig {
     qpack_max_table_capacity: Option<u64>,
     qpack_blocked_streams: Option<u64>,
+    send_grease: bool,
 }
 
 impl ServerConfig {
@@ -32,6 +34,7 @@ impl ServerConfig {
         Self {
             qpack_max_table_capacity: Some(0),
             qpack_blocked_streams: Some(0),
+            send_grease: false,
         }
     }
 
@@ -39,7 +42,22 @@ impl ServerConfig {
         Self {
             qpack_max_table_capacity: Some(4096),
             qpack_blocked_streams: Some(100),
+            send_grease: false,
         }
+    }
+
+    /// Enables server-side HTTP/3 GREASE for this tquic helper.
+    ///
+    /// tquic does not expose a dedicated HTTP/3 GREASE switch, so the test
+    /// server writes a small reserved frame on each response stream before the
+    /// DATA frames. Clients must ignore reserved frame types.
+    ///
+    /// See RFC 9114:
+    /// <https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8>
+    /// <https://www.rfc-editor.org/rfc/rfc9114.html#section-9>
+    pub fn with_grease(mut self) -> Self {
+        self.send_grease = true;
+        self
     }
 
     fn h3_config(self) -> tquic::h3::Http3Config {
@@ -91,6 +109,7 @@ struct ServerHandler {
 struct PendingBody {
     body: Vec<u8>,
     offset: usize,
+    grease_offset: Option<usize>,
 }
 
 impl ServerHandler {
@@ -150,11 +169,12 @@ impl ServerHandler {
                         tquic::h3::Header::new(b"content-type", b"application/octet-stream"),
                         tquic::h3::Header::new(b"content-length", content_length.as_bytes()),
                     ];
+                    let finish_with_headers = body.is_empty() && !self.config.send_grease;
                     let headers_blocked = match self.h3_conn.as_mut().unwrap().send_headers(
                         conn,
                         stream_id,
                         &response_headers,
-                        body.is_empty(),
+                        finish_with_headers,
                     ) {
                         Ok(()) => false,
                         Err(tquic::h3::Http3Error::StreamBlocked) => true,
@@ -164,9 +184,16 @@ impl ServerHandler {
                         }
                     };
 
-                    if !body.is_empty() || headers_blocked {
-                        self.pending_bodies
-                            .insert(stream_id, PendingBody { body, offset: 0 });
+                    let grease_offset = (self.config.send_grease && !headers_blocked).then_some(0);
+                    if !body.is_empty() || headers_blocked || grease_offset.is_some() {
+                        self.pending_bodies.insert(
+                            stream_id,
+                            PendingBody {
+                                body,
+                                offset: 0,
+                                grease_offset,
+                            },
+                        );
                         self.flush_pending_body(conn, stream_id);
                     }
                 }
@@ -198,6 +225,38 @@ impl ServerHandler {
         let Some(pending) = self.pending_bodies.get_mut(&stream_id) else {
             return;
         };
+
+        if let Some(offset) = pending.grease_offset {
+            // The fixed frame type 0x21 is in the reserved HTTP/3 GREASE range
+            // and encodes as a one-byte QUIC varint. It is sent after HEADERS
+            // and before DATA so the client exercises unknown-frame handling
+            // on request streams without changing the response semantics.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-9
+            match conn.stream_write(
+                stream_id,
+                bytes::Bytes::copy_from_slice(&GREASE_FRAME[offset..]),
+                false,
+            ) {
+                Ok(0) | Err(tquic::Error::Done) => {
+                    let _ = conn.stream_want_write(stream_id, true);
+                    return;
+                }
+                Ok(written) => {
+                    let next = offset + written;
+                    if next < GREASE_FRAME.len() {
+                        pending.grease_offset = Some(next);
+                        let _ = conn.stream_want_write(stream_id, true);
+                        return;
+                    }
+                    pending.grease_offset = None;
+                }
+                Err(err) => {
+                    eprintln!("[tquic server] send grease frame error: {err:?}");
+                    pending.grease_offset = None;
+                }
+            }
+        }
 
         if pending.body.is_empty() {
             match h3.send_body(conn, stream_id, bytes::Bytes::new(), true) {
