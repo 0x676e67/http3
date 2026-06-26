@@ -35,9 +35,9 @@ pub struct ClientWebTransportSession {
     control_streams_bound: bool,
 }
 
-// SAFETY: All fields in ClientWebTransportSession are Send/Sync.
+// SAFETY: ClientWebTransportSession is driven through &mut self, so moving it to
+// another task keeps exclusive access to the underlying state machines.
 unsafe impl Send for ClientWebTransportSession {}
-unsafe impl Sync for ClientWebTransportSession {}
 
 impl ClientWebTransportSession {
     /// Creates a WebTransport session.
@@ -855,9 +855,9 @@ struct ServerWtConnection {
     opened_wt_streams: std::collections::HashSet<StreamId>,
 }
 
-// SAFETY: All fields in ServerWebTransportSession are Send/Sync.
+// SAFETY: ServerWebTransportSession is driven through &mut self, so moving it to
+// another task keeps exclusive access to each underlying state machine.
 unsafe impl Send for ServerWebTransportSession {}
-unsafe impl Sync for ServerWebTransportSession {}
 
 impl ServerWebTransportSession {
     /// Creates a WebTransport server.

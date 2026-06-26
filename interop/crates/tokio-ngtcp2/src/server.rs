@@ -48,10 +48,9 @@ struct ServerConnection {
     blocked_streams: Vec<StreamId>,
 }
 
-// SAFETY: All fields are Send/Sync. Connection, Http3Connection, and
-// TlsContext provide unsafe Send/Sync impls.
+// SAFETY: Server is driven through &mut self, so moving it to another task keeps
+// exclusive access to each ngtcp2/nghttp3 state machine.
 unsafe impl Send for Server {}
-unsafe impl Sync for Server {}
 
 impl Server {
     /// Creates a new server.
