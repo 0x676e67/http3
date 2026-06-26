@@ -30,7 +30,7 @@ use crate::{
         stream::StreamType,
         varint::VarInt,
     },
-    qpack::{self, QpackDecoder, QpackEvent},
+    qpack::{self, Decoded, DecoderState, QpackDecoder, QpackEvent},
     quic::{self, RecvStream, SendStream, SendStreamUnframed, StreamErrorIncoming, StreamId},
     shared_state::{ConnectionState, SharedState},
     stream::{self, AcceptRecvStream, AcceptedRecvStream, BufRecvStream, UniStreamHeader},
@@ -1117,20 +1117,20 @@ impl Drop for DecoderGurad {
 }
 
 enum TrailersState {
-    Decoding(qpack::DecoderState),
-    Decoded(qpack::Decoded),
+    Decoding(DecoderState),
+    Decoded(Decoded),
 }
 
 #[allow(missing_docs)]
 pub struct RequestStream<S, B> {
     pub(super) stream: FrameStream<S, B>,
-    trailers: Option<TrailersState>,
     pub(super) conn_state: Arc<SharedState>,
     pub(super) max_field_section_size: u64,
     send_grease_frame: bool,
     decoder: QpackDecoder,
     decoder_gurad: Option<DecoderGurad>,
-    response_headers: Option<qpack::DecoderState>,
+    decoder_state: Option<DecoderState>,
+    trailers_state: Option<TrailersState>,
 }
 
 impl<S, B> RequestStream<S, B>
@@ -1163,11 +1163,11 @@ where
             stream,
             conn_state,
             max_field_section_size,
-            trailers: None,
+            trailers_state: None,
             send_grease_frame: grease,
             decoder,
             decoder_gurad,
-            response_headers: None,
+            decoder_state: None,
         }
     }
 }
@@ -1194,7 +1194,7 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<qpack::Decoded, StreamError>> {
-        if self.response_headers.is_none() {
+        if self.decoder_state.is_none() {
             let frame = match ready!(self.stream.poll_next_frame(cx)) {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
@@ -1214,7 +1214,7 @@ where
 
             match frame {
                 Frames::Headers => {
-                    self.response_headers = Some(qpack::DecoderState::new());
+                    self.decoder_state = Some(qpack::DecoderState::new());
                 }
                 // FrameDecoder can skip an unknown frame and reach a buffered
                 // HEADERS frame in the same pass. Accept that legacy result so
@@ -1223,7 +1223,7 @@ where
                 Frames::Frame(Frame::Headers(mut encoded)) => {
                     let mut state = qpack::DecoderState::new();
                     state.extend(&mut encoded);
-                    self.response_headers = Some(state);
+                    self.decoder_state = Some(state);
                 }
                 Frames::Frame(frame) => {
                     return Poll::Ready(Err(self.handle_connection_error_on_stream(
@@ -1244,7 +1244,7 @@ where
             let end = !self.stream.has_data();
             let decoded = {
                 let state = self
-                    .response_headers
+                    .decoder_state
                     .as_mut()
                     .expect("response header state is initialized");
                 self.decoder
@@ -1253,7 +1253,7 @@ where
 
             match decoded {
                 Poll::Ready(Ok(Some(decoded))) => {
-                    self.response_headers = None;
+                    self.decoder_state = None;
                     if let Some(guard) = self.decoder_gurad.as_mut() {
                         guard.unblock();
                         if let Err(error) = guard.acknowledge(decoded.dyn_ref) {
@@ -1309,7 +1309,7 @@ where
                 .poll_data_chunk(cx, Self::QPACK_DECODE_CHUNK_SIZE)
             {
                 Poll::Ready(Ok(Some(mut data))) => {
-                    self.response_headers
+                    self.decoder_state
                         .as_mut()
                         .expect("response header state is initialized")
                         .extend(&mut data);
@@ -1345,14 +1345,14 @@ where
                     return Poll::Ready(Ok(None));
                 }
                 Ok(Some(Frames::Headers)) => {
-                    self.trailers = Some(TrailersState::Decoding(qpack::DecoderState::new()));
+                    self.trailers_state = Some(TrailersState::Decoding(qpack::DecoderState::new()));
                     // Received trailers, no more data expected
                     return Poll::Ready(Ok(None));
                 }
                 Ok(Some(Frames::Frame(Frame::Headers(mut encoded)))) => {
                     let mut state = qpack::DecoderState::new();
                     state.extend(&mut encoded);
-                    self.trailers = Some(TrailersState::Decoding(state));
+                    self.trailers_state = Some(TrailersState::Decoding(state));
                     return Poll::Ready(Ok(None));
                 }
                 Ok(Some(Frames::Frame(Frame::Data { .. }))) => (),
@@ -1401,7 +1401,7 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
-        let mut trailers = if let Some(state) = self.trailers.take() {
+        let mut trailers = if let Some(state) = self.trailers_state.take() {
             state
         } else {
             match ready!(self.stream.poll_next_frame(cx)) {
@@ -1494,7 +1494,7 @@ where
                                 )));
                             }
                         }
-                        self.trailers = Some(trailers);
+                        self.trailers_state = Some(trailers);
                         return Poll::Pending;
                     }
                     Poll::Ready(Err(qpack::DecoderError::HeaderTooLong(actual_size))) => {
@@ -1512,7 +1512,7 @@ where
                         )));
                     }
                     Poll::Pending => {
-                        self.trailers = Some(trailers);
+                        self.trailers_state = Some(trailers);
                         return Poll::Pending;
                     }
                 }
@@ -1529,7 +1529,7 @@ where
                         ));
                     }
                     Poll::Pending => {
-                        self.trailers = Some(trailers);
+                        self.trailers_state = Some(trailers);
                         return Poll::Pending;
                     }
                 }
@@ -1560,7 +1560,7 @@ where
                 // Stream is finished no problematic frames received
                 Poll::Ready(Ok(None)) => (),
                 Poll::Pending => {
-                    self.trailers = Some(trailers);
+                    self.trailers_state = Some(trailers);
                     return Poll::Pending;
                 }
             }
@@ -1699,23 +1699,23 @@ where
         (
             RequestStream {
                 stream: send,
-                trailers: None,
                 conn_state: self.conn_state.clone(),
                 max_field_section_size: 0,
                 send_grease_frame: self.send_grease_frame,
                 decoder: self.decoder.clone(),
                 decoder_gurad: None,
-                response_headers: None,
+                decoder_state: None,
+                trailers_state: None,
             },
             RequestStream {
                 stream: recv,
-                trailers: self.trailers,
                 conn_state: self.conn_state,
                 max_field_section_size: self.max_field_section_size,
                 send_grease_frame: self.send_grease_frame,
                 decoder: self.decoder,
                 decoder_gurad: self.decoder_gurad,
-                response_headers: self.response_headers,
+                decoder_state: self.decoder_state,
+                trailers_state: self.trailers_state,
             },
         )
     }
