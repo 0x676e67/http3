@@ -221,11 +221,12 @@ async fn run_public_server_requests_at_addr(
         }));
     }
 
-    for handle in handles {
-        let response = handle.await.map_err(|err| {
-            std::io::Error::other(format!("public server interop request task failed: {err}"))
-        })??;
+    let responses = future::try_join_all(handles).await.map_err(|err| {
+        std::io::Error::other(format!("public server interop request task failed: {err}"))
+    })?;
 
+    for response in responses {
+        let response = response?;
         println!(
             "public interop response target={} qpack={} grease={} request={} status={} body_bytes={} content_length={} content_length_match={} content_type={}",
             run.target.name,
