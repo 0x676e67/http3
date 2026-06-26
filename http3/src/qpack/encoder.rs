@@ -91,7 +91,13 @@ impl Encoder {
     pub fn on_decoder_recv<R: Buf>(&mut self, read: &mut R) -> Result<(), EncoderError> {
         while let Some(instruction) = Action::parse(read)? {
             match instruction {
-                Action::Untrack(stream_id) => self.table.untrack_block(stream_id)?,
+                Action::Untrack(stream_id) => {
+                    // A Section Acknowledgment is only valid while this encoder
+                    // still has an unacknowledged dynamic field section for the
+                    // stream.
+                    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
+                    self.table.untrack_block(stream_id)?
+                }
                 Action::StreamCancel(stream_id) => {
                     // Untrack block twice, as this stream might have a trailer in addition to
                     // the header. Failures are ignored as blocks might have been acked before
@@ -640,6 +646,26 @@ mod tests {
             encoder.on_decoder_recv(&mut cur),
             Err(EncoderError::Insertion(DynamicTableError::UnknownStreamId(
                 4
+            )))
+        );
+    }
+
+    #[test]
+    fn section_ack_without_unacknowledged_field_section_is_rejected() {
+        let mut encoder = Encoder::default();
+
+        let mut buf = vec![];
+        // The encoder has not sent any dynamic field section on this stream,
+        // so a Section Acknowledgment cannot correspond to the earliest
+        // unacknowledged field section described by RFC 9204.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
+        HeaderAck(0).encode(&mut buf);
+
+        let mut cur = Cursor::new(&buf);
+        assert_eq!(
+            encoder.on_decoder_recv(&mut cur),
+            Err(EncoderError::Insertion(DynamicTableError::UnknownStreamId(
+                0
             )))
         );
     }
