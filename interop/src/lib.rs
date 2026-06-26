@@ -3,7 +3,7 @@ use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
 use bytes::{Buf, Bytes};
 use futures::future;
 use rustls::pki_types::CertificateDer;
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -260,7 +260,7 @@ pub async fn run_local_quinn_client_interop_matrix_with_config(
 
     let requests = interop_requests();
     for batch in requests.chunks(INTEROP_CONCURRENCY) {
-        let mut handles = Vec::with_capacity(batch.len());
+        let mut tasks = JoinSet::new();
 
         // Requests in one batch run concurrently. The batch size keeps the test
         // cheap enough for CI while still exercising independent request
@@ -270,29 +270,32 @@ pub async fn run_local_quinn_client_interop_matrix_with_config(
             let port = server_addr.port();
             let task_path = path.clone();
 
-            let handle = tokio::spawn(async move {
-                let expected_status = http::StatusCode::from_u16(case.status)?;
-                let req = http::Request::builder()
-                    .method(http::Method::GET)
-                    .uri(format!("https://localhost:{port}{task_path}"))
-                    .body(())?;
+            tasks.spawn(async move {
+                let path = task_path.clone();
+                let result = async {
+                    let expected_status = http::StatusCode::from_u16(case.status)?;
+                    let req = http::Request::builder()
+                        .method(http::Method::GET)
+                        .uri(format!("https://localhost:{port}{task_path}"))
+                        .body(())?;
 
-                let mut stream: http3_rs::client::RequestStream<
-                    http3_quinn_rs::BidiStream<Bytes>,
-                    _,
-                > = send_request.send_request(req).await?;
-                stream.finish().await?;
+                    let mut stream: http3_rs::client::RequestStream<
+                        http3_quinn_rs::BidiStream<Bytes>,
+                        _,
+                    > = send_request.send_request(req).await?;
+                    stream.finish().await?;
 
-                let body = read_response(stream, expected_status).await?;
-                let expected_body = interop_body(case);
-                assert_body_eq(&task_path, &body, &expected_body);
-                Ok::<(), BoxError>(())
+                    let body = read_response(stream, expected_status).await?;
+                    let expected_body = interop_body(case);
+                    assert_body_eq(&task_path, &body, &expected_body);
+                    Ok::<(), BoxError>(())
+                }
+                .await;
+                (path, result)
             });
-
-            handles.push((path, handle));
         }
 
-        wait_for_interop_tasks(batch, handles).await?;
+        wait_for_interop_tasks(batch, tasks).await?;
     }
 
     drop(send_request);
@@ -306,40 +309,40 @@ pub async fn run_local_quinn_client_interop_matrix_with_config(
 
 async fn wait_for_interop_tasks(
     batch: &[(InteropCase, String)],
-    mut handles: Vec<(String, JoinHandle<Result<(), BoxError>>)>,
+    mut tasks: JoinSet<(String, Result<(), BoxError>)>,
 ) -> Result<(), BoxError> {
     let timeout = interop_batch_timeout(batch);
 
-    let result = {
-        let wait_all = future::try_join_all(handles.iter_mut().map(|(path, handle)| {
-            let path = path.clone();
-            async move {
-                match handle.await {
-                    Ok(result) => result.map_err(|err| -> BoxError {
-                        std::io::Error::other(format!(
-                            "interop request task failed for {path}: {err}"
-                        ))
-                        .into()
-                    }),
-                    Err(err) => Err(std::io::Error::other(format!(
+    let result = tokio::time::timeout(timeout, async {
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok((_, Ok(()))) => {}
+                Ok((path, Err(err))) => {
+                    return Err(std::io::Error::other(format!(
                         "interop request task failed for {path}: {err}"
                     ))
-                    .into()),
+                    .into());
+                }
+                Err(err) => {
+                    return Err(std::io::Error::other(format!(
+                        "interop request task panicked or was cancelled: {err}"
+                    ))
+                    .into());
                 }
             }
-        }));
-
-        tokio::time::timeout(timeout, wait_all).await
-    };
+        }
+        Ok(())
+    })
+    .await;
 
     match result {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => {
-            abort_interop_tasks(handles);
+            tasks.abort_all();
             Err(err)
         }
         Err(_) => {
-            abort_interop_tasks(handles);
+            tasks.abort_all();
             let paths = batch
                 .iter()
                 .map(|(_, path)| path.as_str())
@@ -355,12 +358,6 @@ async fn wait_for_interop_tasks(
             )
             .into())
         }
-    }
-}
-
-fn abort_interop_tasks(handles: Vec<(String, JoinHandle<Result<(), BoxError>>)>) {
-    for (_, handle) in handles {
-        handle.abort();
     }
 }
 
