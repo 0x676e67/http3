@@ -43,7 +43,7 @@ jobs:
     name: Check Style
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_style }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -55,7 +55,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_lint }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -68,7 +68,7 @@ jobs:
     needs: [style]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_msrv }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -80,7 +80,7 @@ jobs:
     needs: [style]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_http3_quinn_msrv }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -104,7 +104,7 @@ jobs:
             target: i686-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # Add this step for 32-bit build support
       - name: Install 32-bit development libraries
         if: matrix.target == 'i686-unknown-linux-gnu'
@@ -129,7 +129,7 @@ jobs:
     needs: [test]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_doc }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -141,7 +141,7 @@ jobs:
     needs: [test]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_fuzz }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -156,7 +156,7 @@ jobs:
   #   needs: [test]
   #   runs-on: ubuntu-latest
   #   steps:
-  #     - uses: actions/checkout@v5
+  #     - uses: actions/checkout@v7
   #       with:
   #         persist-credentials: false
   #         fetch-depth: 0
@@ -170,7 +170,7 @@ jobs:
     needs: [test]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Rust stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
