@@ -213,7 +213,7 @@ impl Decoder {
     ///
     /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1)
     /// and [Section 4.5](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5).
-    pub(crate) fn decode_header_incremental(
+    pub(crate) fn decode_header(
         &self,
         state: &mut DecoderState,
         end: bool,
@@ -617,7 +617,7 @@ mod tests {
     ) -> Result<Decoded, DecoderError> {
         let mut state = DecoderState::new();
         state.extend(&mut Cursor::new(buf.as_ref()));
-        match decoder.decode_header_incremental(&mut state, true, max_size)? {
+        match decoder.decode_header(&mut state, true, max_size)? {
             Some(decoded) => Ok(decoded),
             None => Err(DecoderError::UnexpectedEnd),
         }
@@ -740,7 +740,7 @@ mod tests {
         state.extend(&mut Cursor::new(field_section));
         let mut decoder = Decoder::new(TABLE_SIZE as u64, 1).unwrap();
         assert_eq!(
-            decoder.decode_header_incremental(&mut state, true, u64::MAX),
+            decoder.decode_header(&mut state, true, u64::MAX),
             Err(DecoderError::MissingRefs(1))
         );
 
@@ -754,7 +754,7 @@ mod tests {
             .unwrap();
 
         let decoded = decoder
-            .decode_header_incremental(&mut state, true, u64::MAX)
+            .decode_header(&mut state, true, u64::MAX)
             .unwrap()
             .unwrap();
         assert_eq!(decoded.fields, vec![HeaderField::new("dynamic", "value")]);
@@ -771,14 +771,11 @@ mod tests {
         let decoder = Decoder::from(build_table_with_size(2));
         for byte in encoded {
             state.extend(&mut Cursor::new([byte]));
-            assert_eq!(
-                decoder.decode_header_incremental(&mut state, false, u64::MAX),
-                Ok(None)
-            );
+            assert_eq!(decoder.decode_header(&mut state, false, u64::MAX), Ok(None));
         }
 
         let decoded = decoder
-            .decode_header_incremental(&mut state, true, u64::MAX)
+            .decode_header(&mut state, true, u64::MAX)
             .unwrap()
             .unwrap();
         assert_eq!(decoded.fields, vec![field(2), field(1)]);
@@ -798,12 +795,9 @@ mod tests {
         state.extend(&mut Cursor::new(field_section));
         let decoder = Decoder::from(build_table_with_size(0));
 
+        assert_eq!(decoder.decode_header(&mut state, false, u64::MAX), Ok(None));
         assert_eq!(
-            decoder.decode_header_incremental(&mut state, false, u64::MAX),
-            Ok(None)
-        );
-        assert_eq!(
-            decoder.decode_header_incremental(&mut state, true, u64::MAX),
+            decoder.decode_header(&mut state, true, u64::MAX),
             Err(DecoderError::UnexpectedEnd)
         );
     }
@@ -814,7 +808,7 @@ mod tests {
         let decoder = Decoder::from(build_table_with_size(0));
 
         assert_eq!(
-            decoder.decode_header_incremental(&mut state, true, u64::MAX),
+            decoder.decode_header(&mut state, true, u64::MAX),
             Err(DecoderError::UnexpectedEnd)
         );
     }
