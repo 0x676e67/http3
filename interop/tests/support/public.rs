@@ -5,7 +5,7 @@ use futures::future;
 use http::header::CONTENT_LENGTH;
 use interop::{BoxError, ClientInteropConfig, install_crypto_provider};
 use rustls_native_certs::CertificateResult;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 const ALPN_H3: &[u8] = b"h3";
 const REAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -211,21 +211,33 @@ async fn run_public_server_requests_at_addr(
     let driver_task: JoinHandle<_> =
         tokio::spawn(async move { future::poll_fn(|cx| driver.poll_close(cx)).await });
 
-    let mut handles = Vec::with_capacity(run.concurrency);
+    let mut requests = JoinSet::new();
     for request_id in 0..run.concurrency {
         let send_request = send_request.clone();
         let request_uri = uri.clone();
 
-        handles.push(tokio::spawn(async move {
-            send_public_server_request(request_id, request_uri, send_request).await
-        }));
+        requests.spawn(send_public_server_request(
+            request_id,
+            request_uri,
+            send_request,
+        ));
     }
 
-    for handle in handles {
-        let response = handle.await.map_err(|err| {
-            std::io::Error::other(format!("public server interop request task failed: {err}"))
-        })??;
-
+    while let Some(result) = requests.join_next().await {
+        let response = match result {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                requests.abort_all();
+                return Err(err);
+            }
+            Err(err) => {
+                requests.abort_all();
+                return Err(std::io::Error::other(format!(
+                    "public server interop request task failed: {err}"
+                ))
+                .into());
+            }
+        };
         println!(
             "public interop response target={} qpack={} grease={} request={} status={} body_bytes={} content_length={} content_length_match={} content_type={}",
             run.target.name,
