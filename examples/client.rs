@@ -104,14 +104,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("failed to parse trust anchor: {}", e);
     }
 
-    // Keep the example deterministic when workspace builds enable more than one
-    // rustls crypto backend, for example interop tests that also pull aws-lc-rs.
-    let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
 
     tls_config.enable_early_data = true;
     tls_config.alpn_protocols = vec![ALPN.into()];
