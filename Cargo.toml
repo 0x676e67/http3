@@ -8,6 +8,13 @@ members = [
     # Internal
     "examples",
 ]
+default-members = [
+    "http3",
+    "http3-quinn",
+    "http3-webtransport",
+    "http3-datagram",
+    "examples",
+]
 resolver = "2"
 
 [workspace.package]
