@@ -294,6 +294,20 @@ local_interop_test!(
     ClientInteropConfig::qpack_dynamic_table().with_grease()
 );
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2n_h3_max_field_section_size_limit_server_rejects_send() -> Result<(), BoxError> {
+    // s2n-quic-h3 uses upstream h3 for the HTTP/3 server layer. h3 validates
+    // the peer's advertised limit before sending an oversized response field
+    // section, so this backend covers the send-side rejection path rather than
+    // the client's receive-side HeaderTooBig path.
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2
+    support::s2n::run_max_field_section_size_limit(
+        support::s2n::ServerConfig::stateless_qpack(),
+        ClientInteropConfig::stateless_qpack(),
+    )
+    .await
+}
+
 // tquic is not used for the max_field_section_size negative test. Its server
 // API refuses to send a field section larger than the client's advertised
 // limit and returns `ExcessiveLoad` from `send_headers`, so it cannot exercise
