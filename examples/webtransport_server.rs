@@ -80,9 +80,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cert = CertificateDer::from(std::fs::read(cert)?);
     let key = PrivateKeyDer::try_from(std::fs::read(key)?)?;
 
-    let mut tls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)?;
+    // Keep the example deterministic when workspace builds enable more than one
+    // rustls crypto backend, for example interop tests that also pull aws-lc-rs.
+    let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])?
+    .with_no_client_auth()
+    .with_single_cert(vec![cert], key)?;
 
     tls_config.max_early_data_size = u32::MAX;
     let alpn: Vec<Vec<u8>> = vec![
