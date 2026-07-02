@@ -233,6 +233,67 @@ local_interop_test!(
     ClientInteropConfig::qpack_dynamic_table().with_grease()
 );
 
+// s2n-quic supplies the QUIC transport here, while upstream h3 provides the
+// server-side HTTP/3 implementation. h3 0.0.8 sends stateless QPACK response
+// field sections, so this backend covers client QPACK SETTINGS negotiation but
+// does not claim server-side dynamic-table encoding coverage.
+// https://www.rfc-editor.org/rfc/rfc9204.html#section-5
+local_interop_test!(
+    s2n_h3_qpack_client_off_server_off,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::stateless_qpack()
+);
+
+local_interop_test!(
+    s2n_h3_qpack_client_off_server_off_client_grease_on,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::stateless_qpack().with_grease()
+);
+
+local_interop_test!(
+    s2n_h3_qpack_client_on_server_off,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::qpack_dynamic_table()
+);
+
+local_interop_test!(
+    s2n_h3_qpack_client_on_server_off_client_grease_on,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::qpack_dynamic_table().with_grease()
+);
+
+local_interop_test!(
+    s2n_h3_qpack_client_off_server_off_server_grease_on,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack().with_grease(),
+    ClientInteropConfig::stateless_qpack()
+);
+
+local_interop_test!(
+    s2n_h3_qpack_client_off_server_off_client_and_server_grease_on,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack().with_grease(),
+    ClientInteropConfig::stateless_qpack().with_grease()
+);
+
+local_interop_test!(
+    s2n_h3_qpack_client_on_server_off_server_grease_on,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack().with_grease(),
+    ClientInteropConfig::qpack_dynamic_table()
+);
+
+local_interop_test!(
+    s2n_h3_qpack_client_on_server_off_client_and_server_grease_on,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack().with_grease(),
+    ClientInteropConfig::qpack_dynamic_table().with_grease()
+);
+
 // tquic is not used for the max_field_section_size negative test. Its server
 // API refuses to send a field section larger than the client's advertised
 // limit and returns `ExcessiveLoad` from `send_headers`, so it cannot exercise
