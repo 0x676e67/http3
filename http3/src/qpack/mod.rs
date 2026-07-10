@@ -64,7 +64,7 @@ struct QpackDecoderInner {
     decoder: RwLock<Decoder>,
     decoder_dynamic_table: bool,
     decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
-    max_blocked_streams: usize,
+    max_blocked_streams: u64,
     blocked_streams: AtomicUsize,
     /// Connection-driver waker used while a request holds a read guard.
     write_waker: AtomicWaker,
@@ -120,7 +120,11 @@ impl QpackDecoder {
         self.0
             .blocked_streams
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                (current < self.0.max_blocked_streams).then_some(current + 1)
+                let current_u64 = u64::try_from(current).ok()?;
+                if current_u64 >= self.0.max_blocked_streams {
+                    return None;
+                }
+                current.checked_add(1)
             })
             .map(|_| ())
             .map_err(|_| DecoderError::TooManyBlockedStreams)

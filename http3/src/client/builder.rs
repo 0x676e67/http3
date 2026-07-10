@@ -126,6 +126,15 @@ impl Builder {
     /// Sent as `SETTINGS_QPACK_BLOCKED_STREAMS` (0x7). When this is not called,
     /// the setting is omitted and the protocol default of `0` applies. Passing `0`
     /// explicitly sends the setting with value `0`.
+    ///
+    /// QPACK does not define an additional numeric maximum. HTTP/3 setting
+    /// values are QUIC variable-length integers, so the largest encodable value is
+    /// `2^62 - 1`. Large values increase the decoder state a peer can require;
+    /// choose a limit appropriate for the connection's memory budget.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2),
+    /// [Section 7.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3), and
+    /// [RFC 9114, Section 7.2.4](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4).
     pub fn qpack_blocked_streams<T: Into<Option<u64>>>(&mut self, value: T) -> &mut Self {
         self.config.settings.qpack_blocked_streams = value.into();
         self

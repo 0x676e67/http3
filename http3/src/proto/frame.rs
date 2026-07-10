@@ -496,6 +496,16 @@ impl FrameHeader for Settings {
 
 impl Settings {
     pub fn insert(&mut self, id: SettingId, value: u64) -> Result<(), SettingsError> {
+        // SETTINGS identifiers and values are QUIC variable-length integers.
+        // Validate both here so frame length calculation and encoding stay infallible.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4
+        if VarInt::from_u64(id.0).is_err() {
+            return Err(SettingsError::InvalidSettingId(id.0));
+        }
+        if VarInt::from_u64(value).is_err() {
+            return Err(SettingsError::InvalidSettingValue(id, value));
+        }
+
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
         //# The same setting identifier MUST NOT occur more than once in the
         //# SETTINGS frame.
@@ -686,6 +696,42 @@ mod tests {
                 4, 18, 6, 128, 0, 250, 209, 1, 128, 0, 250, 210, 7, 128, 0, 250, 211, 64, 95, 0,
             ],
             Frame::Settings(recv_settings),
+        );
+    }
+
+    #[test]
+    fn settings_accept_maximum_qpack_blocked_streams_value() {
+        let max = VarInt::MAX.into_inner();
+        let mut settings = Settings::default();
+        settings
+            .insert(SettingId::QPACK_MAX_BLOCKED_STREAMS, max)
+            .unwrap();
+        let mut expected = Settings::default();
+        expected
+            .insert(SettingId::QPACK_MAX_BLOCKED_STREAMS, max)
+            .unwrap();
+
+        let mut frame = Frame::<Bytes>::Settings(settings);
+        let mut wire = Vec::new();
+        frame.encode_with_payload(&mut wire);
+
+        assert_eq!(
+            Frame::decode(&mut Cursor::new(wire)).unwrap(),
+            Frame::<Bytes>::Settings(expected)
+        );
+    }
+
+    #[test]
+    fn settings_reject_value_larger_than_quic_varint() {
+        let mut settings = Settings::default();
+        let value = VarInt::MAX.into_inner() + 1;
+
+        assert_eq!(
+            settings.insert(SettingId::QPACK_MAX_BLOCKED_STREAMS, value),
+            Err(SettingsError::InvalidSettingValue(
+                SettingId::QPACK_MAX_BLOCKED_STREAMS,
+                value,
+            ))
         );
     }
 
