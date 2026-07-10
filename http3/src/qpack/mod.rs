@@ -64,7 +64,7 @@ pub(crate) enum QpackEvent {
         stream_id: StreamId,
         required_ref: usize,
     },
-    ReadLockWaker(Waker),
+    DecoderAccessWaker(Waker),
 }
 
 /// Blocked field sections owned by the connection driver.
@@ -385,7 +385,7 @@ impl QpackDecoder {
         if self
             .0
             .decoder_events_send
-            .send(QpackEvent::ReadLockWaker(cx.waker().clone()))
+            .send(QpackEvent::DecoderAccessWaker(cx.waker().clone()))
             .is_err()
         {
             return Poll::Ready(Err(DecoderError::UnexpectedEnd));
