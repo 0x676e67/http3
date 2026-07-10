@@ -1,10 +1,26 @@
 use crate::qpack::decoder::Decoder;
-use crate::qpack::encoder::Encoder;
-use crate::qpack::{Decoded, DecoderError, HeaderField, QpackDecoder, dynamic::DynamicTable};
+use crate::qpack::encoder::{Encoder, set_dynamic_table_size};
+use crate::qpack::{
+    BlockedStreamRegistry, Decoded, DecoderError, HeaderField, QpackDecoder, QpackEvent,
+    dynamic::DynamicTable,
+};
+use crate::quic::StreamId;
 use std::{
     io::Cursor,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
 };
+
+struct WakeCounter(AtomicUsize);
+
+impl futures_util::task::ArcWake for WakeCounter {
+    fn wake_by_ref(counter: &Arc<Self>) {
+        counter.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 pub mod helpers {
     use crate::qpack::{HeaderField, dynamic::DynamicTable};
@@ -95,7 +111,7 @@ fn blocked_header() {
 }
 
 #[test]
-fn shared_decoder_registers_blocked_header() {
+fn shared_decoder_queues_blocked_header_for_connection_driver() {
     let mut enc_table = DynamicTable::new();
     enc_table.set_max_size(TABLE_SIZE).unwrap();
     enc_table.set_max_blocked(100).unwrap();
@@ -125,7 +141,112 @@ fn shared_decoder_registers_blocked_header() {
         decoder.poll_decode_header(&mut cx, &mut block_cur, u64::MAX),
         Poll::Ready(Err(DecoderError::MissingRefs(1)))
     );
-    assert!(decoder_wakers.try_recv().is_ok());
+    assert!(decoder_wakers.try_recv().is_err());
+
+    decoder
+        .queue_blocked_stream(StreamId(0), 1, cx.waker())
+        .unwrap();
+    assert!(matches!(
+        decoder_wakers.try_recv(),
+        Ok(QpackEvent::RegisterBlocked {
+            stream_id: StreamId(0),
+            required_ref: 1,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn decoder_update_releases_blocked_stream_budget_before_request_repoll() {
+    let mut encoder_table = DynamicTable::new();
+    encoder_table.set_max_blocked(1).unwrap();
+    let mut first_encoder_stream = Vec::new();
+    set_dynamic_table_size(&mut encoder_table, &mut first_encoder_stream, TABLE_SIZE).unwrap();
+    let mut encoder = Encoder::from(encoder_table);
+
+    let mut first_field_section = Vec::new();
+    assert_eq!(
+        encoder.encode(
+            0,
+            &mut first_field_section,
+            &mut first_encoder_stream,
+            &[HeaderField::new("first", "value")],
+        ),
+        Ok(1)
+    );
+
+    let (events_send, _events_recv) = tokio::sync::mpsc::unbounded_channel();
+    let decoder = QpackDecoder::new(Decoder::new(TABLE_SIZE as u64, 1).unwrap(), events_send);
+    let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+    assert_eq!(
+        decoder.poll_decode_header(&mut cx, &mut Cursor::new(first_field_section), u64::MAX,),
+        Poll::Ready(Err(DecoderError::MissingRefs(1)))
+    );
+    let mut blocked_streams = BlockedStreamRegistry::new(1);
+    let wake_count = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    let blocked_waker = futures_util::task::waker(wake_count.clone());
+    assert_eq!(
+        blocked_streams.register(StreamId(0), 1, blocked_waker),
+        Ok(())
+    );
+
+    let mut decoder_stream = Vec::new();
+    let Poll::Ready(Ok(insert_count)) = decoder.poll_on_recv_encoder(
+        &mut cx,
+        &mut Cursor::new(first_encoder_stream),
+        &mut decoder_stream,
+    ) else {
+        panic!("first encoder-stream insertion was not processed");
+    };
+    assert_eq!(insert_count, 1);
+    blocked_streams.update_insert_count(insert_count);
+    assert_eq!(wake_count.0.load(Ordering::Relaxed), 1);
+    encoder
+        .on_decoder_recv(&mut Cursor::new(decoder_stream))
+        .unwrap();
+
+    let mut second_field_section = Vec::new();
+    let mut second_encoder_stream = Vec::new();
+    assert_eq!(
+        encoder.encode(
+            4,
+            &mut second_field_section,
+            &mut second_encoder_stream,
+            &[HeaderField::new("second", "value")],
+        ),
+        Ok(2)
+    );
+    assert_eq!(
+        decoder.poll_decode_header(&mut cx, &mut Cursor::new(second_field_section), u64::MAX,),
+        Poll::Ready(Err(DecoderError::MissingRefs(2)))
+    );
+
+    // The first stream became unblocked when Insert Count reached one, even
+    // though its request task has not polled the field section again.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1
+    assert_eq!(
+        blocked_streams.register(StreamId(4), 2, cx.waker().clone()),
+        Ok(())
+    );
+}
+
+#[test]
+fn blocked_registration_after_decoder_update_wakes_immediately() {
+    let mut blocked_streams = BlockedStreamRegistry::new(1);
+    blocked_streams.update_insert_count(1);
+
+    let wake_count = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    let waker = futures_util::task::waker(wake_count.clone());
+
+    // The decoder update can win the race with the request's registration
+    // event. Such a field section is already decodable and consumes no slot.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1
+    assert_eq!(blocked_streams.register(StreamId(0), 1, waker), Ok(()));
+    assert_eq!(wake_count.0.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        blocked_streams.register(StreamId(4), 2, futures_util::task::noop_waker().clone(),),
+        Ok(())
+    );
 }
 
 #[test]
