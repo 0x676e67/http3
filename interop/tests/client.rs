@@ -96,6 +96,53 @@ async fn ngtcp2_max_field_section_size_limit() -> Result<(), BoxError> {
     .await
 }
 
+// The crates.io h3/h3-quinn server gives us a baseline against upstream h3's
+// Quinn adapter. Its response encoder is stateless today, so this matrix covers
+// both client QPACK SETTINGS modes while the server sends literal/static-table
+// response field sections.
+// https://www.rfc-editor.org/rfc/rfc9204.html#section-5
+local_interop_test!(
+    quinn_h3_qpack_client_off_server_off,
+    quinn_h3,
+    support::quinn_h3::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::stateless_qpack()
+);
+
+local_interop_test!(
+    quinn_h3_qpack_client_off_server_off_client_grease_on,
+    quinn_h3,
+    support::quinn_h3::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::stateless_qpack().with_grease()
+);
+
+local_interop_test!(
+    quinn_h3_qpack_client_on_server_off,
+    quinn_h3,
+    support::quinn_h3::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::qpack_dynamic_table()
+);
+
+local_interop_test!(
+    quinn_h3_qpack_client_on_server_off_client_grease_on,
+    quinn_h3,
+    support::quinn_h3::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::qpack_dynamic_table().with_grease()
+);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quinn_h3_max_field_section_size_limit_server_rejects_send() -> Result<(), BoxError> {
+    // h3/h3-quinn validates the peer's advertised limit before sending an
+    // oversized response field section. That cannot exercise the client's
+    // receive-side HeaderTooBig path, but it is still the correct backend-
+    // specific behavior to lock down here.
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2
+    support::quinn_h3::run_max_field_section_size_limit(
+        support::quinn_h3::ServerConfig::stateless_qpack(),
+        ClientInteropConfig::stateless_qpack(),
+    )
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quiche_qpack_client_off_server_off() -> Result<(), BoxError> {
     support::quiche::run_client_interop(
