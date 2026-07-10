@@ -514,6 +514,24 @@ mod tests {
     }
 
     #[test]
+    fn zero_capacity_update_is_allowed_when_advertised_maximum_is_zero() {
+        let mut encoder_stream = Vec::new();
+        DynamicTableSizeUpdate(0).encode(&mut encoder_stream);
+        let mut decoder = Decoder::new(0, 0).unwrap();
+        let mut decoder_stream = Vec::new();
+
+        // The encoder can select any capacity up to the decoder's advertised
+        // maximum. Setting zero when that maximum is zero is therefore valid.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.1
+        assert_eq!(
+            decoder.on_encoder_recv(&mut Cursor::new(encoder_stream), &mut decoder_stream),
+            Ok(0)
+        );
+        assert_eq!(decoder.table.max_mem_size(), 0);
+        assert!(decoder_stream.is_empty());
+    }
+
+    #[test]
     fn required_insert_count_uses_advertised_capacity() {
         let mut field_section = Vec::new();
         HeaderPrefix::new(8, 8, 10, TABLE_SIZE).encode(&mut field_section);
