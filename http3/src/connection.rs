@@ -1064,9 +1064,9 @@ where
                     .qpack_streams
                     .blocked_streams
                     .release(stream_id, required_ref),
-                // Read-lock wakers share this channel with decoder-stream work,
-                // but ordinary flushes retain them until the writer releases.
-                QpackEvent::ReadLockWaker(waker) => {
+                // Decoder-access wakers share this channel with decoder-stream
+                // work, but ordinary flushes retain them until the writer releases.
+                QpackEvent::DecoderAccessWaker(waker) => {
                     if wake_waiters {
                         waker.wake();
                     } else {
