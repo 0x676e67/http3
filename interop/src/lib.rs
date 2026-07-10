@@ -133,7 +133,14 @@ pub fn install_crypto_provider() {
 pub struct TestCertificate {
     pub cert_pem: String,
     pub key_pem: String,
+    pub key_der: Vec<u8>,
     cert_der: CertificateDer<'static>,
+}
+
+impl TestCertificate {
+    pub fn cert_der(&self) -> CertificateDer<'static> {
+        self.cert_der.clone()
+    }
 }
 
 pub fn generate_test_certificate() -> Result<TestCertificate, BoxError> {
@@ -144,6 +151,7 @@ pub fn generate_test_certificate() -> Result<TestCertificate, BoxError> {
     Ok(TestCertificate {
         cert_pem: key.cert.pem(),
         key_pem: key.signing_key.serialize_pem(),
+        key_der: key.signing_key.serialize_der(),
         cert_der,
     })
 }
