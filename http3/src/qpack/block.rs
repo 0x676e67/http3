@@ -172,17 +172,26 @@ impl HeaderPrefix {
             required
         };
 
+        let invalid_base = || ParseError::InvalidBase {
+            required_insert_count: required,
+            sign_negative: self.sign_negative,
+            delta_base: self.delta_base,
+        };
+
+        // Delta Base comes from the peer. Reject a Base outside `usize`
+        // instead of allowing the field section prefix to wrap or panic.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1
         let base = if required == 0 {
             0
         } else if !self.sign_negative {
-            required + self.delta_base
+            required
+                .checked_add(self.delta_base)
+                .ok_or_else(invalid_base)?
         } else {
-            if self.delta_base + 1 > required {
-                return Err(ParseError::InvalidBase(
-                    required as isize - self.delta_base as isize - 1,
-                ));
-            }
-            required - self.delta_base - 1
+            required
+                .checked_sub(self.delta_base)
+                .and_then(|base| base.checked_sub(1))
+                .ok_or_else(invalid_base)?
         };
 
         Ok((required, base))
@@ -558,7 +567,49 @@ mod test {
         let mut read = Cursor::new(&buf);
         assert_eq!(
             HeaderPrefix::decode(&mut read).unwrap().get(2, TABLE_SIZE),
-            Err(ParseError::InvalidBase(-1))
+            Err(ParseError::InvalidBase {
+                required_insert_count: 2,
+                sign_negative: true,
+                delta_base: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn positive_delta_base_overflow_is_rejected() {
+        let mut field_section = vec![];
+        prefix_int::encode(8, 0, 1, &mut field_section);
+        prefix_int::encode(7, 0, 2, &mut field_section);
+
+        let prefix = HeaderPrefix::decode(&mut Cursor::new(field_section)).unwrap();
+        // With MaxEntries set to one, EIC 1 reconstructs a Required Insert
+        // Count of `usize::MAX - 1`; adding the wire Delta Base must fail.
+        assert_eq!(
+            prefix.get(usize::MAX - 1, 32),
+            Err(ParseError::InvalidBase {
+                required_insert_count: usize::MAX - 1,
+                sign_negative: false,
+                delta_base: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn negative_delta_base_arithmetic_overflow_is_rejected() {
+        // This value is wire-representable on 32-bit targets. Exercise the
+        // arithmetic boundary directly so the regression is covered everywhere.
+        let prefix = HeaderPrefix {
+            encoded_insert_count: 2,
+            sign_negative: true,
+            delta_base: usize::MAX,
+        };
+        assert_eq!(
+            prefix.get(0, 32),
+            Err(ParseError::InvalidBase {
+                required_insert_count: 1,
+                sign_negative: true,
+                delta_base: usize::MAX,
+            })
         );
     }
 }
