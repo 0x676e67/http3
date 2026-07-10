@@ -10,6 +10,9 @@ pub mod quiche;
 #[path = "support/public.rs"]
 pub mod public;
 
+#[path = "support/quinn_h3.rs"]
+pub mod quinn_h3;
+
 #[path = "support/s2n.rs"]
 pub mod s2n;
 
