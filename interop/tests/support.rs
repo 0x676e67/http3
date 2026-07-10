@@ -10,5 +10,8 @@ pub mod quiche;
 #[path = "support/public.rs"]
 pub mod public;
 
+#[path = "support/s2n.rs"]
+pub mod s2n;
+
 #[path = "support/tquic.rs"]
 pub mod tquic;
