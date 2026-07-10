@@ -108,7 +108,7 @@ pub struct Decoder {
     // current capacity is separate and starts at zero.
     // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3
     max_table_capacity: usize,
-    max_blocked_streams: usize,
+    max_blocked_streams: u64,
 }
 
 impl Decoder {
@@ -118,12 +118,10 @@ impl Decoder {
     ) -> Result<Self, DecoderError> {
         let max_table_capacity = max_table_capacity.try_into()?;
         DynamicTable::validate_max_size(max_table_capacity)?;
-        let max_blocked_streams = max_blocked_streams.try_into()?;
         // The peer encoder raises the current capacity with a Set Dynamic Table
         // Capacity instruction before inserting entries.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.1
-        let mut table = DynamicTable::new();
-        table.set_max_blocked(max_blocked_streams)?;
+        let table = DynamicTable::new();
         Ok(Self {
             table,
             max_table_capacity,
@@ -147,11 +145,13 @@ impl Decoder {
     ///
     /// This is the value advertised in `SETTINGS_QPACK_BLOCKED_STREAMS`. A zero
     /// value requires the peer to avoid field sections that cannot be decoded
-    /// immediately from the decoder's current dynamic table state.
+    /// immediately from the decoder's current dynamic table state. QPACK defines
+    /// no additional numeric maximum for this setting.
     ///
-    /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3)
-    /// and [Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
-    pub(crate) fn max_blocked_streams(&self) -> usize {
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2),
+    /// [Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5), and
+    /// [RFC 9114, Section 7.2.4](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4).
+    pub(crate) fn max_blocked_streams(&self) -> u64 {
         self.max_blocked_streams
     }
 
@@ -473,6 +473,14 @@ mod tests {
 
         assert!(decoder.dynamic_table_enabled());
         assert_eq!(decoder.table.max_mem_size(), 0);
+    }
+
+    #[test]
+    fn blocked_stream_limit_accepts_full_settings_range() {
+        let max = crate::proto::varint::VarInt::MAX.into_inner();
+        let decoder = Decoder::new(0, max).unwrap();
+
+        assert_eq!(decoder.max_blocked_streams(), max);
     }
 
     #[test]
