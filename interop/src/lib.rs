@@ -2,6 +2,7 @@ use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Buf, Bytes};
 use futures::future;
+use http3_rs::error::StreamError;
 use rustls::pki_types::CertificateDer;
 use tokio::task::JoinSet;
 
@@ -11,11 +12,37 @@ pub const INTEROP_ROUNDS: usize = 3;
 pub const INTEROP_CONCURRENCY: usize = 4;
 pub const INTEROP_TEST_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_BODY_LEN: usize = 36;
+pub const FIELD_SECTION_LIMIT_TEST_MAX: u64 = 512;
+pub const FIELD_SECTION_LIMIT_TEST_HEADER_VALUE_LEN: usize = 2048;
+pub const INTEROP_PADDING_HEADER_NAME: &[u8] = b"x-interop-padding";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InteropCase {
     pub status: u16,
     pub body_len: usize,
+    pub response_header_value_len: Option<usize>,
+}
+
+impl InteropCase {
+    pub const fn new(status: u16, body_len: usize) -> Self {
+        Self {
+            status,
+            body_len,
+            response_header_value_len: None,
+        }
+    }
+
+    pub const fn with_response_header_value_len(
+        status: u16,
+        body_len: usize,
+        response_header_value_len: usize,
+    ) -> Self {
+        Self {
+            status,
+            body_len,
+            response_header_value_len: Some(response_header_value_len),
+        }
+    }
 }
 
 // Keep this table intentionally mixed: small bodies catch header-only and
@@ -24,76 +51,28 @@ pub struct InteropCase {
 // FIN delivery have shown up before.
 // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.1
 pub const INTEROP_CASES: &[InteropCase] = &[
-    InteropCase {
-        status: 200,
-        body_len: 0,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 1,
-    },
-    InteropCase {
-        status: 201,
-        body_len: 1024,
-    },
-    InteropCase {
-        status: 204,
-        body_len: 0,
-    },
-    InteropCase {
-        status: 404,
-        body_len: 128,
-    },
-    InteropCase {
-        status: 503,
-        body_len: 16 * 1024,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 32 * 1024,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 64 * 1024,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 128 * 1024,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 256 * 1024,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 512 * 1024,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 1024 * 1024,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 2 * 1024 * 1024,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 4 * 1024 * 1024,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 8 * 1024 * 1024,
-    },
-    InteropCase {
-        status: 200,
-        body_len: 16 * 1024 * 1024,
-    },
+    InteropCase::new(200, 0),
+    InteropCase::new(200, 1),
+    InteropCase::new(201, 1024),
+    InteropCase::new(204, 0),
+    InteropCase::new(404, 128),
+    InteropCase::new(503, 16 * 1024),
+    InteropCase::new(200, 32 * 1024),
+    InteropCase::new(200, 64 * 1024),
+    InteropCase::new(200, 128 * 1024),
+    InteropCase::new(200, 256 * 1024),
+    InteropCase::new(200, 512 * 1024),
+    InteropCase::new(200, 1024 * 1024),
+    InteropCase::new(200, 2 * 1024 * 1024),
+    InteropCase::new(200, 4 * 1024 * 1024),
+    InteropCase::new(200, 8 * 1024 * 1024),
+    InteropCase::new(200, 16 * 1024 * 1024),
 ];
 
-pub const DEFAULT_INTEROP_CASE: InteropCase = InteropCase {
-    status: 200,
-    body_len: DEFAULT_BODY_LEN,
-};
+pub const DEFAULT_INTEROP_CASE: InteropCase = InteropCase::new(200, DEFAULT_BODY_LEN);
+
+pub const FIELD_SECTION_LIMIT_TEST_CASE: InteropCase =
+    InteropCase::with_response_header_value_len(200, 0, FIELD_SECTION_LIMIT_TEST_HEADER_VALUE_LEN);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ClientInteropConfig {
@@ -154,7 +133,14 @@ pub fn install_crypto_provider() {
 pub struct TestCertificate {
     pub cert_pem: String,
     pub key_pem: String,
+    pub key_der: Vec<u8>,
     cert_der: CertificateDer<'static>,
+}
+
+impl TestCertificate {
+    pub fn cert_der(&self) -> CertificateDer<'static> {
+        self.cert_der.clone()
+    }
 }
 
 pub fn generate_test_certificate() -> Result<TestCertificate, BoxError> {
@@ -165,15 +151,25 @@ pub fn generate_test_certificate() -> Result<TestCertificate, BoxError> {
     Ok(TestCertificate {
         cert_pem: key.cert.pem(),
         key_pem: key.signing_key.serialize_pem(),
+        key_der: key.signing_key.serialize_der(),
         cert_der,
     })
 }
 
 pub fn interop_request_path(case: InteropCase, round: usize, index: usize) -> String {
-    format!(
+    let mut path = format!(
         "/interop/status/{}/body/{}/round/{round}/case/{index}",
         case.status, case.body_len
-    )
+    );
+
+    if let Some(response_header_value_len) = case.response_header_value_len {
+        path.push_str(&format!(
+            "/response-header-value/{}",
+            response_header_value_len
+        ));
+    }
+
+    path
 }
 
 pub fn interop_case_from_path(path: &str) -> Option<InteropCase> {
@@ -190,16 +186,35 @@ pub fn interop_case_from_path(path: &str) -> Option<InteropCase> {
             Some(InteropCase {
                 status: status.parse().ok()?,
                 body_len: body_len.parse().ok()?,
+                response_header_value_len: response_header_value_len(parts)?,
             })
         }
         _ => None,
     }
 }
 
+fn response_header_value_len<'a>(
+    mut parts: impl Iterator<Item = &'a str>,
+) -> Option<Option<usize>> {
+    let mut len = None;
+
+    while let Some(part) = parts.next() {
+        if part == "response-header-value" {
+            len = Some(parts.next()?.parse().ok()?);
+        }
+    }
+
+    Some(len)
+}
+
 pub fn interop_body(case: InteropCase) -> Vec<u8> {
     (0..case.body_len)
         .map(|index| b'a' + ((index + case.status as usize) % 26) as u8)
         .collect()
+}
+
+pub fn interop_response_header_value(case: InteropCase) -> Option<Vec<u8>> {
+    case.response_header_value_len.map(|len| vec![b'x'; len])
 }
 
 pub fn interop_requests() -> Vec<(InteropCase, String)> {
@@ -212,6 +227,10 @@ pub fn interop_requests() -> Vec<(InteropCase, String)> {
     }
 
     requests
+}
+
+pub fn field_section_limit_request_path() -> String {
+    interop_request_path(FIELD_SECTION_LIMIT_TEST_CASE, 0, 0)
 }
 
 pub async fn run_local_quinn_client_interop_matrix_with_config(
@@ -296,6 +315,101 @@ pub async fn run_local_quinn_client_interop_matrix_with_config(
         }
 
         wait_for_interop_tasks(batch, tasks).await?;
+    }
+
+    drop(send_request);
+
+    driver_task.abort();
+    endpoint.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+
+    Ok(())
+}
+
+pub async fn run_local_quinn_client_max_field_section_size_limit(
+    server_addr: SocketAddr,
+    cert: &TestCertificate,
+    config: ClientInteropConfig,
+) -> Result<(), BoxError> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.cert_der.clone())?;
+
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"h3".to_vec()];
+
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
+    )));
+
+    let conn = endpoint.connect(server_addr, "localhost")?.await?;
+    let quinn_conn = http3_quinn_rs::Connection::new(conn);
+
+    let mut builder = http3_rs::client::builder();
+    builder
+        .max_field_section_size(FIELD_SECTION_LIMIT_TEST_MAX)
+        .send_grease(false);
+
+    // RFC 9114 Section 4.2.2 lets an endpoint advertise the largest field
+    // section it is willing to accept. This test intentionally sends a larger
+    // response to make sure the client enforces its receive-side limit.
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2
+    if let Some(capacity) = config.qpack_max_table_capacity {
+        builder.qpack_max_table_capacity(capacity);
+    }
+    if let Some(blocked_streams) = config.qpack_blocked_streams {
+        builder.qpack_blocked_streams(blocked_streams);
+    }
+
+    let (mut driver, mut send_request) = builder.build(quinn_conn).await?;
+    let driver_task =
+        tokio::spawn(async move { future::poll_fn(|cx| driver.poll_close(cx)).await });
+
+    let port = server_addr.port();
+    let path = field_section_limit_request_path();
+    let req = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(format!("https://localhost:{port}{path}"))
+        .body(())?;
+
+    let mut stream: http3_rs::client::RequestStream<http3_quinn_rs::BidiStream<Bytes>, _> =
+        send_request.send_request(req).await?;
+    stream.finish().await?;
+
+    let result = tokio::time::timeout(Duration::from_secs(10), stream.recv_response()).await;
+    match result {
+        Ok(Err(StreamError::HeaderTooBig {
+            actual_size,
+            max_size,
+            ..
+        })) => {
+            assert_eq!(max_size, FIELD_SECTION_LIMIT_TEST_MAX);
+            assert!(
+                actual_size > max_size,
+                "expected response field section to exceed {max_size}, got {actual_size}"
+            );
+        }
+        Ok(Ok(response)) => {
+            return Err(std::io::Error::other(format!(
+                "expected HeaderTooBig, got response status {}",
+                response.status()
+            ))
+            .into());
+        }
+        Ok(Err(err)) => {
+            return Err(
+                std::io::Error::other(format!("expected HeaderTooBig, got {err:?}")).into(),
+            );
+        }
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for max_field_section_size failure",
+            )
+            .into());
+        }
     }
 
     drop(send_request);

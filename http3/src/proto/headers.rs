@@ -381,7 +381,7 @@ impl Field {
     fn parse<N, V>(name: N, value: V) -> Result<Self, HeaderError>
     where
         N: AsRef<[u8]>,
-        V: AsRef<[u8]>,
+        V: AsRef<[u8]> + Send + 'static,
     {
         let name = name.as_ref();
         if name.is_empty() {
@@ -406,8 +406,11 @@ impl Field {
         if name[0] != b':' {
             return Ok(Field::Header((
                 HeaderName::from_lowercase(name).map_err(|_| HeaderError::invalid_name(name))?,
-                HeaderValue::from_bytes(value.as_ref())
-                    .map_err(|_| HeaderError::invalid_value(name, value))?,
+                {
+                    let shared_value = bytes::Bytes::from_owner(value);
+                    HeaderValue::from_maybe_shared(shared_value.clone())
+                        .map_err(|_| HeaderError::invalid_value(name, shared_value))?
+                },
             )));
         }
 
