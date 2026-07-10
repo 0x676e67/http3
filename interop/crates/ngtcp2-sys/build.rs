@@ -71,6 +71,7 @@ fn main() {
         .define("ENABLE_BORINGSSL", "ON")
         .define("BORINGSSL_INCLUDE_DIR", &aws_lc_include)
         .define("BORINGSSL_LIBRARIES", &boringssl_libraries);
+    configure_msvc_runtime(&mut ngtcp2_config);
 
     let ngtcp2_dst = ngtcp2_config.build();
 
@@ -94,6 +95,25 @@ fn main() {
         &PathBuf::from(&aws_lc_include),
         &out_dir.join("bindings.rs"),
     );
+}
+
+fn configure_msvc_runtime(config: &mut cmake::Config) {
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+        return;
+    }
+
+    // Rust uses the release MSVC runtime in every Cargo profile. CMake's Debug
+    // default is MSVCRTD, which conflicts with Rust's runtime at final link.
+    let target_features = std::env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    let runtime = if target_features
+        .split(',')
+        .any(|feature| feature == "crt-static")
+    {
+        "MultiThreaded"
+    } else {
+        "MultiThreadedDLL"
+    };
+    config.define("CMAKE_MSVC_RUNTIME_LIBRARY", runtime);
 }
 
 fn prepare_submodule_source(name: &str, manifest_dir: &Path, out_dir: &Path) -> PathBuf {
