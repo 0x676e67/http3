@@ -1,9 +1,11 @@
 use std::{collections::HashMap, path::Path};
 
 use interop::{
-    BoxError, ClientInteropConfig, DEFAULT_INTEROP_CASE, INTEROP_TEST_TIMEOUT,
-    generate_test_certificate, install_crypto_provider, interop_body, interop_case_from_path,
+    BoxError, ClientInteropConfig, DEFAULT_INTEROP_CASE, INTEROP_PADDING_HEADER_NAME,
+    INTEROP_TEST_TIMEOUT, generate_test_certificate, install_crypto_provider, interop_body,
+    interop_case_from_path, interop_response_header_value,
     run_local_quinn_client_interop_matrix_with_config,
+    run_local_quinn_client_max_field_section_size_limit,
 };
 use ngtcp2::{Header as Ngtcp2Header, Http3Event, Http3SettingsExt, nghttp3_settings};
 use tokio_ngtcp2::Server;
@@ -76,6 +78,17 @@ pub async fn run_client_interop(
                     let case = requests.remove(&stream_id).unwrap_or(DEFAULT_INTEROP_CASE);
                     let body = interop_body(case);
                     let content_length = body.len().to_string();
+                    let padding = interop_response_header_value(case);
+                    let mut response_headers = vec![
+                        Ngtcp2Header::status(case.status),
+                        Ngtcp2Header::new(b"content-type", b"application/octet-stream"),
+                        Ngtcp2Header::new(b"content-length", content_length.as_bytes()),
+                    ];
+
+                    if let Some(padding) = padding {
+                        response_headers
+                            .push(Ngtcp2Header::new(INTEROP_PADDING_HEADER_NAME, padding));
+                    }
 
                     // tokio-ngtcp2 hands this body to nghttp3's data-reader
                     // queue. The wrapper then reports accepted bytes back with
@@ -85,14 +98,7 @@ pub async fn run_client_interop(
                     // RFC 9114 Section 4.1 lets the server send response
                     // HEADERS on the same bidirectional request stream.
                     // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
-                    Some((
-                        vec![
-                            Ngtcp2Header::status(case.status),
-                            Ngtcp2Header::new(b"content-type", b"application/octet-stream"),
-                            Ngtcp2Header::new(b"content-length", content_length.as_bytes()),
-                        ],
-                        body,
-                    ))
+                    Some((response_headers, body))
                 }
                 _ => None,
             }),
@@ -103,6 +109,67 @@ pub async fn run_client_interop(
     let client_result = tokio::time::timeout(
         INTEROP_TEST_TIMEOUT,
         run_local_quinn_client_interop_matrix_with_config(server_addr, &cert, client_config),
+    )
+    .await;
+
+    server_task.abort();
+    let _ = server_task.await;
+    client_result??;
+    Ok(())
+}
+
+pub async fn run_max_field_section_size_limit(
+    server_config: ServerConfig,
+    client_config: ClientInteropConfig,
+) -> Result<(), BoxError> {
+    install_crypto_provider();
+
+    let cert = generate_test_certificate()?;
+    let cert_files = CertificateFiles::new(&cert)?;
+    let (mut server, server_addr) =
+        start_server(&cert_files.cert_path, &cert_files.key_path, server_config).await?;
+
+    let server_task = tokio::spawn(async move {
+        let mut requests = HashMap::new();
+        let _ = tokio::time::timeout(
+            INTEROP_TEST_TIMEOUT,
+            server.run(move |_, event| match event {
+                Http3Event::Header { stream_id, header } => {
+                    if header.name_str() == Some(":path")
+                        && let Some(path) = header.value_str()
+                    {
+                        let case = interop_case_from_path(path).unwrap_or(DEFAULT_INTEROP_CASE);
+                        requests.insert(stream_id, case);
+                    }
+                    None
+                }
+                Http3Event::HeadersEnd { stream_id, .. } => {
+                    let case = requests.remove(&stream_id).unwrap_or(DEFAULT_INTEROP_CASE);
+                    let body = interop_body(case);
+                    let content_length = body.len().to_string();
+                    let padding = interop_response_header_value(case);
+                    let mut response_headers = vec![
+                        Ngtcp2Header::status(case.status),
+                        Ngtcp2Header::new(b"content-type", b"application/octet-stream"),
+                        Ngtcp2Header::new(b"content-length", content_length.as_bytes()),
+                    ];
+
+                    if let Some(padding) = padding {
+                        response_headers
+                            .push(Ngtcp2Header::new(INTEROP_PADDING_HEADER_NAME, padding));
+                    }
+
+                    Some((response_headers, body))
+                }
+                _ => None,
+            }),
+        )
+        .await;
+    });
+
+    let client_result = tokio::time::timeout(
+        INTEROP_TEST_TIMEOUT,
+        run_local_quinn_client_max_field_section_size_limit(server_addr, &cert, client_config),
     )
     .await;
 

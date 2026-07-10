@@ -11,7 +11,12 @@ bytes = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
 http3-rs = { workspace = true, features = ["tracing"] }
+h3 = { version = "0.0.8", features = [
+    "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+    "tracing",
+] }
 http3-quinn-rs = { workspace = true, features = ["tracing"] }
+h3-quinn = { version = "0.0.10", features = ["tracing"] }
 quinn = { workspace = true, features = [
     "runtime-tokio",
     "rustls",
@@ -29,6 +34,14 @@ tempfile = "3"
 tokio = { workspace = true, features = ["full"] }
 
 # QUIC/HTTP3 Server backends
+# s2n-quic-h3 is the official s2n-quic adapter for hyperium h3. Keep it on
+# crates.io so CI catches published-package regressions instead of a pinned git
+# snapshot hiding them.
+s2n-quic = { version = "1.83", default-features = false, features = [
+    "provider-address-token-default",
+    "provider-tls-rustls",
+] }
+s2n-quic-h3 = { version = "0.1", features = ["tracing"] }
 tokio-quiche = { version = "0.19", default-features = false }
 tquic = "1.6"
 ngtcp2 = { workspace = true }

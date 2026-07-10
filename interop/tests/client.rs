@@ -88,6 +88,62 @@ async fn ngtcp2_qpack_client_on_server_on_client_grease_on() -> Result<(), BoxEr
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ngtcp2_max_field_section_size_limit() -> Result<(), BoxError> {
+    support::ngtcp2::run_max_field_section_size_limit(
+        support::ngtcp2::ServerConfig::stateless_qpack(),
+        ClientInteropConfig::stateless_qpack(),
+    )
+    .await
+}
+
+// The crates.io h3/h3-quinn server gives us a baseline against upstream h3's
+// Quinn adapter. Its response encoder is stateless today, so this matrix covers
+// both client QPACK SETTINGS modes while the server sends literal/static-table
+// response field sections.
+// https://www.rfc-editor.org/rfc/rfc9204.html#section-5
+local_interop_test!(
+    quinn_h3_qpack_client_off_server_off,
+    quinn_h3,
+    support::quinn_h3::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::stateless_qpack()
+);
+
+local_interop_test!(
+    quinn_h3_qpack_client_off_server_off_client_grease_on,
+    quinn_h3,
+    support::quinn_h3::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::stateless_qpack().with_grease()
+);
+
+local_interop_test!(
+    quinn_h3_qpack_client_on_server_off,
+    quinn_h3,
+    support::quinn_h3::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::qpack_dynamic_table()
+);
+
+local_interop_test!(
+    quinn_h3_qpack_client_on_server_off_client_grease_on,
+    quinn_h3,
+    support::quinn_h3::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::qpack_dynamic_table().with_grease()
+);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quinn_h3_max_field_section_size_limit_server_rejects_send() -> Result<(), BoxError> {
+    // h3/h3-quinn validates the peer's advertised limit before sending an
+    // oversized response field section. That cannot exercise the client's
+    // receive-side HeaderTooBig path, but it is still the correct backend-
+    // specific behavior to lock down here.
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2
+    support::quinn_h3::run_max_field_section_size_limit(
+        support::quinn_h3::ServerConfig::stateless_qpack(),
+        ClientInteropConfig::stateless_qpack(),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quiche_qpack_client_off_server_off() -> Result<(), BoxError> {
     support::quiche::run_client_interop(
         support::quiche::ServerConfig::stateless_qpack(),
@@ -159,6 +215,15 @@ async fn quiche_qpack_client_on_server_on_client_grease_on() -> Result<(), BoxEr
     .await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiche_max_field_section_size_limit() -> Result<(), BoxError> {
+    support::quiche::run_max_field_section_size_limit(
+        support::quiche::ServerConfig::stateless_qpack(),
+        ClientInteropConfig::stateless_qpack(),
+    )
+    .await
+}
+
 local_interop_test!(
     quiche_qpack_client_off_server_off_server_grease_on,
     quiche,
@@ -215,6 +280,86 @@ local_interop_test!(
     ClientInteropConfig::qpack_dynamic_table().with_grease()
 );
 
+// s2n-quic supplies the QUIC transport here, while upstream h3 provides the
+// server-side HTTP/3 implementation. h3 0.0.8 sends stateless QPACK response
+// field sections, so this backend covers client QPACK SETTINGS negotiation but
+// does not claim server-side dynamic-table encoding coverage.
+// https://www.rfc-editor.org/rfc/rfc9204.html#section-5
+local_interop_test!(
+    s2n_h3_qpack_client_off_server_off,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::stateless_qpack()
+);
+
+local_interop_test!(
+    s2n_h3_qpack_client_off_server_off_client_grease_on,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::stateless_qpack().with_grease()
+);
+
+local_interop_test!(
+    s2n_h3_qpack_client_on_server_off,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::qpack_dynamic_table()
+);
+
+local_interop_test!(
+    s2n_h3_qpack_client_on_server_off_client_grease_on,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack(),
+    ClientInteropConfig::qpack_dynamic_table().with_grease()
+);
+
+local_interop_test!(
+    s2n_h3_qpack_client_off_server_off_server_grease_on,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack().with_grease(),
+    ClientInteropConfig::stateless_qpack()
+);
+
+local_interop_test!(
+    s2n_h3_qpack_client_off_server_off_client_and_server_grease_on,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack().with_grease(),
+    ClientInteropConfig::stateless_qpack().with_grease()
+);
+
+local_interop_test!(
+    s2n_h3_qpack_client_on_server_off_server_grease_on,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack().with_grease(),
+    ClientInteropConfig::qpack_dynamic_table()
+);
+
+local_interop_test!(
+    s2n_h3_qpack_client_on_server_off_client_and_server_grease_on,
+    s2n,
+    support::s2n::ServerConfig::stateless_qpack().with_grease(),
+    ClientInteropConfig::qpack_dynamic_table().with_grease()
+);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2n_h3_max_field_section_size_limit_server_rejects_send() -> Result<(), BoxError> {
+    // s2n-quic-h3 uses upstream h3 for the HTTP/3 server layer. h3 validates
+    // the peer's advertised limit before sending an oversized response field
+    // section, so this backend covers the send-side rejection path rather than
+    // the client's receive-side HeaderTooBig path.
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2
+    support::s2n::run_max_field_section_size_limit(
+        support::s2n::ServerConfig::stateless_qpack(),
+        ClientInteropConfig::stateless_qpack(),
+    )
+    .await
+}
+
+// tquic is not used for the max_field_section_size negative test. Its server
+// API refuses to send a field section larger than the client's advertised
+// limit and returns `ExcessiveLoad` from `send_headers`, so it cannot exercise
+// the client's "received oversized response headers" path.
+// https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tquic_qpack_client_off_server_off() -> Result<(), BoxError> {
     support::tquic::run_client_interop(
