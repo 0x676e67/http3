@@ -34,7 +34,11 @@ pub enum DecoderError {
     InvalidStaticIndex(usize),
     UnknownPrefix(u8),
     MissingRefs(usize),
-    BadBaseIndex(isize),
+    BadBaseIndex {
+        required_insert_count: usize,
+        sign_negative: bool,
+        delta_base: usize,
+    },
     InvalidRequiredInsertCount(usize),
     TooManyBlockedStreams,
     UnexpectedEnd,
@@ -54,7 +58,21 @@ impl std::fmt::Display for DecoderError {
             DecoderError::InvalidStaticIndex(i) => write!(f, "unknown static index: {}", i),
             DecoderError::UnknownPrefix(p) => write!(f, "unknown instruction code: 0x{}", p),
             DecoderError::MissingRefs(n) => write!(f, "missing {} refs to decode block", n),
-            DecoderError::BadBaseIndex(i) => write!(f, "out of bounds base index: {}", i),
+            DecoderError::BadBaseIndex {
+                required_insert_count,
+                sign_negative,
+                delta_base,
+            } => write!(
+                f,
+                "invalid base from required insert count {}, sign {}, and delta base {}",
+                required_insert_count,
+                if *sign_negative {
+                    "negative"
+                } else {
+                    "positive"
+                },
+                delta_base
+            ),
             DecoderError::InvalidRequiredInsertCount(i) => {
                 write!(f, "invalid required insert count: {}", i)
             }
@@ -408,7 +426,15 @@ impl From<ParseError> for DecoderError {
             ParseError::Integer(x) => DecoderError::InvalidInteger(x),
             ParseError::String(x) => DecoderError::InvalidString(x),
             ParseError::InvalidPrefix(p) => DecoderError::UnknownPrefix(p),
-            ParseError::InvalidBase(b) => DecoderError::BadBaseIndex(b),
+            ParseError::InvalidBase {
+                required_insert_count,
+                sign_negative,
+                delta_base,
+            } => DecoderError::BadBaseIndex {
+                required_insert_count,
+                sign_negative,
+                delta_base,
+            },
             ParseError::InvalidRequiredInsertCount(i) => {
                 DecoderError::InvalidRequiredInsertCount(i)
             }
