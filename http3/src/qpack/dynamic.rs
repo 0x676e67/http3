@@ -10,7 +10,6 @@ use crate::qpack::vas::{self, VirtualAddressSpace};
  * https://www.rfc-editor.org/rfc/rfc9204.html#maximum-dynamic-table-capacity
  */
 const SETTINGS_MAX_TABLE_CAPACITY_MAX: usize = 1_073_741_823; // 2^30 -1
-const SETTINGS_MAX_BLOCKED_STREAMS_MAX: usize = 65_535; // 2^16 - 1
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -19,7 +18,6 @@ pub enum Error {
     BadIndex(usize),
     MaxTableSizeReached,
     MaximumTableSizeTooLarge,
-    MaxBlockedStreamsTooLarge,
     UnknownStreamId(u64),
     NoTrackingData,
     InvalidTrackingCount,
@@ -265,9 +263,9 @@ pub struct DynamicTable {
     track_map: BTreeMap<usize, usize>,
     track_blocks: HashMap<u64, VecDeque<HashMap<usize, usize>>>,
     largest_known_received: usize,
-    blocked_max: usize,
-    blocked_count: usize,
-    blocked_streams: BTreeMap<usize, usize>, // <required_ref, blocked_count>
+    blocked_max: u64,
+    blocked_count: u64,
+    blocked_streams: BTreeMap<usize, u64>, // <required_ref, blocked_count>
 }
 
 impl DynamicTable {
@@ -300,13 +298,17 @@ impl DynamicTable {
         }
     }
 
-    pub fn set_max_blocked(&mut self, max: usize) -> Result<(), Error> {
+    /// Sets the number of streams the peer permits this encoder to risk blocking.
+    ///
+    /// QPACK defines no additional numeric upper bound for this setting. HTTP/3
+    /// carries it as a QUIC variable-length integer, and callers should choose a
+    /// value that keeps reference-tracking memory within their own limits.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2)
+    /// [Section 7.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3), and
+    /// [RFC 9114, Section 7.2.4](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4).
+    pub fn set_max_blocked(&mut self, max: u64) -> Result<(), Error> {
         // TODO handle existing data
-        // SETTINGS_QPACK_BLOCKED_STREAMS is limited to 2^16-1.
-        // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3
-        if max > SETTINGS_MAX_BLOCKED_STREAMS_MAX {
-            return Err(Error::MaxBlockedStreamsTooLarge);
-        }
         self.blocked_max = max;
         Ok(())
     }
@@ -552,7 +554,7 @@ impl DynamicTable {
         let acked = std::mem::replace(&mut self.blocked_streams, blocked);
 
         if !acked.is_empty() {
-            let total_acked = acked.iter().fold(0usize, |t, (_, v)| t + v);
+            let total_acked = acked.iter().fold(0u64, |t, (_, v)| t + v);
             self.blocked_count -= total_acked;
         }
     }
@@ -1283,7 +1285,7 @@ mod tests {
         table.set_max_blocked(100).unwrap();
 
         assert_eq!(table.blocked_count, 1);
-        assert_eq!(table.blocked_streams.get(&3), Some(&1usize))
+        assert_eq!(table.blocked_streams.get(&3), Some(&1u64))
     }
 
     #[test]
@@ -1420,9 +1422,12 @@ mod tests {
     }
 
     #[test]
-    fn maximum_blocked_streams_value_is_valid() {
+    fn blocked_stream_limit_accepts_full_settings_range() {
         let mut table = DynamicTable::new();
-        assert_eq!(table.set_max_blocked(65_535), Ok(()));
+        let max = crate::proto::varint::VarInt::MAX.into_inner();
+
+        assert_eq!(table.set_max_blocked(max), Ok(()));
+        assert_eq!(table.blocked_max, max);
     }
 
     #[test]
