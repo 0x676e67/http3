@@ -318,14 +318,14 @@ impl QpackDecoder {
     /// request is decoding a field section, this registers the connection driver
     /// and returns [`Poll::Pending`]. The second lock attempt closes the gap between
     /// the failed first attempt and waker registration.
-    pub(crate) fn poll_on_recv_encoder<R: Buf, W: BufMut>(
+    pub(crate) fn poll_on_recv_encoder<R: Buf + Clone, W: BufMut>(
         &self,
         cx: &mut Context<'_>,
         read: &mut R,
         write: &mut W,
     ) -> Poll<Result<usize, DecoderError>> {
         match self.0.decoder.try_write() {
-            Ok(mut decoder) => return Poll::Ready(decoder.on_encoder_recv(read, write)),
+            Ok(mut decoder) => return Poll::Ready(decoder.on_encoder_recv_buffered(read, write)),
             Err(TryLockError::WouldBlock) => {}
             _ => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
         }
@@ -334,7 +334,7 @@ impl QpackDecoder {
         self.0.write_waker.register(cx.waker());
 
         match self.0.decoder.try_write() {
-            Ok(mut decoder) => Poll::Ready(decoder.on_encoder_recv(read, write)),
+            Ok(mut decoder) => Poll::Ready(decoder.on_encoder_recv_buffered(read, write)),
             Err(TryLockError::WouldBlock) => Poll::Pending,
             _ => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
         }
