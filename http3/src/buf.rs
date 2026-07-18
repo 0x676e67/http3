@@ -114,6 +114,7 @@ impl<T: Buf> Buf for BufList<T> {
     }
 }
 
+#[derive(Clone)]
 pub struct Cursor<'a, B> {
     buf: &'a BufList<B>,
     pos_total: usize, // position amongst all bytes

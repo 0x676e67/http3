@@ -8,8 +8,7 @@ use tracing::instrument;
 use crate::{
     connection::{self},
     error::{
-        Code, StreamError,
-        connection_error_creators::{CloseStream, HandleFrameStreamErrorOnRequestStream},
+        Code, StreamError, connection_error_creators::CloseStream,
         internal_error::InternalConnectionError,
     },
     proto::{frame::Frame, headers::Header},
@@ -97,18 +96,19 @@ where
     /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_response(&mut self) -> Result<Response<()>, StreamError> {
-        let frame = future::poll_fn(|cx| self.inner.stream.poll_next(cx))
-            .await
-            .map_err(|e| self.handle_frame_stream_error_on_request_stream(e))?
-            .ok_or_else(|| {
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-                //# Receipt of an invalid sequence of frames MUST be treated as a
-                //# connection error of type H3_FRAME_UNEXPECTED.
-                self.handle_connection_error_on_stream(InternalConnectionError::new(
-                    Code::H3_FRAME_UNEXPECTED,
-                    "Stream finished without receiving response headers".to_string(),
-                ))
-            })?;
+        let frame = match future::poll_fn(|cx| self.inner.stream.poll_next(cx)).await {
+            Ok(frame) => frame,
+            Err(error) => return Err(self.inner.handle_receive_stream_error(error)),
+        }
+        .ok_or_else(|| {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+            //# Receipt of an invalid sequence of frames MUST be treated as a
+            //# connection error of type H3_FRAME_UNEXPECTED.
+            self.handle_connection_error_on_stream(InternalConnectionError::new(
+                Code::H3_FRAME_UNEXPECTED,
+                "Stream finished without receiving response headers".to_string(),
+            ))
+        })?;
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
         //= type=TODO
@@ -165,7 +165,7 @@ where
 
         let (status, headers) = Header::try_from(fields)
             .map_err(|_e| {
-                self.inner.stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+                self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
                 StreamError::StreamError {
                     code: Code::H3_MESSAGE_ERROR,
                     reason: "Received malformed header".to_string(),
@@ -173,7 +173,7 @@ where
             })?
             .into_response_parts()
             .map_err(|_e| {
-                self.inner.stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+                self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
                 StreamError::StreamError {
                     code: Code::H3_MESSAGE_ERROR,
                     reason: "Received malformed header".to_string(),
@@ -216,7 +216,7 @@ where
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
         let res = self.inner.poll_recv_trailers(cx);
         if let Poll::Ready(Err(StreamError::HeaderTooBig { .. })) = &res {
-            self.inner.stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+            self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
         }
         res
     }
@@ -226,7 +226,7 @@ where
     pub fn stop_sending(&mut self, error_code: Code) {
         // TODO take by value to prevent any further call as this request is cancelled
         // rename `cancel()` ?
-        self.inner.stream.stop_sending(error_code)
+        self.inner.stop_sending(error_code)
     }
 
     /// Returns the underlying stream id

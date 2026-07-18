@@ -6,11 +6,6 @@ use std::{
 use super::{field::HeaderField, static_::StaticTable};
 use crate::qpack::vas::{self, VirtualAddressSpace};
 
-/**
- * https://www.rfc-editor.org/rfc/rfc9204.html#maximum-dynamic-table-capacity
- */
-const SETTINGS_MAX_TABLE_CAPACITY_MAX: usize = 1_073_741_823; // 2^30 -1
-
 #[derive(Debug, PartialEq)]
 pub enum Error {
     BadRelativeIndex(usize),
@@ -314,8 +309,6 @@ impl DynamicTable {
     }
 
     pub fn set_max_size(&mut self, size: usize) -> Result<(), Error> {
-        Self::validate_max_size(size)?;
-
         if size >= self.max_size {
             self.max_size = size;
             return Ok(());
@@ -328,13 +321,6 @@ impl DynamicTable {
         }
 
         self.max_size = size;
-        Ok(())
-    }
-
-    pub(crate) fn validate_max_size(size: usize) -> Result<(), Error> {
-        if size > SETTINGS_MAX_TABLE_CAPACITY_MAX {
-            return Err(Error::MaximumTableSizeTooLarge);
-        }
         Ok(())
     }
 
@@ -606,20 +592,16 @@ mod tests {
         assert_eq!(table.curr_size, table_size);
     }
 
-    /**
-     * https://www.rfc-editor.org/rfc/rfc9204.html#name-maximum-dynamic-table-capac
-     * "To bound the memory requirements of the decoder, the decoder
-     * limits the maximum value the encoder is permitted to set for the
-     * dynamic table capacity. In HTTP/3, this limit is determined by
-     * the value of SETTINGS_QPACK_MAX_TABLE_CAPACITY sent by the
-     * decoder; see Section 5."
-     */
     #[test]
-    fn test_try_set_too_large_maximum_table_size() {
+    fn table_capacity_is_not_limited_by_an_obsolete_draft_bound() {
         let mut table = build_table();
-        let invalid_size = SETTINGS_MAX_TABLE_CAPACITY_MAX + 10;
-        let res_change = table.set_max_size(invalid_size);
-        assert_eq!(res_change, Err(Error::MaximumTableSizeTooLarge));
+        let capacity = 1usize << 30;
+
+        // RFC 9204 uses the decoder's advertised setting as the limit; it does
+        // not retain the 2^30-1 bound from earlier drafts.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3
+        assert_eq!(table.set_max_size(capacity), Ok(()));
+        assert_eq!(table.max_mem_size(), capacity);
     }
 
     /**
@@ -634,22 +616,6 @@ mod tests {
         let res_change = table.set_max_size(0);
         assert!(res_change.is_ok());
         assert_eq!(table.max_mem_size(), 0);
-    }
-
-    /**
-     * https://www.rfc-editor.org/rfc/rfc9204.html#name-maximum-dynamic-table-capac
-     * "To bound the memory requirements of the decoder, the decoder
-     * limits the maximum value the encoder is permitted to set for the
-     * dynamic table capacity. In HTTP/3, this limit is determined by
-     * the value of SETTINGS_QPACK_MAX_TABLE_CAPACITY sent by the
-     * decoder; see Section 5."
-     */
-    #[test]
-    fn test_maximum_table_size_can_reach_maximum() {
-        let mut table = build_table();
-        let res_change = table.set_max_size(SETTINGS_MAX_TABLE_CAPACITY_MAX);
-        assert!(res_change.is_ok());
-        assert_eq!(table.max_mem_size(), SETTINGS_MAX_TABLE_CAPACITY_MAX);
     }
 
     // Test duplicated fields

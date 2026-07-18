@@ -27,6 +27,8 @@ where
     ///
     /// This can be a [`ConnectionErrorIncoming`] or a [`InternalConnectionError`]
     pub fn handle_connection_error<T: Into<ErrorOrigin>>(&mut self, error: T) -> ConnectionError {
+        self.wake_qpack_waiters_on_connection_error();
+
         if let Some(ref error) = self.handled_connection_error {
             return error.clone();
         }
@@ -70,12 +72,14 @@ where
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), ConnectionError>> {
-        if let Some(ref error) = self.handled_connection_error {
-            return Poll::Ready(Err(error.clone()));
+        if let Some(error) = self.handled_connection_error.clone() {
+            self.wake_qpack_waiters_on_connection_error();
+            return Poll::Ready(Err(error));
         };
 
         // Check if the connection is in error state
         if let Some(err) = self.get_conn_error() {
+            self.wake_qpack_waiters_on_connection_error();
             let err = self.close_if_needed(err);
             // err might be a different error so match again
             return Poll::Ready(Err(self.convert_to_connection_error(err)));
