@@ -247,8 +247,9 @@ impl Action {
             DecoderInstruction::Unknown => {
                 return Err(EncoderError::UnknownDecoderInstruction(first));
             }
-            DecoderInstruction::InsertCountIncrement => InsertCountIncrement::decode(&mut buf)?
-                .map(|x| Action::ReceivedRefIncrement(x.0 as usize)),
+            DecoderInstruction::InsertCountIncrement => {
+                InsertCountIncrement::decode(&mut buf)?.map(|x| Action::ReceivedRefIncrement(x.0))
+            }
             DecoderInstruction::HeaderAck => {
                 HeaderAck::decode(&mut buf)?.map(|x| Action::Untrack(x.0))
             }

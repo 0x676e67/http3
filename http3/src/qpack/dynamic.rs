@@ -6,12 +6,6 @@ use std::{
 use super::{field::HeaderField, static_::StaticTable};
 use crate::qpack::vas::{self, VirtualAddressSpace};
 
-/**
- * https://www.rfc-editor.org/rfc/rfc9204.html#maximum-dynamic-table-capacity
- */
-const SETTINGS_MAX_TABLE_CAPACITY_MAX: usize = 1_073_741_823; // 2^30 -1
-const SETTINGS_MAX_BLOCKED_STREAMS_MAX: usize = 65_535; // 2^16 - 1
-
 #[derive(Debug, PartialEq)]
 pub enum Error {
     BadRelativeIndex(usize),
@@ -19,7 +13,6 @@ pub enum Error {
     BadIndex(usize),
     MaxTableSizeReached,
     MaximumTableSizeTooLarge,
-    MaxBlockedStreamsTooLarge,
     UnknownStreamId(u64),
     NoTrackingData,
     InvalidTrackingCount,
@@ -265,9 +258,9 @@ pub struct DynamicTable {
     track_map: BTreeMap<usize, usize>,
     track_blocks: HashMap<u64, VecDeque<HashMap<usize, usize>>>,
     largest_known_received: usize,
-    blocked_max: usize,
-    blocked_count: usize,
-    blocked_streams: BTreeMap<usize, usize>, // <required_ref, blocked_count>
+    blocked_max: u64,
+    blocked_count: u64,
+    blocked_streams: BTreeMap<usize, u64>, // <required_ref, blocked_count>
 }
 
 impl DynamicTable {
@@ -300,20 +293,22 @@ impl DynamicTable {
         }
     }
 
-    pub fn set_max_blocked(&mut self, max: usize) -> Result<(), Error> {
+    /// Sets the number of streams the peer permits this encoder to risk blocking.
+    ///
+    /// QPACK defines no additional numeric upper bound for this setting. HTTP/3
+    /// carries it as a QUIC variable-length integer, and callers should choose a
+    /// value that keeps reference-tracking memory within their own limits.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2)
+    /// [Section 7.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3), and
+    /// [RFC 9114, Section 7.2.4](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4).
+    pub fn set_max_blocked(&mut self, max: u64) -> Result<(), Error> {
         // TODO handle existing data
-        // SETTINGS_QPACK_BLOCKED_STREAMS is limited to 2^16-1.
-        // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3
-        if max > SETTINGS_MAX_BLOCKED_STREAMS_MAX {
-            return Err(Error::MaxBlockedStreamsTooLarge);
-        }
         self.blocked_max = max;
         Ok(())
     }
 
     pub fn set_max_size(&mut self, size: usize) -> Result<(), Error> {
-        Self::validate_max_size(size)?;
-
         if size >= self.max_size {
             self.max_size = size;
             return Ok(());
@@ -326,13 +321,6 @@ impl DynamicTable {
         }
 
         self.max_size = size;
-        Ok(())
-    }
-
-    pub(crate) fn validate_max_size(size: usize) -> Result<(), Error> {
-        if size > SETTINGS_MAX_TABLE_CAPACITY_MAX {
-            return Err(Error::MaximumTableSizeTooLarge);
-        }
         Ok(())
     }
 
@@ -552,7 +540,7 @@ impl DynamicTable {
         let acked = std::mem::replace(&mut self.blocked_streams, blocked);
 
         if !acked.is_empty() {
-            let total_acked = acked.iter().fold(0usize, |t, (_, v)| t + v);
+            let total_acked = acked.iter().fold(0u64, |t, (_, v)| t + v);
             self.blocked_count -= total_acked;
         }
     }
@@ -604,20 +592,16 @@ mod tests {
         assert_eq!(table.curr_size, table_size);
     }
 
-    /**
-     * https://www.rfc-editor.org/rfc/rfc9204.html#name-maximum-dynamic-table-capac
-     * "To bound the memory requirements of the decoder, the decoder
-     * limits the maximum value the encoder is permitted to set for the
-     * dynamic table capacity. In HTTP/3, this limit is determined by
-     * the value of SETTINGS_QPACK_MAX_TABLE_CAPACITY sent by the
-     * decoder; see Section 5."
-     */
     #[test]
-    fn test_try_set_too_large_maximum_table_size() {
+    fn table_capacity_is_not_limited_by_an_obsolete_draft_bound() {
         let mut table = build_table();
-        let invalid_size = SETTINGS_MAX_TABLE_CAPACITY_MAX + 10;
-        let res_change = table.set_max_size(invalid_size);
-        assert_eq!(res_change, Err(Error::MaximumTableSizeTooLarge));
+        let capacity = 1usize << 30;
+
+        // RFC 9204 uses the decoder's advertised setting as the limit; it does
+        // not retain the 2^30-1 bound from earlier drafts.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3
+        assert_eq!(table.set_max_size(capacity), Ok(()));
+        assert_eq!(table.max_mem_size(), capacity);
     }
 
     /**
@@ -632,22 +616,6 @@ mod tests {
         let res_change = table.set_max_size(0);
         assert!(res_change.is_ok());
         assert_eq!(table.max_mem_size(), 0);
-    }
-
-    /**
-     * https://www.rfc-editor.org/rfc/rfc9204.html#name-maximum-dynamic-table-capac
-     * "To bound the memory requirements of the decoder, the decoder
-     * limits the maximum value the encoder is permitted to set for the
-     * dynamic table capacity. In HTTP/3, this limit is determined by
-     * the value of SETTINGS_QPACK_MAX_TABLE_CAPACITY sent by the
-     * decoder; see Section 5."
-     */
-    #[test]
-    fn test_maximum_table_size_can_reach_maximum() {
-        let mut table = build_table();
-        let res_change = table.set_max_size(SETTINGS_MAX_TABLE_CAPACITY_MAX);
-        assert!(res_change.is_ok());
-        assert_eq!(table.max_mem_size(), SETTINGS_MAX_TABLE_CAPACITY_MAX);
     }
 
     // Test duplicated fields
@@ -1283,7 +1251,7 @@ mod tests {
         table.set_max_blocked(100).unwrap();
 
         assert_eq!(table.blocked_count, 1);
-        assert_eq!(table.blocked_streams.get(&3), Some(&1usize))
+        assert_eq!(table.blocked_streams.get(&3), Some(&1u64))
     }
 
     #[test]
@@ -1420,9 +1388,12 @@ mod tests {
     }
 
     #[test]
-    fn maximum_blocked_streams_value_is_valid() {
+    fn blocked_stream_limit_accepts_full_settings_range() {
         let mut table = DynamicTable::new();
-        assert_eq!(table.set_max_blocked(65_535), Ok(()));
+        let max = crate::proto::varint::VarInt::MAX.into_inner();
+
+        assert_eq!(table.set_max_blocked(max), Ok(()));
+        assert_eq!(table.blocked_max, max);
     }
 
     #[test]

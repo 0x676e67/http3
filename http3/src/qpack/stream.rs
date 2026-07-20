@@ -262,20 +262,21 @@ impl DecoderInstruction {
     }
 }
 
+/// Increases the encoder's Known Received Count.
+///
+/// The instruction uses a 6-bit-prefixed integer. The prefix controls the wire
+/// encoding and does not impose a 6-bit value limit.
+///
+/// See [RFC 9204, Section 4.4.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.3).
 #[derive(Debug, PartialEq)]
-pub struct InsertCountIncrement(pub u8);
+pub struct InsertCountIncrement(pub usize);
 
 impl InsertCountIncrement {
     pub fn decode<R: Buf>(buf: &mut R) -> Result<Option<Self>, ParseError> {
         let insert_count = match prefix_int::decode(6, buf) {
-            Ok((0b00, x)) => {
-                if x > 64 {
-                    return Err(ParseError::Integer(
-                        crate::qpack::prefix_int::Error::Overflow,
-                    ));
-                }
-                x as u8
-            }
+            Ok((0b00, x)) => x
+                .try_into()
+                .map_err(|_| ParseError::Integer(IntError::Overflow))?,
             Ok((f, _)) => return Err(ParseError::InvalidPrefix(f)),
             Err(IntError::UnexpectedEnd) => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -375,7 +376,7 @@ mod test {
 
     #[test]
     fn insert_count_increment() {
-        let instruction = InsertCountIncrement(42);
+        let instruction = InsertCountIncrement(4096);
         let mut buf = vec![];
         instruction.encode(&mut buf);
         let mut read = Cursor::new(&buf);

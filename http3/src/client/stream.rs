@@ -112,7 +112,7 @@ where
 
         let (status, headers) = Header::try_from(fields)
             .map_err(|_e| {
-                self.inner.stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+                self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
                 StreamError::StreamError {
                     code: Code::H3_MESSAGE_ERROR,
                     reason: "Received malformed header".to_string(),
@@ -120,7 +120,7 @@ where
             })?
             .into_response_parts()
             .map_err(|_e| {
-                self.inner.stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+                self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
                 StreamError::StreamError {
                     code: Code::H3_MESSAGE_ERROR,
                     reason: "Received malformed header".to_string(),
@@ -163,7 +163,7 @@ where
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
         let res = self.inner.poll_recv_trailers(cx);
         if let Poll::Ready(Err(StreamError::HeaderTooBig { .. })) = &res {
-            self.inner.stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+            self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
         }
         res
     }
@@ -173,7 +173,7 @@ where
     pub fn stop_sending(&mut self, error_code: Code) {
         // TODO take by value to prevent any further call as this request is cancelled
         // rename `cancel()` ?
-        self.inner.stream.stop_sending(error_code)
+        self.inner.stop_sending(error_code)
     }
 
     /// Returns the underlying stream id

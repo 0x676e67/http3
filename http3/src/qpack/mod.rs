@@ -8,10 +8,8 @@ pub use self::{
 };
 
 use std::{
-    sync::{
-        Arc, RwLock, RwLockReadGuard, TryLockError,
-        atomic::{AtomicUsize, Ordering},
-    },
+    collections::BTreeMap,
+    sync::{Arc, RwLock, RwLockReadGuard, TryLockError},
     task::{Context, Poll, Waker},
 };
 
@@ -53,20 +51,125 @@ impl std::fmt::Display for Error {
     }
 }
 
-/// Event emitted by request streams for QPACK decoder stream instructions.
+/// Event emitted by request streams for QPACK decoder work.
 #[derive(Debug)]
 pub(crate) enum QpackEvent {
     HeaderAck(StreamId),
     StreamCancel(StreamId),
-    Waker(Waker),
+    RegisterBlocked {
+        stream_id: StreamId,
+        required_ref: usize,
+        waker: Waker,
+    },
+    ReleaseBlocked {
+        stream_id: StreamId,
+        required_ref: usize,
+    },
+    DecoderAccessWaker(Waker),
+}
+
+/// Blocked field sections owned by the connection driver.
+///
+/// Entries are ordered by Required Insert Count so an encoder-stream update can
+/// remove only the streams that became decodable. Keeping this state in the
+/// driver avoids shared locking on request-stream poll and drop paths.
+pub(crate) struct BlockedStreamRegistry {
+    max_blocked_streams: u64,
+    insert_count: usize,
+    streams: BTreeMap<(usize, StreamId), Waker>,
+}
+
+impl BlockedStreamRegistry {
+    pub(crate) fn new(max_blocked_streams: u64) -> Self {
+        Self {
+            max_blocked_streams,
+            insert_count: 0,
+            streams: BTreeMap::new(),
+        }
+    }
+
+    /// Registers a field section that is waiting for dynamic table entries.
+    ///
+    /// Repeated polls replace the stored task waker without consuming another
+    /// blocked-stream slot. A registration that races with an encoder update is
+    /// woken immediately when its Required Insert Count is already available.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2)
+    /// and [Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
+    pub(crate) fn register(
+        &mut self,
+        stream_id: StreamId,
+        required_ref: usize,
+        waker: Waker,
+    ) -> Result<(), DecoderError> {
+        if required_ref <= self.insert_count {
+            waker.wake();
+            return Ok(());
+        }
+
+        let key = (required_ref, stream_id);
+        if let Some(registered) = self.streams.get_mut(&key) {
+            if !registered.will_wake(&waker) {
+                *registered = waker;
+            }
+            return Ok(());
+        }
+
+        let limit_reached = match u64::try_from(self.streams.len()) {
+            Ok(blocked_streams) => blocked_streams >= self.max_blocked_streams,
+            Err(_) => true,
+        };
+        if limit_reached {
+            waker.wake();
+            return Err(DecoderError::TooManyBlockedStreams);
+        }
+
+        self.streams.insert(key, waker);
+        Ok(())
+    }
+
+    /// Removes a field section after it decodes or its stream is abandoned.
+    ///
+    /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
+    pub(crate) fn release(&mut self, stream_id: StreamId, required_ref: usize) {
+        self.streams.remove(&(required_ref, stream_id));
+    }
+
+    /// Advances the decoder Insert Count and wakes every newly decodable stream.
+    ///
+    /// A stream ceases to be blocked as soon as the decoder has received all
+    /// referenced entries; its request task does not need to run first.
+    ///
+    /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
+    pub(crate) fn update_insert_count(&mut self, insert_count: usize) {
+        if insert_count <= self.insert_count {
+            return;
+        }
+        self.insert_count = insert_count;
+
+        while self
+            .streams
+            .first_key_value()
+            .is_some_and(|(&(required_ref, _), _)| required_ref <= insert_count)
+        {
+            if let Some((_, waker)) = self.streams.pop_first() {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Wakes and removes all blocked streams after a connection-level error.
+    pub(crate) fn wake_all(&mut self) {
+        while let Some((_, waker)) = self.streams.pop_first() {
+            waker.wake();
+        }
+    }
 }
 
 struct QpackDecoderInner {
     decoder: RwLock<Decoder>,
     decoder_dynamic_table: bool,
     decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
-    max_blocked_streams: usize,
-    blocked_streams: AtomicUsize,
     /// Connection-driver waker used while a request holds a read guard.
     write_waker: AtomicWaker,
 }
@@ -90,13 +193,10 @@ impl QpackDecoder {
         decoder: Decoder,
         decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
     ) -> Self {
-        let max_blocked_streams = decoder.max_blocked_streams();
         QpackDecoder(Arc::new(QpackDecoderInner {
             decoder_dynamic_table: decoder.dynamic_table_enabled(),
             decoder: RwLock::new(decoder),
             decoder_events_send,
-            max_blocked_streams,
-            blocked_streams: AtomicUsize::new(0),
             write_waker: AtomicWaker::new(),
         }))
     }
@@ -111,40 +211,61 @@ impl QpackDecoder {
         self.0.decoder_dynamic_table
     }
 
-    /// Registers a request stream that cannot decode its field section yet.
+    /// Queues a blocked field section for the connection driver.
     ///
-    /// A stream is counted once even if it is polled repeatedly. The caller owns
-    /// that per-stream state and must unregister it after decoding or on drop.
-    /// Exceeding the advertised limit is a connection error.
+    /// The driver owns blocked-stream accounting and wakes the request when its
+    /// Required Insert Count is available. This also closes the race where the
+    /// encoder stream advances before the registration event is consumed.
     ///
-    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
-    pub(crate) fn register_blocked_stream(&self) -> Result<(), DecoderError> {
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2)
+    /// and [Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
+    pub(crate) fn queue_blocked_stream(
+        &self,
+        stream_id: StreamId,
+        required_ref: usize,
+        waker: &Waker,
+    ) -> Result<(), DecoderError> {
         self.0
-            .blocked_streams
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                (current < self.0.max_blocked_streams).then_some(current + 1)
+            .decoder_events_send
+            .send(QpackEvent::RegisterBlocked {
+                stream_id,
+                required_ref,
+                waker: waker.clone(),
             })
-            .map(|_| ())
-            .map_err(|_| DecoderError::TooManyBlockedStreams)
+            .map_err(|_| DecoderError::UnexpectedEnd)?;
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            stream_id = ?stream_id,
+            required_ref,
+            "queued blocked QPACK field section"
+        );
+        Ok(())
     }
 
-    /// Unregisters a request stream that was previously counted as blocked.
+    /// Queues removal of a blocked field section from the driver registry.
     ///
-    /// This must be paired with a successful [`Self::register_blocked_stream`]
-    /// call. Dropped or newly decoded field sections release their slot so the
-    /// peer can keep using the advertised blocked-stream budget. The debug
-    /// assertion catches local accounting bugs without turning cleanup into a
-    /// connection-level error path.
+    /// Removal is idempotent because an encoder-stream update may already have
+    /// released the entry before the request task runs again.
     ///
-    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
-    pub(crate) fn unregister_blocked_stream(&self) {
-        let result =
-            self.0
-                .blocked_streams
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    current.checked_sub(1)
-                });
-        debug_assert!(result.is_ok(), "QPACK blocked-stream counter underflow");
+    /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
+    pub(crate) fn release_blocked_stream(&self, stream_id: StreamId, required_ref: usize) -> bool {
+        let queued = self
+            .0
+            .decoder_events_send
+            .send(QpackEvent::ReleaseBlocked {
+                stream_id,
+                required_ref,
+            })
+            .is_ok();
+        #[cfg(feature = "tracing")]
+        if queued {
+            tracing::debug!(
+                stream_id = ?stream_id,
+                required_ref,
+                "queued blocked QPACK field section release"
+            );
+        }
+        queued
     }
 
     /// Queues a Section Acknowledgment for the connection driver to send.
@@ -199,14 +320,14 @@ impl QpackDecoder {
     /// request is decoding a field section, this registers the connection driver
     /// and returns [`Poll::Pending`]. The second lock attempt closes the gap between
     /// the failed first attempt and waker registration.
-    pub(crate) fn poll_on_recv_encoder<R: Buf, W: BufMut>(
+    pub(crate) fn poll_on_recv_encoder<R: Buf + Clone, W: BufMut>(
         &self,
         cx: &mut Context<'_>,
         read: &mut R,
         write: &mut W,
     ) -> Poll<Result<usize, DecoderError>> {
         match self.0.decoder.try_write() {
-            Ok(mut decoder) => return Poll::Ready(decoder.on_encoder_recv(read, write)),
+            Ok(mut decoder) => return Poll::Ready(decoder.on_encoder_recv_buffered(read, write)),
             Err(TryLockError::WouldBlock) => {}
             _ => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
         }
@@ -215,46 +336,18 @@ impl QpackDecoder {
         self.0.write_waker.register(cx.waker());
 
         match self.0.decoder.try_write() {
-            Ok(mut decoder) => Poll::Ready(decoder.on_encoder_recv(read, write)),
+            Ok(mut decoder) => Poll::Ready(decoder.on_encoder_recv_buffered(read, write)),
             Err(TryLockError::WouldBlock) => Poll::Pending,
             _ => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
         }
     }
 
     /// Releases a decode guard and wakes a driver waiting to update the table.
-    ///
-    /// A field section with missing references must also register its request task.
-    /// `waiter_registered` is true when registration already happened while waiting
-    /// for the read lock.
-    ///
-    /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
     fn finish_decode<T>(
         &self,
-        cx: &Context<'_>,
         decoder: RwLockReadGuard<'_, Decoder>,
         decoded: Result<T, DecoderError>,
-        waiter_registered: bool,
     ) -> Poll<Result<T, DecoderError>> {
-        if !waiter_registered {
-            if let Err(DecoderError::MissingRefs(_required_ref)) = &decoded {
-                // Register while the read guard still prevents an encoder update. This
-                // keeps the driver from updating the table before the waiter is visible.
-                if self
-                    .0
-                    .decoder_events_send
-                    .send(QpackEvent::Waker(cx.waker().clone()))
-                    .is_err()
-                {
-                    return Poll::Ready(Err(DecoderError::UnexpectedEnd));
-                }
-                #[cfg(feature = "tracing")]
-                tracing::debug!(
-                    required_ref = *_required_ref,
-                    "queued QPACK decoder waiter for missing references"
-                );
-            }
-        }
-
         // A writer blocked in poll_on_recv_encoder can continue once the guard drops.
         drop(decoder);
         self.0.write_waker.wake();
@@ -283,21 +376,27 @@ impl QpackDecoder {
         match self.0.decoder.try_read() {
             Ok(decoder) => {
                 let decoded = decoder.decode_header(state, end, max_size);
-                return self.finish_decode(cx, decoder, decoded, false);
+                return self.finish_decode(decoder, decoded);
             }
             Err(TryLockError::WouldBlock) => {}
             _ => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
         }
 
-        self.0
+        if self
+            .0
             .decoder_events_send
-            .send(QpackEvent::Waker(cx.waker().clone()))
-            .map_err(|_| DecoderError::UnexpectedEnd)?;
+            .send(QpackEvent::DecoderAccessWaker(cx.waker().clone()))
+            .is_err()
+        {
+            return Poll::Ready(Err(DecoderError::UnexpectedEnd));
+        }
+        #[cfg(feature = "tracing")]
+        tracing::debug!("queued QPACK decoder waiter for decoder write lock");
 
         match self.0.decoder.try_read() {
             Ok(decoder) => {
                 let decoded = decoder.decode_header(state, end, max_size);
-                self.finish_decode(cx, decoder, decoded, true)
+                self.finish_decode(decoder, decoded)
             }
             Err(TryLockError::WouldBlock) => Poll::Pending,
             _ => Poll::Ready(Err(DecoderError::UnexpectedEnd)),

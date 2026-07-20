@@ -34,7 +34,11 @@ pub enum DecoderError {
     InvalidStaticIndex(usize),
     UnknownPrefix(u8),
     MissingRefs(usize),
-    BadBaseIndex(isize),
+    BadBaseIndex {
+        required_insert_count: usize,
+        sign_negative: bool,
+        delta_base: usize,
+    },
     InvalidRequiredInsertCount(usize),
     MalformedFieldSection,
     TooManyBlockedStreams,
@@ -55,7 +59,21 @@ impl std::fmt::Display for DecoderError {
             DecoderError::InvalidStaticIndex(i) => write!(f, "unknown static index: {}", i),
             DecoderError::UnknownPrefix(p) => write!(f, "unknown instruction code: 0x{}", p),
             DecoderError::MissingRefs(n) => write!(f, "missing {} refs to decode block", n),
-            DecoderError::BadBaseIndex(i) => write!(f, "out of bounds base index: {}", i),
+            DecoderError::BadBaseIndex {
+                required_insert_count,
+                sign_negative,
+                delta_base,
+            } => write!(
+                f,
+                "invalid base from required insert count {}, sign {}, and delta base {}",
+                required_insert_count,
+                if *sign_negative {
+                    "negative"
+                } else {
+                    "positive"
+                },
+                delta_base
+            ),
             DecoderError::InvalidRequiredInsertCount(i) => {
                 write!(f, "invalid required insert count: {}", i)
             }
@@ -159,7 +177,7 @@ pub struct Decoder {
     // current capacity is separate and starts at zero.
     // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3
     max_table_capacity: usize,
-    max_blocked_streams: usize,
+    max_blocked_streams: u64,
 }
 
 impl Decoder {
@@ -168,13 +186,10 @@ impl Decoder {
         max_blocked_streams: u64,
     ) -> Result<Self, DecoderError> {
         let max_table_capacity = max_table_capacity.try_into()?;
-        DynamicTable::validate_max_size(max_table_capacity)?;
-        let max_blocked_streams = max_blocked_streams.try_into()?;
         // The peer encoder raises the current capacity with a Set Dynamic Table
         // Capacity instruction before inserting entries.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.1
-        let mut table = DynamicTable::new();
-        table.set_max_blocked(max_blocked_streams)?;
+        let table = DynamicTable::new();
         Ok(Self {
             table,
             max_table_capacity,
@@ -198,11 +213,13 @@ impl Decoder {
     ///
     /// This is the value advertised in `SETTINGS_QPACK_BLOCKED_STREAMS`. A zero
     /// value requires the peer to avoid field sections that cannot be decoded
-    /// immediately from the decoder's current dynamic table state.
+    /// immediately from the decoder's current dynamic table state. QPACK defines
+    /// no additional numeric maximum for this setting.
     ///
-    /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3)
-    /// and [Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
-    pub(crate) fn max_blocked_streams(&self) -> usize {
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2),
+    /// [Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5), and
+    /// [RFC 9114, Section 7.2.4](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4).
+    pub(crate) fn max_blocked_streams(&self) -> u64 {
         self.max_blocked_streams
     }
 
@@ -276,9 +293,32 @@ impl Decoder {
         read: &mut R,
         write: &mut W,
     ) -> Result<usize, DecoderError> {
+        self.on_encoder_recv_with(read, write, Self::parse_instruction)
+    }
+
+    /// Processes encoder instructions through a checkpointable receive cursor.
+    ///
+    /// Unlike the public contiguous-buffer path, this preserves an incomplete
+    /// instruction that spans multiple QUIC receive chunks.
+    ///
+    /// See [RFC 9204, Section 4.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3).
+    pub(crate) fn on_encoder_recv_buffered<R: Buf + Clone, W: BufMut>(
+        &mut self,
+        read: &mut R,
+        write: &mut W,
+    ) -> Result<usize, DecoderError> {
+        self.on_encoder_recv_with(read, write, Self::parse_instruction_buffered)
+    }
+
+    fn on_encoder_recv_with<R: Buf, W: BufMut>(
+        &mut self,
+        read: &mut R,
+        write: &mut W,
+        parse_instruction: fn(&Self, &mut R) -> Result<Option<Instruction>, DecoderError>,
+    ) -> Result<usize, DecoderError> {
         let inserted_on_start = self.table.total_inserted();
 
-        while let Some(instruction) = self.parse_instruction(read)? {
+        while let Some(instruction) = parse_instruction(self, read)? {
             #[cfg(feature = "tracing")]
             trace!("instruction {:?}", instruction);
 
@@ -299,8 +339,10 @@ impl Decoder {
         }
 
         if self.table.total_inserted() != inserted_on_start {
-            InsertCountIncrement((self.table.total_inserted() - inserted_on_start).try_into()?)
-                .encode(write);
+            // The 6-bit field is a prefix, not an upper bound. Large batches
+            // continue in the prefix integer representation.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.3
+            InsertCountIncrement(self.table.total_inserted() - inserted_on_start).encode(write);
         }
 
         Ok(self.table.total_inserted())
@@ -312,21 +354,50 @@ impl Decoder {
         }
 
         let mut buf = Cursor::new(read.chunk());
+        let instruction = self.decode_instruction(&mut buf)?;
+        if instruction.is_some() {
+            read.advance(buf.position() as usize);
+        }
+        Ok(instruction)
+    }
+
+    fn parse_instruction_buffered<R: Buf + Clone>(
+        &self,
+        read: &mut R,
+    ) -> Result<Option<Instruction>, DecoderError> {
+        if read.remaining() < 1 {
+            return Ok(None);
+        }
+
+        // Encoder instructions can cross QUIC receive chunks. Parse against a
+        // checkpoint and commit only after the complete instruction is present.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3
+        let before = read.remaining();
+        let mut buf = read.clone();
+        let instruction = self.decode_instruction(&mut buf)?;
+        if instruction.is_some() {
+            read.advance(before - buf.remaining());
+        }
+        Ok(instruction)
+    }
+
+    fn decode_instruction<R: Buf>(&self, buf: &mut R) -> Result<Option<Instruction>, DecoderError> {
         let first = buf.chunk()[0];
         let instruction = match EncoderInstruction::decode(first) {
             EncoderInstruction::Unknown => return Err(DecoderError::UnknownPrefix(first)),
             EncoderInstruction::DynamicTableSizeUpdate => {
-                DynamicTableSizeUpdate::decode(&mut buf)?.map(|x| Instruction::TableSizeUpdate(x.0))
+                DynamicTableSizeUpdate::decode(&mut *buf)?
+                    .map(|x| Instruction::TableSizeUpdate(x.0))
             }
-            EncoderInstruction::InsertWithoutNameRef => InsertWithoutNameRef::decode(&mut buf)?
+            EncoderInstruction::InsertWithoutNameRef => InsertWithoutNameRef::decode(&mut *buf)?
                 .map(|x| Instruction::Insert(HeaderField::new(x.name, x.value))),
-            EncoderInstruction::Duplicate => match Duplicate::decode(&mut buf)? {
+            EncoderInstruction::Duplicate => match Duplicate::decode(&mut *buf)? {
                 Some(Duplicate(index)) => {
                     Some(Instruction::Insert(self.table.get_relative(index)?.clone()))
                 }
                 None => None,
             },
-            EncoderInstruction::InsertWithNameRef => match InsertWithNameRef::decode(&mut buf)? {
+            EncoderInstruction::InsertWithNameRef => match InsertWithNameRef::decode(&mut *buf)? {
                 Some(InsertWithNameRef::Static { index, value }) => Some(Instruction::Insert(
                     StaticTable::get(index)?.with_value(value),
                 )),
@@ -336,11 +407,6 @@ impl Decoder {
                 None => None,
             },
         };
-
-        if instruction.is_some() {
-            let pos = buf.position();
-            read.advance(pos as usize);
-        }
 
         Ok(instruction)
     }
@@ -584,7 +650,15 @@ impl From<ParseError> for DecoderError {
             ParseError::Integer(x) => x.into(),
             ParseError::String(x) => x.into(),
             ParseError::InvalidPrefix(p) => DecoderError::UnknownPrefix(p),
-            ParseError::InvalidBase(b) => DecoderError::BadBaseIndex(b),
+            ParseError::InvalidBase {
+                required_insert_count,
+                sign_negative,
+                delta_base,
+            } => DecoderError::BadBaseIndex {
+                required_insert_count,
+                sign_negative,
+                delta_base,
+            },
             ParseError::InvalidRequiredInsertCount(i) => {
                 DecoderError::InvalidRequiredInsertCount(i)
             }
@@ -601,7 +675,12 @@ impl From<TryFromIntError> for DecoderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qpack::tests::helpers::{TABLE_SIZE, build_table_with_size};
+    use bytes::Bytes;
+
+    use crate::{
+        buf::BufList,
+        qpack::tests::helpers::{TABLE_SIZE, build_table_with_size},
+    };
 
     fn decode_incremental(
         decoder: &Decoder,
@@ -646,6 +725,14 @@ mod tests {
     }
 
     #[test]
+    fn blocked_stream_limit_accepts_full_settings_range() {
+        let max = crate::proto::varint::VarInt::MAX.into_inner();
+        let decoder = Decoder::new(0, max).unwrap();
+
+        assert_eq!(decoder.max_blocked_streams(), max);
+    }
+
+    #[test]
     fn insert_before_capacity_update_is_rejected() {
         let mut encoder_stream = Vec::new();
         InsertWithoutNameRef::new("key", "value")
@@ -673,6 +760,126 @@ mod tests {
                 DynamicTableError::MaximumTableSizeTooLarge
             ))
         );
+    }
+
+    #[test]
+    fn zero_capacity_update_is_tolerated_when_advertised_maximum_is_zero() {
+        let mut encoder_stream = Vec::new();
+        DynamicTableSizeUpdate(0).encode(&mut encoder_stream);
+        let mut decoder = Decoder::new(0, 0).unwrap();
+        let mut decoder_stream = Vec::new();
+
+        // RFC 9204 forbids all encoder instructions while the advertised
+        // maximum is zero, but does not prescribe a receiver error for this
+        // harmless no-op. Accept it for interoperability.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.1
+        assert_eq!(
+            decoder.on_encoder_recv(&mut Cursor::new(encoder_stream), &mut decoder_stream),
+            Ok(0)
+        );
+        assert_eq!(decoder.table.max_mem_size(), 0);
+        assert!(decoder_stream.is_empty());
+    }
+
+    #[test]
+    fn encoder_instruction_can_span_receive_chunks() {
+        let mut encoder_stream = Vec::new();
+        DynamicTableSizeUpdate(128).encode(&mut encoder_stream);
+        InsertWithoutNameRef::new("key", "value")
+            .encode(&mut encoder_stream)
+            .unwrap();
+        let encoded_len = encoder_stream.len();
+
+        let mut fragments = BufList::new();
+        for byte in encoder_stream {
+            fragments.push(Bytes::from(vec![byte]));
+        }
+
+        let mut read = fragments.cursor();
+        let mut decoder = Decoder::new(128, 0).unwrap();
+        let mut decoder_stream = Vec::new();
+
+        assert_eq!(
+            decoder.on_encoder_recv_buffered(&mut read, &mut decoder_stream),
+            Ok(1)
+        );
+        assert_eq!(read.position(), encoded_len);
+        assert_eq!(
+            InsertCountIncrement::decode(&mut Cursor::new(decoder_stream)),
+            Ok(Some(InsertCountIncrement(1)))
+        );
+    }
+
+    #[test]
+    fn incomplete_fragment_is_preserved_for_the_next_read() {
+        let mut capacity_update = Vec::new();
+        DynamicTableSizeUpdate(128).encode(&mut capacity_update);
+        let capacity_update_len = capacity_update.len();
+
+        let mut insertion = Vec::new();
+        InsertWithoutNameRef::new("key", "value")
+            .encode(&mut insertion)
+            .unwrap();
+        let final_byte = insertion.pop().unwrap();
+
+        let mut fragments = BufList::new();
+        for byte in capacity_update.into_iter().chain(insertion) {
+            fragments.push(Bytes::from(vec![byte]));
+        }
+
+        let mut decoder = Decoder::new(128, 0).unwrap();
+        let mut decoder_stream = Vec::new();
+        let consumed = {
+            let mut read = fragments.cursor();
+            assert_eq!(
+                decoder.on_encoder_recv_buffered(&mut read, &mut decoder_stream),
+                Ok(0)
+            );
+            read.position()
+        };
+        assert_eq!(consumed, capacity_update_len);
+
+        // Commit only the complete capacity update, then retry the preserved
+        // insertion after its final byte arrives.
+        fragments.advance(consumed);
+        fragments.push(Bytes::from(vec![final_byte]));
+        let remaining = fragments.remaining();
+        let mut read = fragments.cursor();
+        assert_eq!(
+            decoder.on_encoder_recv_buffered(&mut read, &mut decoder_stream),
+            Ok(1)
+        );
+        assert_eq!(read.position(), remaining);
+        assert_eq!(decoder.table.max_mem_size(), 128);
+    }
+
+    #[test]
+    fn decoder_reports_large_insert_count_increment() {
+        const INSERTIONS: usize = 256;
+        const ENTRY_SIZE: usize = 32;
+
+        let mut encoder_stream = Vec::new();
+        DynamicTableSizeUpdate(INSERTIONS * ENTRY_SIZE).encode(&mut encoder_stream);
+        for _ in 0..INSERTIONS {
+            InsertWithoutNameRef::new("", "")
+                .encode(&mut encoder_stream)
+                .unwrap();
+        }
+
+        let mut decoder = Decoder::new((INSERTIONS * ENTRY_SIZE) as u64, 0).unwrap();
+        let mut decoder_stream = Vec::new();
+
+        assert_eq!(
+            decoder.on_encoder_recv(&mut Cursor::new(encoder_stream), &mut decoder_stream),
+            Ok(INSERTIONS)
+        );
+        let mut decoder_stream = Cursor::new(decoder_stream);
+        assert_eq!(
+            InsertCountIncrement::decode(&mut decoder_stream),
+            Ok(Some(InsertCountIncrement(INSERTIONS)))
+        );
+        assert!(!decoder_stream.has_remaining());
     }
 
     #[test]
