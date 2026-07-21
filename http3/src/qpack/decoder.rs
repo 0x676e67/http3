@@ -120,6 +120,11 @@ pub(crate) struct DecoderState {
 }
 
 impl DecoderState {
+    // A literal field has at most three prefixed integers before its strings.
+    // Each QPACK integer fits in at most ten bytes, with two bytes left as a
+    // small margin for representation flags.
+    const FIELD_REPRESENTATION_OVERHEAD: u64 = 32;
+
     /// Creates an empty state for one encoded field section.
     ///
     /// The field section prefix is parsed from the first bytes appended with
@@ -154,6 +159,25 @@ impl DecoderState {
             return Err(DecoderError::HeaderTooLong(self.mem_size));
         }
         self.fields.push(field);
+        Ok(())
+    }
+
+    fn check_incomplete_field_size(&self, max_size: u64) -> Result<(), DecoderError> {
+        let remaining = max_size.saturating_sub(self.mem_size);
+        // QPACK uses the HPACK Huffman table, whose longest symbol is 30 bits.
+        // Therefore a valid encoded literal cannot require more than four bytes
+        // per decoded octet, plus the field representation's prefix integers.
+        // Rejecting beyond that point keeps an incomplete literal from bypassing
+        // the configured field section limit while it is arriving in chunks.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.1.2
+        // https://www.rfc-editor.org/rfc/rfc7541.html#appendix-B
+        let encoded_limit = remaining
+            .saturating_mul(4)
+            .saturating_add(Self::FIELD_REPRESENTATION_OVERHEAD);
+        let pending = u64::try_from(self.pending.len()).unwrap_or(u64::MAX);
+        if pending > encoded_limit {
+            return Err(DecoderError::HeaderTooLong(max_size.saturating_add(1)));
+        }
         Ok(())
     }
 
@@ -272,7 +296,10 @@ impl Decoder {
             let mut cursor = Cursor::new(&state.pending[..]);
             let field = match Self::parse_header_field(&decoder_table, &mut cursor) {
                 Ok(field) => field,
-                Err(DecoderError::UnexpectedEnd) if !end => return Ok(None),
+                Err(DecoderError::UnexpectedEnd) if !end => {
+                    state.check_incomplete_field_size(max_size)?;
+                    return Ok(None);
+                }
                 Err(error) => return Err(error),
             };
 
@@ -536,7 +563,10 @@ pub(crate) fn decode_stateless_incremental(
         let mut cursor = Cursor::new(&state.pending[..]);
         let field = match parse_stateless_header_field(&mut cursor) {
             Ok(field) => field,
-            Err(DecoderError::UnexpectedEnd) if !end => return Ok(None),
+            Err(DecoderError::UnexpectedEnd) if !end => {
+                state.check_incomplete_field_size(max_size)?;
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
 
@@ -990,6 +1020,42 @@ mod tests {
     }
 
     #[test]
+    fn incremental_dynamic_decode_fragments_every_field_representation() {
+        let mut encoded = Vec::new();
+        HeaderPrefix::new(4, 2, 4, TABLE_SIZE).encode(&mut encoded);
+        Indexed::Dynamic(0).encode(&mut encoded);
+        IndexedWithPostBase(0).encode(&mut encoded);
+        LiteralWithNameRef::new_dynamic(1, "new bar1")
+            .encode(&mut encoded)
+            .unwrap();
+        LiteralWithPostBaseNameRef::new(1, "new bar4")
+            .encode(&mut encoded)
+            .unwrap();
+
+        let mut state = DecoderState::new();
+        let decoder = Decoder::from(build_table_with_size(4));
+        for byte in encoded {
+            state.extend(&mut Cursor::new([byte]));
+            assert_eq!(decoder.decode_header(&mut state, false, u64::MAX), Ok(None));
+        }
+
+        let decoded = decoder
+            .decode_header(&mut state, true, u64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decoded.fields,
+            vec![
+                field(2),
+                field(3),
+                field(1).with_value("new bar1"),
+                field(4).with_value("new bar4"),
+            ]
+        );
+        assert!(decoded.dyn_ref);
+    }
+
+    #[test]
     fn incremental_dynamic_decode_waits_for_incomplete_field() {
         let mut field_section = Vec::new();
         HeaderPrefix::new(0, 0, 0, TABLE_SIZE).encode(&mut field_section);
@@ -1005,6 +1071,28 @@ mod tests {
         assert_eq!(decoder.decode_header(&mut state, false, u64::MAX), Ok(None));
         assert_eq!(
             decoder.decode_header(&mut state, true, u64::MAX),
+            Err(DecoderError::UnexpectedEnd)
+        );
+    }
+
+    #[test]
+    fn incremental_stateless_decode_rejects_incomplete_field_at_end() {
+        let mut field_section = Vec::new();
+        HeaderPrefix::new(0, 0, 0, 0).encode(&mut field_section);
+        Literal::new("name", "value")
+            .encode(&mut field_section)
+            .unwrap();
+        let _ = field_section.pop();
+
+        let mut state = DecoderState::new();
+        state.extend(&mut Cursor::new(field_section));
+
+        assert_eq!(
+            decode_stateless_incremental(&mut state, false, u64::MAX),
+            Ok(None)
+        );
+        assert_eq!(
+            decode_stateless_incremental(&mut state, true, u64::MAX),
             Err(DecoderError::UnexpectedEnd)
         );
     }
@@ -1033,6 +1121,43 @@ mod tests {
         assert_eq!(
             decode_incremental_limited(&decoder, &field_section, 1),
             Err(DecoderError::HeaderTooLong(header.mem_size() as u64))
+        );
+    }
+
+    #[test]
+    fn incremental_dynamic_decode_bounds_incomplete_literal() {
+        let mut field_section = Vec::new();
+        HeaderPrefix::new(0, 0, 0, TABLE_SIZE).encode(&mut field_section);
+        Literal::new(vec![0], vec![0; 128])
+            .encode(&mut field_section)
+            .unwrap();
+        let _ = field_section.pop();
+
+        let mut state = DecoderState::new();
+        state.extend(&mut Cursor::new(field_section));
+        let decoder = Decoder::new(TABLE_SIZE as u64, 0).unwrap();
+
+        assert_eq!(
+            decoder.decode_header(&mut state, false, 16),
+            Err(DecoderError::HeaderTooLong(17))
+        );
+    }
+
+    #[test]
+    fn incremental_stateless_decode_bounds_incomplete_literal() {
+        let mut field_section = Vec::new();
+        HeaderPrefix::new(0, 0, 0, 0).encode(&mut field_section);
+        Literal::new(vec![0], vec![0; 128])
+            .encode(&mut field_section)
+            .unwrap();
+        let _ = field_section.pop();
+
+        let mut state = DecoderState::new();
+        state.extend(&mut Cursor::new(field_section));
+
+        assert_eq!(
+            decode_stateless_incremental(&mut state, false, 16),
+            Err(DecoderError::HeaderTooLong(17))
         );
     }
 

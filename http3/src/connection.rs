@@ -1124,7 +1124,7 @@ where
     }
 }
 
-struct DecoderGurad {
+struct DecoderGuard {
     stream_id: StreamId,
     shared: Arc<SharedState>,
     cancel_on_drop: bool,
@@ -1132,7 +1132,7 @@ struct DecoderGurad {
     decoder: QpackDecoder,
 }
 
-impl DecoderGurad {
+impl DecoderGuard {
     /// Marks this request stream as blocked on missing dynamic table entries.
     ///
     /// The connection driver owns the blocked-stream registry. Repeated polls
@@ -1208,7 +1208,7 @@ impl DecoderGurad {
     }
 }
 
-impl Drop for DecoderGurad {
+impl Drop for DecoderGuard {
     fn drop(&mut self) {
         self.cancel_reading();
     }
@@ -1226,7 +1226,7 @@ pub struct RequestStream<S, B> {
     pub(super) max_field_section_size: u64,
     send_grease_frame: bool,
     decoder: QpackDecoder,
-    decoder_gurad: Option<DecoderGurad>,
+    decoder_guard: Option<DecoderGuard>,
     decoder_state: Option<DecoderState>,
     trailers_state: Option<TrailersState>,
 }
@@ -1247,7 +1247,7 @@ where
         grease: bool,
         decoder: QpackDecoder,
     ) -> Self {
-        let decoder_gurad = decoder.dynamic_table_enabled().then(|| DecoderGurad {
+        let decoder_guard = decoder.dynamic_table_enabled().then(|| DecoderGuard {
             stream_id: stream.id(),
             shared: conn_state.clone(),
             // Until the field section is successfully decoded, dropping the guard
@@ -1264,7 +1264,7 @@ where
             trailers_state: None,
             send_grease_frame: grease,
             decoder,
-            decoder_gurad,
+            decoder_guard,
             decoder_state: None,
         }
     }
@@ -1286,7 +1286,7 @@ where
     ///
     /// See [RFC 9204, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
     pub(crate) fn cancel_qpack_reading(&mut self) {
-        if let Some(field_section) = self.decoder_gurad.as_mut() {
+        if let Some(field_section) = self.decoder_guard.as_mut() {
             field_section.cancel_reading();
         }
     }
@@ -1329,15 +1329,6 @@ where
                 Frames::Headers => {
                     self.decoder_state = Some(qpack::DecoderState::new());
                 }
-                // FrameDecoder can skip an unknown frame and reach a buffered
-                // HEADERS frame in the same pass. Accept that legacy result so
-                // RFC 9114's unknown-frame handling remains transparent.
-                // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
-                Frames::Frame(Frame::Headers(mut encoded)) => {
-                    let mut state = qpack::DecoderState::new();
-                    state.extend(&mut encoded);
-                    self.decoder_state = Some(state);
-                }
                 Frames::Frame(frame) => {
                     return Poll::Ready(Err(self.handle_connection_error_on_stream(
                         InternalConnectionError::new(
@@ -1371,7 +1362,7 @@ where
             match decoded {
                 Poll::Ready(Ok(Some(decoded))) => {
                     self.decoder_state = None;
-                    if let Some(guard) = self.decoder_gurad.as_mut() {
+                    if let Some(guard) = self.decoder_guard.as_mut() {
                         guard.unblock();
                         if let Err(error) = guard.acknowledge(decoded.dyn_ref) {
                             return Poll::Ready(Err(self.handle_connection_error_on_stream(
@@ -1399,7 +1390,7 @@ where
                             ),
                         )));
                     }
-                    if let Some(guard) = self.decoder_gurad.as_mut() {
+                    if let Some(guard) = self.decoder_guard.as_mut() {
                         if let Err(error) = guard.block(required_ref, cx.waker()) {
                             return Poll::Ready(Err(self.handle_connection_error_on_stream(
                                 InternalConnectionError::new(
@@ -1465,7 +1456,7 @@ where
                     return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
                 }
                 Ok(None) => {
-                    if let Some(field_section) = self.decoder_gurad.as_mut() {
+                    if let Some(field_section) = self.decoder_guard.as_mut() {
                         field_section.finish_reading();
                     }
                     return Poll::Ready(Ok(None));
@@ -1473,12 +1464,6 @@ where
                 Ok(Some(Frames::Headers)) => {
                     self.trailers_state = Some(TrailersState::Decoding(qpack::DecoderState::new()));
                     // Received trailers, no more data expected
-                    return Poll::Ready(Ok(None));
-                }
-                Ok(Some(Frames::Frame(Frame::Headers(mut encoded)))) => {
-                    let mut state = qpack::DecoderState::new();
-                    state.extend(&mut encoded);
-                    self.trailers_state = Some(TrailersState::Decoding(state));
                     return Poll::Ready(Ok(None));
                 }
                 Ok(Some(Frames::Frame(Frame::Data { .. }))) => (),
@@ -1521,60 +1506,78 @@ where
             .map_err(|error| self.handle_receive_stream_error(error))
     }
 
+    fn body_not_fully_received_error() -> StreamError {
+        StreamError::StreamError {
+            code: Code::H3_FRAME_UNEXPECTED,
+            reason: "response body has not been fully received".to_string(),
+        }
+    }
+
     /// Poll receive trailers.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_recv_trailers(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
+        if self.trailers_state.is_none() && self.stream.has_data() {
+            return Poll::Ready(Err(Self::body_not_fully_received_error()));
+        }
+
         let mut trailers = if let Some(state) = self.trailers_state.take() {
             state
         } else {
-            match ready!(self.stream.poll_next_frame(cx)) {
-                Err(frame_stream_error) => {
-                    return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
-                }
-                Ok(None) => {
-                    if let Some(field_section) = self.decoder_gurad.as_mut() {
-                        field_section.finish_reading();
+            loop {
+                match ready!(self.stream.poll_next_frame(cx)) {
+                    Err(frame_stream_error) => {
+                        return Poll::Ready(Err(
+                            self.handle_receive_stream_error(frame_stream_error)
+                        ));
                     }
-                    return Poll::Ready(Ok(None));
-                }
-                Ok(Some(Frames::Headers)) => TrailersState::Decoding(qpack::DecoderState::new()),
-                Ok(Some(Frames::Frame(Frame::Headers(mut encoded)))) => {
-                    let mut state = qpack::DecoderState::new();
-                    state.extend(&mut encoded);
-                    TrailersState::Decoding(state)
-                }
-                Ok(Some(Frames::Frame(other_frame))) => {
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-                    //# Receipt of an invalid sequence of frames MUST be treated as a
-                    //# connection error of type H3_FRAME_UNEXPECTED.
+                    Ok(None) => {
+                        if let Some(field_section) = self.decoder_guard.as_mut() {
+                            field_section.finish_reading();
+                        }
+                        return Poll::Ready(Ok(None));
+                    }
+                    Ok(Some(Frames::Headers)) => {
+                        break TrailersState::Decoding(qpack::DecoderState::new());
+                    }
+                    // Empty DATA frames carry no body bytes and do not prevent
+                    // the following trailer section from being read.
+                    Ok(Some(Frames::Frame(Frame::Data(PayloadLen(0))))) => continue,
+                    Ok(Some(Frames::Frame(Frame::Data(_)))) => {
+                        return Poll::Ready(Err(Self::body_not_fully_received_error()));
+                    }
+                    Ok(Some(Frames::Frame(other_frame))) => {
+                        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+                        //# Receipt of an invalid sequence of frames MUST be treated as a
+                        //# connection error of type H3_FRAME_UNEXPECTED.
 
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
-                    //# Receiving a
-                    //# CANCEL_PUSH frame on a stream other than the control stream MUST be
-                    //# treated as a connection error of type H3_FRAME_UNEXPECTED.
+                        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+                        //# Receiving a
+                        //# CANCEL_PUSH frame on a stream other than the control stream MUST be
+                        //# treated as a connection error of type H3_FRAME_UNEXPECTED.
 
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
-                    //# If an endpoint receives a SETTINGS frame on a different
-                    //# stream, the endpoint MUST respond with a connection error of type
-                    //# H3_FRAME_UNEXPECTED.
+                        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+                        //# If an endpoint receives a SETTINGS frame on a different
+                        //# stream, the endpoint MUST respond with a connection error of type
+                        //# H3_FRAME_UNEXPECTED.
 
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.6
-                    //# A client MUST treat a GOAWAY frame on a stream other than
-                    //# the control stream as a connection error of type H3_FRAME_UNEXPECTED.
+                        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.6
+                        //# A client MUST treat a GOAWAY frame on a stream other than
+                        //# the control stream as a connection error of type H3_FRAME_UNEXPECTED.
 
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
-                    //# The MAX_PUSH_ID frame is always sent on the control stream.  Receipt
-                    //# of a MAX_PUSH_ID frame on any other stream MUST be treated as a
-                    //# connection error of type H3_FRAME_UNEXPECTED.
-                    return Poll::Ready(Err(self.handle_connection_error_on_stream(
-                        InternalConnectionError::new(
-                            Code::H3_FRAME_UNEXPECTED,
-                            format!("unexpected frame: {:?}", other_frame),
-                        ),
-                    )));
+                        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
+                        //# The MAX_PUSH_ID frame is always sent on the control stream.  Receipt
+                        //# of a MAX_PUSH_ID frame on any other stream MUST be treated as a
+                        //# connection error of type H3_FRAME_UNEXPECTED.
+                        return Poll::Ready(Err(self.handle_connection_error_on_stream(
+                            InternalConnectionError::new(
+                                Code::H3_FRAME_UNEXPECTED,
+                                format!("unexpected frame: {:?}", other_frame),
+                            ),
+                        )));
+                    }
                 }
             }
         };
@@ -1590,7 +1593,7 @@ where
                     .poll_decode_header(cx, state, end, self.max_field_section_size)
                 {
                     Poll::Ready(Ok(Some(decoded))) => {
-                        if let Some(guard) = self.decoder_gurad.as_mut() {
+                        if let Some(guard) = self.decoder_guard.as_mut() {
                             guard.unblock();
                             if let Err(error) = guard.acknowledge(decoded.dyn_ref) {
                                 return Poll::Ready(Err(self.handle_connection_error_on_stream(
@@ -1617,7 +1620,7 @@ where
                                 ),
                             )));
                         }
-                        if let Some(guard) = self.decoder_gurad.as_mut() {
+                        if let Some(guard) = self.decoder_guard.as_mut() {
                             if let Err(error) = guard.block(required_ref, cx.waker()) {
                                 return Poll::Ready(Err(self.handle_connection_error_on_stream(
                                     InternalConnectionError::new(
@@ -1696,7 +1699,7 @@ where
             }
         }
 
-        if let Some(guard) = self.decoder_gurad.as_mut() {
+        if let Some(guard) = self.decoder_guard.as_mut() {
             guard.finish_reading();
         }
 
@@ -1841,7 +1844,7 @@ where
                 max_field_section_size: 0,
                 send_grease_frame: self.send_grease_frame,
                 decoder: self.decoder.clone(),
-                decoder_gurad: None,
+                decoder_guard: None,
                 decoder_state: None,
                 trailers_state: None,
             },
@@ -1851,7 +1854,7 @@ where
                 max_field_section_size: self.max_field_section_size,
                 send_grease_frame: self.send_grease_frame,
                 decoder: self.decoder,
-                decoder_gurad: self.decoder_gurad,
+                decoder_guard: self.decoder_guard,
                 decoder_state: self.decoder_state,
                 trailers_state: self.trailers_state,
             },
@@ -1866,13 +1869,13 @@ mod qpack_field_section_tests {
 
     use futures_util::task::{ArcWake, waker};
 
-    fn field_section_guard() -> (DecoderGurad, mpsc::UnboundedReceiver<QpackEvent>) {
+    fn field_section_guard() -> (DecoderGuard, mpsc::UnboundedReceiver<QpackEvent>) {
         let (events_send, events_recv) = mpsc::unbounded_channel();
         let decoder = QpackDecoder::new(qpack::Decoder::new(0, 0).unwrap(), events_send);
         let shared = Arc::new(SharedState::default());
 
         (
-            DecoderGurad {
+            DecoderGuard {
                 stream_id: StreamId(0),
                 shared,
                 cancel_on_drop: true,

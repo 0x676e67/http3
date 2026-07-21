@@ -85,7 +85,10 @@ impl Frame<PayloadLen> {
     /// Decodes a Frame from the stream according to <https://www.rfc-editor.org/rfc/rfc9114#section-7.1>
     pub fn decode<T: Buf>(buf: &mut T) -> Result<Self, FrameError> {
         let remaining = buf.remaining();
-        let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(remaining + 1))?;
+        let incomplete = remaining
+            .checked_add(1)
+            .ok_or(FrameError::InvalidFrameValue)?;
+        let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(incomplete))?;
 
         // Webtransport streams need special handling as they have no length.
         //
@@ -99,23 +102,44 @@ impl Frame<PayloadLen> {
 
         let len = buf
             .get_var()
-            .map_err(|_| FrameError::Incomplete(remaining + 1))?;
+            .map_err(|_| FrameError::Incomplete(incomplete))?;
 
         if ty == FrameType::DATA {
-            return Ok(Frame::Data((len as usize).into()));
+            let len = len.try_into().map_err(|_| FrameError::InvalidFrameValue)?;
+            return Ok(Frame::Data(PayloadLen(len)));
         }
 
-        if buf.remaining() < len as usize {
-            return Err(FrameError::Incomplete(2 + len as usize));
+        // These HTTP/2 frame types are forbidden in HTTP/3. Their payload does
+        // not need to be buffered before reporting H3_FRAME_UNEXPECTED.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
+        if matches!(
+            ty,
+            FrameType::H2_PRIORITY
+                | FrameType::H2_PING
+                | FrameType::H2_WINDOW_UPDATE
+                | FrameType::H2_CONTINUATION
+        ) {
+            return Err(FrameError::UnsupportedFrame(ty.0));
         }
 
-        let mut payload = buf.take(len as usize);
+        let len: usize = len.try_into().map_err(|_| FrameError::InvalidFrameValue)?;
+        if buf.remaining() < len {
+            let header_len = remaining
+                .checked_sub(buf.remaining())
+                .ok_or(FrameError::InvalidFrameValue)?;
+            let expected = header_len
+                .checked_add(len)
+                .ok_or(FrameError::InvalidFrameValue)?;
+            return Err(FrameError::Incomplete(expected));
+        }
+
+        let mut payload = buf.take(len);
 
         #[cfg(feature = "tracing")]
         trace!("frame ty: {:?}", ty);
 
         let frame = match ty {
-            FrameType::HEADERS => Ok(Frame::Headers(payload.copy_to_bytes(len as usize))),
+            FrameType::HEADERS => Ok(Frame::Headers(payload.copy_to_bytes(len))),
             FrameType::SETTINGS => Ok(Frame::Settings(Settings::decode(&mut payload)?)),
             FrameType::CANCEL_PUSH => Ok(Frame::CancelPush(payload.get_var()?.try_into()?)),
             FrameType::PUSH_PROMISE => Ok(Frame::PushPromise(PushPromise::decode(&mut payload)?)),
@@ -125,13 +149,9 @@ impl Frame<PayloadLen> {
             //# These frame
             //# types MUST NOT be sent, and their receipt MUST be treated as a
             //# connection error of type H3_FRAME_UNEXPECTED.
-            FrameType::H2_PRIORITY
-            | FrameType::H2_PING
-            | FrameType::H2_WINDOW_UPDATE
-            | FrameType::H2_CONTINUATION => Err(FrameError::UnsupportedFrame(ty.0)),
-            FrameType::WEBTRANSPORT_BI_STREAM | FrameType::DATA => unreachable!(),
+            FrameType::WEBTRANSPORT_BI_STREAM | FrameType::DATA => Err(FrameError::Malformed),
             _ => {
-                buf.advance(len as usize);
+                buf.advance(len);
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
                 //# Endpoints MUST
                 //# NOT consider these frames to have any meaning upon receipt.
@@ -162,15 +182,44 @@ impl Frame<PayloadLen> {
         buf: &mut T,
     ) -> Result<Option<PayloadLen>, FrameError> {
         let remaining = buf.remaining();
-        let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(remaining + 1))?;
+        let incomplete = remaining
+            .checked_add(1)
+            .ok_or(FrameError::InvalidFrameValue)?;
+        let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(incomplete))?;
         if ty != FrameType::HEADERS {
             return Ok(None);
         }
 
         let len = buf
             .get_var()
-            .map_err(|_| FrameError::Incomplete(remaining + 1))?;
-        Ok(Some(PayloadLen(len as usize)))
+            .map_err(|_| FrameError::Incomplete(incomplete))?
+            .try_into()
+            .map_err(|_| FrameError::InvalidFrameValue)?;
+        Ok(Some(PayloadLen(len)))
+    }
+
+    /// Decodes the type and payload length only when the next frame is unknown.
+    ///
+    /// The stream decoder uses this to discard an unknown payload as chunks
+    /// arrive instead of buffering the complete frame. Unknown frame types have
+    /// no semantics, but their payload still has to be consumed in full.
+    ///
+    /// See [RFC 9114, Section 9](https://www.rfc-editor.org/rfc/rfc9114.html#section-9).
+    pub(crate) fn decode_unknown_prefix<T: Buf>(
+        buf: &mut T,
+    ) -> Result<Option<(u64, u64)>, FrameError> {
+        let remaining = buf.remaining();
+        let incomplete = remaining
+            .checked_add(1)
+            .ok_or(FrameError::InvalidFrameValue)?;
+        let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(incomplete))?;
+        if ty.is_known() {
+            return Ok(None);
+        }
+
+        buf.get_var()
+            .map(|len| Some((ty.0, len)))
+            .map_err(|_| FrameError::Incomplete(incomplete))
     }
 }
 
@@ -352,6 +401,25 @@ impl FrameType {
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, UnexpectedEnd> {
         Ok(FrameType(buf.get_var()?))
     }
+
+    fn is_known(self) -> bool {
+        matches!(
+            self,
+            Self::DATA
+                | Self::HEADERS
+                | Self::H2_PRIORITY
+                | Self::CANCEL_PUSH
+                | Self::SETTINGS
+                | Self::PUSH_PROMISE
+                | Self::H2_PING
+                | Self::GOAWAY
+                | Self::H2_WINDOW_UPDATE
+                | Self::H2_CONTINUATION
+                | Self::MAX_PUSH_ID
+                | Self::WEBTRANSPORT_BI_STREAM
+        )
+    }
+
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
         buf.write_var(self.0);
     }
@@ -674,6 +742,36 @@ mod tests {
         let mut buf = Cursor::new(&[4, 4, 0, 255, 128]);
         let decoded = Frame::decode(&mut buf);
         assert_matches!(decoded, Err(FrameError::Incomplete(6)));
+    }
+
+    #[test]
+    fn unknown_prefix_keeps_wire_length_as_u64() {
+        let mut encoded = Vec::new();
+        FrameType::RESERVED.encode(&mut encoded);
+        encoded.write_var(VarInt::MAX.0);
+
+        let mut buf = Cursor::new(encoded);
+        assert_eq!(
+            Frame::decode_unknown_prefix(&mut buf),
+            Ok(Some((FrameType::RESERVED.0, VarInt::MAX.0)))
+        );
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn frame_length_larger_than_usize_is_rejected() {
+        let mut encoded = Vec::new();
+        FrameType::HEADERS.encode(&mut encoded);
+        encoded.write_var(u64::from(u32::MAX) + 1);
+
+        assert_matches!(
+            Frame::decode_headers_prefix(&mut Cursor::new(&encoded)),
+            Err(FrameError::InvalidFrameValue)
+        );
+        assert_matches!(
+            Frame::decode(&mut Cursor::new(encoded)),
+            Err(FrameError::InvalidFrameValue)
+        );
     }
 
     fn codec_frame_check(mut frame: Frame<Bytes>, wire: &[u8], check_frame: Frame<Bytes>) {

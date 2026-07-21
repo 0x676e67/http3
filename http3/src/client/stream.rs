@@ -29,8 +29,9 @@ use std::{
 ///
 /// TODO: If data is polled before the response has been received, an error will be thrown.
 ///
-/// TODO: If trailers are polled but the body hasn't been fully received, an UNEXPECT_FRAME error will be
-/// thrown
+/// Calling [`RequestStream::recv_trailers()`] before the response body has been
+/// fully received returns an `H3_FRAME_UNEXPECTED` stream error. The body remains
+/// available through [`RequestStream::recv_data()`].
 ///
 /// Whenever the client wants to cancel this request, it can call [`RequestStream::stop_sending()`], which will
 /// put an end to any transfer concerning it.
