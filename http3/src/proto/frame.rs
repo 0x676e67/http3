@@ -71,6 +71,7 @@ pub enum Frame<B> {
 ///
 /// Decoding received frames does not handle `Data` frames payload. Instead, receiving it
 /// and passing it to the user is left under the responsibility of `RequestStream`s.
+#[cfg_attr(target_pointer_width = "32", derive(Debug))]
 pub struct PayloadLen(pub usize);
 
 impl From<usize> for PayloadLen {
