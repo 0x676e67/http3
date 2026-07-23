@@ -117,9 +117,9 @@ impl Builder {
     /// the setting is omitted and the protocol default of `0` applies. Passing `0`
     /// explicitly sends the setting with value `0`.
     ///
-    /// QPACK does not define a separate numeric cap. HTTP/3 setting values use
-    /// QUIC variable-length integers, whose largest value is 2^62-1. The chosen
-    /// value should still reflect the memory this decoder is prepared to use.
+    /// HTTP/3 encodes this setting as a QUIC variable-length integer, so values
+    /// can range up to `2^62 - 1`. Set no more table memory than the decoder can
+    /// hold for this connection.
     ///
     /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3)
     /// and [RFC 9114, Section 7.2.4](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4).
@@ -134,10 +134,9 @@ impl Builder {
     /// the setting is omitted and the protocol default of `0` applies. Passing `0`
     /// explicitly sends the setting with value `0`.
     ///
-    /// QPACK does not define an additional numeric maximum. HTTP/3 setting
-    /// values are QUIC variable-length integers, so the largest encodable value is
-    /// `2^62 - 1`. Large values increase the decoder state a peer can require;
-    /// choose a limit appropriate for the connection's memory budget.
+    /// HTTP/3 encodes this setting as a QUIC variable-length integer, and QPACK
+    /// sets no smaller limit. Each blocked stream needs decoder bookkeeping, so
+    /// choose a value that fits the connection's memory budget.
     ///
     /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2),
     /// [Section 7.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3), and

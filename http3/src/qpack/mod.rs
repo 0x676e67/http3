@@ -67,11 +67,11 @@ pub(crate) enum QpackEvent {
     DecoderAccessWaker(Waker),
 }
 
-/// Blocked field sections owned by the connection driver.
+/// Tracks blocked field sections in the connection driver.
 ///
-/// Entries are ordered by Required Insert Count so an encoder-stream update can
-/// remove only the streams that became decodable. Keeping this state in the
-/// driver avoids shared locking on request-stream poll and drop paths.
+/// Entries are ordered by Required Insert Count, allowing an encoder-stream
+/// update to wake only newly decodable streams. Driver ownership avoids a shared
+/// registry lock in request polling and drop paths.
 pub(crate) struct BlockedStreamRegistry {
     max_blocked_streams: u64,
     insert_count: usize,
@@ -89,9 +89,9 @@ impl BlockedStreamRegistry {
 
     /// Registers a field section that is waiting for dynamic table entries.
     ///
-    /// Repeated polls replace the stored task waker without consuming another
-    /// blocked-stream slot. A registration that races with an encoder update is
-    /// woken immediately when its Required Insert Count is already available.
+    /// Repeated polls update the stored waker without using another slot. If the
+    /// encoder update arrives first, registration sees the current Insert Count
+    /// and wakes the task immediately.
     ///
     /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2)
     /// and [Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
@@ -136,8 +136,8 @@ impl BlockedStreamRegistry {
 
     /// Advances the decoder Insert Count and wakes every newly decodable stream.
     ///
-    /// A stream ceases to be blocked as soon as the decoder has received all
-    /// referenced entries; its request task does not need to run first.
+    /// A stream stops counting as blocked as soon as the decoder has all its
+    /// referenced entries. The request task does not need to poll first.
     ///
     /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
     pub(crate) fn update_insert_count(&mut self, insert_count: usize) {
@@ -175,18 +175,17 @@ struct QpackDecoderInner {
 
 /// Shared QPACK decoder state for a single HTTP/3 connection.
 ///
-/// The decoder is read-mostly: header blocks decode through read guards, while the
-/// connection driver updates the dynamic table through a write guard. Request wakers
-/// wait for dynamic-table updates; the writer waker lets the driver resume after active
-/// decodes release their read guards.
+/// Request tasks use read guards to decode field sections. The connection driver
+/// takes a write guard for dynamic table updates and resumes when active readers
+/// release their guards.
 #[derive(Clone)]
 pub(crate) struct QpackDecoder(Arc<QpackDecoderInner>);
 
 impl QpackDecoder {
     /// Creates the connection's shared decoder.
     ///
-    /// `decoder_waker` sends blocked request wakers to the connection driver. The
-    /// receiving side is kept with the connection's QPACK streams.
+    /// `decoder_events_send` carries decoder-stream work and request wakers to
+    /// the connection driver.
     #[inline(always)]
     pub(crate) fn new(
         decoder: Decoder,
@@ -205,6 +204,8 @@ impl QpackDecoder {
     /// This is fixed from the advertised maximum table capacity when the
     /// connection is created. It does not indicate whether the table currently
     /// contains entries or whether its current capacity was later reduced to zero.
+    ///
+    /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3).
     pub(crate) fn dynamic_table_enabled(&self) -> bool {
         self.0.decoder_dynamic_table
     }
@@ -212,8 +213,9 @@ impl QpackDecoder {
     /// Queues a blocked field section for the connection driver.
     ///
     /// The driver owns blocked-stream accounting and wakes the request when its
-    /// Required Insert Count is available. This also closes the race where the
-    /// encoder stream advances before the registration event is consumed.
+    /// Required Insert Count is available. A delayed registration is compared
+    /// with the current Insert Count, so an earlier encoder update cannot leave
+    /// the request asleep.
     ///
     /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2)
     /// and [Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
@@ -242,8 +244,8 @@ impl QpackDecoder {
 
     /// Queues removal of a blocked field section from the driver registry.
     ///
-    /// Removal is idempotent because an encoder-stream update may already have
-    /// released the entry before the request task runs again.
+    /// An encoder-stream update may release the entry before the request runs
+    /// again, so removal is idempotent.
     ///
     /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
     pub(crate) fn release_blocked_stream(&self, stream_id: StreamId, required_ref: usize) -> bool {
@@ -314,10 +316,10 @@ impl QpackDecoder {
 
     /// Applies instructions received on the peer QPACK encoder stream.
     ///
-    /// Updating the dynamic table requires exclusive access to the decoder. If a
-    /// request is decoding a field section, this registers the connection driver
-    /// and returns [`Poll::Pending`]. The second lock attempt closes the gap between
-    /// the failed first attempt and waker registration.
+    /// Updating the dynamic table requires exclusive decoder access. If a request
+    /// holds a read guard, the connection driver registers its waker and returns
+    /// [`Poll::Pending`]. It retries the lock after registration in case the last
+    /// reader finished in between.
     pub(crate) fn poll_on_recv_encoder<R: Buf + Clone, W: BufMut>(
         &self,
         cx: &mut Context<'_>,
@@ -330,7 +332,7 @@ impl QpackDecoder {
             _ => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
         }
 
-        // A reader may finish between the first attempt and registration.
+        // The last reader may finish between the first attempt and registration.
         self.0.write_waker.register(cx.waker());
 
         match self.0.decoder.try_write() {
@@ -346,7 +348,7 @@ impl QpackDecoder {
         decoder: RwLockReadGuard<'_, Decoder>,
         decoded: Result<Decoded, DecoderError>,
     ) -> Poll<Result<Decoded, DecoderError>> {
-        // A writer blocked in poll_on_recv_encoder can continue once the guard drops.
+        // A driver blocked in poll_on_recv_encoder can continue after the guard drops.
         drop(decoder);
         self.0.write_waker.wake();
         Poll::Ready(decoded)
@@ -354,14 +356,14 @@ impl QpackDecoder {
 
     /// Decodes one QPACK field section.
     ///
-    /// Stateless decoding is used when dynamic-table support is disabled. Otherwise
-    /// the decoder is read-locked so request tasks can decode concurrently while the
-    /// connection driver is idle.
+    /// When dynamic table support is disabled, decoding needs no shared table or
+    /// lock. Otherwise, request tasks take read guards and may decode concurrently.
     ///
-    /// [`DecoderError::MissingRefs`] returns the Required Insert Count to the
-    /// request stream, which registers itself with the connection driver before
-    /// returning [`Poll::Pending`]. A direct [`Poll::Pending`] means the encoder
-    /// stream currently owns the write lock.
+    /// [`DecoderError::MissingRefs`] contains the Required Insert Count used to
+    /// register the request with the connection driver. A direct [`Poll::Pending`]
+    /// means that the driver currently holds the write lock.
+    ///
+    /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
     pub(crate) fn poll_decode_header<T: Buf>(
         &self,
         cx: &mut Context<'_>,
