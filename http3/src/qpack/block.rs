@@ -128,8 +128,8 @@ impl HeaderPrefix {
         total_inserted: usize,
         max_table_size: usize,
     ) -> Result<(usize, usize), ParseError> {
-        // RFC 9204 section 4.5.1.1 defines this reconstruction. It uses the
-        // advertised maximum capacity, not the table's current capacity.
+        // Required Insert Count reconstruction uses the advertised maximum
+        // capacity, not the table's current capacity.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
         let required = if self.encoded_insert_count == 0 {
             0
@@ -142,8 +142,8 @@ impl HeaderPrefix {
                 ));
             }
 
-            // Reconstruct the largest value no more than MaxEntries ahead of the
-            // decoder's current insert count, as specified by RFC 9204 section 4.5.1.1.
+            // Choose the largest candidate no more than MaxEntries ahead of the
+            // decoder's current Insert Count.
             let max_value = total_inserted.checked_add(max_entries).ok_or(
                 ParseError::InvalidRequiredInsertCount(self.encoded_insert_count),
             )?;
@@ -178,8 +178,8 @@ impl HeaderPrefix {
             delta_base: self.delta_base,
         };
 
-        // Delta Base comes from the peer. Reject a Base outside `usize`
-        // instead of allowing the field section prefix to wrap or panic.
+        // Delta Base is peer-controlled. Checked arithmetic rejects a Base that
+        // cannot be represented as `usize`.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1
         let base = if required == 0 {
             0
@@ -582,8 +582,8 @@ mod test {
         prefix_int::encode(7, 0, 2, &mut field_section);
 
         let prefix = HeaderPrefix::decode(&mut Cursor::new(field_section)).unwrap();
-        // With MaxEntries set to one, EIC 1 reconstructs a Required Insert
-        // Count of `usize::MAX - 1`; adding the wire Delta Base must fail.
+        // With MaxEntries set to one, EIC 1 reconstructs Required Insert Count
+        // `usize::MAX - 1`. Adding the wire Delta Base must fail.
         assert_eq!(
             prefix.get(usize::MAX - 1, 32),
             Err(ParseError::InvalidBase {
@@ -596,8 +596,8 @@ mod test {
 
     #[test]
     fn negative_delta_base_arithmetic_overflow_is_rejected() {
-        // This value is wire-representable on 32-bit targets. Exercise the
-        // arithmetic boundary directly so the regression is covered everywhere.
+        // This value is wire-representable on 32-bit targets, so the test covers
+        // the arithmetic boundary on every supported architecture.
         let prefix = HeaderPrefix {
             encoded_insert_count: 2,
             sign_negative: true,

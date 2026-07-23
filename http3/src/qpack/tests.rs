@@ -221,8 +221,8 @@ fn decoder_update_releases_blocked_stream_budget_before_request_repoll() {
         Poll::Ready(Err(DecoderError::MissingRefs(2)))
     );
 
-    // The first stream became unblocked when Insert Count reached one, even
-    // though its request task has not polled the field section again.
+    // Insert Count one released the first stream before its request task polled
+    // the field section again.
     // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1
     assert_eq!(
         blocked_streams.register(StreamId(4), 2, cx.waker().clone()),
@@ -238,8 +238,8 @@ fn blocked_registration_after_decoder_update_wakes_immediately() {
     let wake_count = Arc::new(WakeCounter(AtomicUsize::new(0)));
     let waker = futures_util::task::waker(wake_count.clone());
 
-    // The decoder update can win the race with the request's registration
-    // event. Such a field section is already decodable and consumes no slot.
+    // The update arrived before registration. The registry sees that the field
+    // section is already decodable, wakes it, and uses no blocked-stream slot.
     // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1
     assert_eq!(blocked_streams.register(StreamId(0), 1, waker), Ok(()));
     assert_eq!(wake_count.0.load(Ordering::Relaxed), 1);

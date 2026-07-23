@@ -43,7 +43,7 @@ impl<'a> DynamicTableDecoder<'a> {
     }
 
     pub(super) fn get_postbase(&self, index: usize) -> Result<&HeaderField, Error> {
-        // Apply the same Required Insert Count bound to post-base references.
+        // Post-base references are also bounded by Required Insert Count.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
         self.base
             .checked_add(index)
@@ -295,11 +295,11 @@ impl DynamicTable {
 
     /// Sets the number of streams the peer permits this encoder to risk blocking.
     ///
-    /// QPACK defines no additional numeric upper bound for this setting. HTTP/3
-    /// carries it as a QUIC variable-length integer, and callers should choose a
-    /// value that keeps reference-tracking memory within their own limits.
+    /// HTTP/3 carries this setting as a QUIC variable-length integer, and QPACK
+    /// sets no smaller limit. Callers can use a lower value to bound the memory
+    /// needed to track outstanding references.
     ///
-    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2)
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2),
     /// [Section 7.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3), and
     /// [RFC 9114, Section 7.2.4](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4).
     pub fn set_max_blocked(&mut self, max: u64) -> Result<(), Error> {
@@ -593,12 +593,11 @@ mod tests {
     }
 
     #[test]
-    fn table_capacity_is_not_limited_by_an_obsolete_draft_bound() {
+    fn table_capacity_accepts_one_gibibyte() {
         let mut table = build_table();
         let capacity = 1usize << 30;
 
-        // RFC 9204 uses the decoder's advertised setting as the limit; it does
-        // not retain the 2^30-1 bound from earlier drafts.
+        // The decoder's advertised setting is the limit on dynamic table capacity.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3
         assert_eq!(table.set_max_size(capacity), Ok(()));
         assert_eq!(table.max_mem_size(), capacity);
