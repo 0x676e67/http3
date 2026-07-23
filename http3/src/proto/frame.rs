@@ -587,8 +587,8 @@ impl FrameHeader for Settings {
 
 impl Settings {
     pub fn insert(&mut self, id: SettingId, value: u64) -> Result<(), SettingsError> {
-        // SETTINGS identifiers and values are QUIC variable-length integers.
-        // Validate both here so frame length calculation and encoding stay infallible.
+        // Frame length calculation and encoding assume that both SETTINGS
+        // identifiers and values fit in QUIC variable-length integers.
         // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4
         if VarInt::from_u64(id.0).is_err() {
             return Err(SettingsError::InvalidSettingId(id.0));

@@ -264,8 +264,8 @@ impl DecoderInstruction {
 
 /// Increases the encoder's Known Received Count.
 ///
-/// The instruction uses a 6-bit-prefixed integer. The prefix controls the wire
-/// encoding and does not impose a 6-bit value limit.
+/// The increment uses a 6-bit-prefixed integer. Values above 63 continue in
+/// subsequent bytes.
 ///
 /// See [RFC 9204, Section 4.4.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.3).
 #[derive(Debug, PartialEq)]

@@ -232,13 +232,10 @@ impl Decoder {
         self.max_table_capacity > 0
     }
 
-    /// Returns the maximum number of request or push streams the peer encoder
-    /// is permitted to block concurrently.
+    /// Returns the advertised limit on concurrently blocked request or push streams.
     ///
-    /// This is the value advertised in `SETTINGS_QPACK_BLOCKED_STREAMS`. A zero
-    /// value requires the peer to avoid field sections that cannot be decoded
-    /// immediately from the decoder's current dynamic table state. QPACK defines
-    /// no additional numeric maximum for this setting.
+    /// This is the `SETTINGS_QPACK_BLOCKED_STREAMS` value. A value of zero means
+    /// every field section must be decodable from the current table state.
     ///
     /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2),
     /// [Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5), and
@@ -323,10 +320,10 @@ impl Decoder {
         self.on_encoder_recv_with(read, write, Self::parse_instruction)
     }
 
-    /// Processes encoder instructions through a checkpointable receive cursor.
+    /// Processes encoder instructions from a checkpointable receive cursor.
     ///
-    /// Unlike the public contiguous-buffer path, this preserves an incomplete
-    /// instruction that spans multiple QUIC receive chunks.
+    /// Input advances only after a complete instruction is parsed. A trailing
+    /// partial instruction remains available for the next receive chunk.
     ///
     /// See [RFC 9204, Section 4.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3).
     pub(crate) fn on_encoder_recv_buffered<R: Buf + Clone, W: BufMut>(
@@ -350,12 +347,12 @@ impl Decoder {
             trace!("instruction {:?}", instruction);
 
             match instruction {
-                // An encoder-stream insertion is mandatory; unlike the local
-                // encoder path it cannot silently choose a literal fallback.
+                // Peer insertions must update the decoder table. They cannot use
+                // the local encoder's literal fallback.
                 Instruction::Insert(field) => self.table.put_decoder(field)?,
                 Instruction::TableSizeUpdate(size) => {
-                    // The encoder can change current capacity but cannot exceed
-                    // the limit advertised in our SETTINGS.
+                    // The encoder may change the current capacity within the
+                    // limit advertised in our SETTINGS.
                     // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.1
                     if size > self.max_table_capacity {
                         return Err(DynamicTableError::MaximumTableSizeTooLarge.into());
@@ -366,8 +363,8 @@ impl Decoder {
         }
 
         if self.table.total_inserted() != inserted_on_start {
-            // The 6-bit field is a prefix, not an upper bound. Large batches
-            // continue in the prefix integer representation.
+            // Six bits form the integer prefix. Values above 63 continue in the
+            // following bytes.
             // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.3
             InsertCountIncrement(self.table.total_inserted() - inserted_on_start).encode(write);
         }
@@ -396,8 +393,8 @@ impl Decoder {
             return Ok(None);
         }
 
-        // Encoder instructions can cross QUIC receive chunks. Parse against a
-        // checkpoint and commit only after the complete instruction is present.
+        // Parse from a cloned cursor and advance the real cursor only after a
+        // complete instruction is available.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3
         let before = read.remaining();
         let mut buf = read.clone();
@@ -799,9 +796,9 @@ mod tests {
         let mut decoder = Decoder::new(0, 0).unwrap();
         let mut decoder_stream = Vec::new();
 
-        // RFC 9204 forbids all encoder instructions while the advertised
-        // maximum is zero, but does not prescribe a receiver error for this
-        // harmless no-op. Accept it for interoperability.
+        // Section 3.2.3 says an encoder must send no instructions when the
+        // advertised maximum is zero. A zero-capacity update is valid syntax and
+        // leaves the table at zero, so the decoder accepts it for interoperability.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.1
         assert_eq!(
@@ -1475,9 +1472,8 @@ mod tests {
     #[test]
     fn decode_post_base_name_ref_header_field() {
         let mut buf = vec![];
-        // Base=2 and post-base index 0 refers to absolute entry 3.  The
-        // Required Insert Count has to cover that entry before this field
-        // section is valid.
+        // Base 2 and post-base index 0 refer to absolute entry 3. The Required
+        // Insert Count must cover that entry.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.5
         HeaderPrefix::new(3, 2, 4, TABLE_SIZE).encode(&mut buf);
@@ -1493,9 +1489,8 @@ mod tests {
     #[test]
     fn reject_post_base_name_ref_past_required_insert_count() {
         let mut buf = vec![];
-        // This is the old fixture kept as the invalid case: it declares
-        // Required Insert Count 2, while post-base index 0 from Base=2 names
-        // absolute entry 3.
+        // Required Insert Count 2 does not cover absolute entry 3, which is
+        // selected by post-base index 0 from Base 2.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.5
         HeaderPrefix::new(2, 2, 4, TABLE_SIZE).encode(&mut buf);

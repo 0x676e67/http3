@@ -85,11 +85,10 @@ fn wake_qpack_waiters_on_connection_error(
         waker.wake();
     }
 
-    // No new QPACK work is useful after a terminal connection error. Closing
-    // and draining here also reaches wakers whose registration events had not
-    // yet reached the driver-owned registry.
-    // `try_recv` is only used on this closed, terminal path; normal driver
-    // polling continues to use `poll_recv` with its task context.
+    // Once the connection fails, no QPACK event can make progress. Close the
+    // channel and drain it so wakers not yet registered by the driver are also
+    // released. Normal polling uses `poll_recv`; `try_recv` is limited to this
+    // closed path.
     decoder_events_recv.close();
     while let Ok(event) = decoder_events_recv.try_recv() {
         match event {
@@ -178,10 +177,10 @@ where
     C: quic::Connection<B>,
     B: Buf,
 {
-    /// Wakes request tasks that are waiting for QPACK progress.
+    /// Wakes every request task waiting for QPACK progress.
     ///
-    /// A connection error makes both decoder access and missing dynamic table
-    /// references terminal, so no request may remain pending on the driver.
+    /// The driver cannot provide decoder access or missing table entries after
+    /// a connection error, so no request may remain pending on it.
     pub(crate) fn wake_qpack_waiters_on_connection_error(&mut self) {
         let qpack = &mut self.qpack_streams;
         wake_qpack_waiters_on_connection_error(
@@ -614,9 +613,9 @@ where
 
         loop {
             if encoder_recv.has_remaining() {
-                // A QPACK instruction may span multiple receive buffers. The
-                // cursor crosses those buffers without coalescing them, and only
-                // bytes belonging to complete instructions are committed.
+                // Parse across receive buffers without coalescing them. Advance
+                // only through complete instructions so trailing bytes remain
+                // buffered for the next read.
                 // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3
                 let (result, consumed) = {
                     let mut read = encoder_recv.buf().cursor();
@@ -712,8 +711,8 @@ where
     where
         C::SendStream: quic::SendStreamUnframed<B>,
     {
-        // The QPACK decoder stream is a critical stream. Its closure is an
-        // H3_CLOSED_CRITICAL_STREAM error, not an instruction decoding error.
+        // Losing the QPACK decoder stream is H3_CLOSED_CRITICAL_STREAM. QPACK
+        // instruction errors apply to the peer's encoder stream instead.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
         if let Err(err) = self.poll_qpack_decoder_events(cx, false) {
             return Poll::Ready(Err(err));
@@ -1062,8 +1061,8 @@ where
             waker.wake();
         }
 
-        // Requests can enqueue a waker while the decoder write lock is held.
-        // The update is complete, so newly drained waiters can wake immediately.
+        // The write guard has been released. Requests queued during the update
+        // can wake as their events are drained.
         self.poll_qpack_decoder_events(cx, true)
     }
 
@@ -1109,8 +1108,8 @@ where
                     .qpack_streams
                     .blocked_streams
                     .release(stream_id, required_ref),
-                // Decoder-access wakers share this channel with decoder-stream
-                // work, but ordinary flushes retain them until the writer releases.
+                // A request waiting for the decoder read lock must sleep until
+                // the driver releases its write lock.
                 QpackEvent::DecoderAccessWaker(waker) => {
                     if wake_waiters {
                         waker.wake();
@@ -1133,11 +1132,10 @@ struct DecoderGuard {
 }
 
 impl DecoderGuard {
-    /// Marks this request stream as blocked on missing dynamic table entries.
+    /// Registers this stream after decoding reports missing dynamic table entries.
     ///
-    /// The connection driver owns the blocked-stream registry. Repeated polls
-    /// refresh the task waker, while a changed Required Insert Count first
-    /// releases the previous registration.
+    /// Repeated polls update the waker for the same Required Insert Count. If the
+    /// count changes, the previous driver registration is released first.
     ///
     /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
     fn block(&mut self, required_ref: usize, waker: &Waker) -> Result<(), qpack::DecoderError> {
@@ -1151,11 +1149,10 @@ impl DecoderGuard {
         Ok(())
     }
 
-    /// Removes this request stream from the blocked-stream count.
+    /// Removes this stream's active blocked-field registration.
     ///
-    /// This is called after the field section becomes decodable and when the
-    /// request is dropped. Removal is harmless if an encoder-stream update has
-    /// already removed and woken this entry.
+    /// An encoder-stream update may already have removed the entry, so release
+    /// is idempotent.
     ///
     /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
     fn unblock(&mut self) {
@@ -1165,11 +1162,10 @@ impl DecoderGuard {
         }
     }
 
-    /// Queues a Section Acknowledgment after a dynamic field section is decoded.
+    /// Queues a Section Acknowledgment for a decoded dynamic field section.
     ///
-    /// The decoder sends this only for field sections whose Required Insert
-    /// Count is not zero. Static-table and literal-only sections do not need an
-    /// acknowledgment.
+    /// Only a non-zero Required Insert Count needs acknowledgment. Static-table
+    /// and literal-only field sections have a count of zero.
     ///
     /// See [RFC 9204, Section 4.4.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1).
     fn acknowledge(&mut self, dyn_ref: bool) -> Result<(), qpack::DecoderError> {
@@ -1181,10 +1177,9 @@ impl DecoderGuard {
         Ok(())
     }
 
-    /// Marks the receive side as complete without sending Stream Cancellation.
+    /// Marks the receive side complete without sending Stream Cancellation.
     ///
-    /// Reaching the end of the receive stream is normal completion, not an
-    /// abandoned read.
+    /// End of stream is normal completion and does not abandon any field section.
     ///
     /// See [RFC 9204, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
     fn finish_reading(&mut self) {
@@ -1192,10 +1187,10 @@ impl DecoderGuard {
         self.cancel_on_drop = false;
     }
 
-    /// Cancels outstanding field sections when reading is abandoned.
+    /// Cancels outstanding field sections when the receive side is abandoned.
     ///
-    /// The operation is idempotent because explicit STOP_SENDING and Drop can
-    /// both observe the same abandoned receive side.
+    /// STOP_SENDING and `Drop` can both reach this path, so cancellation is
+    /// queued at most once.
     ///
     /// See [RFC 9204, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
     fn cancel_reading(&mut self) {
@@ -1250,8 +1245,8 @@ where
         let decoder_guard = decoder.dynamic_table_enabled().then(|| DecoderGuard {
             stream_id: stream.id(),
             shared: conn_state.clone(),
-            // Until the field section is successfully decoded, dropping the guard
-            // abandons it and must notify the peer encoder.
+            // Dropping before end of stream abandons any remaining field section
+            // and requires Stream Cancellation.
             cancel_on_drop: true,
             blocked: None,
             decoder: decoder.clone(),
@@ -1282,7 +1277,7 @@ impl<S, B> RequestStream<S, B>
 where
     S: quic::RecvStream,
 {
-    /// Cancels QPACK state associated with an abandoned receive side.
+    /// Cancels QPACK state when the receive side is reset or abandoned.
     ///
     /// See [RFC 9204, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
     pub(crate) fn cancel_qpack_reading(&mut self) {
@@ -1291,7 +1286,7 @@ where
         }
     }
 
-    /// Converts a terminal receive error after canceling outstanding QPACK work.
+    /// Cancels outstanding QPACK work before converting a receive error.
     ///
     /// See [RFC 9204, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
     pub(crate) fn handle_receive_stream_error(&mut self, error: FrameStreamError) -> StreamError {
