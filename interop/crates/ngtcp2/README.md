@@ -5,18 +5,16 @@ Rust wrapper library for [ngtcp2](https://github.com/ngtcp2/ngtcp2) and
 
 ## Scope
 
-This crate is maintained only for the
-[0x676e67/http3-rs](https://github.com/0x676e67/http3-rs) interoperability
-test suite. It wraps the local `ngtcp2-sys` and `nghttp3-sys` crates with a
-small Rust API for client/server interop backends.
-
-It is not intended or recommended for production applications.
+This crate is maintained in the
+[http3-rs](https://github.com/0x676e67/http3-rs) repository. It wraps
+`ngtcp2-sys` and `nghttp3-sys` with a small Rust API for HTTP/3 clients and
+servers.
 
 ## Features
 
 - Integrates ngtcp2 QUIC with nghttp3 HTTP/3.
 - Uses aws-lc as the TLS backend.
-- Provides the Rust API needed by the interop tests.
+- Provides a Rust API for building HTTP/3 clients and servers.
 
 ## Dependencies
 

@@ -252,16 +252,6 @@ impl Header {
 }
 
 // ============================================================================
-// WebTransport session IDs
-// ============================================================================
-//
-// nghttp3 uses `int64_t` for WebTransport session IDs. A type alias keeps the
-// wrapper API readable.
-
-/// WebTransport session ID.
-pub type SessionId = i64;
-
-// ============================================================================
 // HTTP/3 events
 // ============================================================================
 //
@@ -298,10 +288,4 @@ pub enum Http3Event {
     Trailer { stream_id: StreamId, header: Header },
     /// Trailer block completed.
     TrailersEnd { stream_id: StreamId },
-    /// WebTransport data received.
-    WebTransportData {
-        session_id: SessionId,
-        stream_id: StreamId,
-        data: Vec<u8>,
-    },
 }
