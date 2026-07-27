@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use interop::{
     BoxError, ClientInteropConfig, DEFAULT_INTEROP_CASE, FIELD_SECTION_LIMIT_TEST_MAX,
     INTEROP_PADDING_HEADER_NAME, INTEROP_TEST_TIMEOUT, TestCertificate, generate_test_certificate,
@@ -191,6 +191,17 @@ where
         .map(|path| path.as_str())
         .and_then(interop_case_from_path)
         .unwrap_or(DEFAULT_INTEROP_CASE);
+
+    // RFC 9114 Section 4.1 allows a server to stop reading a request early,
+    // but it should use H3_NO_ERROR when asking the client to stop sending.
+    // This test server consumes the request instead, so dropping the Quinn
+    // receive stream cannot race the client's clean finish with STOP_SENDING.
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
+    while let Some(mut data) = stream.recv_data().await? {
+        data.advance(data.remaining());
+    }
+    let _ = stream.recv_trailers().await?;
+
     let body = interop_body(case);
     let status = http::StatusCode::from_u16(case.status)?;
     let content_length = body.len().to_string();

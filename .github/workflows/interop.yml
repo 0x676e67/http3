@@ -44,9 +44,7 @@ jobs:
         run: brew install cmake nasm pkg-config
 
       - name: Run interop tests
-        # Each test keeps its own concurrent request matrix. Running the
-        # top-level tests serially isolates their QUIC endpoints and runtimes.
-        run: cargo test -p interop -- --test-threads=1
+        run: cargo test -p interop
 
       - name: Run real public interop tests
         run: cargo test -p interop --test client -- --ignored --nocapture --test-threads=1
