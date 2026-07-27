@@ -273,7 +273,11 @@ async fn serve_request(
     header_limit_rejects: Option<HeaderLimitRejectSender>,
 ) -> Result<(), BoxError> {
     let (request, mut stream) = resolver.resolve_request().await?;
+
+    // Consume the complete request so the h3 stream reaches a clean receive
+    // state before its transport adapter is dropped.
     while let Some(_chunk) = stream.recv_data().await? {}
+    let _ = stream.recv_trailers().await?;
 
     let case = request
         .uri()
