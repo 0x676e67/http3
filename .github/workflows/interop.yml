@@ -47,4 +47,4 @@ jobs:
         run: cargo test -p interop
 
       - name: Run real public interop tests
-        run: cargo test -p interop --test client -- --ignored --nocapture --test-threads=1
+        run: cargo test -p interop --test client -- --ignored --nocapture
