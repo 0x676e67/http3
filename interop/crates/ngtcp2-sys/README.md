@@ -1,26 +1,24 @@
 # ngtcp2-sys
 
-Rust FFI bindings for [ngtcp2](https://github.com/ngtcp2/ngtcp2).
+[![crates.io](https://img.shields.io/crates/v/ngtcp2-sys.svg)](https://crates.io/crates/ngtcp2-sys)
+[![docs.rs](https://docs.rs/ngtcp2-sys/badge.svg)](https://docs.rs/ngtcp2-sys)
 
-## Scope
+Rust FFI bindings to [ngtcp2](https://github.com/ngtcp2/ngtcp2).
 
-This crate is maintained only for the
-[0x676e67/http3-rs](https://github.com/0x676e67/http3-rs) interoperability
-test suite. It builds the bundled ngtcp2 source and exposes low-level bindings
-used by local QUIC/HTTP/3 server backends.
+This crate builds the bundled ngtcp2 source with CMake and generates bindings
+for the current Cargo target. It uses aws-lc as its TLS backend.
 
-It is not intended or recommended for production applications.
+## Release support
 
-## Features
+The current supported releases are `ngtcp2-sys` 0.2 and ngtcp2 1.25.
 
-- Builds ngtcp2 from the bundled source tree.
-- Uses CMake for the native build.
-- Uses aws-lc as the TLS backend.
-- Generates Rust bindings for the current Cargo target.
+This crate is maintained in the
+[http3-rs](https://github.com/0x676e67/http3-rs) repository. New versions are
+released from time to time.
 
-## Build Requirements
+## Build requirements
 
 - CMake
-- A C compiler such as gcc, clang, or MSVC
-- libclang, required by bindgen
+- A C compiler such as GCC, Clang, or MSVC
+- libclang
 - Go, required to build aws-lc
