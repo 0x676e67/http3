@@ -10,10 +10,6 @@ env:
   core_package_args: >-
     --workspace
     --exclude interop
-    --exclude nghttp3-sys
-    --exclude ngtcp2
-    --exclude ngtcp2-sys
-    --exclude tokio-ngtcp2
   toolchain_style: stable
   toolchain_msrv: "1.85"
   toolchain_http3_quinn_msrv: "1.85"

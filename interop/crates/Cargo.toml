@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "nghttp3-sys",
+    "ngtcp2",
+    "ngtcp2-sys",
+    "tokio-ngtcp2",
+]
+resolver = "2"
+
+[workspace.package]
+repository = "https://github.com/0x676e67/http3-rs"
+
+[workspace.dependencies]
+nghttp3-sys = { version = "=0.2.0", path = "nghttp3-sys" }
+ngtcp2-sys = { version = "=0.2.0", path = "ngtcp2-sys" }
+ngtcp2 = { version = "=0.2.0", path = "ngtcp2" }
+rcgen = "=0.14.5"
+serial_test = "3.4"
+tokio = { version = "1", default-features = false }
