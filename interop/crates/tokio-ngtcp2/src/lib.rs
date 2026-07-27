@@ -5,11 +5,9 @@
 
 mod client;
 mod server;
-mod webtransport;
 
 pub use client::Client;
 pub use server::Server;
-pub use webtransport::{ClientWebTransportSession, ServerWebTransportSession};
 
 use std::net::SocketAddr;
 use std::time::Instant;

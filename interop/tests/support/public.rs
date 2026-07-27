@@ -10,6 +10,7 @@ use tokio::task::{JoinHandle, JoinSet};
 const ALPN_H3: &[u8] = b"h3";
 const REAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const REAL_INTEROP_TIMEOUT: Duration = Duration::from_secs(120);
+const REAL_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
 struct PublicServerTarget {
@@ -255,7 +256,7 @@ async fn run_public_server_requests_at_addr(
     drop(send_request);
     driver_task.abort();
     endpoint.close(0u32.into(), b"done");
-    endpoint.wait_idle().await;
+    let _ = tokio::time::timeout(REAL_IDLE_TIMEOUT, endpoint.wait_idle()).await;
 
     Ok(())
 }

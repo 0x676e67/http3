@@ -1,7 +1,6 @@
 //! ngtcp2 - Rust bindings for ngtcp2/nghttp3.
 //!
-//! Provides Rust bindings for ngtcp2 (QUIC) and nghttp3 (HTTP/3 +
-//! WebTransport).
+//! Provides Rust bindings for ngtcp2 (QUIC) and nghttp3 (HTTP/3).
 
 mod config;
 mod conn;
@@ -17,8 +16,8 @@ pub use crypto::{TlsContext, TlsSession};
 pub use error::{Error, Result};
 pub use h3::Http3Connection;
 pub use types::{
-    ConnectionId, Header, Http3Event, PacketInfo, PathInfo, QuicVersion, SessionId,
-    StreamDirection, StreamId, StreamType,
+    ConnectionId, Header, Http3Event, PacketInfo, PathInfo, QuicVersion, StreamDirection, StreamId,
+    StreamType,
 };
 
 // Re-export selected ngtcp2-sys / nghttp3-sys types used by callers.
@@ -140,13 +139,6 @@ mod tests {
         let settings = nghttp3_settings::default_settings();
         assert_eq!(settings.max_field_section_size, 64 * 1024);
         assert_eq!(settings.enable_connect_protocol, 0);
-    }
-
-    #[test]
-    fn test_http3_settings_webtransport() {
-        let settings = nghttp3_settings::default_settings().with_webtransport();
-        assert_eq!(settings.enable_connect_protocol, 1);
-        assert_eq!(settings.h3_datagram, 1);
     }
 
     #[test]
