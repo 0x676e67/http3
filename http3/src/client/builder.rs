@@ -7,6 +7,7 @@ use std::{
 
 use bytes::{Buf, Bytes};
 
+use super::connection::{Connection, SendRequest};
 use crate::{
     config::Config,
     connection::ConnectionInner,
@@ -14,8 +15,6 @@ use crate::{
     proto::frame::SettingId,
     quic::{self},
 };
-
-use super::connection::{Connection, SendRequest};
 
 /// Start building a new HTTP/3 client
 pub fn builder() -> Builder {
@@ -45,14 +44,14 @@ where
 ///
 /// # Examples
 /// ```rust
-/// # use http3_rs::quic;
+/// # use http3::quic;
 /// # async fn doc<C, O, B>(quic: C)
 /// # where
 /// #   C: quic::Connection<B, OpenStreams = O>,
 /// #   O: quic::OpenStreams<B>,
 /// #   B: bytes::Buf,
 /// # {
-/// let http3_conn = http3_rs::client::builder()
+/// let http3_conn = http3::client::builder()
 ///     .max_field_section_size(8192)
 ///     .build(quic)
 ///     .await

@@ -1,13 +1,13 @@
-//! Public error types for the `http3-rs` crate.
+//! Public error types for the `http3` crate.
+use super::{codes::Code, internal_error::InternalConnectionError};
 use crate::quic::ConnectionErrorIncoming;
 
-use super::{codes::Code, internal_error::InternalConnectionError};
-
 /// This enum represents the closure of a connection because of an a closed quic connection
-/// This can be either from this endpoint because of a violation of the protocol or from the remote endpoint
+/// This can be either from this endpoint because of a violation of the protocol or from the remote
+/// endpoint
 ///
-/// When the code [`Code::H3_NO_ERROR`] is used bei this peer or the remote peer, the connection is closed without an error
-/// according to the [HTTP/3 specification](https://www.rfc-editor.org/rfc/rfc9114.html#name-http-3-error-codes)
+/// When the code [`Code::H3_NO_ERROR`] is used bei this peer or the remote peer, the connection is
+/// closed without an error according to the [HTTP/3 specification](https://www.rfc-editor.org/rfc/rfc9114.html#name-http-3-error-codes)
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ConnectionError {
@@ -108,8 +108,9 @@ pub enum StreamError {
     /// Error is used when violating the MAX_FIELD_SECTION_SIZE
     ///
     /// This can mean different things depending on the context
-    /// When sending a request, this means, that the request cannot be sent because the header is larger then permitted by the server
-    /// When receiving a request, this means, that the server sent a
+    /// When sending a request, this means, that the request cannot be sent because the header is
+    /// larger then permitted by the server When receiving a request, this means, that the
+    /// server sent a
     #[cfg_attr(
         not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"),
         non_exhaustive

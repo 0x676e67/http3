@@ -8,7 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-repository = "https://github.com/0x676e67/http3-rs"
+repository = "https://github.com/0x676e67/http3"
 
 [workspace.dependencies]
 nghttp3-sys = { version = "=0.2.0", path = "nghttp3-sys" }

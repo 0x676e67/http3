@@ -1,30 +1,30 @@
-//! Support for the http3-datagram-rs crate.
+//! Support for the http3-datagram crate.
 //!
-//! This module implements the traits defined in http3-datagram-rs for the Quinn crate.
+//! This module implements the traits defined in http3-datagram.
 
-use std::future::Future;
-use std::task::{Poll, ready};
-
-use futures_util::{StreamExt, stream};
-use http3_datagram_rs::datagram::EncodedDatagram;
-use http3_datagram_rs::quic_traits::{
-    DatagramConnectionExt, RecvDatagram, SendDatagram, SendDatagramErrorIncoming,
+use std::{
+    future::Future,
+    task::{Poll, ready},
 };
 
-use http3_datagram_rs::ConnectionErrorIncoming;
-
+use super::quic_impl::{ReadDatagram, SendDatagramError};
 use bytes::{Buf, Bytes};
-use quinn::{ReadDatagram, SendDatagramError};
+use futures_util::{StreamExt, stream};
+use http3_datagram::{
+    ConnectionErrorIncoming,
+    datagram::EncodedDatagram,
+    quic_traits::{DatagramConnectionExt, RecvDatagram, SendDatagram, SendDatagramErrorIncoming},
+};
 
 use crate::{BoxStreamSync, Connection, convert_connection_error};
 
 /// A Struct which allows to send datagrams over a QUIC connection.
 pub struct SendDatagramHandler {
-    conn: quinn::Connection,
+    conn: super::quic_impl::Connection,
 }
 
 impl<B: Buf> SendDatagram<B> for SendDatagramHandler {
-    fn send_datagram<T: Into<http3_datagram_rs::datagram::EncodedDatagram<B>>>(
+    fn send_datagram<T: Into<http3_datagram::datagram::EncodedDatagram<B>>>(
         &mut self,
         data: T,
     ) -> Result<(), SendDatagramErrorIncoming> {
@@ -86,18 +86,18 @@ fn convert_send_datagram_error(error: SendDatagramError) -> SendDatagramErrorInc
 }
 
 fn convert_h3_error_to_datagram_error(
-    error: http3_rs::quic::ConnectionErrorIncoming,
-) -> http3_datagram_rs::ConnectionErrorIncoming {
+    error: http3::quic::ConnectionErrorIncoming,
+) -> http3_datagram::ConnectionErrorIncoming {
     match error {
         ConnectionErrorIncoming::ApplicationClose { error_code } => {
-            http3_datagram_rs::ConnectionErrorIncoming::ApplicationClose { error_code }
+            http3_datagram::ConnectionErrorIncoming::ApplicationClose { error_code }
         }
-        ConnectionErrorIncoming::Timeout => http3_datagram_rs::ConnectionErrorIncoming::Timeout,
+        ConnectionErrorIncoming::Timeout => http3_datagram::ConnectionErrorIncoming::Timeout,
         ConnectionErrorIncoming::InternalError(err) => {
-            http3_datagram_rs::ConnectionErrorIncoming::InternalError(err)
+            http3_datagram::ConnectionErrorIncoming::InternalError(err)
         }
         ConnectionErrorIncoming::Undefined(error) => {
-            http3_datagram_rs::ConnectionErrorIncoming::Undefined(error)
+            http3_datagram::ConnectionErrorIncoming::Undefined(error)
         }
     }
 }

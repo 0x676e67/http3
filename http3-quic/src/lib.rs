@@ -1,6 +1,6 @@
-//! QUIC Transport implementation with Quinn
+//! QUIC Transport implementation
 //!
-//! This module implements QUIC traits with Quinn.
+//! This module implements QUIC traits.
 #![deny(missing_docs)]
 
 use std::{
@@ -12,19 +12,28 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
-
 use futures_util::{
     Stream, StreamExt,
     stream::{self},
 };
-
-use quinn::ReadError;
-pub use quinn::{self, AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
-
-use http3_rs::{
+use http3::{
     error::Code,
     quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf},
 };
+
+#[cfg(all(feature = "quinn", feature = "quic"))]
+compile_error!("features `quinn` and `quic` are mutually exclusive");
+
+#[cfg(all(feature = "quinn", not(feature = "quic")))]
+pub use quinn as quic_impl;
+
+#[cfg(all(feature = "quic", not(feature = "quinn")))]
+pub use ::quic as quic_impl;
+
+#[cfg(any(feature = "quinn", feature = "quic"))]
+pub use quic_impl::{AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
+
+use quic_impl::ReadError;
 use tokio_util::sync::ReusableBoxFuture;
 
 #[cfg(feature = "tracing")]
@@ -36,11 +45,11 @@ pub mod datagram;
 /// BoxStream with Sync trait
 type BoxStreamSync<'a, T> = Pin<Box<dyn Stream<Item = T> + Sync + Send + 'a>>;
 
-/// A QUIC connection backed by Quinn
+/// A QUIC connection backed
 ///
-/// Implements a [`quic::Connection`] backed by a [`quinn::Connection`].
+/// Implements a [`quic::Connection`] backed by a [`quic_impl::Connection`].
 pub struct Connection {
-    conn: quinn::Connection,
+    conn: quic_impl::Connection,
     incoming_bi: BoxStreamSync<'static, <AcceptBi<'static> as Future>::Output>,
     opening_bi: Option<BoxStreamSync<'static, <OpenBi<'static> as Future>::Output>>,
     incoming_uni: BoxStreamSync<'static, <AcceptUni<'static> as Future>::Output>,
@@ -48,8 +57,8 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Create a [`Connection`] from a [`quinn::Connection`]
-    pub fn new(conn: quinn::Connection) -> Self {
+    /// Create a [`Connection`] from a [`quic_impl::Connection`]
+    pub fn new(conn: quic_impl::Connection) -> Self {
         Self {
             conn: conn.clone(),
             incoming_bi: Box::pin(stream::unfold(conn.clone(), |conn| async {
@@ -105,21 +114,21 @@ where
     }
 }
 
-fn convert_connection_error(e: quinn::ConnectionError) -> http3_rs::quic::ConnectionErrorIncoming {
+fn convert_connection_error(e: quic_impl::ConnectionError) -> http3::quic::ConnectionErrorIncoming {
     match e {
-        quinn::ConnectionError::ApplicationClosed(application_close) => {
+        quic_impl::ConnectionError::ApplicationClosed(application_close) => {
             ConnectionErrorIncoming::ApplicationClose {
                 error_code: application_close.error_code.into(),
             }
         }
-        quinn::ConnectionError::TimedOut => ConnectionErrorIncoming::Timeout,
+        quic_impl::ConnectionError::TimedOut => ConnectionErrorIncoming::Timeout,
 
-        error @ quinn::ConnectionError::VersionMismatch
-        | error @ quinn::ConnectionError::Reset
-        | error @ quinn::ConnectionError::LocallyClosed
-        | error @ quinn::ConnectionError::CidsExhausted
-        | error @ quinn::ConnectionError::TransportError(_)
-        | error @ quinn::ConnectionError::ConnectionClosed(_) => {
+        error @ quic_impl::ConnectionError::VersionMismatch
+        | error @ quic_impl::ConnectionError::Reset
+        | error @ quic_impl::ConnectionError::LocallyClosed
+        | error @ quic_impl::ConnectionError::CidsExhausted
+        | error @ quic_impl::ConnectionError::TransportError(_)
+        | error @ quic_impl::ConnectionError::ConnectionClosed(_) => {
             ConnectionErrorIncoming::Undefined(Arc::new(error))
         }
     }
@@ -181,12 +190,12 @@ where
     }
 }
 
-/// Stream opener backed by a Quinn connection
+/// Stream opener backed by a QUIC connection
 ///
 /// Implements [`quic::OpenStreams`] using [`quinn::Connection`],
 /// [`quinn::OpenBi`], [`quinn::OpenUni`].
 pub struct OpenStreams {
-    conn: quinn::Connection,
+    conn: quic_impl::Connection,
     opening_bi: Option<BoxStreamSync<'static, <OpenBi<'static> as Future>::Output>>,
     opening_uni: Option<BoxStreamSync<'static, <OpenUni<'static> as Future>::Output>>,
 }
@@ -258,7 +267,7 @@ impl Clone for OpenStreams {
     }
 }
 
-/// Quinn-backed bidirectional stream
+/// QUIC-backed bidirectional stream
 ///
 /// Implements [`quic::BidiStream`] which allows the stream to be split
 /// into two structs each implementing one direction.
@@ -347,11 +356,11 @@ where
     }
 }
 
-/// Quinn-backed receive stream
+/// QUIC-backed receive stream
 ///
 /// Implements a [`quic::RecvStream`] backed by a [`quinn::RecvStream`].
 pub struct RecvStream {
-    stream: Option<quinn::RecvStream>,
+    stream: Option<quic_impl::RecvStream>,
     read_chunk_fut: ReadChunkFuture,
     is_0rtt: bool,
     pending_stop: Option<VarInt>,
@@ -360,13 +369,13 @@ pub struct RecvStream {
 type ReadChunkFuture = ReusableBoxFuture<
     'static,
     (
-        quinn::RecvStream,
-        Result<Option<quinn::Chunk>, quinn::ReadError>,
+        quic_impl::RecvStream,
+        Result<Option<quic_impl::Chunk>, quic_impl::ReadError>,
     ),
 >;
 
 impl RecvStream {
-    fn new(stream: quinn::RecvStream) -> Self {
+    fn new(stream: quic_impl::RecvStream) -> Self {
         let is_0rtt = stream.is_0rtt();
         Self {
             stream: Some(stream),
@@ -442,32 +451,33 @@ fn convert_read_error_to_stream_error(error: ReadError) -> StreamErrorIncoming {
             }
         }
         error @ ReadError::ClosedStream => StreamErrorIncoming::Unknown(Box::new(error)),
-        ReadError::IllegalOrderedRead => panic!("http3-quinn-rs only performs ordered reads"),
+        ReadError::IllegalOrderedRead => panic!("http3-quic only performs ordered reads"),
         error @ ReadError::ZeroRttRejected => StreamErrorIncoming::Unknown(Box::new(error)),
     }
 }
 
-fn convert_write_error_to_stream_error(error: quinn::WriteError) -> StreamErrorIncoming {
+fn convert_write_error_to_stream_error(error: quic_impl::WriteError) -> StreamErrorIncoming {
     match error {
-        quinn::WriteError::Stopped(var_int) => StreamErrorIncoming::StreamTerminated {
+        quic_impl::WriteError::Stopped(var_int) => StreamErrorIncoming::StreamTerminated {
             error_code: var_int.into_inner(),
         },
-        quinn::WriteError::ConnectionLost(connection_error) => {
+        quic_impl::WriteError::ConnectionLost(connection_error) => {
             StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error: convert_connection_error(connection_error),
             }
         }
-        error @ quinn::WriteError::ClosedStream | error @ quinn::WriteError::ZeroRttRejected => {
+        error @ quic_impl::WriteError::ClosedStream
+        | error @ quic_impl::WriteError::ZeroRttRejected => {
             StreamErrorIncoming::Unknown(Box::new(error))
         }
     }
 }
 
-/// Quinn-backed send stream
+/// QUIC-backed send stream
 ///
-/// Implements a [`quic::SendStream`] backed by a [`quinn::SendStream`].
+/// Implements a [`quic::SendStream`] backed by a [`quic_impl::SendStream`].
 pub struct SendStream<B: Buf> {
-    stream: quinn::SendStream,
+    stream: quic_impl::SendStream,
     writing: Option<WriteBuf<B>>,
 }
 
@@ -475,7 +485,7 @@ impl<B> SendStream<B>
 where
     B: Buf,
 {
-    fn new(stream: quinn::SendStream) -> SendStream<B> {
+    fn new(stream: quic_impl::SendStream) -> SendStream<B> {
         Self {
             stream,
             writing: None,
@@ -524,7 +534,7 @@ where
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn send_data<D: Into<WriteBuf<B>>>(&mut self, data: D) -> Result<(), StreamErrorIncoming> {
         if self.writing.is_some() {
-            // This can only happen if the traits are misused by http3-rs itself.
+            // This can only happen if the traits are misused by http3 itself.
             // If this happens log an error and close the connection with H3_INTERNAL_ERROR
 
             #[cfg(feature = "tracing")]

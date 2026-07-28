@@ -13,7 +13,7 @@ for the current Cargo target. It uses aws-lc as its TLS backend.
 The current supported releases are `ngtcp2-sys` 0.2 and ngtcp2 1.25.
 
 This crate is maintained in the
-[http3-rs](https://github.com/0x676e67/http3-rs) repository. New versions are
+[http3](https://github.com/0x676e67/http3) repository. New versions are
 released from time to time.
 
 ## Build requirements

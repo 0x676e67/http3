@@ -1,5 +1,5 @@
 use bytes::Buf;
-use http3_rs::{
+use http3::{
     error::{Code, internal_error::InternalConnectionError},
     proto::varint::VarInt,
     quic::StreamId,
@@ -38,13 +38,14 @@ where
         })?;
 
         //= https://www.rfc-editor.org/rfc/rfc9297#section-2.1
-        // Quarter Stream ID: A variable-length integer that contains the value of the client-initiated bidirectional
-        // stream that this datagram is associated with divided by four (the division by four stems
-        // from the fact that HTTP requests are sent on client-initiated bidirectional streams,
-        // which have stream IDs that are divisible by four). The largest legal QUIC stream ID
-        // value is 262-1, so the largest legal value of the Quarter Stream ID field is 260-1.
-        // Receipt of an HTTP/3 Datagram that includes a larger value MUST be treated as an HTTP/3
-        // connection error of type H3_DATAGRAM_ERROR (0x33).
+        // Quarter Stream ID: A variable-length integer that contains the value of the
+        // client-initiated bidirectional stream that this datagram is associated with
+        // divided by four (the division by four stems from the fact that HTTP requests are
+        // sent on client-initiated bidirectional streams, which have stream IDs that are
+        // divisible by four). The largest legal QUIC stream ID value is 262-1, so the
+        // largest legal value of the Quarter Stream ID field is 260-1. Receipt of an HTTP/3
+        // Datagram that includes a larger value MUST be treated as an HTTP/3 connection
+        // error of type H3_DATAGRAM_ERROR (0x33).
         let stream_id = StreamId::try_from(u64::from(q_stream_id) * 4).map_err(|_| {
             InternalConnectionError::new(Code::H3_DATAGRAM_ERROR, "invalid stream id".to_string())
         })?;

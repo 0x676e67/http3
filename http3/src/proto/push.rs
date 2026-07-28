@@ -1,5 +1,7 @@
-use std::convert::TryFrom;
-use std::fmt::{self, Display};
+use std::{
+    convert::TryFrom,
+    fmt::{self, Display},
+};
 
 use super::varint::VarInt;
 

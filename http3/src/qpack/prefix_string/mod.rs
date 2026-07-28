@@ -2,21 +2,19 @@ mod bitwin;
 mod decode;
 mod encode;
 
-use std::convert::TryInto;
-use std::fmt;
-use std::num::TryFromIntError;
+use std::{convert::TryInto, fmt, num::TryFromIntError};
 
 use bytes::{Buf, BufMut};
 
-pub use self::bitwin::BitWindow;
-
 pub use self::{
+    bitwin::BitWindow,
     decode::{Error as HuffmanDecodingError, HpackStringDecode},
     encode::{Error as HuffmanEncodingError, HpackStringEncode},
 };
-
-use crate::proto::coding::BufMutExt;
-use crate::qpack::prefix_int::{self, Error as IntegerError};
+use crate::{
+    proto::coding::BufMutExt,
+    qpack::prefix_int::{self, Error as IntegerError},
+};
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -97,9 +95,11 @@ impl From<TryFromIntError> for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use assert_matches::assert_matches;
     use std::io::Cursor;
+
+    use assert_matches::assert_matches;
+
+    use super::*;
 
     #[test]
     fn codec_6() {

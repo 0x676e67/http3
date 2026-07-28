@@ -1,4 +1,4 @@
-//! Error handling logic and types for the `http3-rs` crate.
+//! Error handling logic and types for the `http3` crate.
 
 mod codes;
 

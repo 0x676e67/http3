@@ -63,7 +63,7 @@ done
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
-tmp_root="${TMPDIR:-/tmp}/http3-rs-publish-$$"
+tmp_root="${TMPDIR:-/tmp}/http3-publish-$$"
 
 cd "$repo_root"
 
