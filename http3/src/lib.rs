@@ -55,10 +55,12 @@ mod stream;
 #[cfg(not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"))]
 mod webtransport;
 
-pub use proto::frame::SettingId;
-pub use proto::headers::{PseudoId, PseudoOrder, PseudoOrderBuilder};
+pub use proto::{
+    frame::SettingId,
+    headers::{PseudoId, PseudoOrder, PseudoOrderBuilder},
+};
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-extern crate self as http3_rs;
+extern crate self as http3;

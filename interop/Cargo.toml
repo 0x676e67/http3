@@ -10,12 +10,12 @@ repository = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
-http3-rs = { workspace = true, features = ["tracing"] }
+http3 = { workspace = true, features = ["tracing"] }
 h3 = { version = "0.0.8", features = [
     "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
     "tracing",
 ] }
-http3-quinn-rs = { workspace = true, features = ["tracing"] }
+http3-quic = { workspace = true, features = ["tracing"] }
 h3-quinn = { version = "0.0.10", features = ["tracing"] }
 quinn = { workspace = true, features = [
     "runtime-tokio",

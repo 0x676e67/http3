@@ -45,7 +45,8 @@ pub trait ConnectionState {
     fn shared_state(&self) -> &SharedState;
     /// Get the connection error if the connection is in error state because of another task
     ///
-    /// Return the error as an Err variant if it is set in order to allow using ? in the calling function
+    /// Return the error as an Err variant if it is set in order to allow using ? in the calling
+    /// function
     fn get_conn_error(&self) -> Option<ErrorOrigin> {
         self.shared_state().connection_error.get().cloned()
     }

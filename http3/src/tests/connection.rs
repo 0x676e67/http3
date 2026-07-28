@@ -9,12 +9,11 @@ use futures_util::future;
 use http::{Request, Response, StatusCode};
 use tokio::sync::oneshot::{self};
 
-use crate::client::SendRequest;
-use crate::error::{Code, ConnectionError, LocalError, StreamError};
-use crate::quic::ConnectionErrorIncoming;
-use crate::tests::get_stream_blocking;
-use crate::{ConnectionState, client, server};
+use super::{Pair, http3_quinn, init_tracing};
 use crate::{
+    ConnectionState, client,
+    client::SendRequest,
+    error::{Code, ConnectionError, LocalError, StreamError},
     proto::{
         coding::Encode as _,
         frame::{Frame, Settings},
@@ -22,11 +21,10 @@ use crate::{
         stream::StreamType,
         varint::VarInt,
     },
-    quic::{self, SendStream},
+    quic::{self, ConnectionErrorIncoming, SendStream},
+    server,
+    tests::get_stream_blocking,
 };
-
-use super::http3_quinn_rs;
-use super::{Pair, init_tracing};
 
 #[tokio::test]
 async fn connect() {
@@ -645,7 +643,7 @@ async fn goaway_from_server_not_request_id() {
         control_stream.write_all(&buf[..]).await.unwrap();
         control_stream.finish().unwrap(); // close the client control stream immediately
 
-        let (mut driver, _send) = client::new(http3_quinn_rs::Connection::new(connection))
+        let (mut driver, _send) = client::new(http3_quinn::Connection::new(connection))
             .await
             .unwrap();
 
@@ -864,7 +862,8 @@ async fn graceful_shutdown_client() {
 }
 
 #[tokio::test]
-// This test is to ensure that the server does still process requests even if a stream is started but has not sent any data
+// This test is to ensure that the server does still process requests even if a stream is started
+// but has not sent any data
 async fn server_not_blocking_on_idle_request() {
     init_tracing();
     let mut pair = Pair::default();

@@ -1,8 +1,7 @@
 [workspace]
 members = [
     "http3",
-    "http3-quinn",
-    "http3-webtransport",
+    "http3-quic",
     "http3-datagram",
 
     # Internal
@@ -11,8 +10,7 @@ members = [
 ]
 default-members = [
     "http3",
-    "http3-quinn",
-    "http3-webtransport",
+    "http3-quic",
     "http3-datagram",
     "examples",
 ]
@@ -25,13 +23,12 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 rust-version = "1.85"
-repository = "https://github.com/0x676e67/http3-rs"
+repository = "https://github.com/0x676e67/http3"
 
 [workspace.dependencies]
-http3-datagram-rs = { version = "0.0.2", path = "http3-datagram" }
-http3-quinn-rs = { version = "0.0.10", path = "http3-quinn" }
-http3-rs = { version = "0.0.8", path = "http3" }
-http3-webtransport-rs = { version = "0.1.2", path = "http3-webtransport" }
+http3-datagram = { version = "0.0.2", path = "./http3-datagram" }
+http3-quic = { version = "0.0.11", path = "./http3-quic" }
+http3 = { version = "0.0.8", path = "http3" }
 
 # Internal
 ngtcp2-sys = "=0.2.0"
@@ -50,6 +47,7 @@ http = "1"
 octets = "0.3.0"
 pin-project-lite = { version = "0.2", default-features = false }
 proptest = "1"
+quic = { version = "0.11", default-features = false }
 quinn = { version = "0.11", default-features = false }
 quinn-proto = { version = "0.11", default-features = false }
 rcgen = "=0.14.5"

@@ -21,7 +21,7 @@ use futures_util::{
 use quinn::ReadError;
 pub use quinn::{self, AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
 
-use http3_rs::{
+use http3::{
     error::Code,
     quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf},
 };
@@ -29,9 +29,6 @@ use tokio_util::sync::ReusableBoxFuture;
 
 #[cfg(feature = "tracing")]
 use tracing::instrument;
-
-#[cfg(feature = "datagram")]
-pub mod datagram;
 
 /// BoxStream with Sync trait
 type BoxStreamSync<'a, T> = Pin<Box<dyn Stream<Item = T> + Sync + Send + 'a>>;
@@ -105,7 +102,7 @@ where
     }
 }
 
-fn convert_connection_error(e: quinn::ConnectionError) -> http3_rs::quic::ConnectionErrorIncoming {
+fn convert_connection_error(e: quinn::ConnectionError) -> http3::quic::ConnectionErrorIncoming {
     match e {
         quinn::ConnectionError::ApplicationClosed(application_close) => {
             ConnectionErrorIncoming::ApplicationClose {

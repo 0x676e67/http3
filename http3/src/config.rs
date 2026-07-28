@@ -34,11 +34,13 @@ pub struct Config {
 /// HTTP/3 Settings
 #[derive(Debug, Clone, Copy)]
 pub struct Settings {
-    /// The MAX_FIELD_SECTION_SIZE in HTTP/3 refers to the maximum size of the dynamic table used in HPACK compression.
-    /// HPACK is the compression algorithm used in HTTP/3 to reduce the size of the header fields in HTTP requests and responses.
+    /// The MAX_FIELD_SECTION_SIZE in HTTP/3 refers to the maximum size of the dynamic table used
+    /// in HPACK compression. HPACK is the compression algorithm used in HTTP/3 to reduce the
+    /// size of the header fields in HTTP requests and responses.
 
     /// In HTTP/3, the MAX_FIELD_SECTION_SIZE is set to 12.
-    /// This means that the dynamic table used for HPACK compression can have a maximum size of 2^12 bytes, which is 4KB.
+    /// This means that the dynamic table used for HPACK compression can have a maximum size of
+    /// 2^12 bytes, which is 4KB.
     pub(crate) max_field_section_size: u64,
 
     /// https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1
@@ -47,7 +49,8 @@ pub struct Settings {
     /// https://www.rfc-editor.org/info/rfc8441 defines an extended CONNECT method in Section 4,
     /// enabled by the SETTINGS_ENABLE_CONNECT_PROTOCOL parameter.
     /// That parameter is only defined for HTTP/2.
-    /// for extended CONNECT in HTTP/3; instead, the SETTINGS_ENABLE_WEBTRANSPORT setting implies that an endpoint supports extended CONNECT.
+    /// for extended CONNECT in HTTP/3; instead, the SETTINGS_ENABLE_WEBTRANSPORT setting implies
+    /// that an endpoint supports extended CONNECT.
     pub(crate) enable_extended_connect: bool,
     /// Enable HTTP Datagrams, see https://datatracker.ietf.org/doc/rfc9297/ for details
     pub(crate) enable_datagram: bool,
@@ -228,7 +231,8 @@ impl Settings {
     /// https://www.rfc-editor.org/info/rfc8441 defines an extended CONNECT method in Section 4,
     /// enabled by the SETTINGS_ENABLE_CONNECT_PROTOCOL parameter.
     /// That parameter is only defined for HTTP/2.
-    /// for extended CONNECT in HTTP/3; instead, the SETTINGS_ENABLE_WEBTRANSPORT setting implies that an endpoint supports extended CONNECT.
+    /// for extended CONNECT in HTTP/3; instead, the SETTINGS_ENABLE_WEBTRANSPORT setting implies
+    /// that an endpoint supports extended CONNECT.
     pub fn enable_extended_connect(&self) -> bool {
         self.enable_extended_connect
     }

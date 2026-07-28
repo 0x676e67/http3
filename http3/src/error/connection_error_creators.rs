@@ -4,17 +4,16 @@ use std::task::Poll;
 
 use bytes::Buf;
 
+use super::{
+    ConnectionError, LocalError, StreamError,
+    codes::Code,
+    internal_error::{ErrorOrigin, InternalConnectionError},
+};
 use crate::{
     connection::ConnectionInner,
     frame::FrameStreamError,
     quic::{self, ConnectionErrorIncoming, StreamErrorIncoming},
     shared_state::ConnectionState,
-};
-
-use super::{
-    ConnectionError, LocalError, StreamError,
-    codes::Code,
-    internal_error::{ErrorOrigin, InternalConnectionError},
 };
 
 /// This trait is implemented for all types which can close the connection

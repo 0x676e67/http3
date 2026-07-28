@@ -1,16 +1,15 @@
-//! This module contains the internal error type, which is used to represent errors, which have not yet affected the connection state
+//! This module contains the internal error type, which is used to represent errors, which have not
+//! yet affected the connection state
 
-use std::error::Error;
-
-use crate::{frame::FrameProtocolError, quic::ConnectionErrorIncoming};
+use std::{error::Error, fmt::Display};
 
 use super::codes::Code;
-use std::fmt::Display;
+use crate::{frame::FrameProtocolError, quic::ConnectionErrorIncoming};
 
 /// This error type represents an internal error type, which is used
 /// to represent errors, which have not yet affected the connection state
 ///
-/// Internal error produced by an `http3-rs` module.
+/// Internal error produced by an `http3` module.
 ///
 /// This error type is used in functions which handle a http3 connection state
 #[derive(Debug, Clone, Hash)]

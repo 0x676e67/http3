@@ -8,10 +8,10 @@
 //! ```rust
 //! async fn doc<C>(conn: C)
 //! where
-//! C: http3_rs::quic::Connection<bytes::Bytes> + 'static,
-//! <C as http3_rs::quic::OpenStreams<bytes::Bytes>>::BidiStream: Send + 'static
+//! C: http3::quic::Connection<bytes::Bytes> + 'static,
+//! <C as http3::quic::OpenStreams<bytes::Bytes>>::BidiStream: Send + 'static
 //! {
-//!     let mut server_builder = http3_rs::server::builder();
+//!     let mut server_builder = http3::server::builder();
 //!     // Build the Connection
 //!     let mut http3_conn = server_builder.build(conn).await.unwrap();
 //!     loop {
@@ -45,15 +45,14 @@
 //! ```
 //!
 //! ## File server
-//! A ready-to-use example of a file server is available [here](https://github.com/0x676e67/http3-rs/blob/main/examples/server.rs)
+//! A ready-to-use example of a file server is available [here](https://github.com/0x676e67/http3/blob/main/examples/server.rs)
 
 mod builder;
 mod connection;
 mod request;
 mod stream;
 
-pub use builder::Builder;
-pub use builder::builder;
+pub use builder::{Builder, builder};
 pub use connection::Connection;
 pub use request::RequestResolver;
 pub use stream::RequestStream;

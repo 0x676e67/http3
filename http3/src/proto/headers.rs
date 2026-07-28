@@ -39,10 +39,10 @@ define_enum_with_values! {
 
 /// Represents the order of HTTP/3 pseudo-header fields in a header block.
 ///
-/// This structure maintains an ordered list of pseudo-header fields (such as `:method`, `:scheme`, etc.)
-/// for use when encoding HTTP/3 header blocks. The order of pseudo-headers can be configured to match
-/// specific browser fingerprints (e.g. Chrome uses "masp" = Method, Authority, Scheme, Path;
-/// Firefox uses "msap" = Method, Scheme, Authority, Path).
+/// This structure maintains an ordered list of pseudo-header fields (such as `:method`, `:scheme`,
+/// etc.) for use when encoding HTTP/3 header blocks. The order of pseudo-headers can be configured
+/// to match specific browser fingerprints (e.g. Chrome uses "masp" = Method, Authority, Scheme,
+/// Path; Firefox uses "msap" = Method, Scheme, Authority, Path).
 ///
 /// Typically, a `PseudoOrder` is constructed using the [`PseudoOrderBuilder`] to enforce uniqueness
 /// and correct ordering.
@@ -623,8 +623,9 @@ impl fmt::Display for HeaderError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use assert_matches::assert_matches;
+
+    use super::*;
 
     #[test]
     fn request_has_no_authority_nor_host() {

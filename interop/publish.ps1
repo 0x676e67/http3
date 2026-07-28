@@ -53,7 +53,7 @@ function Enable-PublishInManifest {
 }
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "http3-rs-publish-$([System.Guid]::NewGuid().ToString('N'))"
+$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "http3-publish-$([System.Guid]::NewGuid().ToString('N'))"
 
 try {
     $dirty = git -C $repoRoot status --porcelain

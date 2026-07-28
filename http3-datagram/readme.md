@@ -1,6 +1,6 @@
-# http3-datagram-rs
+# http3-datagram
 
-This crate implements [HTTP Datagrams](https://datatracker.ietf.org/doc/html/rfc9297) for `http3-rs`.
+This crate implements [HTTP Datagrams](https://datatracker.ietf.org/doc/html/rfc9297) for `http3`.
 
 # Status
 This crate is still in experimental. The API is subject to change. It may contain bugs and is not yet complete. Use with caution.
