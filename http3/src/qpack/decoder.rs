@@ -491,9 +491,9 @@ impl From<TryFromIntError> for DecoderError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use bytes::Bytes;
 
+    use super::*;
     use crate::{
         buf::BufList,
         qpack::tests::helpers::{TABLE_SIZE, build_table_with_size},
