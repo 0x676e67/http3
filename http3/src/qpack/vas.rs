@@ -42,9 +42,8 @@
  *    v          v                   v
  *  + - +------+ - + - + - + - + - + - +  inserted: 21
  *  | a |      | p | q | r | s | t | u |  dropped: 15
- *  + - +------+ - + - + - + - + - + - +  delta: 21 - 15: 6
- *    ^          ^                   ^
- *    |          |                   |
+ *  + - +------+ - + - + - + - + - + - +  delta: 21 - 15: 6 ^          ^                   ^ | |
+ *    |
  * abs:-      abs:16              abs:21
  * rel:-      rel:5               rel:0
  * pos:-      pos:0               pos:6
@@ -59,9 +58,8 @@
  *                       v
  *  + - +------+ - + - + - + - + - + - +  inserted: 21
  *  | a |      | p | q | r | s | t | u |  dropped: 15
- *  + - +------+ - + - + - + - + - + - +  delta: 21 - 15: 6
- *    ^          ^       ^           ^
- *    |          |       |           |
+ *  + - +------+ - + - + - + - + - + - +  delta: 21 - 15: 6 ^          ^       ^           ^ | |
+ *    |           |
  * abs:-      abs:16  abs:18      abs:21
  * rel:-      rel:2   rel:0       rel:-
  * pst:-      pst:-   pst:-       pst:2
@@ -144,8 +142,9 @@ impl VirtualAddressSpace {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use proptest::proptest;
+
+    use super::*;
 
     #[test]
     fn test_no_relative_index_when_empty() {

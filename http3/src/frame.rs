@@ -1,22 +1,19 @@
 use std::task::{Context, Poll};
 
 use bytes::Buf;
-
 #[cfg(feature = "tracing")]
 use tracing::trace;
 
-use crate::error::Code;
-use crate::proto::frame::SettingsError;
-use crate::proto::push::InvalidPushId;
-use crate::quic::{InvalidStreamId, StreamErrorIncoming};
-use crate::stream::{BufRecvStream, WriteBuf};
 use crate::{
     buf::BufList,
+    error::Code,
     proto::{
-        frame::{self, Frame, PayloadLen},
+        frame::{self, Frame, PayloadLen, SettingsError},
+        push::InvalidPushId,
         stream::StreamId,
     },
-    quic::{BidiStream, RecvStream, SendStream},
+    quic::{BidiStream, InvalidStreamId, RecvStream, SendStream, StreamErrorIncoming},
+    stream::{BufRecvStream, WriteBuf},
 };
 
 /// Decodes Frames from the underlying QUIC stream
@@ -102,7 +99,8 @@ where
     /// Retrieves the next piece of data in an incoming data packet or webtransport stream
     ///
     ///
-    /// WebTransport bidirectional payload has no finite length and is processed until the end of the stream.
+    /// WebTransport bidirectional payload has no finite length and is processed until the end of
+    /// the stream.
     pub fn poll_data(
         &mut self,
         cx: &mut Context<'_>,
@@ -314,11 +312,6 @@ pub enum FrameProtocolError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use assert_matches::assert_matches;
-    use bytes::{BufMut, Bytes, BytesMut};
-    use futures_util::future::poll_fn;
     use std::{
         collections::VecDeque,
         sync::{
@@ -327,6 +320,11 @@ mod tests {
         },
     };
 
+    use assert_matches::assert_matches;
+    use bytes::{BufMut, Bytes, BytesMut};
+    use futures_util::future::poll_fn;
+
+    use super::*;
     use crate::proto::{coding::Encode, frame::FrameType, varint::VarInt};
 
     // Decoder

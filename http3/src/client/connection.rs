@@ -9,10 +9,10 @@ use std::{
 use bytes::{Buf, BytesMut};
 use futures_util::future;
 use http::request;
-
 #[cfg(feature = "tracing")]
 use tracing::{info, instrument, trace};
 
+use super::stream::RequestStream;
 use crate::{
     connection::{self, ConnectionInner},
     error::{
@@ -26,8 +26,6 @@ use crate::{
     shared_state::{ConnectionState, SharedState},
     stream::{self, BufRecvStream},
 };
-
-use super::stream::RequestStream;
 
 /// HTTP/3 request sender
 ///
@@ -48,7 +46,7 @@ use super::stream::RequestStream;
 /// ## Sending a request with no body
 ///
 /// ```rust
-/// # use http3_rs::{quic, client::*};
+/// # use http3::{quic, client::*};
 /// # use http::{Request, Response};
 /// # use bytes::Buf;
 /// # async fn doc<T,B>(mut send_request: SendRequest<T, B>) -> Result<(), Box<dyn std::error::Error>>
@@ -74,7 +72,7 @@ use super::stream::RequestStream;
 /// ## Sending a request with a body and trailers
 ///
 /// ```rust
-/// # use http3_rs::{quic, client::*};
+/// # use http3::{quic, client::*};
 /// # use http::{Request, Response, HeaderMap};
 /// # use bytes::{Buf, Bytes};
 /// # async fn doc<T,B>(mut send_request: SendRequest<T, Bytes>) -> Result<(), Box<dyn std::error::Error>>
@@ -289,7 +287,7 @@ where
 /// ```rust
 /// # use bytes::Buf;
 /// # use futures_util::future;
-/// # use http3_rs::{client::*, quic};
+/// # use http3::{client::*, quic};
 /// # use tokio::task::JoinHandle;
 /// # async fn doc<C, B>(mut connection: Connection<C, B>)
 /// #    -> JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>
@@ -313,9 +311,9 @@ where
 /// ```rust
 /// # use bytes::Buf;
 /// # use futures_util::future;
-/// # use http3_rs::quic;
-/// # use http3_rs::client::Connection;
-/// # use http3_rs::client::SendRequest;
+/// # use http3::quic;
+/// # use http3::client::Connection;
+/// # use http3::client::SendRequest;
 /// # use tokio::{self, sync::oneshot, task::JoinHandle};
 /// # async fn doc<C, B>(mut connection: Connection<C, B>)
 /// #    -> Result<(), Box<dyn std::error::Error + Send + Sync>>

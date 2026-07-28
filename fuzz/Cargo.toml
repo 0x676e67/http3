@@ -5,7 +5,7 @@ authors = ["Automatically generated"]
 publish = false
 rust-version = "1.85"
 edition = "2024"
-repository = "https://github.com/0x676e67/http3-rs"
+repository = "https://github.com/0x676e67/http3"
 
 [package.metadata]
 cargo-fuzz = true

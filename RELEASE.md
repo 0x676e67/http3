@@ -15,7 +15,7 @@
 
 ### 🚜 Refactor
 
-- Rename crates for http3-rs fork
+- Rename crates for http3 fork
 
 ### ⚙️ Miscellaneous Tasks
 

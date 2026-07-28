@@ -1,9 +1,11 @@
-use crate::qpack::decoder::Decoder;
-use crate::qpack::encoder::Encoder;
-use crate::qpack::{Decoded, DecoderError, HeaderField, QpackDecoder, dynamic::DynamicTable};
 use std::{
     io::Cursor,
     task::{Context, Poll},
+};
+
+use crate::qpack::{
+    Decoded, DecoderError, HeaderField, QpackDecoder, decoder::Decoder, dynamic::DynamicTable,
+    encoder::Encoder,
 };
 
 pub mod helpers {

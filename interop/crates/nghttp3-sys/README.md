@@ -13,7 +13,7 @@ for the current Cargo target.
 The current supported releases are `nghttp3-sys` 0.2 and nghttp3 1.18.
 
 This crate is maintained in the
-[http3-rs](https://github.com/0x676e67/http3-rs) repository. New versions are
+[http3](https://github.com/0x676e67/http3) repository. New versions are
 released from time to time.
 
 ## Build requirements

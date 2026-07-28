@@ -1,5 +1,6 @@
-use bytes::{Buf, BufMut};
 use std::convert::TryInto;
+
+use bytes::{Buf, BufMut};
 
 use super::{
     parse_error::ParseError,
@@ -328,8 +329,9 @@ impl StreamCancel {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use std::io::Cursor;
+
+    use super::*;
 
     #[test]
     fn insert_with_name_ref() {

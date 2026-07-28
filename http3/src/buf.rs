@@ -1,5 +1,4 @@
-use std::collections::VecDeque;
-use std::io::IoSlice;
+use std::{collections::VecDeque, io::IoSlice};
 
 use bytes::{Buf, Bytes};
 
@@ -167,8 +166,9 @@ impl<'a, B: Buf> Buf for Cursor<'a, B> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use bytes::Bytes;
+
+    use super::*;
 
     #[test]
     fn cursor_advance() {

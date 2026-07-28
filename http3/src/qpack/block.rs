@@ -407,9 +407,9 @@ impl Literal {
 
 #[cfg(test)]
 mod test {
+    use std::{convert::TryInto, io::Cursor};
+
     use super::*;
-    use std::convert::TryInto;
-    use std::io::Cursor;
 
     const TABLE_SIZE: usize = 4096;
 
