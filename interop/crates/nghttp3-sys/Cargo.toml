@@ -1,7 +1,7 @@
 [package]
 name = "nghttp3-sys"
-version = "0.0.0"
-description = "nghttp3 FFI bindings used by http3-rs interoperability tests"
+version = "0.2.0"
+description = "FFI bindings to nghttp3"
 edition = "2024"
 rust-version = "1.96"
 build = "build.rs"
