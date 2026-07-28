@@ -1660,10 +1660,11 @@ where
 
 #[cfg(test)]
 mod qpack_field_section_tests {
-    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures_util::task::{ArcWake, waker};
+
+    use super::*;
 
     fn field_section_guard() -> (DecoderGuard, mpsc::UnboundedReceiver<QpackEvent>) {
         let (events_send, events_recv) = mpsc::unbounded_channel();

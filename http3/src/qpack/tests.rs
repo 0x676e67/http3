@@ -1,10 +1,3 @@
-use crate::qpack::decoder::Decoder;
-use crate::qpack::encoder::{Encoder, set_dynamic_table_size};
-use crate::qpack::{
-    BlockedStreamRegistry, Decoded, DecoderError, HeaderField, QpackDecoder, QpackEvent,
-    dynamic::DynamicTable,
-};
-use crate::quic::StreamId;
 use std::{
     io::Cursor,
     sync::{
@@ -12,6 +5,16 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
+};
+
+use crate::{
+    qpack::{
+        BlockedStreamRegistry, Decoded, DecoderError, HeaderField, QpackDecoder, QpackEvent,
+        decoder::Decoder,
+        dynamic::DynamicTable,
+        encoder::{Encoder, set_dynamic_table_size},
+    },
+    quic::StreamId,
 };
 
 struct WakeCounter(AtomicUsize);
