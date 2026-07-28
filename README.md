@@ -7,9 +7,7 @@ A Tokio aware, HTTP/3 implementation for Rust.
 [![Crates.io](https://img.shields.io/crates/v/http3.svg)](https://crates.io/crates/http3)
 [![Documentation](https://docs.rs/http3/badge.svg)][docs]
 
-More information about this crate can be found in the [crate documentation][docs].
-
-[docs]: https://docs.rs/http3
+More information about this crate can be found in the [crate documentation][docs](https://docs.rs/http3).
 
 ## Features
 
