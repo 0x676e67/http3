@@ -26,11 +26,13 @@ compile_error!("features `quinn` and `quic` are mutually exclusive");
 
 #[cfg(all(feature = "quic", not(feature = "quinn")))]
 pub use quic;
+#[cfg(all(feature = "quinn", not(feature = "quic")))]
+pub use quinn as quic;
+
 use quic::ReadError;
 #[cfg(any(feature = "quinn", feature = "quic"))]
 pub use quic::{AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
-#[cfg(all(feature = "quinn", not(feature = "quic")))]
-pub use quinn as quic;
+
 use tokio_util::sync::ReusableBoxFuture;
 #[cfg(feature = "tracing")]
 use tracing::instrument;

@@ -12,17 +12,21 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
+
 use futures_util::{
     Stream, StreamExt,
     stream::{self},
 };
+
+use quinn::ReadError;
+pub use quinn::{self, AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
+
 use http3::{
     error::Code,
     quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf},
 };
-use quinn::ReadError;
-pub use quinn::{self, AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
 use tokio_util::sync::ReusableBoxFuture;
+
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
