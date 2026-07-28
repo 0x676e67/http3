@@ -2,7 +2,7 @@ use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Buf, Bytes};
 use futures::future;
-use http3_rs::error::StreamError;
+use http3::error::StreamError;
 use rustls::pki_types::CertificateDer;
 use tokio::task::JoinSet;
 
@@ -252,9 +252,9 @@ pub async fn run_local_quinn_client_interop_matrix_with_config(
     )));
 
     let conn = endpoint.connect(server_addr, "localhost")?.await?;
-    let quinn_conn = http3_quinn_rs::Connection::new(conn);
+    let quinn_conn = http3_quic::Connection::new(conn);
 
-    let mut builder = http3_rs::client::builder();
+    let mut builder = http3::client::builder();
     builder
         .max_field_section_size(16 * 1024)
         .send_grease(config.send_grease);
@@ -272,7 +272,7 @@ pub async fn run_local_quinn_client_interop_matrix_with_config(
 
     let (mut driver, send_request) = builder.build(quinn_conn).await?;
 
-    // The http3-rs client makes connection progress from the driver future.
+    // The http3 client makes connection progress from the driver future.
     // Keep it alive while request tasks are waiting on response HEADERS/DATA.
     let driver_task =
         tokio::spawn(async move { future::poll_fn(|cx| driver.poll_close(cx)).await });
@@ -298,10 +298,8 @@ pub async fn run_local_quinn_client_interop_matrix_with_config(
                         .uri(format!("https://localhost:{port}{task_path}"))
                         .body(())?;
 
-                    let mut stream: http3_rs::client::RequestStream<
-                        http3_quinn_rs::BidiStream<Bytes>,
-                        _,
-                    > = send_request.send_request(req).await?;
+                    let mut stream: http3::client::RequestStream<http3_quic::BidiStream<Bytes>, _> =
+                        send_request.send_request(req).await?;
                     stream.finish().await?;
 
                     let body = read_response(stream, expected_status).await?;
@@ -345,9 +343,9 @@ pub async fn run_local_quinn_client_max_field_section_size_limit(
     )));
 
     let conn = endpoint.connect(server_addr, "localhost")?.await?;
-    let quinn_conn = http3_quinn_rs::Connection::new(conn);
+    let quinn_conn = http3_quic::Connection::new(conn);
 
-    let mut builder = http3_rs::client::builder();
+    let mut builder = http3::client::builder();
     builder
         .max_field_section_size(FIELD_SECTION_LIMIT_TEST_MAX)
         .send_grease(false);
@@ -374,7 +372,7 @@ pub async fn run_local_quinn_client_max_field_section_size_limit(
         .uri(format!("https://localhost:{port}{path}"))
         .body(())?;
 
-    let mut stream: http3_rs::client::RequestStream<http3_quinn_rs::BidiStream<Bytes>, _> =
+    let mut stream: http3::client::RequestStream<http3_quic::BidiStream<Bytes>, _> =
         send_request.send_request(req).await?;
     stream.finish().await?;
 
@@ -504,7 +502,7 @@ fn interop_batch_timeout(batch: &[(InteropCase, String)]) -> Duration {
 }
 
 async fn read_response(
-    mut stream: http3_rs::client::RequestStream<http3_quinn_rs::BidiStream<Bytes>, Bytes>,
+    mut stream: http3::client::RequestStream<http3_quic::BidiStream<Bytes>, Bytes>,
     expected_status: http::StatusCode,
 ) -> Result<Vec<u8>, BoxError> {
     let response = stream.recv_response().await?;

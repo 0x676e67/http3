@@ -8,10 +8,10 @@
 //! ```rust
 //! fn doc<C,B>(conn: C)
 //! where
-//! C: http3_rs::quic::Connection<B>,
+//! C: http3::quic::Connection<B>,
 //! B: bytes::Buf,
 //! {
-//!     let mut server_builder = http3_rs::server::builder();
+//!     let mut server_builder = http3::server::builder();
 //!     // Set the maximum header size
 //!     server_builder.max_field_section_size(1000);
 //!     // do not send grease types
@@ -24,17 +24,15 @@
 use std::{collections::HashSet, result::Result};
 
 use bytes::Buf;
-
 use tokio::sync::mpsc;
 
+use super::connection::Connection;
 use crate::{
     config::Config,
     connection::ConnectionInner,
     error::ConnectionError,
     quic::{self},
 };
-
-use super::connection::Connection;
 
 /// Create a builder of HTTP/3 server connections
 ///
@@ -89,8 +87,8 @@ impl Builder {
     ///
     ///
     /// **Server**:
-    /// Supporting for webtransport also requires setting `enable_extended_connect` `enable_datagram`
-    /// and `max_webtransport_sessions`.
+    /// Supporting for webtransport also requires setting `enable_extended_connect`
+    /// `enable_datagram` and `max_webtransport_sessions`.
     #[inline]
     pub fn enable_webtransport(&mut self, value: bool) -> &mut Self {
         self.config.settings.enable_webtransport = value;

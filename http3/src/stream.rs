@@ -50,10 +50,10 @@ const WRITE_BUF_ENCODE_SIZE: usize = 512;
 /// `Buf::chunk()` will yield the encoded header, then the payload. For unidirectional streams,
 /// this type makes it possible to prefix wire data with the `StreamType`.
 ///
-/// Conveying frames as `Into<WriteBuf>` makes it possible to encode only when generating wire-format
-/// data is necessary (say, in `quic::SendStream::send_data`). It also has a public API ergonomy
-/// advantage: `WriteBuf` doesn't have to appear in public associated types. On the other hand,
-/// QUIC implementers have to call `into()`, which will encode the header in `Self::buf`.
+/// Conveying frames as `Into<WriteBuf>` makes it possible to encode only when generating
+/// wire-format data is necessary (say, in `quic::SendStream::send_data`). It also has a public API
+/// ergonomy advantage: `WriteBuf` doesn't have to appear in public associated types. On the other
+/// hand, QUIC implementers have to call `into()`, which will encode the header in `Self::buf`.
 pub struct WriteBuf<B> {
     buf: [u8; WRITE_BUF_ENCODE_SIZE],
     len: usize,
@@ -724,9 +724,8 @@ fn convert_to_std_io_error(error: StreamErrorIncoming) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
-    use crate::proto::coding::BufExt;
-
     use super::*;
+    use crate::proto::coding::BufExt;
 
     #[test]
     fn write_wt_uni_header() {

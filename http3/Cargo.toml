@@ -1,14 +1,15 @@
 [package]
-name = "http3-rs"
+name = "http3"
 version = "0.0.8"
 rust-version = { workspace = true }
 authors = [
+    "0x676e67 <gngppz@gmail.com>",
     "Sean McArthur <sean@seanmonstar.com>",
     "Jean-Christophe BEGUE <jc.begue@pm.me>",
 ]
 license = "MIT"
 edition = { workspace = true }
-documentation = "https://docs.rs/http3-rs"
+documentation = "https://docs.rs/http3"
 repository = { workspace = true }
 readme = "../README.md"
 description = "An async HTTP/3 implementation."
@@ -20,8 +21,14 @@ categories = [
 ]
 
 [features]
-i-implement-a-third-party-backend-and-opt-into-breaking-changes = []
+# Enables tracing.
 tracing = ["dep:tracing"]
+
+# Enables **unstable** APIs. Any API exposed by this feature has no backwards
+# compatibility guarantees. In other words, you should not use this feature for
+# anything besides experimentation. Definitely **do not** publish a crate that
+# depends on this feature.
+unstable = []
 
 [dependencies]
 bytes = { workspace = true }
@@ -55,4 +62,3 @@ tracing-subscriber = { workspace = true, features = [
 ] }
 futures = { workspace = true }
 tokio-util = { workspace = true }
-http3-datagram-rs = { workspace = true }
