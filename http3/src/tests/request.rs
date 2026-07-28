@@ -5,7 +5,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::future;
 use http::{HeaderMap, Request, Response, StatusCode, request};
 
-use super::{Pair, http3_quic, init_tracing};
+use super::{Pair, http3_quinn, init_tracing};
 use crate::{
     ConnectionState, client,
     config::Settings,
@@ -1474,7 +1474,7 @@ where
     let client_fut = async {
         let connection = pair.client_inner().await;
 
-        let (mut driver, send) = client::new(http3_quic::Connection::new(connection.clone()))
+        let (mut driver, send) = client::new(http3_quinn::Connection::new(connection.clone()))
             .await
             .unwrap();
 

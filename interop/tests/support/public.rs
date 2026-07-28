@@ -168,9 +168,9 @@ async fn run_public_server_requests_at_addr(
     tls_config.enable_early_data = true;
     tls_config.alpn_protocols = vec![ALPN_H3.into()];
 
-    let mut endpoint = http3_quic::quic_impl::Endpoint::client("[::]:0".parse()?)?;
-    endpoint.set_default_client_config(http3_quic::quic_impl::ClientConfig::new(Arc::new(
-        http3_quic::quic_impl::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
+    let mut endpoint = http3_quic::quic::Endpoint::client("[::]:0".parse()?)?;
+    endpoint.set_default_client_config(http3_quic::quic::ClientConfig::new(Arc::new(
+        http3_quic::quic::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
     )));
 
     let connecting = endpoint.connect(addr, host)?;

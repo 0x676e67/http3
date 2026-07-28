@@ -1,6 +1,6 @@
-//! QUIC Transport implementation
+//! QUIC Transport implementation with Quinn
 //!
-//! This module implements QUIC traits.
+//! This module implements QUIC traits with Quinn.
 #![deny(missing_docs)]
 
 use std::{
@@ -12,42 +12,32 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
+
 use futures_util::{
     Stream, StreamExt,
     stream::{self},
 };
+
+use quinn::ReadError;
+pub use quinn::{self, AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
+
 use http3::{
     error::Code,
-    quic::{ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf},
+    quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf},
 };
-
-#[cfg(all(feature = "quinn", feature = "quic"))]
-compile_error!("features `quinn` and `quic` are mutually exclusive");
-
-#[cfg(all(feature = "quic", not(feature = "quinn")))]
-pub use quic;
-#[cfg(all(feature = "quinn", not(feature = "quic")))]
-pub use quinn as quic;
-
-use quic::ReadError;
-#[cfg(any(feature = "quinn", feature = "quic"))]
-pub use quic::{AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
-
 use tokio_util::sync::ReusableBoxFuture;
+
 #[cfg(feature = "tracing")]
 use tracing::instrument;
-
-#[cfg(feature = "datagram")]
-pub mod datagram;
 
 /// BoxStream with Sync trait
 type BoxStreamSync<'a, T> = Pin<Box<dyn Stream<Item = T> + Sync + Send + 'a>>;
 
-/// A QUIC connection backed
+/// A QUIC connection backed by Quinn
 ///
-/// Implements a [`quic::Connection`] backed by a [`quic::Connection`].
+/// Implements a [`quic::Connection`] backed by a [`quinn::Connection`].
 pub struct Connection {
-    conn: quic::Connection,
+    conn: quinn::Connection,
     incoming_bi: BoxStreamSync<'static, <AcceptBi<'static> as Future>::Output>,
     opening_bi: Option<BoxStreamSync<'static, <OpenBi<'static> as Future>::Output>>,
     incoming_uni: BoxStreamSync<'static, <AcceptUni<'static> as Future>::Output>,
@@ -55,8 +45,8 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Create a [`Connection`] from a [`quic::Connection`]
-    pub fn new(conn: quic::Connection) -> Self {
+    /// Create a [`Connection`] from a [`quinn::Connection`]
+    pub fn new(conn: quinn::Connection) -> Self {
         Self {
             conn: conn.clone(),
             incoming_bi: Box::pin(stream::unfold(conn.clone(), |conn| async {
@@ -71,7 +61,7 @@ impl Connection {
     }
 }
 
-impl<B> http3::quic::Connection<B> for Connection
+impl<B> quic::Connection<B> for Connection
 where
     B: Buf,
 {
@@ -112,27 +102,27 @@ where
     }
 }
 
-fn convert_connection_error(e: quic::ConnectionError) -> http3::quic::ConnectionErrorIncoming {
+fn convert_connection_error(e: quinn::ConnectionError) -> http3::quic::ConnectionErrorIncoming {
     match e {
-        quic::ConnectionError::ApplicationClosed(application_close) => {
+        quinn::ConnectionError::ApplicationClosed(application_close) => {
             ConnectionErrorIncoming::ApplicationClose {
                 error_code: application_close.error_code.into(),
             }
         }
-        quic::ConnectionError::TimedOut => ConnectionErrorIncoming::Timeout,
+        quinn::ConnectionError::TimedOut => ConnectionErrorIncoming::Timeout,
 
-        error @ quic::ConnectionError::VersionMismatch
-        | error @ quic::ConnectionError::Reset
-        | error @ quic::ConnectionError::LocallyClosed
-        | error @ quic::ConnectionError::CidsExhausted
-        | error @ quic::ConnectionError::TransportError(_)
-        | error @ quic::ConnectionError::ConnectionClosed(_) => {
+        error @ quinn::ConnectionError::VersionMismatch
+        | error @ quinn::ConnectionError::Reset
+        | error @ quinn::ConnectionError::LocallyClosed
+        | error @ quinn::ConnectionError::CidsExhausted
+        | error @ quinn::ConnectionError::TransportError(_)
+        | error @ quinn::ConnectionError::ConnectionClosed(_) => {
             ConnectionErrorIncoming::Undefined(Arc::new(error))
         }
     }
 }
 
-impl<B> http3::quic::OpenStreams<B> for Connection
+impl<B> quic::OpenStreams<B> for Connection
 where
     B: Buf,
 {
@@ -188,17 +178,17 @@ where
     }
 }
 
-/// Stream opener backed by a QUIC connection
+/// Stream opener backed by a Quinn connection
 ///
 /// Implements [`quic::OpenStreams`] using [`quinn::Connection`],
 /// [`quinn::OpenBi`], [`quinn::OpenUni`].
 pub struct OpenStreams {
-    conn: quic::Connection,
+    conn: quinn::Connection,
     opening_bi: Option<BoxStreamSync<'static, <OpenBi<'static> as Future>::Output>>,
     opening_uni: Option<BoxStreamSync<'static, <OpenUni<'static> as Future>::Output>>,
 }
 
-impl<B> http3::quic::OpenStreams<B> for OpenStreams
+impl<B> quic::OpenStreams<B> for OpenStreams
 where
     B: Buf,
 {
@@ -265,7 +255,7 @@ impl Clone for OpenStreams {
     }
 }
 
-/// QUIC-backed bidirectional stream
+/// Quinn-backed bidirectional stream
 ///
 /// Implements [`quic::BidiStream`] which allows the stream to be split
 /// into two structs each implementing one direction.
@@ -277,7 +267,7 @@ where
     recv: RecvStream,
 }
 
-impl<B> http3::quic::BidiStream<B> for BidiStream<B>
+impl<B> quic::BidiStream<B> for BidiStream<B>
 where
     B: Buf,
 {
@@ -289,7 +279,7 @@ where
     }
 }
 
-impl<B: Buf> http3::quic::RecvStream for BidiStream<B> {
+impl<B: Buf> quic::RecvStream for BidiStream<B> {
     type Buf = Bytes;
 
     fn poll_data(
@@ -308,7 +298,7 @@ impl<B: Buf> http3::quic::RecvStream for BidiStream<B> {
     }
 }
 
-impl<B> http3::quic::SendStream<B> for BidiStream<B>
+impl<B> quic::SendStream<B> for BidiStream<B>
 where
     B: Buf,
 {
@@ -332,7 +322,7 @@ where
         self.send.send_id()
     }
 }
-impl<B> http3::quic::SendStreamUnframed<B> for BidiStream<B>
+impl<B> quic::SendStreamUnframed<B> for BidiStream<B>
 where
     B: Buf,
 {
@@ -345,7 +335,7 @@ where
     }
 }
 
-impl<B> http3::quic::Is0rtt for BidiStream<B>
+impl<B> quic::Is0rtt for BidiStream<B>
 where
     B: Buf,
 {
@@ -354,11 +344,11 @@ where
     }
 }
 
-/// QUIC-backed receive stream
+/// Quinn-backed receive stream
 ///
 /// Implements a [`quic::RecvStream`] backed by a [`quinn::RecvStream`].
 pub struct RecvStream {
-    stream: Option<quic::RecvStream>,
+    stream: Option<quinn::RecvStream>,
     read_chunk_fut: ReadChunkFuture,
     is_0rtt: bool,
     pending_stop: Option<VarInt>,
@@ -367,13 +357,13 @@ pub struct RecvStream {
 type ReadChunkFuture = ReusableBoxFuture<
     'static,
     (
-        quic::RecvStream,
-        Result<Option<quic::Chunk>, quic::ReadError>,
+        quinn::RecvStream,
+        Result<Option<quinn::Chunk>, quinn::ReadError>,
     ),
 >;
 
 impl RecvStream {
-    fn new(stream: quic::RecvStream) -> Self {
+    fn new(stream: quinn::RecvStream) -> Self {
         let is_0rtt = stream.is_0rtt();
         Self {
             stream: Some(stream),
@@ -385,7 +375,7 @@ impl RecvStream {
     }
 }
 
-impl http3::quic::RecvStream for RecvStream {
+impl quic::RecvStream for RecvStream {
     type Buf = Bytes;
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
@@ -428,7 +418,7 @@ impl http3::quic::RecvStream for RecvStream {
     }
 }
 
-impl http3::quic::Is0rtt for RecvStream {
+impl quic::Is0rtt for RecvStream {
     /// Check if this stream has been opened during 0-RTT.
     ///
     /// In which case any non-idempotent request should be considered dangerous at the application
@@ -449,32 +439,32 @@ fn convert_read_error_to_stream_error(error: ReadError) -> StreamErrorIncoming {
             }
         }
         error @ ReadError::ClosedStream => StreamErrorIncoming::Unknown(Box::new(error)),
-        ReadError::IllegalOrderedRead => panic!("http3-quic only performs ordered reads"),
+        ReadError::IllegalOrderedRead => panic!("http3-quinn-rs only performs ordered reads"),
         error @ ReadError::ZeroRttRejected => StreamErrorIncoming::Unknown(Box::new(error)),
     }
 }
 
-fn convert_write_error_to_stream_error(error: quic::WriteError) -> StreamErrorIncoming {
+fn convert_write_error_to_stream_error(error: quinn::WriteError) -> StreamErrorIncoming {
     match error {
-        quic::WriteError::Stopped(var_int) => StreamErrorIncoming::StreamTerminated {
+        quinn::WriteError::Stopped(var_int) => StreamErrorIncoming::StreamTerminated {
             error_code: var_int.into_inner(),
         },
-        quic::WriteError::ConnectionLost(connection_error) => {
+        quinn::WriteError::ConnectionLost(connection_error) => {
             StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error: convert_connection_error(connection_error),
             }
         }
-        error @ quic::WriteError::ClosedStream | error @ quic::WriteError::ZeroRttRejected => {
+        error @ quinn::WriteError::ClosedStream | error @ quinn::WriteError::ZeroRttRejected => {
             StreamErrorIncoming::Unknown(Box::new(error))
         }
     }
 }
 
-/// QUIC-backed send stream
+/// Quinn-backed send stream
 ///
-/// Implements a [`quic::SendStream`] backed by a [`quic::SendStream`].
+/// Implements a [`quic::SendStream`] backed by a [`quinn::SendStream`].
 pub struct SendStream<B: Buf> {
-    stream: quic::SendStream,
+    stream: quinn::SendStream,
     writing: Option<WriteBuf<B>>,
 }
 
@@ -482,7 +472,7 @@ impl<B> SendStream<B>
 where
     B: Buf,
 {
-    fn new(stream: quic::SendStream) -> SendStream<B> {
+    fn new(stream: quinn::SendStream) -> SendStream<B> {
         Self {
             stream,
             writing: None,
@@ -490,7 +480,7 @@ where
     }
 }
 
-impl<B> http3::quic::SendStream<B> for SendStream<B>
+impl<B> quic::SendStream<B> for SendStream<B>
 where
     B: Buf,
 {
@@ -531,7 +521,7 @@ where
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn send_data<D: Into<WriteBuf<B>>>(&mut self, data: D) -> Result<(), StreamErrorIncoming> {
         if self.writing.is_some() {
-            // This can only happen if the traits are misused by http3 itself.
+            // This can only happen if the traits are misused by http3-rs itself.
             // If this happens log an error and close the connection with H3_INTERNAL_ERROR
 
             #[cfg(feature = "tracing")]
@@ -553,7 +543,7 @@ where
     }
 }
 
-impl<B> http3::quic::SendStreamUnframed<B> for SendStream<B>
+impl<B> quic::SendStreamUnframed<B> for SendStream<B>
 where
     B: Buf,
 {

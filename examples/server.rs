@@ -3,7 +3,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use bytes::{Bytes, BytesMut};
 use http::StatusCode;
 use http3::server::RequestResolver;
-use http3_quic::quic_impl::crypto::rustls::QuicServerConfig;
+use http3_quic::quic::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use structopt::StructOpt;
 use tokio::{fs::File, io::AsyncReadExt};

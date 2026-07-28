@@ -9,7 +9,7 @@ use futures_util::future;
 use http::{Request, Response, StatusCode};
 use tokio::sync::oneshot::{self};
 
-use super::{Pair, http3_quic, init_tracing};
+use super::{Pair, http3_quinn, init_tracing};
 use crate::{
     ConnectionState, client,
     client::SendRequest,
@@ -643,7 +643,7 @@ async fn goaway_from_server_not_request_id() {
         control_stream.write_all(&buf[..]).await.unwrap();
         control_stream.finish().unwrap(); // close the client control stream immediately
 
-        let (mut driver, _send) = client::new(http3_quic::Connection::new(connection))
+        let (mut driver, _send) = client::new(http3_quinn::Connection::new(connection))
             .await
             .unwrap();
 

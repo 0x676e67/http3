@@ -7,7 +7,6 @@ use std::{
     task::{Poll, ready},
 };
 
-use super::quic_impl::{ReadDatagram, SendDatagramError};
 use bytes::{Buf, Bytes};
 use futures_util::{StreamExt, stream};
 use http3_datagram::{
@@ -16,11 +15,12 @@ use http3_datagram::{
     quic_traits::{DatagramConnectionExt, RecvDatagram, SendDatagram, SendDatagramErrorIncoming},
 };
 
+use super::quic::{ReadDatagram, SendDatagramError};
 use crate::{BoxStreamSync, Connection, convert_connection_error};
 
 /// A Struct which allows to send datagrams over a QUIC connection.
 pub struct SendDatagramHandler {
-    conn: super::quic_impl::Connection,
+    conn: super::quic::Connection,
 }
 
 impl<B: Buf> SendDatagram<B> for SendDatagramHandler {
