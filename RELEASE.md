@@ -7,15 +7,41 @@
 - *(h3)* Add settings ordering and arbitrary settings support
 - *(h3)* Add QPACK settings support for HTTP/3 impersonation
 - *(h3)* Make SettingId and constants public with doc comments
+- *(client,qpack)* Implement qpack dynamic table decoder (#1)
 
 ### 🐛 Bug Fixes
 
 - *(client)* Correct behavior of standard CONNECT (#322)
 - *(h3)* Always append GREASE last, use u32 random value matching Chromium
+- *(client, qpack)* Wait for missing refs without lost wakeups (#17)
+- *(ngtcp2, nghttp3)* Fix Windows MSVC CRT interop build warning (#38)
+- *(interop)* Use published crates and drain h3 requests (#44)
+
+### 💼 Other
+
+- *(deps)* Update dependencies
 
 ### 🚜 Refactor
 
-- Rename crates for http3 fork
+- Rename crates for http3-rs fork
+- Crates for `http3` fork (#45)
+- *(feature)* Rename third-party backend flag to `unstable` (#46)
+
+### ⚡ Performance
+
+- *(header)* Optimize HeaderValue creation via zero-copy sharing (#33)
+
+### 🧪 Testing
+
+- *(http3, client)* Add server interop tests (#21)
+- *(http3, client)* Add real-server interop tests (#22)
+- *(http3, client)* Add real GREASE interop tests (#25)
+- *(interop)* Tighten ngtcp2 FFI safety boundaries (#27)
+- *(http3, client)* Add GREASE interop tests (#28)
+- *(interop)* Join local interop request tasks concurrently (#30)
+- *(interop)* Join public server request tasks concurrently (#29)
+- *(interop)* Add s2n h3 server backend (#34)
+- *(interop)* Add quinn h3 server backend (#37)
 
 ### ⚙️ Miscellaneous Tasks
 
@@ -26,6 +52,9 @@
 - Update Rust baseline and workflow tooling
 - Use latest nightly for fuzzing
 - Keep nightly jobs current
+- Update dependabot configuration for new ecosystems (#23)
+- Limit default workspace members
+- *(interop)* Update ngtcp2 crates to 0.2.0 (#43)
 ## [h3-quinn-v0.0.9] - 2025-03-18
 
 ### 💼 Other
