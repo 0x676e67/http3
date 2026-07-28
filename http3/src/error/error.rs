@@ -93,10 +93,7 @@ pub enum StreamError {
     /// When sending a request, this means, that the request cannot be sent because the header is
     /// larger then permitted by the server When receiving a request, this means, that the
     /// server sent a
-    #[cfg_attr(
-        not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"),
-        non_exhaustive
-    )]
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     HeaderTooBig {
         /// The actual size of the header block
         actual_size: u64,

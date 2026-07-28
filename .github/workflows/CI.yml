@@ -25,7 +25,7 @@ jobs:
       - style
       - lint
       - msrv
-      - msrv_http3_quinn
+      - msrv_http3_quic
       - test
       - doc
       - fuzz
@@ -71,7 +71,7 @@ jobs:
           toolchain: ${{ env.toolchain_msrv }}
       - run: cargo check -p http3
 
-  msrv_http3_quinn:
+  msrv_http3_quic:
     name: Check MSRV of `http3-quic`
     needs: [style]
     runs-on: ubuntu-latest
@@ -90,12 +90,7 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         toolchain: [stable, beta]
-        features:
-          [
-            unstable,
-            tracing,
-            "tracing,unstable",
-          ]
+        features: [unstable, tracing, "tracing,unstable"]
         target: [x86_64-unknown-linux-gnu]
         include:
           # Add a 32-bit target test configuration
