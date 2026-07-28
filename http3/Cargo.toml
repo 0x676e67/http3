@@ -21,8 +21,14 @@ categories = [
 ]
 
 [features]
-i-implement-a-third-party-backend-and-opt-into-breaking-changes = []
+# Enables tracing.
 tracing = ["dep:tracing"]
+
+# Enables **unstable** APIs. Any API exposed by this feature has no backwards
+# compatibility guarantees. In other words, you should not use this feature for
+# anything besides experimentation. Definitely **do not** publish a crate that
+# depends on this feature.
+unstable = []
 
 [dependencies]
 bytes = { workspace = true }

@@ -92,16 +92,16 @@ jobs:
         toolchain: [stable, beta]
         features:
           [
-            i-implement-a-third-party-backend-and-opt-into-breaking-changes,
+            unstable,
             tracing,
-            "tracing,i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+            "tracing,unstable",
           ]
         target: [x86_64-unknown-linux-gnu]
         include:
           # Add a 32-bit target test configuration
           - os: ubuntu-latest
             toolchain: stable
-            features: i-implement-a-third-party-backend-and-opt-into-breaking-changes
+            features: unstable
             target: i686-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
