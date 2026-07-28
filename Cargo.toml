@@ -8,10 +8,6 @@ members = [
     # Internal
     "examples",
     "interop",
-    "interop/crates/nghttp3-sys",
-    "interop/crates/ngtcp2",
-    "interop/crates/ngtcp2-sys",
-    "interop/crates/tokio-ngtcp2",
 ]
 default-members = [
     "http3",
@@ -22,6 +18,7 @@ default-members = [
 ]
 exclude = [
   "fuzz",
+  "interop/crates",
 ]
 resolver = "2"
 
@@ -37,10 +34,10 @@ http3-rs = { version = "0.0.8", path = "http3" }
 http3-webtransport-rs = { version = "0.1.2", path = "http3-webtransport" }
 
 # Internal
-ngtcp2-sys = { version = "0.0.0", path = "interop/crates/ngtcp2-sys" }
-nghttp3-sys = { version = "0.0.0", path = "interop/crates/nghttp3-sys" }
-ngtcp2 = { version = "0.0.0", path = "interop/crates/ngtcp2" }
-tokio-ngtcp2 = { version = "0.0.0", path = "interop/crates/tokio-ngtcp2" }
+ngtcp2-sys = "=0.2.0"
+nghttp3-sys = "=0.2.0"
+ngtcp2 = "=0.2.0"
+tokio-ngtcp2 = "=0.2.0"
 
 # External crates
 anyhow = "1.0"

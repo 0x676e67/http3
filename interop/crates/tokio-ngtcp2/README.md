@@ -1,15 +1,12 @@
 # tokio-ngtcp2
 
-Tokio async runtime integration for the local ngtcp2/nghttp3 wrapper.
+Tokio async runtime integration for the `ngtcp2` Rust wrapper.
 
 ## Scope
 
-This crate is maintained only for the
-[0x676e67/http3-rs](https://github.com/0x676e67/http3-rs) interoperability
-test suite. It adapts the local `ngtcp2` wrapper to Tokio so the interop tests
-can run ngtcp2/nghttp3 HTTP/3 servers.
-
-It is not intended or recommended for production applications.
+This crate is maintained in the
+[http3-rs](https://github.com/0x676e67/http3-rs) repository. It adapts the
+`ngtcp2` wrapper to Tokio for asynchronous HTTP/3 clients and servers.
 
 ## Features
 

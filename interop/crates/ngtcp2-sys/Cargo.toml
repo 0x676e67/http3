@@ -1,7 +1,7 @@
 [package]
 name = "ngtcp2-sys"
-version = "0.0.0"
-description = "ngtcp2 FFI bindings used by http3-rs interoperability tests"
+version = "0.2.0"
+description = "FFI bindings to ngtcp2"
 edition = "2024"
 rust-version = "1.96"
 build = "build.rs"
@@ -47,7 +47,7 @@ include = [
 doctest = false
 
 [dependencies]
-aws-lc-sys = { version = "0.41", features = ["ssl"] }
+aws-lc-sys = { version = "0.43.0", features = ["ssl"] }
 libc = "0.2"
 
 [build-dependencies]

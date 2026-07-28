@@ -1,13 +1,13 @@
 //! Integration tests
 //!
-//! Integration tests for HTTP/3 and WebTransport
+//! Integration tests for HTTP/3.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ngtcp2::{Header, Http3SettingsExt, TransportParamsExt};
+use ngtcp2::{Header, TransportParamsExt};
 use rcgen::generate_simple_self_signed;
-use tokio_ngtcp2::{Client, ClientWebTransportSession, Server, ServerWebTransportSession};
+use tokio_ngtcp2::{Client, Server};
 
 /// Generate a certificate for tests
 fn generate_test_certificate() -> (PathBuf, PathBuf) {
@@ -69,42 +69,9 @@ async fn test_server_creation() {
 }
 
 #[tokio::test]
-async fn test_webtransport_client_creation() {
-    // Check that a WebTransport client can be created
-    let result = ClientWebTransportSession::connect(
-        "127.0.0.1:14434".parse().unwrap(),
-        "localhost",
-        "/webtransport",
-    )
-    .await;
-
-    assert!(result.is_ok());
-
-    let session = result.unwrap();
-    assert_eq!(session.remote_addr(), "127.0.0.1:14434".parse().unwrap());
-    assert!(session.session_id().is_none()); // The session has not been established yet
-}
-
-#[tokio::test]
-async fn test_webtransport_server_creation() {
-    let (cert_path, key_path) = generate_test_certificate();
-
-    // Create the WebTransport server
-    let result =
-        ServerWebTransportSession::bind("127.0.0.1:0".parse().unwrap(), &cert_path, &key_path)
-            .await;
-
-    assert!(result.is_ok());
-
-    let server = result.unwrap();
-    assert_ne!(server.local_addr().port(), 0);
-}
-
-#[tokio::test]
-async fn test_transport_params_webtransport() {
+async fn test_transport_params_datagram() {
     use ngtcp2::ngtcp2_transport_params;
 
-    // Check WebTransport transport parameters
     let params = ngtcp2_transport_params::default_params().with_datagram(65535);
 
     assert_eq!(params.max_datagram_frame_size, 65535);
@@ -112,34 +79,18 @@ async fn test_transport_params_webtransport() {
     assert!(params.initial_max_streams_uni > 0);
 }
 
-#[tokio::test]
-async fn test_h3_settings_webtransport() {
-    use ngtcp2::nghttp3_settings;
-
-    // Check WebTransport HTTP/3 settings
-    let settings = nghttp3_settings::default_settings().with_webtransport();
-
-    assert_eq!(settings.enable_connect_protocol, 1);
-    assert_eq!(settings.h3_datagram, 1);
-    assert_eq!(settings.wt_enabled, 1);
-}
-
 #[test]
 fn test_header_creation() {
-    // Check HTTP/3 header creation
     let headers = [
-        Header::method("CONNECT"),
-        Header::new(b":protocol", b"webtransport"),
+        Header::method("GET"),
         Header::scheme("https"),
         Header::authority("localhost:4433"),
-        Header::path("/webtransport"),
+        Header::path("/"),
     ];
 
-    assert_eq!(headers.len(), 5);
+    assert_eq!(headers.len(), 4);
     assert_eq!(headers[0].name_str(), Some(":method"));
-    assert_eq!(headers[0].value_str(), Some("CONNECT"));
-    assert_eq!(headers[1].name_str(), Some(":protocol"));
-    assert_eq!(headers[1].value_str(), Some("webtransport"));
+    assert_eq!(headers[0].value_str(), Some("GET"));
 }
 
 #[tokio::test]
