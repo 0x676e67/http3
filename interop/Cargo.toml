@@ -29,7 +29,7 @@ rustls = { workspace = true, features = [
     "std",
 ] }
 rustls-native-certs = { workspace = true }
-rustls-pki-types = { version = "1", features = ["std"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["full"] }
 
@@ -41,8 +41,8 @@ s2n-quic = { version = "1.83", default-features = false, features = [
     "provider-address-token-default",
     "provider-tls-rustls",
 ] }
-s2n-quic-h3 = { version = "0.1", features = ["tracing"] }
-tokio-quiche = { version = "0.19", default-features = false }
+s2n-quic-h3 = { version = "0.2.0", features = ["tracing"] }
+tokio-quiche = { version = "0.19.1", default-features = false }
 tquic = "1.6"
 ngtcp2 = { workspace = true }
 tokio-ngtcp2 = { workspace = true }

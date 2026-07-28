@@ -11,7 +11,7 @@ documentation = "https://docs.rs/http3-quic"
 repository = { workspace = true }
 readme = "README.md"
 description = "QUIC transport implementation."
-keywords = ["http3", "quic"]
+keywords = ["http3", "quic", "quinn"]
 categories = ["network-programming", "web-programming"]
 license = "MIT"
 
