@@ -1,13 +1,12 @@
-use bytes::{Buf, BufMut, Bytes};
-use smallvec::SmallVec;
 use std::{
     convert::TryInto,
     fmt::{self, Debug},
 };
+
+use bytes::{Buf, BufMut, Bytes};
+use smallvec::SmallVec;
 #[cfg(feature = "tracing")]
 use tracing::trace;
-
-use crate::webtransport::SessionId;
 
 use super::{
     coding::{Decode, Encode},
@@ -15,6 +14,7 @@ use super::{
     stream::InvalidStreamId,
     varint::{BufExt, BufMutExt, UnexpectedEnd, VarInt},
 };
+use crate::webtransport::SessionId;
 
 #[derive(Debug, PartialEq)]
 pub enum FrameError {
@@ -622,9 +622,11 @@ impl From<InvalidPushId> for FrameError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use assert_matches::assert_matches;
     use std::io::Cursor;
+
+    use assert_matches::assert_matches;
+
+    use super::*;
 
     #[test]
     fn unknown_frame_type() {

@@ -1,40 +1,31 @@
 //! Server-side HTTP/3 stream management
 
-use bytes::Buf;
+use std::{
+    option::Option,
+    result::Result,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
+use bytes::{Buf, BytesMut};
+use futures_util::future;
+use http::{HeaderMap, Response, response};
+use quic::StreamId;
+#[cfg(feature = "tracing")]
+use tracing::{error, instrument};
+
+use super::connection::RequestEnd;
 use crate::{
     error::{
         Code, StreamError, connection_error_creators::CloseStream,
         internal_error::InternalConnectionError,
     },
-    quic::{self},
-    shared_state::{ConnectionState, SharedState},
-};
-
-use super::connection::RequestEnd;
-use std::sync::Arc;
-
-use std::{
-    option::Option,
-    result::Result,
-    task::{Context, Poll},
-};
-
-use bytes::BytesMut;
-use futures_util::future;
-use http::{HeaderMap, Response, response};
-
-use quic::StreamId;
-
-use crate::{
     proto::{frame::Frame, headers::Header},
     qpack,
-    quic::SendStream as _,
+    quic::{self, SendStream as _},
+    shared_state::{ConnectionState, SharedState},
     stream::{self},
 };
-
-#[cfg(feature = "tracing")]
-use tracing::{error, instrument};
 
 /// Manage request and response transfer for an incoming request
 ///
@@ -113,8 +104,8 @@ where
     /// # Example
     ///
     /// ```no_run
-    /// # use http3_rs::server::RequestStream;
-    /// # async fn example(mut stream: RequestStream<impl http3_rs::quic::BidiStream<bytes::Bytes> + http3_rs::quic::Is0rtt, bytes::Bytes>) {
+    /// # use http3::server::RequestStream;
+    /// # async fn example(mut stream: RequestStream<impl http3::quic::BidiStream<bytes::Bytes> + http3::quic::Is0rtt, bytes::Bytes>) {
     /// if stream.is_0rtt() {
     ///     // Reject non-idempotent methods (e.g., POST, PUT, DELETE)
     ///     // to prevent replay attacks

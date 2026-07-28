@@ -6,7 +6,7 @@ Rust wrapper library for [ngtcp2](https://github.com/ngtcp2/ngtcp2) and
 ## Scope
 
 This crate is maintained in the
-[http3-rs](https://github.com/0x676e67/http3-rs) repository. It wraps
+[http3](https://github.com/0x676e67/http3) repository. It wraps
 `ngtcp2-sys` and `nghttp3-sys` with a small Rust API for HTTP/3 clients and
 servers.
 

@@ -1,15 +1,13 @@
-# http3-rs
+# http3
 
 A Tokio aware, HTTP/3 implementation for Rust.
 
-[![CI](https://github.com/0x676e67/http3-rs/actions/workflows/CI.yml/badge.svg)](https://github.com/0x676e67/http3-rs/actions/workflows/CI.yml)
+[![CI](https://github.com/0x676e67/http3/actions/workflows/CI.yml/badge.svg)](https://github.com/0x676e67/http3/actions/workflows/CI.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Crates.io](https://img.shields.io/crates/v/http3-rs.svg)](https://crates.io/crates/http3-rs)
-[![Documentation](https://docs.rs/http3-rs/badge.svg)][docs]
+[![Crates.io](https://img.shields.io/crates/v/http3.svg)](https://crates.io/crates/http3)
+[![Documentation](https://docs.rs/http3/badge.svg)][docs]
 
-More information about this crate can be found in the [crate documentation][docs].
-
-[docs]: https://docs.rs/http3-rs
+More information about this crate can be found in the [crate documentation][docs](https://docs.rs/http3).
 
 ## Features
 
@@ -23,17 +21,17 @@ More information about this crate can be found in the [crate documentation][docs
 
 ## Usage
 
-To use `http3-rs`, first add this to your `Cargo.toml`:
+To use `http3`, first add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-http3-rs = "0.0.8"
+http3 = "0.0.8"
 ```
 
 Next, add this to your crate:
 
 ```rust
-use http3_rs::client::Connection;
+use http3::client::Connection;
 
 fn main() {
     // ...

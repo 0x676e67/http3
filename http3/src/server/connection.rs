@@ -11,10 +11,12 @@ use std::{
 };
 
 use bytes::Buf;
-use quic::RecvStream;
-use quic::StreamId;
+use quic::{RecvStream, StreamId};
 use tokio::sync::mpsc;
+#[cfg(feature = "tracing")]
+use tracing::{instrument, trace, warn};
 
+use super::request::RequestResolver;
 use crate::{
     connection::ConnectionInner,
     error::{Code, ConnectionError, internal_error::InternalConnectionError},
@@ -27,11 +29,6 @@ use crate::{
     shared_state::{ConnectionState, SharedState},
     stream::BufRecvStream,
 };
-
-#[cfg(feature = "tracing")]
-use tracing::{instrument, trace, warn};
-
-use super::request::RequestResolver;
 
 /// Server connection driver
 ///
@@ -78,8 +75,8 @@ where
 {
     /// Create a new HTTP/3 server connection with default settings
     ///
-    /// Use a custom [`super::builder::Builder`] with [`super::builder::builder()`] to create a connection
-    /// with different settings.
+    /// Use a custom [`super::builder::Builder`] with [`super::builder::builder()`] to create a
+    /// connection with different settings.
     /// Provide a Connection which implements [`quic::Connection`].
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn new(conn: C) -> Result<Self, ConnectionError> {
@@ -87,21 +84,21 @@ where
     }
 }
 
-#[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
+#[cfg(feature = "unstable")]
 /// Impls for extension implementation which are not stable
 impl<C, B> Connection<C, B>
 where
     C: quic::Connection<B>,
     B: Buf,
 {
-    #[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
+    #[cfg(feature = "unstable")]
     /// Create a [`RequestResolver`] to handle an incoming request.
     pub fn create_resolver(&self, stream: FrameStream<C::BidiStream, B>) -> RequestResolver<C, B> {
         self.create_resolver_internal(stream)
     }
 
     /// Polls the Connection and accepts an incoming request_streams
-    #[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
+    #[cfg(feature = "unstable")]
     pub fn poll_accept_request_stream(
         &mut self,
         cx: &mut Context<'_>,
@@ -117,8 +114,9 @@ where
 {
     /// Accept an incoming request.
     ///
-    /// This method returns a [`RequestResolver`] which can be used to read the request and send the response.
-    /// This method will return `None` when the connection receives a GOAWAY frame and all requests have been completed.
+    /// This method returns a [`RequestResolver`] which can be used to read the request and send the
+    /// response. This method will return `None` when the connection receives a GOAWAY frame and
+    /// all requests have been completed.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn accept(&mut self) -> Result<Option<RequestResolver<C, B>>, ConnectionError> {
         // Accept the incoming stream

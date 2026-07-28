@@ -5,6 +5,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::future;
 use http::{HeaderMap, Request, Response, StatusCode, request};
 
+use super::{Pair, http3_quinn, init_tracing};
 use crate::{
     ConnectionState, client,
     config::Settings,
@@ -21,9 +22,6 @@ use crate::{
     server,
     tests::get_stream_blocking,
 };
-
-use super::http3_quinn_rs;
-use super::{Pair, init_tracing};
 
 #[tokio::test]
 async fn get() {
@@ -468,7 +466,8 @@ async fn header_too_big_client_error() {
 
         let incoming = incoming_req.accept().await.unwrap().unwrap();
 
-        // client does not send any data, so the server will not receive any data, resulting in a H3_REQUEST_INCOMPLETE
+        // client does not send any data, so the server will not receive any data, resulting in a
+        // H3_REQUEST_INCOMPLETE
         assert_matches!(
             incoming
                 .resolve_request()
@@ -1475,7 +1474,7 @@ where
     let client_fut = async {
         let connection = pair.client_inner().await;
 
-        let (mut driver, send) = client::new(http3_quinn_rs::Connection::new(connection.clone()))
+        let (mut driver, send) = client::new(http3_quinn::Connection::new(connection.clone()))
             .await
             .unwrap();
 

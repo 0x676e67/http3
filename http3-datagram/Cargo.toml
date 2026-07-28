@@ -1,12 +1,13 @@
 [package]
-name = "http3-datagram-rs"
+name = "http3-datagram"
 version = "0.0.2"
 rust-version = { workspace = true }
 edition = { workspace = true }
-documentation = "https://docs.rs/http3-datagram-rs"
+authors = ["0x676e67 <gngppz@gmail.com>"]
+documentation = "https://docs.rs/http3-datagram"
 repository = { workspace = true }
 readme = "README.md"
-description = "RFC 9297 datagram extension for http3-rs"
+description = "RFC 9297 datagram extension for http3"
 keywords = ["http3", "quic", "rfc9297"]
 categories = ["network-programming", "web-programming"]
 license = "MIT"
@@ -19,6 +20,6 @@ tracing = { workspace = true, optional = true }
 [features]
 tracing = ["dep:tracing"]
 
-[dependencies.http3-rs]
+[dependencies.http3]
 workspace = true
-features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"]
+features = ["unstable"]
