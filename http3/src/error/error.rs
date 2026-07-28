@@ -12,26 +12,17 @@ use crate::quic::ConnectionErrorIncoming;
 #[non_exhaustive]
 pub enum ConnectionError {
     /// The error occurred on the local side of the connection
-    #[cfg_attr(
-        not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"),
-        non_exhaustive
-    )]
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     Local {
         /// The error
         error: LocalError,
     },
     /// Error returned by the quic layer
     /// A QUIC error occurred or the remote HTTP/3 endpoint closed the connection.
-    #[cfg_attr(
-        not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"),
-        non_exhaustive
-    )]
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     Remote(ConnectionErrorIncoming),
     /// Timeout occurred
-    #[cfg_attr(
-        not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"),
-        non_exhaustive
-    )]
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     Timeout,
 }
 
@@ -78,10 +69,7 @@ pub enum LocalError {
 #[non_exhaustive]
 pub enum StreamError {
     /// The error occurred on the stream
-    #[cfg_attr(
-        not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"),
-        non_exhaustive
-    )]
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     StreamError {
         /// The error code
         code: Code,
@@ -91,19 +79,13 @@ pub enum StreamError {
     /// The remote peer terminated the corresponding stream side
     ///
     /// Either Reset on peers sending side or StopSending on peers receiving side
-    #[cfg_attr(
-        not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"),
-        non_exhaustive
-    )]
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     RemoteTerminate {
         /// Reset code received from the peer
         code: Code,
     },
     /// The error occurred on the connection
-    #[cfg_attr(
-        not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"),
-        non_exhaustive
-    )]
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     ConnectionError(ConnectionError),
     /// Error is used when violating the MAX_FIELD_SECTION_SIZE
     ///
@@ -111,10 +93,7 @@ pub enum StreamError {
     /// When sending a request, this means, that the request cannot be sent because the header is
     /// larger then permitted by the server When receiving a request, this means, that the
     /// server sent a
-    #[cfg_attr(
-        not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"),
-        non_exhaustive
-    )]
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     HeaderTooBig {
         /// The actual size of the header block
         actual_size: u64,
@@ -124,16 +103,10 @@ pub enum StreamError {
     /// Received a GoAway frame from the remote
     ///
     /// Stream operations cannot be performed
-    #[cfg_attr(
-        not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"),
-        non_exhaustive
-    )]
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     RemoteClosing,
     /// Undefined error propagated by the quic layer
-    #[cfg_attr(
-        not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"),
-        non_exhaustive
-    )]
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     Undefined(Box<dyn std::error::Error + Send + Sync>),
 }
 

@@ -22,4 +22,4 @@ tracing = ["dep:tracing"]
 
 [dependencies.http3]
 workspace = true
-features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"]
+features = ["unstable"]

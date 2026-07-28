@@ -84,21 +84,21 @@ where
     }
 }
 
-#[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
+#[cfg(feature = "unstable")]
 /// Impls for extension implementation which are not stable
 impl<C, B> Connection<C, B>
 where
     C: quic::Connection<B>,
     B: Buf,
 {
-    #[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
+    #[cfg(feature = "unstable")]
     /// Create a [`RequestResolver`] to handle an incoming request.
     pub fn create_resolver(&self, stream: FrameStream<C::BidiStream, B>) -> RequestResolver<C, B> {
         self.create_resolver_internal(stream)
     }
 
     /// Polls the Connection and accepts an incoming request_streams
-    #[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
+    #[cfg(feature = "unstable")]
     pub fn poll_accept_request_stream(
         &mut self,
         cx: &mut Context<'_>,
