@@ -125,10 +125,15 @@ done
 
 cd "$tmp_root"
 
-crates="nghttp3-sys ngtcp2-sys ngtcp2 tokio-ngtcp2"
+manifests="
+interop/crates/nghttp3-sys/Cargo.toml
+interop/crates/ngtcp2-sys/Cargo.toml
+interop/crates/ngtcp2/Cargo.toml
+interop/crates/tokio-ngtcp2/Cargo.toml
+"
 
-for crate in $crates; do
-    set -- publish -p "$crate" --registry "$registry"
+for manifest in $manifests; do
+    set -- publish --manifest-path "$manifest" --registry "$registry"
     if [ "$execute" -eq 0 ]; then
         set -- "$@" --dry-run
     fi
@@ -144,7 +149,7 @@ for crate in $crates; do
 
     cargo "$@"
 
-    if [ "$execute" -eq 1 ] && [ "$crate" != "tokio-ngtcp2" ] && [ "$delay_seconds" -gt 0 ]; then
+    if [ "$execute" -eq 1 ] && [ "$manifest" != "interop/crates/tokio-ngtcp2/Cargo.toml" ] && [ "$delay_seconds" -gt 0 ]; then
         echo "Waiting $delay_seconds seconds for registry index propagation..."
         sleep "$delay_seconds"
     fi

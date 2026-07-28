@@ -26,14 +26,8 @@ pub trait Http3SettingsExt {
     /// Creates default settings.
     fn default_settings() -> Self;
 
-    /// Enables WebTransport support.
-    fn with_webtransport(self) -> Self;
-
     /// Sets the maximum field section size.
     fn with_max_field_section_size(self, size: u64) -> Self;
-
-    /// Enables or disables WebTransport.
-    fn with_wt_enabled(self, enabled: u8) -> Self;
 }
 
 impl Http3SettingsExt for nghttp3_settings {
@@ -54,20 +48,8 @@ impl Http3SettingsExt for nghttp3_settings {
         settings
     }
 
-    fn with_webtransport(mut self) -> Self {
-        self.enable_connect_protocol = 1;
-        self.h3_datagram = 1;
-        self.wt_enabled = 1;
-        self
-    }
-
     fn with_max_field_section_size(mut self, size: u64) -> Self {
         self.max_field_section_size = size;
-        self
-    }
-
-    fn with_wt_enabled(mut self, enabled: u8) -> Self {
-        self.wt_enabled = enabled;
         self
     }
 }

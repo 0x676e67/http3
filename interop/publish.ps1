@@ -7,13 +7,6 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$crates = @(
-    "nghttp3-sys",
-    "ngtcp2-sys",
-    "ngtcp2",
-    "tokio-ngtcp2"
-)
-
 $crateManifests = @(
     "interop/crates/nghttp3-sys/Cargo.toml",
     "interop/crates/ngtcp2-sys/Cargo.toml",
@@ -51,7 +44,7 @@ function Enable-PublishInManifest {
 
     $content = Get-Content -Raw -LiteralPath $Manifest
     $replacement = "publish = [`"$Registry`"]"
-    $updated = $content -replace "(?m)^publish = false$", $replacement
+    $updated = $content -replace "(?m)^publish = false\r?$", $replacement
     if ($updated -eq $content) {
         throw "publish = false not found in $Manifest"
     }
@@ -76,8 +69,9 @@ try {
     }
 
     Push-Location $tempRoot
-    foreach ($crate in $crates) {
-        $args = @("publish", "-p", $crate, "--registry", $Registry)
+    for ($index = 0; $index -lt $crateManifests.Count; $index++) {
+        $manifest = $crateManifests[$index]
+        $args = @("publish", "--manifest-path", $manifest, "--registry", $Registry)
         if (-not $Execute) {
             $args += "--dry-run"
         }
@@ -89,10 +83,10 @@ try {
         & cargo @args
 
         if ($LASTEXITCODE -ne 0) {
-            throw "cargo publish failed for $crate"
+            throw "cargo publish failed for $manifest"
         }
 
-        if ($Execute -and $crate -ne $crates[-1] -and $DelaySeconds -gt 0) {
+        if ($Execute -and $index -lt $crateManifests.Count - 1 -and $DelaySeconds -gt 0) {
             Write-Host "Waiting $DelaySeconds seconds for registry index propagation..."
             Start-Sleep -Seconds $DelaySeconds
         }
