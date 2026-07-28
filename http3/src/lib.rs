@@ -17,42 +17,42 @@ mod buf;
 
 mod shared_state;
 
-#[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
+#[cfg(feature = "unstable")]
 pub use shared_state::{ConnectionState, SharedState};
 
 pub mod error;
 
-#[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
+#[cfg(feature = "unstable")]
 #[allow(missing_docs)]
 pub mod connection;
-#[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
+#[cfg(feature = "unstable")]
 #[allow(missing_docs)]
 pub mod frame;
-#[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
+#[cfg(feature = "unstable")]
 #[allow(missing_docs)]
 pub mod proto;
-#[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
+#[cfg(feature = "unstable")]
 #[allow(dead_code, missing_docs)]
 pub mod qpack;
-#[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
+#[cfg(feature = "unstable")]
 #[allow(missing_docs)]
 pub mod stream;
-#[cfg(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes")]
+#[cfg(feature = "unstable")]
 #[allow(missing_docs)]
 pub mod webtransport;
 
-#[cfg(not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"))]
+#[cfg(not(feature = "unstable"))]
 mod connection;
-#[cfg(not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"))]
+#[cfg(not(feature = "unstable"))]
 mod frame;
-#[cfg(not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"))]
+#[cfg(not(feature = "unstable"))]
 mod proto;
-#[cfg(not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"))]
+#[cfg(not(feature = "unstable"))]
 #[allow(dead_code)]
 mod qpack;
-#[cfg(not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"))]
+#[cfg(not(feature = "unstable"))]
 mod stream;
-#[cfg(not(feature = "i-implement-a-third-party-backend-and-opt-into-breaking-changes"))]
+#[cfg(not(feature = "unstable"))]
 mod webtransport;
 
 pub use proto::{
