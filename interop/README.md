@@ -1,6 +1,6 @@
 # HTTP/3 Interop
 
-Local interoperability tests for the `http3-rs` Quinn client.
+Local interoperability tests for the `http3` QUIC client.
 
 The tests run the same client against several HTTP/3 server backends:
 ngtcp2/nghttp3, quiche, and tquic. The ngtcp2/nghttp3 wrappers live in

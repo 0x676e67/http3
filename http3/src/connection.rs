@@ -10,7 +10,6 @@ use futures_util::{future, ready};
 use http::HeaderMap;
 use stream::WriteBuf;
 use tokio::sync::mpsc;
-
 #[cfg(feature = "tracing")]
 use tracing::{instrument, warn};
 
@@ -109,14 +108,16 @@ where
     B: Buf,
 {
     pub shared: Arc<SharedState>,
-    /// TODO: breaking encapsulation just to see if we can get this to work, will fix before merging
+    /// TODO: breaking encapsulation just to see if we can get this to work, will fix before
+    /// merging
     pub conn: C,
     control_send: C::SendStream,
     control_recv: Option<FrameStream<C::RecvStream, B>>,
     pub(crate) qpack_streams: QpackStreams<C, B>,
     /// Buffers incoming uni/recv streams which have yet to be claimed.
     ///
-    /// This is opposed to discarding them by returning in `poll_accept_recv`, which may cause them to be missed by something else polling.
+    /// This is opposed to discarding them by returning in `poll_accept_recv`, which may cause them
+    /// to be missed by something else polling.
     ///
     /// See: <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-4.5>
     ///
@@ -200,7 +201,8 @@ where
 
         let settings = frame::Settings::try_from(self.config.clone()).map_err(|_err| {
             // TODO: converting a config to settings should never fail
-            //       it should be impossible to construct a config which cannot be represented as settings
+            //       it should be impossible to construct a config which cannot be represented as
+            // settings
             self.handle_connection_error(InternalConnectionError::new(
                 Code::H3_INTERNAL_ERROR,
                 "error when creating settings frame".to_string(),
@@ -460,7 +462,8 @@ where
 
     /// Polls incoming streams
     ///
-    /// Accepted streams which are not control, decoder, or encoder streams are buffer in `accepted_recv_streams`
+    /// Accepted streams which are not control, decoder, or encoder streams are buffer in
+    /// `accepted_recv_streams`
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_accept_recv(&mut self, cx: &mut Context<'_>) -> Result<(), ConnectionError> {
         let _ = self.poll_connection_error(cx)?;
@@ -871,7 +874,8 @@ where
             }
             Ok(Some(frame)) => {
                 // All other frames are not allowed on the control stream
-                // Unknown frames are not covered by the Frame enum and poll_next will just ignore them
+                // Unknown frames are not covered by the Frame enum and poll_next will just ignore
+                // them
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.1
                 //= type=implication
                 //# DATA frames MUST be associated with an HTTP request or response.
@@ -1859,10 +1863,11 @@ where
 
 #[cfg(test)]
 mod qpack_field_section_tests {
-    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures_util::task::{ArcWake, waker};
+
+    use super::*;
 
     fn field_section_guard() -> (DecoderGuard, mpsc::UnboundedReceiver<QpackEvent>) {
         let (events_send, events_recv) = mpsc::unbounded_channel();

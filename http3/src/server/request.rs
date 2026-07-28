@@ -2,11 +2,11 @@ use std::{convert::TryFrom, sync::Arc};
 
 use bytes::Buf;
 use http::{Request, StatusCode};
-
 use tokio::sync::mpsc::UnboundedSender;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
+use super::{connection::RequestEnd, stream::RequestStream};
 use crate::{
     connection::{self},
     error::{
@@ -23,8 +23,6 @@ use crate::{
     quic::{self, SendStream, StreamId},
     shared_state::{ConnectionState, SharedState},
 };
-
-use super::{connection::RequestEnd, stream::RequestStream};
 
 /// Helper struct to await the request headers and return a `Request` object
 pub struct RequestResolver<C, B>

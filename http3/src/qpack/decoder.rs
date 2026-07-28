@@ -1,29 +1,25 @@
-use bytes::{Buf, BufMut, BytesMut};
 use std::{convert::TryInto, fmt, io::Cursor, num::TryFromIntError};
 
+use bytes::{Buf, BufMut, BytesMut};
 #[cfg(feature = "tracing")]
 use tracing::trace;
-
-use super::{
-    dynamic::{DynamicTable, DynamicTableDecoder, Error as DynamicTableError},
-    field::HeaderField,
-    static_::{Error as StaticError, StaticTable},
-    vas,
-};
 
 use super::{
     block::{
         HeaderBlockField, HeaderPrefix, Indexed, IndexedWithPostBase, Literal, LiteralWithNameRef,
         LiteralWithPostBaseNameRef,
     },
+    dynamic::{DynamicTable, DynamicTableDecoder, Error as DynamicTableError},
+    field::HeaderField,
     parse_error::ParseError,
+    prefix_int, prefix_string,
+    static_::{Error as StaticError, StaticTable},
     stream::{
         Duplicate, DynamicTableSizeUpdate, EncoderInstruction, HeaderAck, InsertCountIncrement,
         InsertWithNameRef, InsertWithoutNameRef, StreamCancel,
     },
+    vas,
 };
-
-use super::{prefix_int, prefix_string};
 
 #[derive(Debug, PartialEq)]
 pub enum DecoderError {
@@ -701,9 +697,9 @@ impl From<TryFromIntError> for DecoderError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use bytes::Bytes;
 
+    use super::*;
     use crate::{
         buf::BufList,
         qpack::tests::helpers::{TABLE_SIZE, build_table_with_size},

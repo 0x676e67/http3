@@ -1,3 +1,8 @@
+use std::{
+    convert::TryFrom,
+    task::{Context, Poll},
+};
+
 use bytes::Buf;
 use futures_util::future;
 use http::{HeaderMap, Response};
@@ -13,33 +18,30 @@ use crate::{
     quic::{self},
     shared_state::{ConnectionState, SharedState},
 };
-use std::{
-    convert::TryFrom,
-    task::{Context, Poll},
-};
 
 /// Manage request bodies transfer, response and trailers.
 ///
-/// Once a request has been sent via [`crate::client::SendRequest::send_request()`], a response can be awaited by calling
-/// [`RequestStream::recv_response()`]. A body for this request can be sent with [`RequestStream::send_data()`], then the request
-/// shall be completed by either sending trailers with  [`RequestStream::finish()`].
+/// Once a request has been sent via [`crate::client::SendRequest::send_request()`], a response can
+/// be awaited by calling [`RequestStream::recv_response()`]. A body for this request can be sent
+/// with [`RequestStream::send_data()`], then the request shall be completed by either sending
+/// trailers with  [`RequestStream::finish()`].
 ///
-/// After receiving the response's headers, it's body can be read by [`RequestStream::recv_data()`] until it returns
-/// `None`. Then the trailers will eventually be available via [`RequestStream::recv_trailers()`].
+/// After receiving the response's headers, it's body can be read by [`RequestStream::recv_data()`]
+/// until it returns `None`. Then the trailers will eventually be available via
+/// [`RequestStream::recv_trailers()`].
 ///
 /// TODO: If data is polled before the response has been received, an error will be thrown.
 ///
-/// Calling [`RequestStream::recv_trailers()`] before the response body has been
-/// fully received returns an `H3_FRAME_UNEXPECTED` stream error. The body remains
-/// available through [`RequestStream::recv_data()`].
+/// TODO: If trailers are polled but the body hasn't been fully received, an UNEXPECT_FRAME error
+/// will be thrown
 ///
-/// Whenever the client wants to cancel this request, it can call [`RequestStream::stop_sending()`], which will
-/// put an end to any transfer concerning it.
+/// Whenever the client wants to cancel this request, it can call [`RequestStream::stop_sending()`],
+/// which will put an end to any transfer concerning it.
 ///
 /// # Examples
 ///
 /// ```rust
-/// # use http3_rs::{quic, client::*};
+/// # use http3::{quic, client::*};
 /// # use http::{Request, Response};
 /// # use bytes::Buf;
 /// # use tokio::io::AsyncWriteExt;

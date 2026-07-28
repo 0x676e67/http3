@@ -3,15 +3,19 @@
 //! This module includes traits and types meant to allow being generic over any
 //! QUIC implementation.
 
-use std::fmt::{Debug, Display};
-use std::sync::Arc;
-use std::task::{self, Poll};
+use std::{
+    fmt::{Debug, Display},
+    sync::Arc,
+    task::{self, Poll},
+};
 
 use bytes::Buf;
 
 use crate::error::Code;
-pub use crate::proto::stream::{InvalidStreamId, StreamId};
-pub use crate::stream::WriteBuf;
+pub use crate::{
+    proto::stream::{InvalidStreamId, StreamId},
+    stream::WriteBuf,
+};
 
 /// Error type to communicate that the quic connection was closed
 ///
@@ -25,8 +29,8 @@ pub enum ConnectionErrorIncoming {
     },
     /// Quic connection timeout
     Timeout,
-    /// This variant can be used to signal, that an internal error occurred within the trait implementations
-    /// HTTP/3 will close the connection with H3_INTERNAL_ERROR
+    /// This variant can be used to signal, that an internal error occurred within the trait
+    /// implementations HTTP/3 will close the connection with H3_INTERNAL_ERROR
     InternalError(String),
     /// An unknown error occurred outside the HTTP/3 layer
     ///
@@ -52,7 +56,8 @@ impl Debug for ConnectionErrorIncoming {
 /// Error type to communicate that the stream was closed
 ///
 /// This is used by to implement the quic abstraction traits
-/// When an error within the quic trait implementation occurs, use ConnectionErrorIncoming variant with InternalError
+/// When an error within the quic trait implementation occurs, use ConnectionErrorIncoming variant
+/// with InternalError
 #[derive(Debug)]
 pub enum StreamErrorIncoming {
     /// Stream is closed because the whole connection is closed
@@ -70,7 +75,8 @@ pub enum StreamErrorIncoming {
     /// An unknown error occurred outside the HTTP/3 layer
     ///
     /// H3 will handle this exactly like a StreamTerminated
-    /// like closing the connection with an error if http3 forbids a stream end for example with the control stream
+    /// like closing the connection with an error if http3 forbids a stream end for example with the
+    /// control stream
     Unknown(Box<dyn std::error::Error + Send + Sync>),
 }
 

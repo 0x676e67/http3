@@ -303,7 +303,6 @@ impl From<ParseError> for EncoderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::qpack::tests::helpers::{TABLE_SIZE, build_table};
 
     #[allow(clippy::type_complexity)]

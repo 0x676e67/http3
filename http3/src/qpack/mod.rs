@@ -1,12 +1,3 @@
-use crate::quic::StreamId;
-
-pub(crate) use self::decoder::DecoderState;
-pub use self::{
-    decoder::{Decoded, Decoder, DecoderError, ack_header, decode_stateless, stream_canceled},
-    encoder::{EncoderError, encode_stateless},
-    field::HeaderField,
-};
-
 use std::{
     collections::BTreeMap,
     sync::{Arc, RwLock, RwLockReadGuard, TryLockError},
@@ -16,6 +7,14 @@ use std::{
 use bytes::{Buf, BufMut};
 use futures_util::task::AtomicWaker;
 use tokio::sync::mpsc;
+
+pub(crate) use self::decoder::DecoderState;
+pub use self::{
+    decoder::{Decoded, Decoder, DecoderError, ack_header, decode_stateless, stream_canceled},
+    encoder::{EncoderError, encode_stateless},
+    field::HeaderField,
+};
+use crate::quic::StreamId;
 
 mod block;
 mod dynamic;

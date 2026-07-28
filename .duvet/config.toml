@@ -11,8 +11,8 @@ source = "https://www.rfc-editor.org/rfc/rfc9204.html"
 
 [report.html]
 enabled = true
-issue-link = "https://github.com/0x676e67/http3-rs/issues"
-blob-link = "https://github.com/0x676e67/http3-rs/blob/${{ SHA || GITHUB_SHA || 'main' }}"
+issue-link = "https://github.com/0x676e67/http3/issues"
+blob-link = "https://github.com/0x676e67/http3/blob/${{ SHA || GITHUB_SHA || 'main' }}"
 
 # Enable snapshots to prevent requirement coverage regressions
 [report.snapshot]

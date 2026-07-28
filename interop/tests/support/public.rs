@@ -168,9 +168,9 @@ async fn run_public_server_requests_at_addr(
     tls_config.enable_early_data = true;
     tls_config.alpn_protocols = vec![ALPN_H3.into()];
 
-    let mut endpoint = http3_quinn_rs::quinn::Endpoint::client("[::]:0".parse()?)?;
-    endpoint.set_default_client_config(http3_quinn_rs::quinn::ClientConfig::new(Arc::new(
-        http3_quinn_rs::quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
+    let mut endpoint = http3_quic::quic::Endpoint::client("[::]:0".parse()?)?;
+    endpoint.set_default_client_config(http3_quic::quic::ClientConfig::new(Arc::new(
+        http3_quic::quic::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
     )));
 
     let connecting = endpoint.connect(addr, host)?;
@@ -182,9 +182,9 @@ async fn run_public_server_requests_at_addr(
                 format!("timed out connecting to {host} at {addr} after {REAL_CONNECT_TIMEOUT:?}"),
             )
         })??;
-    let quinn_conn = http3_quinn_rs::Connection::new(conn);
+    let quinn_conn = http3_quic::Connection::new(conn);
 
-    let mut builder = http3_rs::client::builder();
+    let mut builder = http3::client::builder();
     builder
         .max_field_section_size(262_144)
         .enable_datagram(true)
@@ -264,14 +264,14 @@ async fn run_public_server_requests_at_addr(
 async fn send_public_server_request(
     request_id: usize,
     uri: http::Uri,
-    mut send_request: http3_rs::client::SendRequest<http3_quinn_rs::OpenStreams, Bytes>,
+    mut send_request: http3::client::SendRequest<http3_quic::OpenStreams, Bytes>,
 ) -> Result<PublicServerResponse, BoxError> {
     let req = http::Request::builder()
         .method(http::Method::GET)
         .uri(uri)
         .body(())?;
 
-    let mut stream: http3_rs::client::RequestStream<http3_quinn_rs::BidiStream<Bytes>, _> =
+    let mut stream: http3::client::RequestStream<http3_quic::BidiStream<Bytes>, _> =
         send_request.send_request(req).await?;
     stream.finish().await?;
 
