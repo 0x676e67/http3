@@ -13,7 +13,7 @@ readme = "README.md"
 description = "QUIC transport implementation."
 keywords = ["http3", "quic", "quinn"]
 categories = ["network-programming", "web-programming"]
-license = "MIT"
+license = { workspace = true }
 
 [dependencies]
 http3 = { workspace = true }
