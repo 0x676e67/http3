@@ -10,7 +10,7 @@ readme = "README.md"
 description = "RFC 9297 datagram extension for http3"
 keywords = ["http3", "quic", "rfc9297"]
 categories = ["network-programming", "web-programming"]
-license = "MIT"
+license = { workspace = true }
 
 
 [dependencies]
