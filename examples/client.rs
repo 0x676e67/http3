@@ -170,6 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // your own code
         tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
     }
+    
     if opt.skip_verify {
         info!("TLS certificate verification is disabled for this run");
         tls_config
@@ -178,7 +179,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut client_endpoint = http3_quic::quic::Endpoint::client("[::]:0".parse().unwrap())?;
-
     let client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
     ));
