@@ -7,7 +7,7 @@ authors = [
     "Sean McArthur <sean@seanmonstar.com>",
     "Jean-Christophe BEGUE <jc.begue@pm.me>",
 ]
-license = "MIT"
+license = { workspace = true }
 edition = { workspace = true }
 documentation = "https://docs.rs/http3"
 repository = { workspace = true }
