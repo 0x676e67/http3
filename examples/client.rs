@@ -3,7 +3,10 @@ use std::{path::PathBuf, sync::Arc};
 use bytes::{Buf, Bytes};
 use futures::future;
 use http3::error::{Code, ConnectionError, StreamError};
-use rustls::pki_types::CertificateDer;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::WebPkiSupportedAlgorithms;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use rustls_native_certs::CertificateResult;
 use structopt::StructOpt;
 use tracing::{Level, error, info};
@@ -46,6 +49,55 @@ struct Opt {
         help = "URI of the server to connect to"
     )]
     pub uri: String,
+
+    #[structopt(long, help = "Skip server certificate verification (insecure)")]
+    pub skip_verify: bool,
+}
+
+#[derive(Debug)]
+struct SkipServerVerification(WebPkiSupportedAlgorithms);
+
+impl SkipServerVerification {
+    fn new() -> Self {
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .expect("rustls default crypto provider not initialized");
+        Self(provider.signature_verification_algorithms)
+    }
+}
+
+impl ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_schemes()
+    }
 }
 
 #[tokio::main]
@@ -84,22 +136,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // create quinn client endpoint
 
-    // load CA certificates stored in the system
     let mut roots = rustls::RootCertStore::empty();
-    let CertificateResult { certs, errors, .. } = rustls_native_certs::load_native_certs();
-    for cert in certs {
-        if let Err(e) = roots.add(cert) {
+    if !opt.skip_verify {
+        // load CA certificates stored in the system
+        let CertificateResult { certs, errors, .. } = rustls_native_certs::load_native_certs();
+        for cert in certs {
+            if let Err(e) = roots.add(cert) {
+                error!("failed to parse trust anchor: {}", e);
+            }
+        }
+        for e in errors {
+            error!("couldn't load default trust roots: {}", e);
+        }
+
+        // load certificate of CA who issues the server certificate
+        // NOTE that this should be used for dev only
+        if let Err(e) = roots.add(CertificateDer::from(std::fs::read(opt.ca)?)) {
             error!("failed to parse trust anchor: {}", e);
         }
-    }
-    for e in errors {
-        error!("couldn't load default trust roots: {}", e);
-    }
-
-    // load certificate of CA who issues the server certificate
-    // NOTE that this should be used for dev only
-    if let Err(e) = roots.add(CertificateDer::from(std::fs::read(opt.ca)?)) {
-        error!("failed to parse trust anchor: {}", e);
     }
 
     let mut tls_config = rustls::ClientConfig::builder()
@@ -116,9 +170,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // your own code
         tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
     }
+    
+    if opt.skip_verify {
+        info!("TLS certificate verification is disabled for this run");
+        tls_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(SkipServerVerification::new()));
+    }
 
     let mut client_endpoint = http3_quic::quic::Endpoint::client("[::]:0".parse().unwrap())?;
-
     let client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
     ));
