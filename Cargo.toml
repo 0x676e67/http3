@@ -24,6 +24,7 @@ resolver = "2"
 edition = "2024"
 rust-version = "1.85"
 repository = "https://github.com/0x676e67/http3"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 http3-datagram = { version = "0.0.2", path = "./http3-datagram" }
