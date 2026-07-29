@@ -17,6 +17,11 @@ To start the example client you can run following command:
 ```bash
 > cargo run --example client -- https://localhost:4433
 ```
+or if you need to ignore certificate validation:
+
+```bash
+> cargo run --example client -- --skip-verify --requests 10 --qpack-blocked-streams 100 --qpack-max-table-capacity 65535 https://localhost:8181/api/all
+```
 
 This sends an HTTP request to the server.  
 
