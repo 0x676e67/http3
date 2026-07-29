@@ -170,7 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // your own code
         tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
     }
-    
+
     if opt.skip_verify {
         info!("TLS certificate verification is disabled for this run");
         tls_config
