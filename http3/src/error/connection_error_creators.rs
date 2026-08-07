@@ -13,8 +13,18 @@ use crate::{
     connection::ConnectionInner,
     frame::FrameStreamError,
     quic::{self, ConnectionErrorIncoming, StreamErrorIncoming},
-    shared_state::ConnectionState,
+    shared_state::{ConnectionState, SharedState},
 };
+
+fn publish_connection_error_before_wake(
+    shared: &SharedState,
+    error: ErrorOrigin,
+    wake: impl FnOnce(),
+) -> ErrorOrigin {
+    let error = shared.set_conn_error(error);
+    wake();
+    error
+}
 
 /// This trait is implemented for all types which can close the connection
 impl<C, B> ConnectionInner<C, B>
@@ -26,13 +36,17 @@ where
     ///
     /// This can be a [`ConnectionErrorIncoming`] or a [`InternalConnectionError`]
     pub fn handle_connection_error<T: Into<ErrorOrigin>>(&mut self, error: T) -> ConnectionError {
-        self.wake_qpack_waiters_on_connection_error();
-
-        if let Some(ref error) = self.handled_connection_error {
-            return error.clone();
+        if let Some(error) = self.handled_connection_error.clone() {
+            self.wake_qpack_waiters_on_connection_error();
+            return error;
         }
 
-        let err = self.set_conn_error(error.into());
+        // Keep an independent handle so the wake callback can mutably access
+        // the connection after the shared error has been published.
+        let shared = self.shared.clone();
+        let err = publish_connection_error_before_wake(shared.as_ref(), error.into(), || {
+            self.wake_qpack_waiters_on_connection_error();
+        });
         let err = self.close_if_needed(err);
         // err might be a different error so match again
         self.convert_to_connection_error(err)
@@ -207,5 +221,34 @@ where
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn connection_error_is_published_before_wake() {
+        let shared = SharedState::default();
+        let wake_called = Cell::new(false);
+
+        let error = publish_connection_error_before_wake(
+            &shared,
+            InternalConnectionError::new(Code::H3_INTERNAL_ERROR, "connection failed".into())
+                .into(),
+            || {
+                assert!(shared.get_conn_error().is_some());
+                wake_called.set(true);
+            },
+        );
+
+        assert!(matches!(
+            error,
+            ErrorOrigin::Internal(ref error) if error.code == Code::H3_INTERNAL_ERROR
+        ));
+        assert!(wake_called.get());
     }
 }
