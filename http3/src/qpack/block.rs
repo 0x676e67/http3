@@ -181,13 +181,14 @@ impl HeaderPrefix {
         // Delta Base is peer-controlled. Checked arithmetic rejects a Base that
         // cannot be represented as `usize`.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1
-        let base = if required == 0 {
-            0
-        } else if !self.sign_negative {
+        let base = if !self.sign_negative {
             required
                 .checked_add(self.delta_base)
                 .ok_or_else(invalid_base)?
         } else {
+            // A negative sign is invalid when Required Insert Count is no
+            // greater than Delta Base, including when both values are zero.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.2
             required
                 .checked_sub(self.delta_base)
                 .and_then(|base| base.checked_sub(1))
@@ -571,6 +572,24 @@ mod test {
                 required_insert_count: 2,
                 sign_negative: true,
                 delta_base: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn negative_delta_base_with_zero_required_insert_count_is_rejected() {
+        let prefix = HeaderPrefix {
+            encoded_insert_count: 0,
+            sign_negative: true,
+            delta_base: 0,
+        };
+
+        assert_eq!(
+            prefix.get(0, TABLE_SIZE),
+            Err(ParseError::InvalidBase {
+                required_insert_count: 0,
+                sign_negative: true,
+                delta_base: 0,
             })
         );
     }
