@@ -70,19 +70,14 @@ where
     encoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
     decoder: QpackDecoder,
     blocked_streams: qpack::BlockedStreamRegistry,
-    decoder_wakers: Vec<Waker>,
     decoder_events_recv: mpsc::UnboundedReceiver<QpackEvent>,
 }
 
 fn wake_qpack_waiters_on_connection_error(
     blocked_streams: &mut qpack::BlockedStreamRegistry,
-    decoder_wakers: &mut Vec<Waker>,
     decoder_events_recv: &mut mpsc::UnboundedReceiver<QpackEvent>,
 ) {
     blocked_streams.wake_all();
-    for waker in decoder_wakers.drain(..) {
-        waker.wake();
-    }
 
     // Once the connection fails, no QPACK event can make progress. Close the
     // channel and drain it so wakers not yet registered by the driver are also
@@ -186,7 +181,6 @@ where
         let qpack = &mut self.qpack_streams;
         wake_qpack_waiters_on_connection_error(
             &mut qpack.blocked_streams,
-            &mut qpack.decoder_wakers,
             &mut qpack.decoder_events_recv,
         );
     }
@@ -363,7 +357,6 @@ where
             decoder_send_buf: BytesMut::new(),
             decoder,
             blocked_streams,
-            decoder_wakers: Vec::with_capacity(3),
             decoder_events_recv,
             decoder_recv: None,
             encoder_send: encoder_send.ok(),
@@ -636,12 +629,12 @@ where
                         self.qpack_streams
                             .blocked_streams
                             .update_insert_count(insert_count);
-                        if let Err(err) = self.poll_qpack_decoder_waiters(cx) {
+                        if let Err(err) = self.poll_qpack_decoder_events(cx) {
                             return Poll::Ready(Err(err));
                         }
                     }
                     Poll::Ready(Err(err)) => {
-                        if let Err(err) = self.poll_qpack_decoder_waiters(cx) {
+                        if let Err(err) = self.poll_qpack_decoder_events(cx) {
                             return Poll::Ready(Err(err));
                         }
                         return Poll::Ready(Err(self.handle_connection_error(
@@ -717,7 +710,7 @@ where
         // Losing the QPACK decoder stream is H3_CLOSED_CRITICAL_STREAM. QPACK
         // instruction errors apply to the peer's encoder stream instead.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
-        if let Err(err) = self.poll_qpack_decoder_events(cx, false) {
+        if let Err(err) = self.poll_qpack_decoder_events(cx) {
             return Poll::Ready(Err(err));
         }
 
@@ -1060,21 +1053,7 @@ where
         self.qpack_streams.decoder.clone()
     }
 
-    fn poll_qpack_decoder_waiters(&mut self, cx: &mut Context<'_>) -> Result<(), ConnectionError> {
-        for waker in self.qpack_streams.decoder_wakers.drain(..) {
-            waker.wake();
-        }
-
-        // The write guard has been released. Requests queued during the update
-        // can wake as their events are drained.
-        self.poll_qpack_decoder_events(cx, true)
-    }
-
-    fn poll_qpack_decoder_events(
-        &mut self,
-        cx: &mut Context<'_>,
-        wake_waiters: bool,
-    ) -> Result<(), ConnectionError> {
+    fn poll_qpack_decoder_events(&mut self, cx: &mut Context<'_>) -> Result<(), ConnectionError> {
         while let Poll::Ready(Some(event)) = self.qpack_streams.decoder_events_recv.poll_recv(cx) {
             match event {
                 QpackEvent::HeaderAck(stream_id) => qpack::ack_header(
@@ -1112,15 +1091,10 @@ where
                     .qpack_streams
                     .blocked_streams
                     .release(stream_id, required_ref),
-                // A request waiting for the decoder read lock must sleep until
-                // the driver releases its write lock.
-                QpackEvent::DecoderAccessWaker(waker) => {
-                    if wake_waiters {
-                        waker.wake();
-                    } else {
-                        self.qpack_streams.decoder_wakers.push(waker);
-                    }
-                }
+                // Missing references use `RegisterBlocked`. This event only
+                // waits for a write guard scoped to `poll_on_recv_encoder`, which
+                // has been released before the driver can consume the event.
+                QpackEvent::DecoderAccessWaker(waker) => waker.wake(),
             }
         }
         Ok(())
@@ -1783,7 +1757,6 @@ mod qpack_field_section_tests {
         blocked_streams
             .register(StreamId(0), 1, waker.clone())
             .unwrap();
-        let mut decoder_wakers = vec![waker.clone()];
         let (events_send, mut events_recv) = mpsc::unbounded_channel();
         events_send
             .send(QpackEvent::RegisterBlocked {
@@ -1796,14 +1769,9 @@ mod qpack_field_section_tests {
             .send(QpackEvent::DecoderAccessWaker(waker))
             .unwrap();
 
-        wake_qpack_waiters_on_connection_error(
-            &mut blocked_streams,
-            &mut decoder_wakers,
-            &mut events_recv,
-        );
+        wake_qpack_waiters_on_connection_error(&mut blocked_streams, &mut events_recv);
 
-        assert_eq!(counter.0.load(Ordering::Relaxed), 4);
-        assert!(decoder_wakers.is_empty());
+        assert_eq!(counter.0.load(Ordering::Relaxed), 3);
         assert!(
             events_send
                 .send(QpackEvent::HeaderAck(StreamId(0)))
