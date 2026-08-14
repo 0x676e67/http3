@@ -334,12 +334,18 @@ impl DynamicTable {
         Ok(())
     }
 
+    /// Adds an entry received from the peer's encoder stream.
+    ///
+    /// A decoder resolves dynamic references by index, so it does not populate
+    /// the field and name maps used by `DynamicTableEncoder`. Decoded field
+    /// bytes remain independently owned; sharing slices of a connection receive
+    /// buffer here could retain a much larger allocation for the table's
+    /// lifetime, as seen in <https://github.com/hyperium/h2/issues/923>.
+    ///
+    /// See [RFC 9204, Section 3.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2)
+    /// and [Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3).
     pub(super) fn put_decoder(&mut self, field: HeaderField) -> Result<(), Error> {
-        let index = self
-            .insert(field.clone())?
-            .ok_or(Error::MaxTableSizeReached)?;
-
-        self.update_maps(field, index);
+        self.insert(field)?.ok_or(Error::MaxTableSizeReached)?;
         Ok(())
     }
 
@@ -412,16 +418,22 @@ impl DynamicTable {
 
             self.vas.drop();
 
-            if let Entry::Occupied(e) = self.name_map.entry(field.name.clone()) {
-                if self.vas.evicted(*e.get()) {
-                    e.remove();
-                }
+            if !self.name_map.is_empty()
+                && self
+                    .name_map
+                    .get(field.name.as_ref())
+                    .is_some_and(|index| self.vas.evicted(*index))
+            {
+                self.name_map.remove(field.name.as_ref());
             }
 
-            if let Entry::Occupied(e) = self.field_map.entry(field) {
-                if self.vas.evicted(*e.get()) {
-                    e.remove();
-                }
+            if !self.field_map.is_empty()
+                && self
+                    .field_map
+                    .get(&field)
+                    .is_some_and(|index| self.vas.evicted(*index))
+            {
+                self.field_map.remove(&field);
             }
         }
         Ok(())
@@ -1242,6 +1254,26 @@ mod tests {
         assert_eq!(table.field_map.len(), 4);
         assert_eq!(table.name_map.get(&b"foo1"[..]), Some(&5usize));
         assert_eq!(table.field_map.get(&field), Some(&5usize));
+    }
+
+    #[test]
+    fn decoder_insert_avoids_encoder_lookup_maps() {
+        let mut table = DynamicTable::new();
+        table
+            .set_max_size(HeaderField::new("a", "1").mem_size())
+            .unwrap();
+
+        table.put_decoder(HeaderField::new("a", "1")).unwrap();
+        let latest = HeaderField::new("b", "2");
+        table.put_decoder(latest.clone()).unwrap();
+
+        // Decoder references use table positions. Evicting an older entry does
+        // not require the encoder's field or name lookup maps.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.2
+        assert_eq!(table.fields.len(), 1);
+        assert_eq!(table.get_relative(0), Ok(&latest));
+        assert!(table.field_map.is_empty());
+        assert!(table.name_map.is_empty());
     }
 
     #[test]
