@@ -5,19 +5,21 @@ use bytes::{Buf, Bytes};
 #[derive(Debug)]
 pub(crate) struct BufList<T> {
     bufs: VecDeque<T>,
+    remaining: usize,
 }
 
 impl<T: Buf> BufList<T> {
     pub(crate) fn new() -> BufList<T> {
         BufList {
             bufs: VecDeque::new(),
+            remaining: 0,
         }
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn push(&mut self, buf: T) {
         debug_assert!(buf.has_remaining());
+        self.remaining = self.remaining.saturating_add(buf.remaining());
         self.bufs.push_back(buf);
     }
 
@@ -33,7 +35,9 @@ impl<T: Buf> BufList<T> {
 
 impl BufList<Bytes> {
     pub fn take_first_chunk(&mut self) -> Option<Bytes> {
-        self.bufs.pop_front()
+        let chunk = self.bufs.pop_front()?;
+        self.remaining = self.remaining.saturating_sub(chunk.remaining());
+        Some(chunk)
     }
 
     pub fn take_chunk(&mut self, max_len: usize) -> Option<Bytes> {
@@ -41,6 +45,10 @@ impl BufList<Bytes> {
             .bufs
             .front_mut()
             .map(|chunk| chunk.split_to(usize::min(max_len, chunk.remaining())));
+
+        if let Some(chunk) = chunk.as_ref() {
+            self.remaining = self.remaining.saturating_sub(chunk.remaining());
+        }
 
         if let Some(front) = self.bufs.front() {
             if front.remaining() == 0 {
@@ -55,7 +63,7 @@ impl BufList<Bytes> {
         T: Buf,
     {
         debug_assert!(buf.has_remaining());
-        self.bufs.push_back(buf.copy_to_bytes(buf.remaining()))
+        self.push(buf.copy_to_bytes(buf.remaining()))
     }
 }
 
@@ -71,7 +79,7 @@ impl<T: Buf> From<T> for BufList<T> {
 impl<T: Buf> Buf for BufList<T> {
     #[inline]
     fn remaining(&self) -> usize {
-        self.bufs.iter().map(|buf| buf.remaining()).sum()
+        self.remaining
     }
 
     #[inline]
@@ -81,6 +89,9 @@ impl<T: Buf> Buf for BufList<T> {
 
     #[inline]
     fn advance(&mut self, mut cnt: usize) {
+        assert!(cnt <= self.remaining, "cannot advance past the buffer");
+        self.remaining -= cnt;
+
         while cnt > 0 {
             {
                 let front = &mut self.bufs[0];
@@ -179,5 +190,22 @@ mod tests {
         assert_eq!(cur.remaining(), 2);
         cur.advance(2);
         assert_eq!(cur.remaining(), 0);
+    }
+
+    #[test]
+    fn remaining_tracks_buffer_mutations() {
+        let mut buf = BufList::new();
+        buf.push(Bytes::from_static(b"abc"));
+        buf.push(Bytes::from_static(b"de"));
+        assert_eq!(buf.remaining(), 5);
+
+        assert_eq!(buf.take_chunk(2), Some(Bytes::from_static(b"ab")));
+        assert_eq!(buf.remaining(), 3);
+
+        buf.advance(2);
+        assert_eq!(buf.remaining(), 1);
+
+        assert_eq!(buf.take_first_chunk(), Some(Bytes::from_static(b"e")));
+        assert_eq!(buf.remaining(), 0);
     }
 }
