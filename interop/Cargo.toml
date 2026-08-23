@@ -34,14 +34,6 @@ tempfile = "3"
 tokio = { workspace = true, features = ["full"] }
 
 # QUIC/HTTP3 Server backends
-# s2n-quic-h3 is the official s2n-quic adapter for hyperium h3. Keep it on
-# crates.io so CI catches published-package regressions instead of a pinned git
-# snapshot hiding them.
-s2n-quic = { version = "1.83", default-features = false, features = [
-    "provider-address-token-default",
-    "provider-tls-rustls",
-] }
-s2n-quic-h3 = { version = "0.2.0", features = ["tracing"] }
 tokio-quiche = { version = "0.19.1", default-features = false }
 tquic = "1.6"
 ngtcp2 = { workspace = true }

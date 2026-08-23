@@ -41,6 +41,7 @@
 - *(interop)* Join local interop request tasks concurrently (#30)
 - *(interop)* Join public server request tasks concurrently (#29)
 - *(interop)* Add s2n h3 server backend (#34)
+- *(interop)* Remove the yanked s2n-quic-h3 server backend
 - *(interop)* Add quinn h3 server backend (#37)
 
 ### ⚙️ Miscellaneous Tasks
