@@ -105,6 +105,10 @@ pub struct Decoder {
     // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3
     max_table_capacity: usize,
     max_blocked_streams: u64,
+    // Preserve a decoded literal name while its value is still arriving on the
+    // encoder stream. This avoids decoding and allocating the name on each retry.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.3
+    pending_literal_name: Option<Vec<u8>>,
 }
 
 impl Decoder {
@@ -121,6 +125,7 @@ impl Decoder {
             table,
             max_table_capacity,
             max_blocked_streams,
+            pending_literal_name: None,
         })
     }
 
@@ -197,8 +202,9 @@ impl Decoder {
 
     /// Processes encoder instructions from a checkpointable receive cursor.
     ///
-    /// Input advances only after a complete instruction is parsed. A trailing
-    /// partial instruction remains available for the next receive chunk.
+    /// Complete parts of an instruction can be consumed before the entire
+    /// instruction arrives. The decoder keeps that parsed state and leaves the
+    /// incomplete part available for the next receive chunk.
     ///
     /// See [RFC 9204, Section 4.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3).
     pub(crate) fn on_encoder_recv_buffered<R: Buf + Clone, W: BufMut>(
@@ -213,7 +219,7 @@ impl Decoder {
         &mut self,
         read: &mut R,
         write: &mut W,
-        parse_instruction: fn(&Self, &mut R) -> Result<Option<Instruction>, DecoderError>,
+        parse_instruction: fn(&mut Self, &mut R) -> Result<Option<Instruction>, DecoderError>,
     ) -> Result<usize, DecoderError> {
         let inserted_on_start = self.table.total_inserted();
 
@@ -247,7 +253,10 @@ impl Decoder {
         Ok(self.table.total_inserted())
     }
 
-    fn parse_instruction<R: Buf>(&self, read: &mut R) -> Result<Option<Instruction>, DecoderError> {
+    fn parse_instruction<R: Buf>(
+        &mut self,
+        read: &mut R,
+    ) -> Result<Option<Instruction>, DecoderError> {
         if read.remaining() < 1 {
             return Ok(None);
         }
@@ -261,11 +270,35 @@ impl Decoder {
     }
 
     fn parse_instruction_buffered<R: Buf + Clone>(
-        &self,
+        &mut self,
         read: &mut R,
     ) -> Result<Option<Instruction>, DecoderError> {
+        if self.pending_literal_name.is_some() {
+            return self.parse_pending_literal_value(read);
+        }
+
         if read.remaining() < 1 {
             return Ok(None);
+        }
+
+        if matches!(
+            EncoderInstruction::decode(read.chunk()[0]),
+            EncoderInstruction::InsertWithoutNameRef
+        ) {
+            // Consume a complete literal name immediately. If the value is
+            // fragmented, the next poll resumes from its prefix instead of
+            // decoding the name again.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.3
+            let before = read.remaining();
+            let mut buf = read.clone();
+            let name = match prefix_string::decode(6, &mut buf) {
+                Ok(name) => name,
+                Err(prefix_string::Error::UnexpectedEnd) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            read.advance(before - buf.remaining());
+            self.pending_literal_name = Some(name);
+            return self.parse_pending_literal_value(read);
         }
 
         // Parse from a cloned cursor and advance the real cursor only after a
@@ -278,6 +311,25 @@ impl Decoder {
             read.advance(before - buf.remaining());
         }
         Ok(instruction)
+    }
+
+    fn parse_pending_literal_value<R: Buf + Clone>(
+        &mut self,
+        read: &mut R,
+    ) -> Result<Option<Instruction>, DecoderError> {
+        let before = read.remaining();
+        let mut buf = read.clone();
+        let value = match prefix_string::decode(8, &mut buf) {
+            Ok(value) => value,
+            Err(prefix_string::Error::UnexpectedEnd) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(name) = self.pending_literal_name.take() else {
+            return Err(DecoderError::UnexpectedEnd);
+        };
+
+        read.advance(before - buf.remaining());
+        Ok(Some(Instruction::Insert(HeaderField::new(name, value))))
     }
 
     fn decode_instruction<R: Buf>(&self, buf: &mut R) -> Result<Option<Instruction>, DecoderError> {
@@ -402,6 +454,7 @@ impl From<DynamicTable> for Decoder {
             table,
             max_table_capacity,
             max_blocked_streams: 0,
+            pending_literal_name: None,
         }
     }
 }
@@ -609,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_fragment_is_preserved_for_the_next_read() {
+    fn incomplete_literal_value_preserves_decoded_name() {
         let mut capacity_update = Vec::new();
         DynamicTableSizeUpdate(128).encode(&mut capacity_update);
         let capacity_update_len = capacity_update.len();
@@ -618,6 +671,11 @@ mod tests {
         InsertWithoutNameRef::new("key", "value")
             .encode(&mut insertion)
             .unwrap();
+        let encoded_name_len = {
+            let mut read = Cursor::new(&insertion);
+            let _ = prefix_string::decode(6, &mut read).unwrap();
+            usize::try_from(read.position()).unwrap()
+        };
         let final_byte = insertion.pop().unwrap();
 
         let mut fragments = BufList::new();
@@ -635,10 +693,12 @@ mod tests {
             );
             read.position()
         };
-        assert_eq!(consumed, capacity_update_len);
+        assert_eq!(consumed, capacity_update_len + encoded_name_len);
+        assert_eq!(decoder.pending_literal_name.as_deref(), Some(&b"key"[..]));
 
-        // Commit only the complete capacity update, then retry the preserved
-        // insertion after its final byte arrives.
+        // The name bytes can be released immediately. The decoder keeps the
+        // decoded name until the final value byte arrives.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.3
         fragments.advance(consumed);
         fragments.push(Bytes::from(vec![final_byte]));
         let remaining = fragments.remaining();
@@ -648,6 +708,7 @@ mod tests {
             Ok(1)
         );
         assert_eq!(read.position(), remaining);
+        assert!(decoder.pending_literal_name.is_none());
         assert_eq!(decoder.table.max_mem_size(), 128);
     }
 
@@ -858,7 +919,7 @@ mod tests {
 
     #[test]
     fn enc_recv_buf_too_short() {
-        let decoder = Decoder::from(build_table_with_size(0));
+        let mut decoder = Decoder::from(build_table_with_size(0));
         let mut buf = vec![];
         {
             let mut enc = Cursor::new(&buf);
