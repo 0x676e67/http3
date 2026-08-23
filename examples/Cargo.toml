@@ -2,6 +2,9 @@
 name = "examples"
 version = "0.0.0"
 publish = false
+# Dependabot creates a temporary src/main.rs while updating Cargo.lock. This
+# package only has explicit examples, so do not infer an `examples` binary.
+autobins = false
 rust-version = { workspace = true }
 edition = { workspace = true }
 repository = { workspace = true }
