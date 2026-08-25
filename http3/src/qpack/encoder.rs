@@ -88,10 +88,42 @@ impl Encoder {
         Ok(required_ref)
     }
 
+    /// Applies instructions received on the peer's QPACK decoder stream.
+    ///
+    /// A trailing incomplete instruction remains unread for the next call.
+    ///
+    /// See [RFC 9204, Section 4.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4).
     pub fn on_decoder_recv<R: Buf>(&mut self, read: &mut R) -> Result<(), EncoderError> {
-        while let Some(instruction) = Action::parse(read)? {
+        self.on_decoder_recv_with(read, Action::parse)
+    }
+
+    /// Applies decoder instructions through a checkpointable receive cursor.
+    ///
+    /// This path allows one instruction to span transport buffers without
+    /// coalescing them. Input advances only after a complete instruction has
+    /// been parsed.
+    ///
+    /// See [RFC 9204, Section 4.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4).
+    pub(crate) fn on_decoder_recv_buffered<R: Buf + Clone>(
+        &mut self,
+        read: &mut R,
+    ) -> Result<(), EncoderError> {
+        self.on_decoder_recv_with(read, Action::parse_buffered)
+    }
+
+    fn on_decoder_recv_with<R: Buf>(
+        &mut self,
+        read: &mut R,
+        parse: impl Fn(&mut R) -> Result<Option<Action>, EncoderError>,
+    ) -> Result<(), EncoderError> {
+        while let Some(instruction) = parse(read)? {
             match instruction {
-                Action::Untrack(stream_id) => self.table.untrack_block(stream_id)?,
+                Action::Untrack(stream_id) => {
+                    // An acknowledgment must match an outstanding dynamic field
+                    // section on this stream.
+                    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
+                    self.table.untrack_block(stream_id)?
+                }
                 Action::StreamCancel(stream_id) => {
                     // Untrack block twice, as this stream might have a trailer in addition to
                     // the header. Failures are ignored as blocks might have been acked before
@@ -236,27 +268,47 @@ impl Action {
         }
 
         let mut buf = Cursor::new(read.chunk());
+        let instruction = Self::decode(&mut buf)?;
+
+        if instruction.is_some() {
+            read.advance(buf.position() as usize);
+        }
+
+        Ok(instruction)
+    }
+
+    fn parse_buffered<R: Buf + Clone>(read: &mut R) -> Result<Option<Action>, EncoderError> {
+        if read.remaining() < 1 {
+            return Ok(None);
+        }
+
+        let before = read.remaining();
+        let mut buf = read.clone();
+        let instruction = Self::decode(&mut buf)?;
+
+        if instruction.is_some() {
+            read.advance(before - buf.remaining());
+        }
+
+        Ok(instruction)
+    }
+
+    fn decode<R: Buf>(buf: &mut R) -> Result<Option<Action>, EncoderError> {
         let first = buf.chunk()[0];
         let instruction = match DecoderInstruction::decode(first) {
             DecoderInstruction::Unknown => {
                 return Err(EncoderError::UnknownDecoderInstruction(first));
             }
             DecoderInstruction::InsertCountIncrement => {
-                InsertCountIncrement::decode(&mut buf)?.map(|x| Action::ReceivedRefIncrement(x.0))
+                InsertCountIncrement::decode(&mut *buf)?.map(|x| Action::ReceivedRefIncrement(x.0))
             }
             DecoderInstruction::HeaderAck => {
-                HeaderAck::decode(&mut buf)?.map(|x| Action::Untrack(x.0))
+                HeaderAck::decode(&mut *buf)?.map(|x| Action::Untrack(x.0))
             }
             DecoderInstruction::StreamCancel => {
-                StreamCancel::decode(&mut buf)?.map(|x| Action::StreamCancel(x.0))
+                StreamCancel::decode(&mut *buf)?.map(|x| Action::StreamCancel(x.0))
             }
         };
-
-        if instruction.is_some() {
-            let pos = buf.position();
-            read.advance(pos as usize);
-        }
-
         Ok(instruction)
     }
 }
@@ -296,8 +348,13 @@ impl From<ParseError> for EncoderError {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
-    use crate::qpack::tests::helpers::{TABLE_SIZE, build_table, build_table_with_size};
+    use crate::{
+        buf::BufList,
+        qpack::tests::helpers::{TABLE_SIZE, build_table, build_table_with_size},
+    };
 
     #[allow(clippy::type_complexity)]
     fn check_encode_field(
@@ -617,6 +674,27 @@ mod tests {
             Action::parse(&mut cur),
             Ok(Some(Action::StreamCancel(2321)))
         );
+    }
+
+    #[test]
+    fn decoder_instruction_can_span_receive_chunks() {
+        let mut encoded = vec![];
+        StreamCancel(2321).encode(&mut encoded);
+
+        let mut received = BufList::new();
+        received.push(Bytes::copy_from_slice(&encoded[..1]));
+        let mut encoder = Encoder::default();
+
+        {
+            let mut cursor = received.cursor();
+            assert_eq!(encoder.on_decoder_recv_buffered(&mut cursor), Ok(()));
+            assert_eq!(cursor.position(), 0);
+        }
+
+        received.push(Bytes::copy_from_slice(&encoded[1..]));
+        let mut cursor = received.cursor();
+        assert_eq!(encoder.on_decoder_recv_buffered(&mut cursor), Ok(()));
+        assert_eq!(cursor.position(), encoded.len());
     }
 
     #[test]

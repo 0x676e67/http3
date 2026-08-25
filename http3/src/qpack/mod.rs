@@ -8,6 +8,7 @@ use bytes::{Buf, BufMut};
 use futures_util::task::AtomicWaker;
 use tokio::sync::mpsc;
 
+pub(crate) use self::encoder::Encoder;
 pub use self::{
     decoder::{Decoded, Decoder, DecoderError, ack_header, decode_stateless, stream_canceled},
     encoder::{EncoderError, encode_stateless},
