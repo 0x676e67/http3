@@ -16,6 +16,7 @@ pub enum Error {
     UnknownStreamId(u64),
     NoTrackingData,
     InvalidTrackingCount,
+    InvalidInsertCountIncrement,
 }
 
 pub struct DynamicTableDecoder<'a> {
@@ -539,22 +540,41 @@ impl DynamicTable {
         }
     }
 
-    pub fn update_largest_received(&mut self, increment: usize) {
-        self.largest_known_received += increment;
-
-        if self.blocked_count == 0 {
-            return;
+    /// Applies an Insert Count Increment received from the decoder.
+    ///
+    /// Zero is invalid, and the resulting Known Received Count cannot exceed
+    /// the number of insertions sent by this encoder. Validation happens before
+    /// the table is changed. Either case is a `QPACK_DECODER_STREAM_ERROR`.
+    ///
+    /// See [RFC 9204, Section 4.4.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.3).
+    pub fn update_largest_received(&mut self, increment: usize) -> Result<(), Error> {
+        if increment == 0 {
+            return Err(Error::InvalidInsertCountIncrement);
         }
 
-        let blocked = self
-            .blocked_streams
-            .split_off(&(self.largest_known_received + 1));
+        let largest_known_received = self
+            .largest_known_received
+            .checked_add(increment)
+            .filter(|count| *count <= self.total_inserted())
+            .ok_or(Error::InvalidInsertCountIncrement)?;
+
+        self.largest_known_received = largest_known_received;
+
+        if self.blocked_count == 0 {
+            return Ok(());
+        }
+
+        let blocked = match self.largest_known_received.checked_add(1) {
+            Some(first_unacknowledged) => self.blocked_streams.split_off(&first_unacknowledged),
+            None => BTreeMap::new(),
+        };
         let acked = std::mem::replace(&mut self.blocked_streams, blocked);
 
         if !acked.is_empty() {
             let total_acked = acked.iter().fold(0u64, |t, (_, v)| t + v);
             self.blocked_count -= total_acked;
         }
+        Ok(())
     }
 
     pub(super) fn max_mem_size(&self) -> usize {
@@ -1364,7 +1384,7 @@ mod tests {
         assert_eq!(table.blocked_count, 2);
         assert_eq!(table.blocked_streams.get(&2), Some(&1));
 
-        table.update_largest_received(2);
+        table.update_largest_received(2).unwrap();
 
         assert_eq!(table.blocked_count, 1);
         assert_eq!(table.blocked_streams.get(&2), None);
@@ -1375,6 +1395,8 @@ mod tests {
     fn unblock_stream_larger() {
         let mut table = tracked_table(42);
         table.set_max_blocked(100).unwrap();
+        table.put(HeaderField::new("foo4", "quxx")).unwrap();
+        table.put(HeaderField::new("foo5", "quxx")).unwrap();
 
         table.encoder(44).commit(2);
         table.encoder(46).commit(5);
@@ -1383,7 +1405,7 @@ mod tests {
         assert_eq!(table.blocked_streams.get(&2), Some(&1));
         assert_eq!(table.blocked_streams.get(&3), Some(&1));
 
-        table.update_largest_received(5);
+        table.update_largest_received(5).unwrap();
 
         assert_eq!(table.blocked_count, 0);
         assert_eq!(table.blocked_streams.len(), 0);
@@ -1399,7 +1421,10 @@ mod tests {
         assert_eq!(table.blocked_count, 2);
         assert_eq!(table.blocked_streams.get(&3), Some(&2));
 
-        table.update_largest_received(5);
+        // Only three insertions were sent. A larger value would violate the
+        // Insert Count Increment limit in RFC 9204 Section 4.4.3.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.3
+        table.update_largest_received(3).unwrap();
 
         assert_eq!(table.blocked_count, 0);
         assert_eq!(table.blocked_streams.len(), 0);
@@ -1473,7 +1498,7 @@ mod tests {
             encoder.commit(0);
         }
 
-        table.update_largest_received(3);
+        table.update_largest_received(3).unwrap();
         assert_eq!(table.blocked_count, 0);
 
         let mut encoder = table.encoder(46);
@@ -1484,5 +1509,18 @@ mod tests {
                 absolute: 4
             })
         );
+    }
+
+    #[test]
+    fn overflowing_insert_count_increment_does_not_mutate_table() {
+        let mut table = tracked_table(42);
+        table.update_largest_received(1).unwrap();
+
+        assert_eq!(
+            table.update_largest_received(usize::MAX),
+            Err(Error::InvalidInsertCountIncrement)
+        );
+        assert_eq!(table.largest_known_received, 1);
+        assert_eq!(table.blocked_count, 1);
     }
 }

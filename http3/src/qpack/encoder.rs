@@ -101,7 +101,7 @@ impl Encoder {
                     }
                 }
                 Action::ReceivedRefIncrement(increment) => {
-                    self.table.update_largest_received(increment)
+                    self.table.update_largest_received(increment)?
                 }
             }
         }
@@ -297,7 +297,7 @@ impl From<ParseError> for EncoderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qpack::tests::helpers::{TABLE_SIZE, build_table};
+    use crate::qpack::tests::helpers::{TABLE_SIZE, build_table, build_table_with_size};
 
     #[allow(clippy::type_complexity)]
     fn check_encode_field(
@@ -656,10 +656,31 @@ mod tests {
         );
 
         let mut encoder = Encoder {
-            table: build_table(),
+            table: build_table_with_size(4),
         };
 
         let mut cur = Cursor::new(&buf);
         assert_eq!(encoder.on_decoder_recv(&mut cur), Ok(()));
+    }
+
+    #[test]
+    fn invalid_insert_count_increments_are_rejected() {
+        // Zero and counts beyond the insertions sent by the encoder are
+        // QPACK_DECODER_STREAM_ERROR conditions.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.3
+        for increment in [0, 2] {
+            let mut buf = vec![];
+            InsertCountIncrement(increment).encode(&mut buf);
+            let mut encoder = Encoder {
+                table: build_table_with_size(1),
+            };
+
+            assert_eq!(
+                encoder.on_decoder_recv(&mut Cursor::new(buf)),
+                Err(EncoderError::Insertion(
+                    DynamicTableError::InvalidInsertCountIncrement
+                ))
+            );
+        }
     }
 }
