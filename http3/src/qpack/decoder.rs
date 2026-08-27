@@ -53,7 +53,11 @@ impl std::fmt::Display for DecoderError {
             DecoderError::DynamicTable(e) => write!(f, "dynamic table error: {:?}", e),
             DecoderError::InvalidStaticIndex(i) => write!(f, "unknown static index: {}", i),
             DecoderError::UnknownPrefix(p) => write!(f, "unknown instruction code: 0x{}", p),
-            DecoderError::MissingRefs(n) => write!(f, "missing {} refs to decode block", n),
+            DecoderError::MissingRefs(required_insert_count) => write!(
+                f,
+                "field section requires insert count {}",
+                required_insert_count
+            ),
             DecoderError::BadBaseIndex {
                 required_insert_count,
                 sign_negative,
@@ -551,6 +555,14 @@ mod tests {
         buf::BufList,
         qpack::tests::helpers::{TABLE_SIZE, build_table_with_size},
     };
+
+    #[test]
+    fn missing_refs_display_reports_required_insert_count() {
+        assert_eq!(
+            DecoderError::MissingRefs(100).to_string(),
+            "field section requires insert count 100"
+        );
+    }
 
     #[test]
     fn test_header_too_long() {
