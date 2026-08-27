@@ -586,6 +586,17 @@ mod tests {
         assert_eq!(decoder.table.max_mem_size(), 0);
     }
 
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn decoder_rejects_capacity_larger_than_the_address_space() {
+        let capacity = u64::from(u32::MAX) + 1;
+
+        assert!(matches!(
+            Decoder::new(capacity, 0),
+            Err(DecoderError::BufSize(_))
+        ));
+    }
+
     #[test]
     fn blocked_stream_limit_accepts_full_settings_range() {
         let max = crate::proto::varint::VarInt::MAX.into_inner();

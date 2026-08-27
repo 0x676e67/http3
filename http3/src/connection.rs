@@ -74,6 +74,47 @@ where
     decoder_events_recv: mpsc::UnboundedReceiver<QpackEvent>,
 }
 
+fn invalid_qpack_decoder_configuration(error: qpack::DecoderError) -> InternalConnectionError {
+    // This failure comes from a local setting that cannot be represented on
+    // the current target, not from a field section received from the peer.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-6
+    InternalConnectionError::new(
+        Code::H3_INTERNAL_ERROR,
+        format!("invalid QPACK decoder configuration: {error}"),
+    )
+}
+
+fn open_critical_send_stream<C, B>(
+    conn: &mut C,
+    result: Result<C::SendStream, StreamErrorIncoming>,
+    stream_name: &str,
+) -> Result<C::SendStream, ConnectionError>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    match result {
+        Ok(stream) => Ok(stream),
+        Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
+            Err(conn.handle_quic_error_raw(connection_error))
+        }
+        Err(StreamErrorIncoming::StreamTerminated { error_code }) => Err(conn
+            .close_raw_connection_with_h3_error(InternalConnectionError::new(
+                Code::H3_CLOSED_CRITICAL_STREAM,
+                format!("{stream_name} stream was terminated with error code {error_code}"),
+            ))),
+        Err(StreamErrorIncoming::Unknown(error)) => Err(conn.close_raw_connection_with_h3_error(
+            // No critical stream exists yet, so this local transport failure
+            // cannot be reported as a stream closed by the peer.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-8.1
+            InternalConnectionError::new(
+                Code::H3_INTERNAL_ERROR,
+                format!("failed to open {stream_name} stream: {error}"),
+            ),
+        )),
+    }
+}
+
 fn wake_qpack_waiters_on_connection_error(
     blocked_streams: &mut qpack::BlockedStreamRegistry,
     decoder_events_recv: &mut mpsc::UnboundedReceiver<QpackEvent>,
@@ -174,6 +215,30 @@ where
     C: quic::Connection<B>,
     B: Buf,
 {
+    fn handle_critical_send_stream_result(
+        &mut self,
+        result: Result<(), StreamErrorIncoming>,
+        stream_name: &str,
+    ) -> Result<(), ConnectionError> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
+                Err(self.handle_connection_error(connection_error))
+            }
+            Err(StreamErrorIncoming::StreamTerminated { error_code }) => Err(self
+                .handle_connection_error(InternalConnectionError::new(
+                    Code::H3_CLOSED_CRITICAL_STREAM,
+                    format!("{stream_name} stream was terminated with error code {error_code}"),
+                ))),
+            Err(StreamErrorIncoming::Unknown(error)) => {
+                Err(self.handle_connection_error(InternalConnectionError::new(
+                    Code::H3_CLOSED_CRITICAL_STREAM,
+                    format!("failed to write {stream_name} stream header: {error}"),
+                )))
+            }
+        }
+    }
+
     /// Wakes every request task waiting for QPACK progress.
     ///
     /// The driver cannot provide decoder access or missing table entries after
@@ -233,105 +298,73 @@ where
         //# the peer prior to sending the SETTINGS frame; settings MUST be sent
         //# as soon as the transport is ready to send data.
 
-        let mut decoder_send = Option::take(&mut self.qpack_streams.decoder_send);
-        let mut encoder_send = Option::take(&mut self.qpack_streams.encoder_send);
-
         //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
         //# Each endpoint
         //# MUST initiate, at most, one encoder stream and, at most, one decoder
         //# stream.
 
-        let (control, ..) = future::join3(
-            stream::write(
-                &mut self.control_send,
-                WriteBuf::from(UniStreamHeader::Control(settings)),
-            ),
-            async {
-                if let Some(stream) = &mut decoder_send {
-                    let _ = stream::write(stream, WriteBuf::from(UniStreamHeader::Decoder)).await;
-                }
-            },
-            async {
-                if let Some(stream) = &mut encoder_send {
-                    let _ = stream::write(stream, WriteBuf::from(UniStreamHeader::Encoder)).await;
-                }
-            },
+        let control = stream::write(
+            &mut self.control_send,
+            WriteBuf::from(UniStreamHeader::Control(settings)),
         )
         .await;
+        self.handle_critical_send_stream_result(control, "control")?;
 
-        self.qpack_streams.decoder_send = decoder_send;
-        self.qpack_streams.encoder_send = encoder_send;
+        // QPACK encoder and decoder streams are critical streams. A peer must
+        // not close either direction once the stream has been created.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+        let mut decoder_send = match self.qpack_streams.decoder_send.take() {
+            Some(stream) => stream,
+            None => {
+                return Err(self.handle_connection_error(InternalConnectionError::new(
+                    Code::H3_INTERNAL_ERROR,
+                    "QPACK decoder stream was not initialized".to_string(),
+                )));
+            }
+        };
+        let decoder =
+            stream::write(&mut decoder_send, WriteBuf::from(UniStreamHeader::Decoder)).await;
+        self.qpack_streams.decoder_send = Some(decoder_send);
+        self.handle_critical_send_stream_result(decoder, "QPACK decoder")?;
 
-        match control {
-            Ok(control) => Ok(control),
-            Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
-                Err(self.handle_connection_error(connection_error))
+        let mut encoder_send = match self.qpack_streams.encoder_send.take() {
+            Some(stream) => stream,
+            None => {
+                return Err(self.handle_connection_error(InternalConnectionError::new(
+                    Code::H3_INTERNAL_ERROR,
+                    "QPACK encoder stream was not initialized".to_string(),
+                )));
             }
-            Err(StreamErrorIncoming::StreamTerminated { error_code: err }) => Err(self
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
-                //# If either control
-                //# stream is closed at any point, this MUST be treated as a connection
-                //# error of type H3_CLOSED_CRITICAL_STREAM.
-                .handle_connection_error(InternalConnectionError::new(
-                    Code::H3_CLOSED_CRITICAL_STREAM,
-                    format!(
-                        "control stream was requested to stop sending with error code {}",
-                        err
-                    ),
-                ))),
-            Err(StreamErrorIncoming::Unknown(error)) => {
-                Err(self.handle_connection_error(InternalConnectionError::new(
-                    Code::H3_CLOSED_CRITICAL_STREAM,
-                    format!("an error occurred on the control stream {}", error),
-                )))
-            }
-        }
+        };
+        let encoder =
+            stream::write(&mut encoder_send, WriteBuf::from(UniStreamHeader::Encoder)).await;
+        self.qpack_streams.encoder_send = Some(encoder_send);
+        self.handle_critical_send_stream_result(encoder, "QPACK encoder")
     }
 
     /// Initiates the connection and opens a control stream
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn new(mut conn: C, config: Config) -> Result<Self, ConnectionError> {
+        let decoder = qpack::Decoder::new(
+            config.settings.qpack_max_table_capacity.unwrap_or(0),
+            config.settings.qpack_blocked_streams.unwrap_or(0),
+        )
+        .map_err(|error| {
+            conn.close_raw_connection_with_h3_error(invalid_qpack_decoder_configuration(error))
+        })?;
+
         //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
         //# Endpoints SHOULD create the HTTP control stream as well as the
         //# unidirectional streams required by mandatory extensions (such as the
         //# QPACK encoder and decoder streams) first, and then create additional
 
         // start streams
-        let (control_send, encoder_send, decoder_send) = (
-            future::poll_fn(|cx| conn.poll_open_send(cx)).await,
-            future::poll_fn(|cx| conn.poll_open_send(cx)).await,
-            future::poll_fn(|cx| conn.poll_open_send(cx)).await,
-        );
-
-        let control_send = match control_send {
-            Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
-                return Err(conn.handle_quic_error_raw(connection_error));
-            }
-            Err(StreamErrorIncoming::StreamTerminated { error_code: err }) => {
-                return Err(
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
-                    //# If either control
-                    //# stream is closed at any point, this MUST be treated as a connection
-                    //# error of type H3_CLOSED_CRITICAL_STREAM.
-                    conn.close_raw_connection_with_h3_error(InternalConnectionError::new(
-                        Code::H3_CLOSED_CRITICAL_STREAM,
-                        format!(
-                            "control stream was requested to stop sending with error code {}",
-                            err,
-                        ),
-                    )),
-                );
-            }
-            Err(StreamErrorIncoming::Unknown(error)) => {
-                return Err(
-                    conn.close_raw_connection_with_h3_error(InternalConnectionError::new(
-                        Code::H3_CLOSED_CRITICAL_STREAM,
-                        format!("an error occurred on the control stream {}", error),
-                    )),
-                );
-            }
-            Ok(control_send) => control_send,
-        };
+        let control_send = future::poll_fn(|cx| conn.poll_open_send(cx)).await;
+        let control_send = open_critical_send_stream(&mut conn, control_send, "control")?;
+        let encoder_send = future::poll_fn(|cx| conn.poll_open_send(cx)).await;
+        let encoder_send = open_critical_send_stream(&mut conn, encoder_send, "QPACK encoder")?;
+        let decoder_send = future::poll_fn(|cx| conn.poll_open_send(cx)).await;
+        let decoder_send = open_critical_send_stream(&mut conn, decoder_send, "QPACK decoder")?;
 
         let (decoder_events_send, decoder_events_recv) = mpsc::unbounded_channel();
 
@@ -340,28 +373,18 @@ where
         //# The
         //# sender MUST NOT close the control stream, and the receiver MUST NOT
         //# request that the sender close the control stream.
-        let decoder = qpack::Decoder::new(
-            config.settings.qpack_max_table_capacity.unwrap_or(0),
-            config.settings.qpack_blocked_streams.unwrap_or(0),
-        )
-        .map_err(|err| {
-            conn.close_raw_connection_with_h3_error(InternalConnectionError::new(
-                Code::QPACK_DECOMPRESSION_FAILED,
-                format!("invalid QPACK decoder configuration: {}", err),
-            ))
-        })?;
         let blocked_streams = qpack::BlockedStreamRegistry::new(decoder.max_blocked_streams());
         let decoder = QpackDecoder::new(decoder, decoder_events_send);
 
         let qpack_streams = QpackStreams {
-            decoder_send: decoder_send.ok(),
+            decoder_send: Some(decoder_send),
             decoder_send_buf: BytesMut::new(),
             decoder,
             encoder: qpack::Encoder::default(),
             blocked_streams,
             decoder_events_recv,
             decoder_recv: None,
-            encoder_send: encoder_send.ok(),
+            encoder_send: Some(encoder_send),
             encoder_recv: None,
         };
 
@@ -591,6 +614,10 @@ where
     {
         let _ = self.poll_connection_error(cx)?;
 
+        // Do not accumulate decoder instructions while the decoder stream is
+        // flow-control blocked. RFC 9204 allows implementations to limit
+        // unsent decoder-stream data as part of their memory policy.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3
         match self.poll_flush_qpack_decoder(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
@@ -821,7 +848,15 @@ where
 
         while self.qpack_streams.decoder_send_buf.has_remaining() {
             match decoder_send.poll_send(cx, &mut self.qpack_streams.decoder_send_buf) {
-                Poll::Ready(Ok(0)) | Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_INTERNAL_ERROR,
+                            "QPACK decoder stream made no write progress".to_string(),
+                        ),
+                    )));
+                }
+                Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(_)) => {}
                 Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
                     connection_error,
@@ -1162,7 +1197,7 @@ where
                     required_ref,
                     waker,
                 } => {
-                    if let Err(err) =
+                    if let Err(waker) =
                         self.qpack_streams
                             .blocked_streams
                             .register(stream_id, required_ref, waker)
@@ -1171,10 +1206,15 @@ where
                         // advertised by the decoder. Exceeding it is a connection
                         // error, not a request-stream error.
                         // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2
-                        return Err(self.handle_connection_error(InternalConnectionError::new(
+                        let error = self.handle_connection_error(InternalConnectionError::new(
                             Code::QPACK_DECOMPRESSION_FAILED,
-                            format!("QPACK blocked-stream limit exceeded: {err}"),
-                        )));
+                            format!(
+                                "QPACK blocked-stream limit exceeded: {}",
+                                qpack::DecoderError::TooManyBlockedStreams
+                            ),
+                        ));
+                        waker.wake();
+                        return Err(error);
                     }
                 }
                 QpackEvent::ReleaseBlocked {
@@ -1817,21 +1857,24 @@ mod qpack_field_section_tests {
         let mut blocked_streams = qpack::BlockedStreamRegistry::new(1);
         let waker = futures_util::task::noop_waker();
 
-        assert_eq!(
-            blocked_streams.register(StreamId(0), 1, waker.clone()),
-            Ok(())
+        assert!(
+            blocked_streams
+                .register(StreamId(0), 1, waker.clone())
+                .is_ok()
         );
-        assert_eq!(
-            blocked_streams.register(StreamId(0), 1, waker.clone()),
-            Ok(())
+        assert!(
+            blocked_streams
+                .register(StreamId(0), 1, waker.clone())
+                .is_ok()
         );
-        assert_eq!(
-            blocked_streams.register(StreamId(4), 2, waker.clone()),
-            Err(qpack::DecoderError::TooManyBlockedStreams)
+        assert!(
+            blocked_streams
+                .register(StreamId(4), 2, waker.clone())
+                .is_err()
         );
 
         blocked_streams.release(StreamId(0), 1);
-        assert_eq!(blocked_streams.register(StreamId(4), 2, waker), Ok(()));
+        assert!(blocked_streams.register(StreamId(4), 2, waker).is_ok());
     }
 
     struct WakeCounter {
@@ -1885,5 +1928,40 @@ mod qpack_field_section_tests {
                 .send(QpackEvent::HeaderAck(StreamId(0)))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn blocked_stream_limit_defers_wake_until_error_is_published() {
+        let shared = Arc::new(SharedState::default());
+        let counter = Arc::new(WakeCounter {
+            wakes: AtomicUsize::new(0),
+            shared: shared.clone(),
+        });
+        let mut blocked_streams = qpack::BlockedStreamRegistry::new(0);
+
+        let waker = blocked_streams
+            .register(StreamId(0), 1, waker(counter.clone()))
+            .expect_err("the blocked-stream limit should reject the field section");
+        assert_eq!(counter.wakes.load(Ordering::Relaxed), 0);
+
+        shared.set_conn_error(
+            InternalConnectionError::new(
+                Code::QPACK_DECOMPRESSION_FAILED,
+                "blocked-stream limit exceeded".into(),
+            )
+            .into(),
+        );
+        waker.wake();
+
+        assert_eq!(counter.wakes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn invalid_local_qpack_configuration_is_an_internal_error() {
+        let conversion_error = u8::try_from(u16::MAX).unwrap_err();
+        let error =
+            invalid_qpack_decoder_configuration(qpack::DecoderError::BufSize(conversion_error));
+
+        assert_eq!(error.code, Code::H3_INTERNAL_ERROR);
     }
 }

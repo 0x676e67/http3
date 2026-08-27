@@ -188,9 +188,10 @@ fn decoder_update_releases_blocked_stream_budget_before_request_repoll() {
     let mut blocked_streams = BlockedStreamRegistry::new(1);
     let wake_count = Arc::new(WakeCounter(AtomicUsize::new(0)));
     let blocked_waker = futures_util::task::waker(wake_count.clone());
-    assert_eq!(
-        blocked_streams.register(StreamId(0), 1, blocked_waker),
-        Ok(())
+    assert!(
+        blocked_streams
+            .register(StreamId(0), 1, blocked_waker)
+            .is_ok()
     );
 
     let mut decoder_stream = Vec::new();
@@ -227,9 +228,10 @@ fn decoder_update_releases_blocked_stream_budget_before_request_repoll() {
     // Insert Count one released the first stream before its request task polled
     // the field section again.
     // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1
-    assert_eq!(
-        blocked_streams.register(StreamId(4), 2, cx.waker().clone()),
-        Ok(())
+    assert!(
+        blocked_streams
+            .register(StreamId(4), 2, cx.waker().clone())
+            .is_ok()
     );
 }
 
@@ -244,11 +246,12 @@ fn blocked_registration_after_decoder_update_wakes_immediately() {
     // The update arrived before registration. The registry sees that the field
     // section is already decodable, wakes it, and uses no blocked-stream slot.
     // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1
-    assert_eq!(blocked_streams.register(StreamId(0), 1, waker), Ok(()));
+    assert!(blocked_streams.register(StreamId(0), 1, waker).is_ok());
     assert_eq!(wake_count.0.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        blocked_streams.register(StreamId(4), 2, futures_util::task::noop_waker().clone(),),
-        Ok(())
+    assert!(
+        blocked_streams
+            .register(StreamId(4), 2, futures_util::task::noop_waker().clone(),)
+            .is_ok()
     );
 }
 

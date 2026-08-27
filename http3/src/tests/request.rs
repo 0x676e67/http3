@@ -7,7 +7,7 @@ use http::{HeaderMap, Request, Response, StatusCode, request};
 
 use super::{Pair, http3_quinn, init_tracing};
 use crate::{
-    ConnectionState, client,
+    client,
     config::Settings,
     error::{Code, ConnectionError, LocalError, StreamError},
     proto::{
@@ -20,6 +20,7 @@ use crate::{
     qpack,
     quic::ConnectionErrorIncoming,
     server,
+    shared_state::ConnectionState,
     tests::get_stream_blocking,
 };
 

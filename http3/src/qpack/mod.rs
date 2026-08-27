@@ -9,6 +9,8 @@ use futures_util::task::AtomicWaker;
 use tokio::sync::mpsc;
 
 pub(crate) use self::encoder::Encoder;
+#[cfg(test)]
+pub(crate) use self::stream::{DynamicTableSizeUpdate, InsertCountIncrement, InsertWithoutNameRef};
 pub use self::{
     decoder::{Decoded, Decoder, DecoderError, ack_header, decode_stateless, stream_canceled},
     encoder::{EncoderError, encode_stateless},
@@ -93,6 +95,9 @@ impl BlockedStreamRegistry {
     /// encoder update arrives first, registration sees the current Insert Count
     /// and wakes the task immediately.
     ///
+    /// When the peer exceeds the advertised limit, the unregistered waker is
+    /// returned so the connection driver can publish the error before waking it.
+    ///
     /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2)
     /// and [Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
     pub(crate) fn register(
@@ -100,7 +105,7 @@ impl BlockedStreamRegistry {
         stream_id: StreamId,
         required_ref: usize,
         waker: Waker,
-    ) -> Result<(), DecoderError> {
+    ) -> Result<(), Waker> {
         if required_ref <= self.insert_count {
             waker.wake();
             return Ok(());
@@ -119,8 +124,9 @@ impl BlockedStreamRegistry {
             Err(_) => true,
         };
         if limit_reached {
-            waker.wake();
-            return Err(DecoderError::TooManyBlockedStreams);
+            // The driver publishes the connection error before waking this
+            // task. Waking here would let it observe an unfinished error state.
+            return Err(waker);
         }
 
         self.streams.insert(key, waker);

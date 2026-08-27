@@ -88,9 +88,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::Datagram;
     use bytes::{Buf, Bytes};
     use http3::quic::StreamId;
+
+    use super::Datagram;
 
     #[test]
     fn encode_preserves_quarter_stream_id() {

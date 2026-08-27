@@ -11,18 +11,20 @@ use tokio::sync::oneshot::{self};
 
 use super::{Pair, http3_quinn, init_tracing};
 use crate::{
-    ConnectionState, client,
+    client,
     client::SendRequest,
     error::{Code, ConnectionError, LocalError, StreamError},
     proto::{
-        coding::Encode as _,
+        coding::{Decode as _, Encode as _},
         frame::{Frame, Settings},
         push::PushId,
         stream::StreamType,
         varint::VarInt,
     },
+    qpack,
     quic::{self, ConnectionErrorIncoming, SendStream},
     server,
+    shared_state::ConnectionState,
     tests::get_stream_blocking,
 };
 
@@ -651,6 +653,109 @@ async fn client_rejects_closed_qpack_decoder_stream() {
     })
     .await
     .expect("closed QPACK decoder stream was not observed");
+}
+
+#[tokio::test]
+async fn client_flushes_insert_count_increment_without_a_blocked_request() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let server = pair.server();
+
+    let client_fut = async {
+        let mut builder = client::builder();
+        builder.qpack_max_table_capacity(128);
+        builder.send_grease(false);
+        let (mut connection, _send_request) = builder
+            .build::<_, _, Bytes>(pair.client().await)
+            .await
+            .expect("client init");
+
+        assert_matches!(
+            future::poll_fn(|cx| connection.poll_close(cx)).await,
+            ConnectionError::Remote(ConnectionErrorIncoming::ApplicationClose {
+                error_code,
+            }) if error_code == Code::H3_NO_ERROR.value()
+        );
+    };
+
+    let server_fut = async {
+        let connection = server.endpoint.accept().await.unwrap().await.unwrap();
+
+        let mut control_stream = connection.open_uni().await.unwrap();
+        let mut control = BytesMut::new();
+        StreamType::CONTROL.encode(&mut control);
+        Frame::<Bytes>::Settings(Settings::default()).encode(&mut control);
+        control_stream.write_all(&control).await.unwrap();
+
+        let mut decoder_stream = connection.open_uni().await.unwrap();
+        let mut stream_type = BytesMut::new();
+        StreamType::DECODER.encode(&mut stream_type);
+        decoder_stream.write_all(&stream_type).await.unwrap();
+
+        let mut encoder_stream = connection.open_uni().await.unwrap();
+        let mut instructions = BytesMut::new();
+        StreamType::ENCODER.encode(&mut instructions);
+        qpack::DynamicTableSizeUpdate(128).encode(&mut instructions);
+        qpack::InsertWithoutNameRef::new("name", "value")
+            .encode(&mut instructions)
+            .unwrap();
+        encoder_stream.write_all(&instructions).await.unwrap();
+
+        let mut other_streams = Vec::new();
+        loop {
+            let mut stream = connection.accept_uni().await.unwrap();
+            let mut received = BytesMut::new();
+            while received.is_empty() {
+                let chunk = stream
+                    .read_chunk(usize::MAX, true)
+                    .await
+                    .unwrap()
+                    .expect("client critical stream closed");
+                received.extend_from_slice(&chunk.bytes);
+            }
+
+            let stream_type = StreamType::decode(&mut received).unwrap();
+            if stream_type != StreamType::DECODER {
+                other_streams.push(stream);
+                continue;
+            }
+
+            while received.is_empty() {
+                let chunk = stream
+                    .read_chunk(usize::MAX, true)
+                    .await
+                    .unwrap()
+                    .expect("client decoder stream closed");
+                received.extend_from_slice(&chunk.bytes);
+            }
+
+            assert_eq!(
+                qpack::InsertCountIncrement::decode(&mut received),
+                Ok(Some(qpack::InsertCountIncrement(1)))
+            );
+            assert!(!received.has_remaining());
+            other_streams.push(stream);
+            break;
+        }
+
+        connection.close(
+            quinn::VarInt::from_u64(Code::H3_NO_ERROR.value()).unwrap(),
+            b"test complete",
+        );
+
+        drop((
+            control_stream,
+            decoder_stream,
+            encoder_stream,
+            other_streams,
+        ));
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("Insert Count Increment was not received");
 }
 
 #[tokio::test]
