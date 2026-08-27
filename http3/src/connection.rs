@@ -636,9 +636,9 @@ where
                         }
                     }
                     Poll::Ready(Err(err)) => {
-                        if let Err(err) = self.poll_qpack_decoder_events(cx) {
-                            return Poll::Ready(Err(err));
-                        }
+                        // Do not drain QPACK events before publishing the error.
+                        // A woken request can run on another executor thread and
+                        // must observe the connection error before it is polled.
                         return Poll::Ready(Err(self.handle_connection_error(
                             InternalConnectionError::new(
                                 Code::QPACK_ENCODER_STREAM_ERROR,
@@ -1834,17 +1834,25 @@ mod qpack_field_section_tests {
         assert_eq!(blocked_streams.register(StreamId(4), 2, waker), Ok(()));
     }
 
-    struct WakeCounter(AtomicUsize);
+    struct WakeCounter {
+        wakes: AtomicUsize,
+        shared: Arc<SharedState>,
+    }
 
     impl ArcWake for WakeCounter {
         fn wake_by_ref(arc_self: &Arc<Self>) {
-            arc_self.0.fetch_add(1, Ordering::Relaxed);
+            assert!(arc_self.shared.get_conn_error().is_some());
+            arc_self.wakes.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     #[test]
-    fn connection_error_wakes_all_qpack_waiters() {
-        let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    fn qpack_waiters_observe_connection_error_before_wake() {
+        let shared = Arc::new(SharedState::default());
+        let counter = Arc::new(WakeCounter {
+            wakes: AtomicUsize::new(0),
+            shared: shared.clone(),
+        });
         let waker = waker(counter.clone());
         let mut blocked_streams = qpack::BlockedStreamRegistry::new(4);
         blocked_streams
@@ -1862,9 +1870,16 @@ mod qpack_field_section_tests {
             .send(QpackEvent::DecoderAccessWaker(waker))
             .unwrap();
 
+        shared.set_conn_error(
+            InternalConnectionError::new(
+                Code::QPACK_ENCODER_STREAM_ERROR,
+                "invalid encoder instruction".into(),
+            )
+            .into(),
+        );
         wake_qpack_waiters_on_connection_error(&mut blocked_streams, &mut events_recv);
 
-        assert_eq!(counter.0.load(Ordering::Relaxed), 3);
+        assert_eq!(counter.wakes.load(Ordering::Relaxed), 3);
         assert!(
             events_send
                 .send(QpackEvent::HeaderAck(StreamId(0)))
