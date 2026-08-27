@@ -51,7 +51,7 @@ proptest = "1"
 quic = { version = "0.11", default-features = false }
 quinn = { version = "0.11", default-features = false }
 quinn-proto = { version = "0.11", default-features = false }
-rcgen = "=0.14.5"
+rcgen = "=0.14.9"
 rustls = { version = "0.23.42", default-features = false }
 rustls-native-certs = "0.8"
 smallvec = "1.15.0"
