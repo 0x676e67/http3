@@ -9,7 +9,9 @@
 //! async fn doc<C>(conn: C)
 //! where
 //! C: http3::quic::Connection<bytes::Bytes> + 'static,
-//! <C as http3::quic::OpenStreams<bytes::Bytes>>::BidiStream: Send + 'static
+//! <C as http3::quic::OpenStreams<bytes::Bytes>>::BidiStream: Send + 'static,
+//! <C as http3::quic::OpenStreams<bytes::Bytes>>::SendStream:
+//!     http3::quic::SendStreamUnframed<bytes::Bytes>,
 //! {
 //!     let mut server_builder = http3::server::builder();
 //!     // Build the Connection

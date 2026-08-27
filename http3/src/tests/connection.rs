@@ -502,6 +502,112 @@ async fn server_rejects_invalid_qpack_decoder_stream_instruction() {
 }
 
 #[tokio::test]
+async fn server_rejects_invalid_qpack_encoder_stream_instruction() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+    let (done_send, done_recv) = oneshot::channel();
+
+    let client_fut = async {
+        let connection = pair.client_inner().await;
+
+        let mut control_stream = connection.open_uni().await.unwrap();
+        let mut control = BytesMut::new();
+        StreamType::CONTROL.encode(&mut control);
+        Frame::<Bytes>::Settings(Settings::default()).encode(&mut control);
+        control_stream.write_all(&control).await.unwrap();
+
+        let mut encoder_stream = connection.open_uni().await.unwrap();
+        let mut instruction = BytesMut::new();
+        StreamType::ENCODER.encode(&mut instruction);
+        // The default server setting permits no dynamic table capacity. A Set
+        // Dynamic Table Capacity instruction for 1 therefore exceeds the limit.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.1
+        instruction.extend_from_slice(&[0x21]);
+        encoder_stream.write_all(&instruction).await.unwrap();
+
+        let _ = done_recv.await;
+        drop(encoder_stream);
+        drop(control_stream);
+        drop(connection);
+    };
+
+    let server_fut = async {
+        let conn = server.next().await;
+        let mut incoming = server::Connection::new(conn).await.unwrap();
+        assert_matches!(
+            incoming.accept().await.map(|_| ()).unwrap_err(),
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::QPACK_ENCODER_STREAM_ERROR,
+                    ..
+                }
+            }
+        );
+        done_send.send(()).unwrap();
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("QPACK encoder-stream error was not observed");
+}
+
+#[tokio::test]
+async fn server_rejects_closed_qpack_encoder_stream() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+    let (done_send, done_recv) = oneshot::channel();
+
+    let client_fut = async {
+        let connection = pair.client_inner().await;
+
+        let mut control_stream = connection.open_uni().await.unwrap();
+        let mut control = BytesMut::new();
+        StreamType::CONTROL.encode(&mut control);
+        Frame::<Bytes>::Settings(Settings::default()).encode(&mut control);
+        control_stream.write_all(&control).await.unwrap();
+
+        let mut encoder_stream = connection.open_uni().await.unwrap();
+        let mut stream_type = BytesMut::new();
+        StreamType::ENCODER.encode(&mut stream_type);
+        encoder_stream.write_all(&stream_type).await.unwrap();
+
+        // FIN closes a critical QPACK stream even when no dynamic entries were sent.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+        encoder_stream.finish().unwrap();
+
+        let _ = done_recv.await;
+        drop(encoder_stream);
+        drop(control_stream);
+        drop(connection);
+    };
+
+    let server_fut = async {
+        let conn = server.next().await;
+        let mut incoming = server::Connection::new(conn).await.unwrap();
+        assert_matches!(
+            incoming.accept().await.map(|_| ()).unwrap_err(),
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_CLOSED_CRITICAL_STREAM,
+                    ..
+                }
+            }
+        );
+        done_send.send(()).unwrap();
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("closed QPACK encoder stream was not observed");
+}
+
+#[tokio::test]
 async fn client_rejects_closed_qpack_decoder_stream() {
     init_tracing();
     let mut pair = Pair::default();
