@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap, VecDeque, btree_map::Entry as BTEntry, hash_map::Entry},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque, hash_map::Entry},
 };
 
 use super::{field::HeaderField, static_::StaticTable};
@@ -62,19 +62,17 @@ impl<'a> DynamicTableDecoder<'a> {
 pub struct DynamicTableEncoder<'a> {
     table: &'a mut DynamicTable,
     base: usize,
-    commited: bool,
+    committed: bool,
     stream_id: u64,
+    allow_blocking: bool,
     block_refs: HashMap<usize, usize>,
 }
 
 impl<'a> Drop for DynamicTableEncoder<'a> {
     fn drop(&mut self) {
-        if !self.commited {
-            // TODO maybe possible to replace and not clone here?
-            // HOW Err should be handled?
-            self.table
-                .track_cancel(self.block_refs.iter().map(|(x, y)| (*x, *y)))
-                .ok();
+        if !self.committed {
+            let refs = std::mem::take(&mut self.block_refs);
+            let _ = self.table.release_refs(&refs);
         }
     }
 }
@@ -92,11 +90,16 @@ impl<'a> DynamicTableEncoder<'a> {
         self.table.total_inserted()
     }
 
-    pub(super) fn commit(&mut self, largest_ref: usize) {
-        self.table
-            .track_block(self.stream_id, self.block_refs.clone());
-        self.table.register_blocked(largest_ref);
-        self.commited = true;
+    pub(super) fn commit(&mut self, required_insert_count: usize) {
+        // A zero Required Insert Count never produces a Section
+        // Acknowledgment, so only dynamic field sections belong in this queue.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
+        if required_insert_count != 0 {
+            let refs = std::mem::take(&mut self.block_refs);
+            self.table
+                .track_block(self.stream_id, required_insert_count, refs);
+        }
+        self.committed = true;
     }
 
     pub(super) fn find(&mut self, field: &HeaderField) -> DynamicLookupResult {
@@ -105,14 +108,20 @@ impl<'a> DynamicTableEncoder<'a> {
 
     fn lookup_result(&mut self, absolute: Option<usize>) -> DynamicLookupResult {
         match absolute {
-            Some(absolute) if absolute <= self.base => {
+            Some(absolute)
+                if (absolute <= self.table.largest_known_received || self.allow_blocking)
+                    && absolute <= self.base =>
+            {
                 self.track_ref(absolute);
                 DynamicLookupResult::Relative {
                     index: self.base - absolute,
                     absolute,
                 }
             }
-            Some(absolute) if absolute > self.base => {
+            Some(absolute)
+                if (absolute <= self.table.largest_known_received || self.allow_blocking)
+                    && absolute > self.base =>
+            {
                 self.track_ref(absolute);
                 DynamicLookupResult::PostBase {
                     index: absolute - self.base - 1,
@@ -124,7 +133,11 @@ impl<'a> DynamicTableEncoder<'a> {
     }
 
     pub(super) fn insert(&mut self, field: &HeaderField) -> Result<DynamicInsertionResult, Error> {
-        if self.table.blocked_count >= self.table.blocked_max {
+        // A newly inserted entry is not known to the decoder yet. Referencing
+        // it is allowed only when this stream can consume a blocked-stream
+        // slot (or already consumes one).
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2
+        if !self.allow_blocking {
             return Ok(DynamicInsertionResult::NotInserted(
                 self.find_name(&field.name),
             ));
@@ -248,6 +261,42 @@ pub enum DynamicInsertionResult {
     NotInserted(DynamicLookupResult),
 }
 
+#[derive(Debug)]
+struct TrackedFieldSection {
+    required_insert_count: usize,
+    refs: HashMap<usize, usize>,
+}
+
+#[derive(Debug, Default)]
+struct TrackedStream {
+    field_sections: VecDeque<TrackedFieldSection>,
+    max_required_insert_count: usize,
+}
+
+impl TrackedStream {
+    fn push(&mut self, field_section: TrackedFieldSection) {
+        self.max_required_insert_count = self
+            .max_required_insert_count
+            .max(field_section.required_insert_count);
+        self.field_sections.push_back(field_section);
+    }
+
+    fn pop_front(&mut self) -> Option<TrackedFieldSection> {
+        let field_section = self.field_sections.pop_front()?;
+        // If this was the maximum, acknowledging it advances KRC to at least
+        // this value, so every lower remaining count is already unblocked. A
+        // later count above KRC will also be above this cached value.
+        if self.field_sections.is_empty() {
+            self.max_required_insert_count = 0;
+        }
+        Some(field_section)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.field_sections.is_empty()
+    }
+}
+
 #[derive(Default)]
 pub struct DynamicTable {
     fields: VecDeque<HeaderField>,
@@ -257,11 +306,12 @@ pub struct DynamicTable {
     field_map: HashMap<HeaderField, usize>,
     name_map: HashMap<Cow<'static, [u8]>, usize>,
     track_map: BTreeMap<usize, usize>,
-    track_blocks: HashMap<u64, VecDeque<HashMap<usize, usize>>>,
+    track_blocks: HashMap<u64, TrackedStream>,
     largest_known_received: usize,
     blocked_max: u64,
-    blocked_count: u64,
-    blocked_streams: BTreeMap<usize, u64>, // <required_ref, blocked_count>
+    // Ordered by Required Insert Count so decoder feedback can release all
+    // newly unblocked streams without scanning every tracked stream.
+    blocked_streams: BTreeSet<(usize, u64)>,
 }
 
 impl DynamicTable {
@@ -285,12 +335,15 @@ impl DynamicTable {
                 .insert(field.clone(), self.vas.index(idx).unwrap());
         }
 
+        let allow_blocking = self.stream_is_blocked(stream_id) || !self.blocked_limit_reached();
+
         DynamicTableEncoder {
             base: self.vas.largest_ref(),
             table: self,
             block_refs: HashMap::new(),
-            commited: false,
+            committed: false,
             stream_id,
+            allow_blocking,
         }
     }
 
@@ -377,19 +430,83 @@ impl DynamicTable {
         self.vas.total_inserted()
     }
 
-    pub(super) fn untrack_block(&mut self, stream_id: u64) -> Result<(), Error> {
-        let mut entry = self.track_blocks.entry(stream_id);
-        let block = match entry {
-            Entry::Occupied(ref mut blocks) if blocks.get().len() > 1 => {
-                blocks.get_mut().pop_front()
-            }
-            Entry::Occupied(blocks) => blocks.remove().pop_front(),
-            Entry::Vacant { .. } => return Err(Error::UnknownStreamId(stream_id)),
+    /// Applies a Section Acknowledgment to the earliest outstanding dynamic
+    /// field section on `stream_id`.
+    ///
+    /// The acknowledged Required Insert Count can advance the Known Received
+    /// Count. Only this field section's references are released; later field
+    /// sections on the same stream remain outstanding.
+    ///
+    /// See [RFC 9204, Section 2.1.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.4)
+    /// and [Section 2.2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.2.1).
+    pub(super) fn acknowledge_section(&mut self, stream_id: u64) -> Result<(), Error> {
+        let required_insert_count = {
+            let stream = self
+                .track_blocks
+                .get(&stream_id)
+                .ok_or(Error::UnknownStreamId(stream_id))?;
+            let field_section = stream.field_sections.front().ok_or(Error::NoTrackingData)?;
+            self.validate_refs(&field_section.refs)?;
+            field_section.required_insert_count
         };
 
-        if let Some(b) = block {
-            self.track_cancel(b.iter().map(|(x, y)| (*x, *y)))?;
+        if required_insert_count > self.total_inserted() {
+            return Err(Error::InvalidTrackingCount);
         }
+
+        let (previous_required, current_required, field_section, stream_empty) = {
+            let stream = self
+                .track_blocks
+                .get_mut(&stream_id)
+                .ok_or(Error::UnknownStreamId(stream_id))?;
+            let previous_required = stream.max_required_insert_count;
+            let field_section = stream.pop_front().ok_or(Error::NoTrackingData)?;
+            (
+                previous_required,
+                stream.max_required_insert_count,
+                field_section,
+                stream.is_empty(),
+            )
+        };
+
+        self.advance_largest_received(required_insert_count);
+        self.replace_blocked_requirement(stream_id, previous_required, current_required);
+        self.release_refs_validated(&field_section.refs);
+
+        if stream_empty {
+            self.track_blocks.remove(&stream_id);
+        }
+        Ok(())
+    }
+
+    /// Releases every outstanding dynamic-table reference on `stream_id`.
+    ///
+    /// Stream Cancellation covers all field sections on the stream, not only
+    /// response headers and trailers. A cancellation for a stream without
+    /// outstanding dynamic references is harmless.
+    ///
+    /// See [RFC 9204, Section 2.2.2.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.2.2)
+    /// and [Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
+    pub(super) fn cancel_stream(&mut self, stream_id: u64) -> Result<(), Error> {
+        let Some(stream) = self.track_blocks.get(&stream_id) else {
+            return Ok(());
+        };
+
+        let mut refs = HashMap::new();
+        for field_section in &stream.field_sections {
+            for (&reference, &count) in &field_section.refs {
+                let tracked = refs.entry(reference).or_insert(0usize);
+                *tracked = tracked
+                    .checked_add(count)
+                    .ok_or(Error::InvalidTrackingCount)?;
+            }
+        }
+        self.validate_refs(&refs)?;
+
+        let previous_required = stream.max_required_insert_count;
+        self.track_blocks.remove(&stream_id);
+        self.blocked_streams.remove(&(previous_required, stream_id));
+        self.release_refs_validated(&refs);
         Ok(())
     }
 
@@ -485,58 +602,94 @@ impl DynamicTable {
         matches!(self.track_map.get(&reference), Some(count) if *count > 0)
     }
 
-    fn track_block(&mut self, stream_id: u64, refs: HashMap<usize, usize>) {
-        match self.track_blocks.entry(stream_id) {
-            Entry::Occupied(mut e) => {
-                e.get_mut().push_back(refs);
-            }
-            Entry::Vacant(e) => {
-                let mut blocks = VecDeque::with_capacity(2);
-                blocks.push_back(refs);
-                e.insert(blocks);
-            }
-        }
+    fn track_block(
+        &mut self,
+        stream_id: u64,
+        required_insert_count: usize,
+        refs: HashMap<usize, usize>,
+    ) {
+        let (previous_required, current_required) = {
+            let stream = self.track_blocks.entry(stream_id).or_default();
+            let previous_required = stream.max_required_insert_count;
+            stream.push(TrackedFieldSection {
+                required_insert_count,
+                refs,
+            });
+            (previous_required, stream.max_required_insert_count)
+        };
+        self.replace_blocked_requirement(stream_id, previous_required, current_required);
     }
 
-    fn track_cancel<T>(&mut self, refs: T) -> Result<(), Error>
-    where
-        T: IntoIterator<Item = (usize, usize)>,
-    {
-        for (reference, count) in refs {
-            match self.track_map.entry(reference) {
-                BTEntry::Occupied(mut e) => {
-                    use std::cmp::Ordering;
-                    match e.get().cmp(&count) {
-                        Ordering::Less => {
-                            return Err(Error::InvalidTrackingCount);
-                        }
-                        Ordering::Equal => {
-                            e.remove(); // TODO just pu 0 ?
-                        }
-                        _ => *e.get_mut() -= count,
-                    }
-                }
-                BTEntry::Vacant(_) => return Err(Error::InvalidTrackingCount),
+    fn validate_refs(&self, refs: &HashMap<usize, usize>) -> Result<(), Error> {
+        for (&reference, &count) in refs {
+            if self
+                .track_map
+                .get(&reference)
+                .is_none_or(|tracked| *tracked < count)
+            {
+                return Err(Error::InvalidTrackingCount);
             }
         }
         Ok(())
     }
 
-    fn register_blocked(&mut self, largest: usize) {
-        if largest <= self.largest_known_received {
+    fn release_refs(&mut self, refs: &HashMap<usize, usize>) -> Result<(), Error> {
+        self.validate_refs(refs)?;
+        self.release_refs_validated(refs);
+        Ok(())
+    }
+
+    fn release_refs_validated(&mut self, refs: &HashMap<usize, usize>) {
+        for (&reference, &count) in refs {
+            let remove = if let Some(tracked) = self.track_map.get_mut(&reference) {
+                *tracked -= count;
+                *tracked == 0
+            } else {
+                false
+            };
+            if remove {
+                self.track_map.remove(&reference);
+            }
+        }
+    }
+
+    fn stream_is_blocked(&self, stream_id: u64) -> bool {
+        self.track_blocks
+            .get(&stream_id)
+            .is_some_and(|stream| stream.max_required_insert_count > self.largest_known_received)
+    }
+
+    fn blocked_limit_reached(&self) -> bool {
+        usize::try_from(self.blocked_max)
+            .is_ok_and(|blocked_max| self.blocked_streams.len() >= blocked_max)
+    }
+
+    fn replace_blocked_requirement(
+        &mut self,
+        stream_id: u64,
+        previous_required: usize,
+        current_required: usize,
+    ) {
+        if previous_required > self.largest_known_received {
+            self.blocked_streams.remove(&(previous_required, stream_id));
+        }
+        if current_required > self.largest_known_received {
+            self.blocked_streams.insert((current_required, stream_id));
+        }
+    }
+
+    fn advance_largest_received(&mut self, largest_known_received: usize) {
+        if largest_known_received <= self.largest_known_received {
             return;
         }
 
-        self.blocked_count += 1;
-
-        match self.blocked_streams.entry(largest) {
-            BTEntry::Occupied(mut e) => {
-                let entry = e.get_mut();
-                *entry += 1;
-            }
-            BTEntry::Vacant(e) => {
-                e.insert(1);
-            }
+        self.largest_known_received = largest_known_received;
+        while self
+            .blocked_streams
+            .first()
+            .is_some_and(|(required, _)| *required <= largest_known_received)
+        {
+            self.blocked_streams.pop_first();
         }
     }
 
@@ -558,22 +711,7 @@ impl DynamicTable {
             .filter(|count| *count <= self.total_inserted())
             .ok_or(Error::InvalidInsertCountIncrement)?;
 
-        self.largest_known_received = largest_known_received;
-
-        if self.blocked_count == 0 {
-            return Ok(());
-        }
-
-        let blocked = match self.largest_known_received.checked_add(1) {
-            Some(first_unacknowledged) => self.blocked_streams.split_off(&first_unacknowledged),
-            None => BTreeMap::new(),
-        };
-        let acked = std::mem::replace(&mut self.blocked_streams, blocked);
-
-        if !acked.is_empty() {
-            let total_acked = acked.iter().fold(0u64, |t, (_, v)| t + v);
-            self.blocked_count -= total_acked;
-        }
+        self.advance_largest_received(largest_known_received);
         Ok(())
     }
 
@@ -1010,7 +1148,7 @@ mod tests {
             );
             encoder.commit(1);
         }
-        table.untrack_block(4).unwrap();
+        table.acknowledge_section(4).unwrap();
 
         {
             let mut encoder = table.encoder(4);
@@ -1063,7 +1201,7 @@ mod tests {
     }
 
     #[test]
-    fn encoder_insertion_refs_commited() {
+    fn encoder_insertion_refs_committed() {
         let mut table = build_table();
         let stream_id = 42;
         {
@@ -1074,7 +1212,7 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(encoder.block_refs.len(), 3);
-            encoder.commit(2);
+            encoder.commit(3);
         }
 
         for idx in 1..4 {
@@ -1082,14 +1220,20 @@ mod tests {
             assert_eq!(table.track_map.get(&1), Some(&1));
         }
         let track_blocks = table.track_blocks;
-        let block = track_blocks.get(&stream_id).unwrap().front().unwrap();
-        assert_eq!(block.get(&1), Some(&1));
-        assert_eq!(block.get(&2), Some(&1));
-        assert_eq!(block.get(&3), Some(&1));
+        let block = track_blocks
+            .get(&stream_id)
+            .unwrap()
+            .field_sections
+            .front()
+            .unwrap();
+        assert_eq!(block.required_insert_count, 3);
+        assert_eq!(block.refs.get(&1), Some(&1));
+        assert_eq!(block.refs.get(&2), Some(&1));
+        assert_eq!(block.refs.get(&3), Some(&1));
     }
 
     #[test]
-    fn encoder_insertion_refs_not_commited() {
+    fn encoder_insertion_refs_not_committed() {
         let mut table = build_table();
         table.track_blocks = HashMap::new();
         let stream_id = 42;
@@ -1150,7 +1294,7 @@ mod tests {
             assert_eq!(encoder.block_refs.get(&2), Some(&2));
         }
 
-        // check ref count is correctly decremented after uncommited drop()
+        // Dropping an uncommitted field section releases its references.
         assert_eq!(table.track_map.get(&1), Some(&1));
         assert_eq!(table.track_map.get(&2), None);
     }
@@ -1201,39 +1345,55 @@ mod tests {
     }
 
     #[test]
-    fn untrack_block() {
+    fn acknowledge_section() {
         let mut table = tracked_table(42);
         assert_eq!(table.track_map.len(), 3);
         assert_eq!(table.track_blocks.len(), 1);
-        table.untrack_block(42).unwrap();
+        table.acknowledge_section(42).unwrap();
         assert_eq!(table.track_map.len(), 0);
         assert_eq!(table.track_blocks.len(), 0);
+        assert_eq!(table.largest_known_received, 3);
+        assert!(table.blocked_streams.is_empty());
     }
 
     #[test]
-    fn untrack_block_not_in_map() {
+    fn acknowledge_section_rejects_missing_reference_count() {
         let mut table = tracked_table(42);
         table.track_map.remove(&2);
-        assert_eq!(table.untrack_block(42), Err(Error::InvalidTrackingCount));
+        assert_eq!(
+            table.acknowledge_section(42),
+            Err(Error::InvalidTrackingCount)
+        );
     }
 
     #[test]
-    fn untrack_block_wrong_count() {
+    fn acknowledge_section_rejects_wrong_reference_count() {
         let mut table = tracked_table(42);
         table.track_blocks.entry(42).and_modify(|x| {
-            x.get_mut(0).unwrap().entry(2).and_modify(|c| *c += 1);
+            x.field_sections
+                .get_mut(0)
+                .unwrap()
+                .refs
+                .entry(2)
+                .and_modify(|c| *c += 1);
         });
-        assert_eq!(table.untrack_block(42), Err(Error::InvalidTrackingCount));
+        assert_eq!(
+            table.acknowledge_section(42),
+            Err(Error::InvalidTrackingCount)
+        );
     }
 
     #[test]
-    fn untrack_bloc_wrong_stream() {
+    fn acknowledge_section_rejects_unknown_stream() {
         let mut table = tracked_table(41);
-        assert_eq!(table.untrack_block(42), Err(Error::UnknownStreamId(42)));
+        assert_eq!(
+            table.acknowledge_section(42),
+            Err(Error::UnknownStreamId(42))
+        );
     }
 
     #[test]
-    fn untrack_trailers() {
+    fn acknowledgments_follow_field_section_order() {
         const STREAM_ID: u64 = 42;
         let mut table = tracked_table(STREAM_ID);
         {
@@ -1245,15 +1405,19 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(encoder.block_refs.len(), 6);
-            encoder.commit(6);
+            encoder.commit(9);
         }
-        assert_eq!(table.untrack_block(STREAM_ID), Ok(()));
+        assert_eq!(table.blocked_streams.len(), 1);
+        assert_eq!(table.acknowledge_section(STREAM_ID), Ok(()));
+        assert_eq!(table.largest_known_received, 3);
         assert!(!table.is_tracked(3));
         assert!(table.is_tracked(5));
-        assert_eq!(table.untrack_block(STREAM_ID), Ok(()));
-        assert!(!table.is_tracked(6));
+        assert!(table.blocked_streams.contains(&(9, STREAM_ID)));
+        assert_eq!(table.acknowledge_section(STREAM_ID), Ok(()));
+        assert_eq!(table.largest_known_received, 9);
+        assert!(!table.is_tracked(9));
         assert_eq!(
-            table.untrack_block(STREAM_ID),
+            table.acknowledge_section(STREAM_ID),
             Err(Error::UnknownStreamId(STREAM_ID))
         );
     }
@@ -1297,12 +1461,120 @@ mod tests {
     }
 
     #[test]
+    fn zero_required_insert_count_is_not_queued_for_acknowledgment() {
+        let mut table = build_table();
+
+        table.encoder(42).commit(0);
+
+        assert!(table.track_blocks.is_empty());
+        assert_eq!(
+            table.acknowledge_section(42),
+            Err(Error::UnknownStreamId(42))
+        );
+    }
+
+    #[test]
+    fn multiple_field_sections_block_one_stream_and_acknowledge_in_order() {
+        let mut table = build_table();
+        table.set_max_blocked(1).unwrap();
+
+        {
+            let mut encoder = table.encoder(42);
+            assert!(matches!(
+                encoder.insert(&HeaderField::new("first", "value")),
+                Ok(DynamicInsertionResult::Inserted { absolute: 1, .. })
+            ));
+            encoder.commit(1);
+        }
+        {
+            // The stream already consumes the only blocked-stream slot, so a
+            // later field section on it may still reference a new insertion.
+            let mut encoder = table.encoder(42);
+            assert!(matches!(
+                encoder.insert(&HeaderField::new("second", "value")),
+                Ok(DynamicInsertionResult::Inserted { absolute: 2, .. })
+            ));
+            encoder.commit(2);
+        }
+
+        assert_eq!(table.blocked_streams.len(), 1);
+        assert!(table.blocked_streams.contains(&(2, 42)));
+        assert_eq!(table.track_blocks[&42].field_sections.len(), 2);
+
+        table.acknowledge_section(42).unwrap();
+        assert_eq!(table.largest_known_received, 1);
+        assert_eq!(table.track_blocks[&42].field_sections.len(), 1);
+        assert!(table.blocked_streams.contains(&(2, 42)));
+        assert!(!table.is_tracked(1));
+        assert!(table.is_tracked(2));
+
+        table.acknowledge_section(42).unwrap();
+        assert_eq!(table.largest_known_received, 2);
+        assert!(table.track_blocks.is_empty());
+        assert!(table.blocked_streams.is_empty());
+        assert!(table.track_map.is_empty());
+    }
+
+    #[test]
+    fn stream_cancellation_releases_every_field_section_and_blocked_slot() {
+        let mut table = build_table();
+        table.set_max_blocked(1).unwrap();
+
+        for absolute in 1..=3 {
+            let mut encoder = table.encoder(42);
+            assert!(matches!(
+                encoder.insert(&HeaderField::new(format!("field{absolute}"), "value")),
+                Ok(DynamicInsertionResult::Inserted {
+                    absolute: inserted,
+                    ..
+                }) if inserted == absolute
+            ));
+            encoder.commit(absolute);
+        }
+
+        assert_eq!(table.track_blocks[&42].field_sections.len(), 3);
+        assert_eq!(table.blocked_streams.len(), 1);
+        table.cancel_stream(42).unwrap();
+        assert!(table.track_blocks.is_empty());
+        assert!(table.track_map.is_empty());
+        assert!(table.blocked_streams.is_empty());
+
+        // Cancellation does not acknowledge insertions, but it frees the
+        // blocked-stream slot for another stream.
+        assert_eq!(table.largest_known_received, 0);
+        assert!(matches!(
+            table
+                .encoder(44)
+                .insert(&HeaderField::new("replacement", "value")),
+            Ok(DynamicInsertionResult::Inserted { absolute: 4, .. })
+        ));
+        assert_eq!(table.cancel_stream(42), Ok(()));
+    }
+
+    #[test]
+    fn acknowledged_entries_can_be_referenced_without_a_blocked_slot() {
+        let mut table = build_table();
+        let field = HeaderField::new("known", "value");
+        table.put(field.clone()).unwrap();
+        table.update_largest_received(1).unwrap();
+        table.set_max_blocked(0).unwrap();
+
+        assert_eq!(
+            table.encoder(42).find(&field),
+            DynamicLookupResult::Relative {
+                index: 0,
+                absolute: 1,
+            }
+        );
+    }
+
+    #[test]
     fn blocked_stream_registered() {
         let mut table = tracked_table(42);
         table.set_max_blocked(100).unwrap();
 
-        assert_eq!(table.blocked_count, 1);
-        assert_eq!(table.blocked_streams.get(&3), Some(&1u64))
+        assert_eq!(table.blocked_streams.len(), 1);
+        assert!(table.blocked_streams.contains(&(3, 42)));
     }
 
     #[test]
@@ -1316,8 +1588,8 @@ mod tests {
             .unwrap();
         // encoder dropped without commit
 
-        assert_eq!(table.blocked_count, 1);
-        assert_eq!(table.blocked_streams.get(&5), None);
+        assert_eq!(table.blocked_streams.len(), 1);
+        assert!(table.blocked_streams.contains(&(3, 42)));
     }
 
     #[test]
@@ -1335,12 +1607,13 @@ mod tests {
                     absolute: 3,
                 }
             );
-            // the encoder inserts a reference to foo3 in a block (absolte index = 3)
+            // This field section references foo3 (absolute index 3).
             encoder.commit(3);
         }
 
-        assert_eq!(table.blocked_count, 2);
-        assert_eq!(table.blocked_streams.get(&3), Some(&2));
+        assert_eq!(table.blocked_streams.len(), 2);
+        assert!(table.blocked_streams.contains(&(3, 42)));
+        assert!(table.blocked_streams.contains(&(3, 44)));
     }
 
     #[test]
@@ -1350,25 +1623,41 @@ mod tests {
 
         {
             let mut encoder = table.encoder(44);
+            assert_eq!(
+                encoder.find(&HeaderField::new("foo2", "quxx")),
+                DynamicLookupResult::Relative {
+                    index: 1,
+                    absolute: 2,
+                }
+            );
             encoder.commit(2);
         }
 
-        assert_eq!(table.blocked_count, 2);
-        assert_eq!(table.blocked_streams.get(&2), Some(&1));
+        assert_eq!(table.blocked_streams.len(), 2);
+        assert!(table.blocked_streams.contains(&(2, 44)));
     }
 
     #[test]
     fn blocked_stream_register_put_larger() {
         let mut table = tracked_table(42);
         table.set_max_blocked(100).unwrap();
+        table.put(HeaderField::new("foo4", "quxx")).unwrap();
+        table.put(HeaderField::new("foo5", "quxx")).unwrap();
 
         {
             let mut encoder = table.encoder(44);
+            assert_eq!(
+                encoder.find(&HeaderField::new("foo5", "quxx")),
+                DynamicLookupResult::Relative {
+                    index: 0,
+                    absolute: 5,
+                }
+            );
             encoder.commit(5);
         }
 
-        assert_eq!(table.blocked_count, 2);
-        assert_eq!(table.blocked_streams.get(&5), Some(&1));
+        assert_eq!(table.blocked_streams.len(), 2);
+        assert!(table.blocked_streams.contains(&(5, 44)));
     }
 
     #[test]
@@ -1378,17 +1667,24 @@ mod tests {
 
         {
             let mut encoder = table.encoder(44);
+            assert_eq!(
+                encoder.find(&HeaderField::new("foo2", "quxx")),
+                DynamicLookupResult::Relative {
+                    index: 1,
+                    absolute: 2,
+                }
+            );
             encoder.commit(2);
         }
 
-        assert_eq!(table.blocked_count, 2);
-        assert_eq!(table.blocked_streams.get(&2), Some(&1));
+        assert_eq!(table.blocked_streams.len(), 2);
+        assert!(table.blocked_streams.contains(&(2, 44)));
 
         table.update_largest_received(2).unwrap();
 
-        assert_eq!(table.blocked_count, 1);
-        assert_eq!(table.blocked_streams.get(&2), None);
-        assert_eq!(table.blocked_streams.get(&3), Some(&1));
+        assert_eq!(table.blocked_streams.len(), 1);
+        assert!(!table.blocked_streams.contains(&(2, 44)));
+        assert!(table.blocked_streams.contains(&(3, 42)));
     }
 
     #[test]
@@ -1398,17 +1694,31 @@ mod tests {
         table.put(HeaderField::new("foo4", "quxx")).unwrap();
         table.put(HeaderField::new("foo5", "quxx")).unwrap();
 
-        table.encoder(44).commit(2);
-        table.encoder(46).commit(5);
+        {
+            let mut encoder = table.encoder(44);
+            assert!(matches!(
+                encoder.find(&HeaderField::new("foo2", "quxx")),
+                DynamicLookupResult::Relative { absolute: 2, .. }
+            ));
+            encoder.commit(2);
+        }
+        {
+            let mut encoder = table.encoder(46);
+            assert!(matches!(
+                encoder.find(&HeaderField::new("foo5", "quxx")),
+                DynamicLookupResult::Relative { absolute: 5, .. }
+            ));
+            encoder.commit(5);
+        }
 
-        assert_eq!(table.blocked_count, 3);
-        assert_eq!(table.blocked_streams.get(&2), Some(&1));
-        assert_eq!(table.blocked_streams.get(&3), Some(&1));
+        assert_eq!(table.blocked_streams.len(), 3);
+        assert!(table.blocked_streams.contains(&(2, 44)));
+        assert!(table.blocked_streams.contains(&(3, 42)));
+        assert!(table.blocked_streams.contains(&(5, 46)));
 
         table.update_largest_received(5).unwrap();
 
-        assert_eq!(table.blocked_count, 0);
-        assert_eq!(table.blocked_streams.len(), 0);
+        assert!(table.blocked_streams.is_empty());
     }
 
     #[test]
@@ -1416,23 +1726,30 @@ mod tests {
         let mut table = tracked_table(42);
         table.set_max_blocked(100).unwrap();
 
-        table.encoder(44).commit(3);
+        {
+            let mut encoder = table.encoder(44);
+            assert!(matches!(
+                encoder.find(&HeaderField::new("foo3", "quxx")),
+                DynamicLookupResult::Relative { absolute: 3, .. }
+            ));
+            encoder.commit(3);
+        }
 
-        assert_eq!(table.blocked_count, 2);
-        assert_eq!(table.blocked_streams.get(&3), Some(&2));
+        assert_eq!(table.blocked_streams.len(), 2);
+        assert!(table.blocked_streams.contains(&(3, 42)));
+        assert!(table.blocked_streams.contains(&(3, 44)));
 
         // Only three insertions were sent. A larger value would violate the
         // Insert Count Increment limit in RFC 9204 Section 4.4.3.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.3
         table.update_largest_received(3).unwrap();
 
-        assert_eq!(table.blocked_count, 0);
-        assert_eq!(table.blocked_streams.len(), 0);
+        assert!(table.blocked_streams.is_empty());
     }
 
     #[test]
     fn no_insert_when_max_blocked_0() {
-        let mut table = tracked_table(42);
+        let mut table = build_table();
         table.set_max_blocked(0).unwrap();
 
         assert_eq!(
@@ -1469,7 +1786,7 @@ mod tests {
             encoder.commit(4);
         }
 
-        assert_eq!(table.blocked_count, 2);
+        assert_eq!(table.blocked_streams.len(), 2);
 
         let mut encoder = table.encoder(46);
         assert_eq!(
@@ -1485,7 +1802,7 @@ mod tests {
         let mut table = tracked_table(42);
         table.set_max_blocked(1).unwrap();
 
-        assert_eq!(table.blocked_count, 1);
+        assert_eq!(table.blocked_streams.len(), 1);
 
         {
             let mut encoder = table.encoder(44);
@@ -1499,7 +1816,7 @@ mod tests {
         }
 
         table.update_largest_received(3).unwrap();
-        assert_eq!(table.blocked_count, 0);
+        assert!(table.blocked_streams.is_empty());
 
         let mut encoder = table.encoder(46);
         assert_eq!(
@@ -1521,6 +1838,6 @@ mod tests {
             Err(Error::InvalidInsertCountIncrement)
         );
         assert_eq!(table.largest_known_received, 1);
-        assert_eq!(table.blocked_count, 1);
+        assert_eq!(table.blocked_streams.len(), 1);
     }
 }
