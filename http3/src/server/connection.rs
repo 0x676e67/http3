@@ -221,6 +221,11 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), ConnectionError>> {
+        self.inner.poll_accept_recv(cx)?;
+        if let Poll::Ready(Err(err)) = self.inner.poll_qpack_decoder_stream(cx) {
+            return Poll::Ready(Err(err));
+        }
+
         while (self.poll_next_control(cx)?).is_ready() {}
         Poll::Pending
     }

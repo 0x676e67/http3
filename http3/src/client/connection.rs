@@ -403,6 +403,10 @@ where
             return Poll::Ready(err);
         }
 
+        if let Poll::Ready(Err(err)) = self.inner.poll_qpack_decoder_stream(cx) {
+            return Poll::Ready(err);
+        }
+
         if let Poll::Ready(Err(err)) = self.inner.poll_qpack_encoder_stream(cx) {
             return Poll::Ready(err);
         }

@@ -66,6 +66,7 @@ where
     decoder_send_buf: BytesMut,
     decoder_send: Option<C::SendStream>,
     decoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
+    encoder: qpack::Encoder,
     encoder_send: Option<C::SendStream>,
     encoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
     decoder: QpackDecoder,
@@ -356,6 +357,7 @@ where
             decoder_send: decoder_send.ok(),
             decoder_send_buf: BytesMut::new(),
             decoder,
+            encoder: qpack::Encoder::default(),
             blocked_streams,
             decoder_events_recv,
             decoder_recv: None,
@@ -694,6 +696,97 @@ where
                 Poll::Pending => {
                     self.qpack_streams.encoder_recv =
                         Some(AcceptedRecvStream::Encoder(encoder_recv));
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+
+    /// Drives instructions received on the peer's QPACK decoder stream.
+    ///
+    /// Decoder instruction failures are reported by this endpoint's encoder as
+    /// `QPACK_DECODER_STREAM_ERROR`. Closing or resetting the stream is instead
+    /// a critical-stream failure.
+    ///
+    /// See [RFC 9204, Section 4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2)
+    /// and [Section 6](https://www.rfc-editor.org/rfc/rfc9204.html#section-6).
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_qpack_decoder_stream(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectionError>> {
+        let _ = self.poll_connection_error(cx)?;
+
+        let Some(accepted) = self.qpack_streams.decoder_recv.take() else {
+            return Poll::Pending;
+        };
+
+        let mut decoder_recv = match accepted {
+            AcceptedRecvStream::Decoder(stream) => stream,
+            other => {
+                self.qpack_streams.decoder_recv = Some(other);
+                return Poll::Pending;
+            }
+        };
+
+        loop {
+            if decoder_recv.has_remaining() {
+                // Decoder instructions are unframed and can span QUIC receive
+                // buffers. Parse through a cursor and advance only complete
+                // instructions.
+                // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4
+                let (result, consumed) = {
+                    let mut read = decoder_recv.buf().cursor();
+                    let result = self
+                        .qpack_streams
+                        .encoder
+                        .on_decoder_recv_buffered(&mut read);
+                    (result, read.position())
+                };
+                decoder_recv.buf_mut().advance(consumed);
+
+                if let Err(err) = result {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::QPACK_DECODER_STREAM_ERROR,
+                            format!("invalid QPACK decoder stream instruction: {err}"),
+                        ),
+                    )));
+                }
+            }
+
+            match decoder_recv.poll_read(cx) {
+                Poll::Ready(Ok(false)) => continue,
+                Poll::Ready(Ok(true)) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            "QPACK decoder stream closed".to_string(),
+                        ),
+                    )));
+                }
+                Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error,
+                })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
+                Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            format!("QPACK decoder stream reset with error code {error_code}"),
+                        ),
+                    )));
+                }
+                Poll::Ready(Err(StreamErrorIncoming::Unknown(error))) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            format!("QPACK decoder stream error: {error}"),
+                        ),
+                    )));
+                }
+                Poll::Pending => {
+                    self.qpack_streams.decoder_recv =
+                        Some(AcceptedRecvStream::Decoder(decoder_recv));
                     return Poll::Pending;
                 }
             }
