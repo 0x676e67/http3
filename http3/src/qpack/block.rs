@@ -182,6 +182,8 @@ impl HeaderPrefix {
         // cannot be represented as `usize`.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1
         let base = if !self.sign_negative {
+            // With no dynamic references, RIC 0 can still use any Base.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.2
             required
                 .checked_add(self.delta_base)
                 .ok_or_else(invalid_base)?
@@ -592,6 +594,20 @@ mod test {
                 delta_base: 0,
             })
         );
+    }
+
+    #[test]
+    fn positive_delta_base_with_zero_required_insert_count_is_allowed() {
+        let prefix = HeaderPrefix {
+            encoded_insert_count: 0,
+            sign_negative: false,
+            delta_base: 1,
+        };
+
+        // A field section without dynamic references can use any Base. RIC 0
+        // therefore does not require Delta Base to be zero when the sign is positive.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.2
+        assert_eq!(prefix.get(0, TABLE_SIZE), Ok((0, 1)));
     }
 
     #[test]
