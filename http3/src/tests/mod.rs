@@ -38,7 +38,10 @@ pub fn init_tracing() {
 /// Only use this for testing purposes.
 async fn get_stream_blocking<C: quic::Connection<B>, B: Buf>(
     incoming: &mut crate::server::Connection<C, B>,
-) -> Option<(Request<()>, crate::server::RequestStream<C::BidiStream, B>)> {
+) -> Option<(Request<()>, crate::server::RequestStream<C::BidiStream, B>)>
+where
+    C::SendStream: quic::SendStreamUnframed<B>,
+{
     let request_resolver = incoming.accept().await.ok()??;
     let (request, stream) = request_resolver.resolve_request().await.ok()?;
     Some((request, stream))
@@ -145,7 +148,9 @@ pub struct Server {
 }
 
 impl Server {
-    pub async fn next(&mut self) -> impl quic::Connection<Bytes> + use<> {
+    pub async fn next(
+        &mut self,
+    ) -> impl quic::Connection<Bytes, SendStream: quic::SendStreamUnframed<Bytes>> + use<> {
         Connection::new(self.endpoint.accept().await.unwrap().await.unwrap())
     }
 }
