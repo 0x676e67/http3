@@ -19,6 +19,7 @@ use crate::{
 #[derive(Debug, PartialEq)]
 pub enum Error {
     UnexpectedEnd,
+    EncodedStringTooLong { len: u64, limit: usize },
     Integer(IntegerError),
     HuffmanDecoding(HuffmanDecodingError),
     HuffmanEncoding(HuffmanEncodingError),
@@ -29,6 +30,9 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::UnexpectedEnd => write!(f, "unexpected end"),
+            Error::EncodedStringTooLong { len, limit } => {
+                write!(f, "encoded string length {len} exceeds limit {limit}")
+            }
             Error::Integer(e) => write!(f, "could not parse integer: {}", e),
             Error::HuffmanDecoding(e) => write!(f, "Huffman decode failed: {:?}", e),
             Error::HuffmanEncoding(e) => write!(f, "Huffman encode failed: {:?}", e),
@@ -38,7 +42,22 @@ impl std::fmt::Display for Error {
 }
 
 pub fn decode<B: Buf>(size: u8, buf: &mut B) -> Result<Vec<u8>, Error> {
+    decode_limited(size, buf, usize::MAX)
+}
+
+pub(crate) fn decode_limited<B: Buf>(
+    size: u8,
+    buf: &mut B,
+    max_encoded_len: usize,
+) -> Result<Vec<u8>, Error> {
     let (flags, len) = prefix_int::decode(size - 1, buf)?;
+    let limit = u64::try_from(max_encoded_len).unwrap_or(u64::MAX);
+    if len > limit {
+        return Err(Error::EncodedStringTooLong {
+            len,
+            limit: max_encoded_len,
+        });
+    }
     let len: usize = len.try_into()?;
     if buf.remaining() < len {
         return Err(Error::UnexpectedEnd);
@@ -160,5 +179,20 @@ mod tests {
         let buf = vec![0b0100_0011, b'b', b'a'];
         let mut read = Cursor::new(&buf);
         assert_matches!(decode(6, &mut read), Err(Error::UnexpectedEnd));
+    }
+
+    #[test]
+    fn encoded_length_limit_is_checked_before_payload() {
+        let mut buf = Vec::new();
+        prefix_int::encode(7, 0, 5, &mut buf);
+        let prefix_len = buf.len();
+        let mut read = Cursor::new(buf);
+
+        assert_eq!(
+            decode_limited(8, &mut read, 4),
+            Err(Error::EncodedStringTooLong { len: 5, limit: 4 })
+        );
+        assert_eq!(usize::try_from(read.position()).unwrap(), prefix_len);
+        assert_eq!(read.remaining(), 0);
     }
 }

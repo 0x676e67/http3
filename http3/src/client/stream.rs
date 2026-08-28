@@ -165,7 +165,7 @@ where
 
         let qpack::Decoded { fields, .. } = decoded;
 
-        let (status, headers) = Header::try_from(fields)
+        let (status, headers, pseudo_sensitivity) = Header::try_from(fields)
             .map_err(|_e| {
                 self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
                 StreamError::StreamError {
@@ -184,6 +184,9 @@ where
         let mut resp = Response::new(());
         *resp.status_mut() = status;
         *resp.headers_mut() = headers;
+        if !pseudo_sensitivity.is_empty() {
+            resp.extensions_mut().insert(pseudo_sensitivity);
+        }
         *resp.version_mut() = http::Version::HTTP_3;
 
         Ok(resp)

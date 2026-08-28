@@ -1,4 +1,4 @@
-use std::{hint::black_box, time::Duration};
+use std::{future::Future as _, hint::black_box, time::Duration};
 
 use assert_matches::assert_matches;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -15,6 +15,7 @@ use crate::{
         frame::{self, Frame, FrameType},
         headers::Header,
         push::PushId,
+        stream::StreamType,
         varint::VarInt,
     },
     qpack,
@@ -82,6 +83,336 @@ async fn get() {
     };
 
     tokio::join!(server_fut, client_fut);
+}
+
+#[tokio::test]
+async fn client_rejects_huffman_eos_in_response_field_section() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let server = pair.server_inner();
+
+    let client_fut = async {
+        let (mut driver, mut send) = client::new(pair.client().await).await.unwrap();
+        let mut request_stream = send
+            .send_request(Request::get("http://localhost/").body(()).unwrap())
+            .await
+            .unwrap();
+
+        let (response, connection) = tokio::join!(
+            async {
+                let response = request_stream.recv_response().await;
+                drop(send);
+                response
+            },
+            future::poll_fn(|cx| driver.poll_close(cx)),
+        );
+        assert_matches!(
+            response,
+            Err(StreamError::ConnectionError(ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::QPACK_DECOMPRESSION_FAILED,
+                    ..
+                }
+            }))
+        );
+        assert_matches!(
+            connection,
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::QPACK_DECOMPRESSION_FAILED,
+                    ..
+                }
+            }
+        );
+    };
+
+    let server_fut = async {
+        let connection = server.accept().await.unwrap().await.unwrap();
+        let mut control_stream = connection.open_uni().await.unwrap();
+        let mut control = BytesMut::new();
+        StreamType::CONTROL.encode(&mut control);
+        Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut control);
+        control_stream.write_all(&control).await.unwrap();
+
+        let (mut response_send, _request_recv) = connection.accept_bi().await.unwrap();
+        // RIC 0, Base 0, a static-name literal, then a Huffman string carrying
+        // the forbidden EOS symbol.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.1.2
+        // https://www.rfc-editor.org/rfc/rfc7541.html#section-5.2
+        let field_section = [0x00, 0x00, 0b0101_0000, 0b1000_0100, 0xff, 0xff, 0xff, 0xff];
+        let mut response = BytesMut::new();
+        Frame::headers(field_section.to_vec()).encode_with_payload(&mut response);
+        response_send.write_all(&response).await.unwrap();
+
+        assert_matches!(
+            connection.closed().await,
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code,
+                ..
+            }) if error_code.into_inner() == Code::QPACK_DECOMPRESSION_FAILED.value()
+        );
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(server_fut, client_fut);
+    })
+    .await
+    .expect("malformed response field section did not close the connection");
+}
+
+#[tokio::test]
+async fn client_keeps_blocked_field_section_prefix_across_table_updates() {
+    const TABLE_CAPACITY: u64 = 34;
+
+    init_tracing();
+    let mut pair = Pair::default();
+    let server = pair.server_inner();
+    let (blocked_send, blocked_recv) = tokio::sync::oneshot::channel();
+
+    let client_fut = async {
+        let mut builder = client::builder();
+        builder
+            .qpack_max_table_capacity(TABLE_CAPACITY)
+            .qpack_blocked_streams(1);
+        let (mut driver, mut send) = builder
+            .build::<_, _, Bytes>(pair.client().await)
+            .await
+            .unwrap();
+        let mut request_stream = send
+            .send_request(Request::get("http://localhost/").body(()).unwrap())
+            .await
+            .unwrap();
+
+        let mut response = Box::pin(request_stream.recv_response());
+        future::poll_fn(|cx| {
+            if let std::task::Poll::Ready(error) = driver.poll_close(cx) {
+                panic!("connection closed before the field section blocked: {error:?}");
+            }
+            if let std::task::Poll::Ready(result) = response.as_mut().poll(cx) {
+                panic!("response completed before the field section blocked: {result:?}");
+            }
+
+            if driver.inner.qpack_blocked_stream_count() == 1 {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        blocked_send.send(()).unwrap();
+
+        let (response, connection) =
+            tokio::join!(response, future::poll_fn(|cx| driver.poll_close(cx)),);
+        drop(send);
+        assert_matches!(
+            response,
+            Err(StreamError::ConnectionError(ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::QPACK_DECOMPRESSION_FAILED,
+                    ..
+                }
+            }))
+        );
+        assert_matches!(
+            connection,
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::QPACK_DECOMPRESSION_FAILED,
+                    ..
+                }
+            }
+        );
+    };
+
+    let server_fut = async {
+        let connection = server.accept().await.unwrap().await.unwrap();
+        let mut control_stream = connection.open_uni().await.unwrap();
+        let mut control = BytesMut::new();
+        StreamType::CONTROL.encode(&mut control);
+        Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut control);
+        control_stream.write_all(&control).await.unwrap();
+
+        let mut encoder_stream = connection.open_uni().await.unwrap();
+        let mut encoder_header = BytesMut::new();
+        StreamType::ENCODER.encode(&mut encoder_header);
+        encoder_stream.write_all(&encoder_header).await.unwrap();
+
+        let (mut response_send, _request_recv) = connection.accept_bi().await.unwrap();
+        // With MaxEntries 1, encoded RIC 2 reconstructs to RIC 1 while the
+        // decoder table is empty. Relative index 0 therefore names insertion 1.
+        let mut response = BytesMut::new();
+        Frame::headers(vec![0x02, 0x00, 0x80]).encode_with_payload(&mut response);
+        response_send.write_all(&response).await.unwrap();
+
+        // Wait until the connection driver has recorded the original Required
+        // Insert Count. Each subsequent 34-byte entry evicts its predecessor.
+        blocked_recv.await.unwrap();
+        let mut instructions = BytesMut::new();
+        qpack::DynamicTableSizeUpdate(usize::try_from(TABLE_CAPACITY).unwrap())
+            .encode(&mut instructions);
+        for value in ["1", "2", "3"] {
+            qpack::InsertWithoutNameRef::new("a", value)
+                .encode(&mut instructions)
+                .unwrap();
+        }
+        encoder_stream.write_all(&instructions).await.unwrap();
+
+        // The original insertion is gone. Reconstructing the prefix a second
+        // time would incorrectly bind the response to insertion 3 instead.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
+        assert_matches!(
+            connection.closed().await,
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code,
+                ..
+            }) if error_code.into_inner() == Code::QPACK_DECOMPRESSION_FAILED.value()
+        );
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(server_fut, client_fut);
+    })
+    .await
+    .expect("blocked field section did not preserve its reconstructed prefix");
+}
+
+#[tokio::test]
+async fn client_rejects_oversized_encoded_field_section_from_frame_header() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let server = pair.server_inner();
+
+    let client_fut = async {
+        let mut builder = client::builder();
+        builder.max_qpack_decode_buffer_size(4);
+        let (mut driver, mut send) = builder
+            .build::<_, _, Bytes>(pair.client().await)
+            .await
+            .unwrap();
+        let mut request_stream = send
+            .send_request(Request::get("http://localhost/").body(()).unwrap())
+            .await
+            .unwrap();
+
+        let (response, connection) = tokio::join!(
+            async {
+                let response = request_stream.recv_response().await;
+                drop(send);
+                response
+            },
+            future::poll_fn(|cx| driver.poll_close(cx)),
+        );
+        assert_matches!(
+            response,
+            Err(StreamError::ConnectionError(ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_EXCESSIVE_LOAD,
+                    ..
+                }
+            }))
+        );
+        assert_matches!(
+            connection,
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_EXCESSIVE_LOAD,
+                    ..
+                }
+            }
+        );
+    };
+
+    let server_fut = async {
+        let connection = server.accept().await.unwrap().await.unwrap();
+        let mut control_stream = connection.open_uni().await.unwrap();
+        let mut control = BytesMut::new();
+        StreamType::CONTROL.encode(&mut control);
+        Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut control);
+        control_stream.write_all(&control).await.unwrap();
+
+        let (mut response_send, _request_recv) = connection.accept_bi().await.unwrap();
+        let mut response_header = BytesMut::new();
+        FrameType::HEADERS.encode(&mut response_header);
+        VarInt::from(5u32).encode(&mut response_header);
+        response_send.write_all(&response_header).await.unwrap();
+
+        assert_matches!(
+            connection.closed().await,
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code,
+                ..
+            }) if error_code.into_inner() == Code::H3_EXCESSIVE_LOAD.value()
+        );
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(server_fut, client_fut);
+    })
+    .await
+    .expect("oversized encoded field section did not close the connection");
+}
+
+#[tokio::test]
+async fn server_rejects_oversized_encoded_field_section_from_frame_header() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+
+    let client_fut = async {
+        let connection = pair.client_inner().await;
+
+        let mut control_stream = connection.open_uni().await.unwrap();
+        let mut control = BytesMut::new();
+        StreamType::CONTROL.encode(&mut control);
+        Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut control);
+        control_stream.write_all(&control).await.unwrap();
+
+        let (mut request_send, _request_recv) = connection.open_bi().await.unwrap();
+        let mut request_header = BytesMut::new();
+        FrameType::HEADERS.encode(&mut request_header);
+        VarInt::from(5u32).encode(&mut request_header);
+        request_send.write_all(&request_header).await.unwrap();
+
+        assert_matches!(
+            connection.closed().await,
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code,
+                ..
+            }) if error_code.into_inner() == Code::H3_EXCESSIVE_LOAD.value()
+        );
+    };
+
+    let server_fut = async {
+        let conn = server.next().await;
+        let mut builder = server::builder();
+        builder.max_qpack_decode_buffer_size(4);
+        let mut incoming = builder.build(conn).await.unwrap();
+        let resolver = incoming.accept().await.unwrap().unwrap();
+        assert_matches!(
+            resolver.resolve_request().await.map(|_| ()),
+            Err(StreamError::ConnectionError(ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_EXCESSIVE_LOAD,
+                    ..
+                }
+            }))
+        );
+        assert_matches!(
+            incoming.accept().await.map(|_| ()).unwrap_err(),
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_EXCESSIVE_LOAD,
+                    ..
+                }
+            }
+        );
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(server_fut, client_fut);
+    })
+    .await
+    .expect("oversized request field section did not close the connection");
 }
 
 #[tokio::test]

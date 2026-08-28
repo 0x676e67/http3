@@ -90,6 +90,19 @@ impl Builder {
         self
     }
 
+    /// Limits compressed QPACK input buffered before a field section is decoded.
+    ///
+    /// This is a local memory limit, not an HTTP/3 setting. It applies to an
+    /// encoded HEADERS payload and to one encoded string on the peer's QPACK
+    /// encoder stream. The default is 16 MiB.
+    ///
+    /// See [RFC 9204, Section 7.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3)
+    /// and [Section 7.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4).
+    pub fn max_qpack_decode_buffer_size(&mut self, value: usize) -> &mut Self {
+        self.config.qpack_decode_buffer_size = value;
+        self
+    }
+
     /// Just like in HTTP/2, HTTP/3 also uses the concept of "grease"
     /// to prevent potential interoperability issues in the future.
     /// In HTTP/3, the concept of grease is used to ensure that the protocol can evolve
@@ -189,6 +202,7 @@ impl Builder {
             conn_state: inner.shared.clone(),
             decoder: inner.qpack_decoder(),
             max_field_section_size: self.config.settings.max_field_section_size,
+            max_qpack_decode_buffer_size: self.config.qpack_decode_buffer_size,
             sender_count: Arc::new(AtomicUsize::new(1)),
             send_grease_frame: self.config.send_grease,
             _buf: PhantomData,

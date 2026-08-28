@@ -4,6 +4,8 @@ use super::BitWindow;
 pub enum Error {
     MissingBits(BitWindow),
     Unhandled(BitWindow, usize),
+    Eos,
+    InvalidPadding(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -14,53 +16,29 @@ enum DecodeValue {
 
 #[derive(Clone, Debug)]
 struct HuffmanDecoder {
-    lookup: u32,
+    lookup: usize,
     table: &'static [DecodeValue],
+    eos: bool,
 }
 
 impl HuffmanDecoder {
-    fn check_eof(&self, bit_pos: &mut BitWindow, input: &[u8]) -> Result<Option<u32>, Error> {
-        use std::cmp::Ordering;
-        match ((bit_pos.byte + 1) as usize).cmp(&input.len()) {
-            // Position is out-of-range
-            Ordering::Greater => {
-                return Ok(None);
-            }
-            // Position is on the last byte
-            Ordering::Equal => {
-                let side = bit_pos.opposite_bit_window();
-
-                let rest = match read_bits(input, side.byte, side.bit, side.count) {
-                    Ok(x) => x,
-                    Err(()) => {
-                        return Err(Error::MissingBits(side));
-                    }
-                };
-
-                let eof_filler = ((2u16 << (side.count - 1)) - 1) as u8;
-                if rest & eof_filler == eof_filler {
-                    return Ok(None);
-                }
-            }
-            Ordering::Less => {}
-        }
-        Err(Error::MissingBits(bit_pos.clone()))
-    }
-
-    fn fetch_value(&self, bit_pos: &mut BitWindow, input: &[u8]) -> Result<Option<u32>, Error> {
+    fn fetch_value(&self, bit_pos: &mut BitWindow, input: &[u8]) -> Option<u32> {
         match read_bits(input, bit_pos.byte, bit_pos.bit, bit_pos.count) {
-            Ok(value) => Ok(Some(value as u32)),
-            Err(()) => self.check_eof(bit_pos, input),
+            Ok(value) => Some(value as u32),
+            Err(()) => None,
         }
     }
 
     fn decode_next(&self, bit_pos: &mut BitWindow, input: &[u8]) -> Result<Option<u8>, Error> {
+        if self.eos {
+            return Err(Error::Eos);
+        }
+
         bit_pos.forwards(self.lookup);
 
         let value = match self.fetch_value(bit_pos, input) {
-            Ok(Some(value)) => value as usize,
-            Ok(None) => return Ok(None),
-            Err(err) => return Err(err),
+            Some(value) => value as usize,
+            None => return Ok(None),
         };
 
         let at_value = match (self.table).get(value) {
@@ -78,8 +56,19 @@ impl HuffmanDecoder {
 /// Read `len` bits from the `src` slice at the specified position
 ///
 /// Never read more than 8 bits at a time. `bit_offset` may be larger than 8.
-fn read_bits(src: &[u8], mut byte_offset: u32, mut bit_offset: u32, len: u32) -> Result<u8, ()> {
-    if len == 0 || len > 8 || src.len() as u32 * 8 < (byte_offset * 8) + bit_offset + len {
+fn read_bits(
+    src: &[u8],
+    mut byte_offset: usize,
+    mut bit_offset: usize,
+    len: usize,
+) -> Result<u8, ()> {
+    let total_bits = src.len().checked_mul(8).ok_or(())?;
+    let end = byte_offset
+        .checked_mul(8)
+        .and_then(|offset| offset.checked_add(bit_offset))
+        .and_then(|offset| offset.checked_add(len))
+        .ok_or(())?;
+    if len == 0 || len > 8 || total_bits < end {
         return Err(());
     }
 
@@ -89,11 +78,11 @@ fn read_bits(src: &[u8], mut byte_offset: u32, mut bit_offset: u32, len: u32) ->
 
     Ok(if bit_offset + len <= 8 {
         // Read all the bits from a single byte
-        (src[byte_offset as usize] << bit_offset) >> (8 - len)
+        (src[byte_offset] << bit_offset) >> (8 - len)
     } else {
         // The range of bits spans over 2 bytes
-        let mut result = (src[byte_offset as usize] as u16) << 8;
-        result |= src[byte_offset as usize + 1] as u16;
+        let mut result = (src[byte_offset] as u16) << 8;
+        result |= src[byte_offset + 1] as u16;
         ((result << bit_offset) >> (16 - len)) as u8
     })
 }
@@ -110,7 +99,8 @@ macro_rules! bits_decode {
             table: &[
                 $( DecodeValue::Sym($sym), )*
                 $( DecodeValue::Partial(&$sub), )*
-            ]
+            ],
+            eos: false,
         }
     };
     // 2-final
@@ -120,7 +110,8 @@ macro_rules! bits_decode {
             table: &[
                 DecodeValue::Sym($first),
                 DecodeValue::Sym($second),
-            ]
+            ],
+            eos: false,
         }
     };
     // 4-final
@@ -132,7 +123,8 @@ macro_rules! bits_decode {
                 DecodeValue::Sym($second),
                 DecodeValue::Sym($third),
                 DecodeValue::Sym($fourth),
-            ]
+            ],
+            eos: false,
         }
     };
     // 2-final-partial
@@ -142,7 +134,8 @@ macro_rules! bits_decode {
             table: &[
                 DecodeValue::Sym($first),
                 DecodeValue::Partial(&$second),
-            ]
+            ],
+            eos: false,
         }
     };
     // 2-partial
@@ -152,7 +145,8 @@ macro_rules! bits_decode {
             table: &[
                 DecodeValue::Partial(&$first),
                 DecodeValue::Partial(&$second),
-            ]
+            ],
+            eos: false,
         }
     };
     // 4-partial
@@ -165,13 +159,20 @@ macro_rules! bits_decode {
                 DecodeValue::Partial(&$second),
                 DecodeValue::Partial(&$third),
                 DecodeValue::Partial(&$fourth),
-            ]
+            ],
+            eos: false,
         }
     };
     [ $( $name:ident => ( $($value:tt)* ), )* ] => {
-        $( const $name: HuffmanDecoder = bits_decode!( $( $value )* ); )*
+        $( static $name: HuffmanDecoder = bits_decode!( $( $value )* ); )*
     };
 }
+
+static EOF: HuffmanDecoder = HuffmanDecoder {
+    lookup: 0,
+    table: &[],
+    eos: true,
+};
 
 #[rustfmt::skip]
 bits_decode![
@@ -291,22 +292,75 @@ bits_decode![
     END27B_1110 => (127, 220),
     END27B_1111 => (lookup: 1, [249, => END31_1,]),
     END31_1 => (lookup: 2, [10, 13, 22, => EOF,]),
-    EOF => (lookup: 8, []),
     ];
 
 pub struct DecodeIter<'a> {
     bit_pos: BitWindow,
     content: &'a Vec<u8>,
+    symbol_end: usize,
+    finished: bool,
 }
 
 impl<'a> Iterator for DecodeIter<'a> {
     type Item = Result<u8, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
         match HPACK_STRING.decode_next(&mut self.bit_pos, self.content) {
-            Ok(Some(x)) => Some(Ok(x)),
-            Err(err) => Some(Err(err)),
-            Ok(None) => None,
+            Ok(Some(x)) => match self.bit_pos.end() {
+                Some(end) => {
+                    self.symbol_end = end;
+                    Some(Ok(x))
+                }
+                None => {
+                    self.finished = true;
+                    Some(Err(Error::MissingBits(self.bit_pos.clone())))
+                }
+            },
+            Err(err) => {
+                self.finished = true;
+                Some(Err(err))
+            }
+            Ok(None) => {
+                self.finished = true;
+                let total_bits = match self.content.len().checked_mul(8) {
+                    Some(total_bits) => total_bits,
+                    None => return Some(Err(Error::MissingBits(self.bit_pos.clone()))),
+                };
+                let padding = match total_bits.checked_sub(self.symbol_end) {
+                    Some(padding) => padding,
+                    None => return Some(Err(Error::MissingBits(self.bit_pos.clone()))),
+                };
+                if padding == 0 {
+                    return None;
+                }
+                // QPACK uses the HPACK Huffman code unchanged. The EOS symbol is
+                // forbidden in strings, and padding is at most seven one bits.
+                // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.1.2
+                // https://www.rfc-editor.org/rfc/rfc7541.html#section-5.2
+                if padding > 7 {
+                    return Some(Err(Error::InvalidPadding(padding)));
+                }
+
+                let padding_bits = match read_bits(
+                    self.content,
+                    self.symbol_end / 8,
+                    self.symbol_end % 8,
+                    padding,
+                ) {
+                    Ok(bits) => bits,
+                    Err(()) => return Some(Err(Error::MissingBits(self.bit_pos.clone()))),
+                };
+                let expected = ((1u16 << padding) - 1) as u8;
+                if padding_bits == expected {
+                    None
+                } else {
+                    Some(Err(Error::InvalidPadding(padding)))
+                }
+            }
         }
     }
 }
@@ -320,6 +374,8 @@ impl HpackStringDecode for Vec<u8> {
         DecodeIter {
             bit_pos: BitWindow::new(),
             content: self,
+            symbol_end: 0,
+            finished: false,
         }
     }
 }
@@ -329,6 +385,7 @@ mod tests {
     #![allow(clippy::identity_op)]
 
     use super::*;
+    use crate::qpack::prefix_string::HpackStringEncode;
 
     #[test]
     fn test_read_bits() {
@@ -451,12 +508,12 @@ mod tests {
         120 => (0b111_1001 << 1) | /* padding */ 0b1; // 'x'
         121 => (0b111_1010 << 1) | /* padding */ 0b1; // 'y'
         122 => (0b111_1011 << 1) | /* padding */ 0b1; // 'z'
-        38 => 0b1111_1000, /* padding */ 0b1111_1111; // '&'
-        42 => 0b1111_1001, /* padding */ 0b1111_1111; // '*'
-        44 => 0b1111_1010, /* padding */ 0b1111_1111; // ','
-        59 => 0b1111_1011, /* padding */ 0b1111_1111;
-        88 => 0b1111_1100, /* padding */ 0b1111_1111; // 'X'
-        90 => 0b1111_1101, /* padding */ 0b1111_1111; // 'Z'
+        38 => 0b1111_1000; // '&'
+        42 => 0b1111_1001; // '*'
+        44 => 0b1111_1010; // ','
+        59 => 0b1111_1011;
+        88 => 0b1111_1100; // 'X'
+        90 => 0b1111_1101; // 'Z'
         33 => 0b1111_1110, (0b00 << 6) | /* padding */ 0b11_1111; // '!'
         34 => 0b1111_1110, (0b01 << 6) | /* padding */ 0b11_1111; // '"'
         40 => 0b1111_1110, (0b10 << 6) | /* padding */ 0b11_1111; // '('
@@ -557,18 +614,18 @@ mod tests {
         197 => 0b1111_1111, 0b1111_1111, (0b111_0010 << 1) | /* padding */ 0b1;
         231 => 0b1111_1111, 0b1111_1111, (0b111_0011 << 1) | /* padding */ 0b1;
         239 => 0b1111_1111, 0b1111_1111, (0b111_0100 << 1) | /* padding */ 0b1;
-        9 => 0b1111_1111, 0b1111_1111, 0b1110_1010, /* padding */ 0b1111_1111;
-        142 => 0b1111_1111, 0b1111_1111, 0b1110_1011, /* padding */ 0b1111_1111;
-        144 => 0b1111_1111, 0b1111_1111, 0b1110_1100, /* padding */ 0b1111_1111;
-        145 => 0b1111_1111, 0b1111_1111, 0b1110_1101, /* padding */ 0b1111_1111;
-        148 => 0b1111_1111, 0b1111_1111, 0b1110_1110, /* padding */ 0b1111_1111;
-        159 => 0b1111_1111, 0b1111_1111, 0b1110_1111, /* padding */ 0b1111_1111;
-        171 => 0b1111_1111, 0b1111_1111, 0b1111_0000, /* padding */ 0b1111_1111;
-        206 => 0b1111_1111, 0b1111_1111, 0b1111_0001, /* padding */ 0b1111_1111;
-        215 => 0b1111_1111, 0b1111_1111, 0b1111_0010, /* padding */ 0b1111_1111;
-        225 => 0b1111_1111, 0b1111_1111, 0b1111_0011, /* padding */ 0b1111_1111;
-        236 => 0b1111_1111, 0b1111_1111, 0b1111_0100, /* padding */ 0b1111_1111;
-        237 => 0b1111_1111, 0b1111_1111, 0b1111_0101, /* padding */ 0b1111_1111;
+        9 => 0b1111_1111, 0b1111_1111, 0b1110_1010;
+        142 => 0b1111_1111, 0b1111_1111, 0b1110_1011;
+        144 => 0b1111_1111, 0b1111_1111, 0b1110_1100;
+        145 => 0b1111_1111, 0b1111_1111, 0b1110_1101;
+        148 => 0b1111_1111, 0b1111_1111, 0b1110_1110;
+        159 => 0b1111_1111, 0b1111_1111, 0b1110_1111;
+        171 => 0b1111_1111, 0b1111_1111, 0b1111_0000;
+        206 => 0b1111_1111, 0b1111_1111, 0b1111_0001;
+        215 => 0b1111_1111, 0b1111_1111, 0b1111_0010;
+        225 => 0b1111_1111, 0b1111_1111, 0b1111_0011;
+        236 => 0b1111_1111, 0b1111_1111, 0b1111_0100;
+        237 => 0b1111_1111, 0b1111_1111, 0b1111_0101;
         199 => 0b1111_1111, 0b1111_1111, 0b1111_0110, (0b0 << 7) | /* padding */ 0b111_1111;
         207 => 0b1111_1111, 0b1111_1111, 0b1111_0110, (0b1 << 7) | /* padding */ 0b111_1111;
         234 => 0b1111_1111, 0b1111_1111, 0b1111_0111, (0b0 << 7) | /* padding */ 0b111_1111;
@@ -641,6 +698,62 @@ mod tests {
         22 => 0b1111_1111, 0b1111_1111, 0b1111_1111, (0b11_1110 << 2) | /* padding */ 0b11;
         // 256 => 0b1111_1111, 0b1111_1111, 0b1111_1111, (0b11_1111 << 2) | /* padding */ 0b11;
         ];
+    }
+
+    #[test]
+    fn exact_byte_code_has_no_padding() {
+        let encoded = vec![0b1111_1000];
+        let mut decoded = encoded.hpack_decode();
+
+        assert_eq!(decoded.next(), Some(Ok(b'&')));
+        assert_eq!(decoded.symbol_end, 8);
+        assert_eq!(decoded.next(), None);
+    }
+
+    #[test]
+    fn rejects_invalid_huffman_terminators() {
+        let invalid_padding: Result<Vec<_>, Error> = vec![0b0001_1010].hpack_decode().collect();
+        assert_eq!(invalid_padding, Err(Error::InvalidPadding(3)));
+
+        let overlong_padding: Result<Vec<_>, Error> =
+            vec![0b1111_1000, 0b1111_1111].hpack_decode().collect();
+        assert_eq!(overlong_padding, Err(Error::InvalidPadding(8)));
+
+        let eos: Result<Vec<_>, Error> = vec![0xff, 0xff, 0xff, 0xff].hpack_decode().collect();
+        assert_eq!(eos, Err(Error::Eos));
+
+        let eos_followed_by_data: Result<Vec<_>, Error> =
+            vec![0xff, 0xff, 0xff, 0xfc].hpack_decode().collect();
+        assert_eq!(eos_followed_by_data, Err(Error::Eos));
+
+        let encoded = vec![0xff, 0xff, 0xff, 0xfc];
+        let mut decoded = encoded.hpack_decode();
+        assert_eq!(decoded.next(), Some(Err(Error::Eos)));
+        assert_eq!(decoded.next(), None);
+    }
+
+    #[test]
+    fn accepts_zero_through_seven_padding_bits() {
+        // These symbols have code lengths of 8, 7, 6, 5, 12, 11, 10,
+        // and 25 bits, respectively.
+        for symbol in [b'&', b'B', b' ', b'a', b'#', b'\'', b'!', 199] {
+            let encoded = vec![symbol].hpack_encode().unwrap();
+            let decoded: Result<Vec<_>, Error> = encoded.hpack_decode().collect();
+            assert_eq!(decoded, Ok(vec![symbol]));
+        }
+    }
+
+    #[test]
+    fn every_accepted_short_input_is_canonical() {
+        for value in 0u16..=u16::MAX {
+            let bytes = value.to_be_bytes();
+            for encoded in [&bytes[..1], &bytes[..]] {
+                let decoded: Result<Vec<_>, Error> = encoded.to_vec().hpack_decode().collect();
+                if let Ok(decoded) = decoded {
+                    assert_eq!(decoded.hpack_encode().unwrap(), encoded);
+                }
+            }
+        }
     }
 
     /**
@@ -1712,11 +1825,8 @@ mod tests {
             0b1111_1111,
             0b1111_1011,
             (0b10 << 6)
-                // 256 eof |11111111|11111111|11111111|111111
+                // pad symbol 255 to the next byte boundary
                 + 0b11_1111,
-            0b1111_1111,
-            0b1111_1111,
-            0b1111_1111,
         ];
         let expected = (0u8..=255).collect();
         let res: Result<Vec<_>, Error> = bytes.hpack_decode().collect();

@@ -37,6 +37,7 @@ where
     pub(super) request_end_send: UnboundedSender<StreamId>,
     pub(super) send_grease_frame: bool,
     pub(super) max_field_section_size: u64,
+    pub(super) max_qpack_decode_buffer_size: usize,
     pub(super) shared: Arc<SharedState>,
     pub(super) decoder: QpackDecoder,
 }
@@ -125,7 +126,11 @@ where
             }
         };
 
-        let decoded = match qpack::decode_stateless(&mut encoded, self.max_field_section_size) {
+        let decoded = match qpack::decode_stateless_limited(
+            &mut encoded,
+            self.max_field_section_size,
+            self.max_qpack_decode_buffer_size,
+        ) {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
             //# An HTTP/3 implementation MAY impose a limit on the maximum size of
             //# the message header it will accept on an individual HTTP message.
@@ -149,6 +154,7 @@ where
             inner: connection::RequestStream::new(
                 self.frame_stream,
                 self.max_field_section_size,
+                self.max_qpack_decode_buffer_size,
                 self.shared.clone(),
                 self.send_grease_frame,
                 self.decoder,
@@ -225,7 +231,7 @@ where
             },
             Err(err) => Err(err),
         };
-        let (method, uri, protocol, headers) = match result {
+        let (method, uri, protocol, headers, pseudo_sensitivity) = match result {
             Ok(parts) => parts,
             Err(err) => {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
@@ -248,6 +254,9 @@ where
         *req.method_mut() = method;
         *req.uri_mut() = uri;
         *req.headers_mut() = headers;
+        if !pseudo_sensitivity.is_empty() {
+            req.extensions_mut().insert(pseudo_sensitivity);
+        }
         // NOTE: insert `Protocol` and not `Option<Protocol>`
         if let Some(protocol) = protocol {
             req.extensions_mut().insert(protocol);

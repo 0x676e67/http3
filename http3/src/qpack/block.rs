@@ -3,8 +3,8 @@ use bytes::{Buf, BufMut};
 use super::{parse_error::ParseError, prefix_int, prefix_string};
 
 // 4.5. Field Line Representations
-// Single header field line. These representations reference the static table or
-// the dynamic table in a particular state, but do not modify that state.
+// Each variant represents one field line. These representations reference the
+// static table or the dynamic table in a particular state, but do not modify it.
 // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5
 pub enum HeaderBlockField {
     // 4.5.2. Indexed Field Line
@@ -310,8 +310,16 @@ impl IndexedWithPostBase {
 
 #[derive(Debug, PartialEq)]
 pub enum LiteralWithNameRef {
-    Static { index: usize, value: Vec<u8> },
-    Dynamic { index: usize, value: Vec<u8> },
+    Static {
+        index: usize,
+        value: Vec<u8>,
+        never_indexed: bool,
+    },
+    Dynamic {
+        index: usize,
+        value: Vec<u8>,
+        never_indexed: bool,
+    },
 }
 
 impl LiteralWithNameRef {
@@ -319,6 +327,7 @@ impl LiteralWithNameRef {
         LiteralWithNameRef::Static {
             index,
             value: value.into(),
+            never_indexed: false,
         }
     }
 
@@ -326,12 +335,29 @@ impl LiteralWithNameRef {
         LiteralWithNameRef::Dynamic {
             index,
             value: value.into(),
+            never_indexed: false,
         }
     }
 
+    pub fn with_never_indexed(mut self) -> Self {
+        match &mut self {
+            Self::Static { never_indexed, .. } | Self::Dynamic { never_indexed, .. } => {
+                *never_indexed = true;
+            }
+        }
+        self
+    }
+
     pub fn decode<R: Buf>(buf: &mut R) -> Result<Self, ParseError> {
+        Self::decode_limited(buf, usize::MAX)
+    }
+
+    pub(crate) fn decode_limited<R: Buf>(
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<Self, ParseError> {
         match prefix_int::decode(4, buf)? {
-            (f, i) if f & 0b0101 == 0b0101 => {
+            (f, i) if f & 0b1101 == 0b0101 => {
                 if i > (usize::MAX as u64) {
                     return Err(ParseError::Integer(
                         crate::qpack::prefix_int::Error::Overflow,
@@ -340,10 +366,11 @@ impl LiteralWithNameRef {
 
                 Ok(LiteralWithNameRef::new_static(
                     i as usize,
-                    prefix_string::decode(8, buf)?,
-                ))
+                    prefix_string::decode_limited(8, buf, max_encoded_string_size)?,
+                )
+                .with_never_indexed_if(f & 0b0010 != 0))
             }
-            (f, i) if f & 0b0101 == 0b0100 => {
+            (f, i) if f & 0b1101 == 0b0100 => {
                 if i > (usize::MAX as u64) {
                     return Err(ParseError::Integer(
                         crate::qpack::prefix_int::Error::Overflow,
@@ -352,8 +379,9 @@ impl LiteralWithNameRef {
 
                 Ok(LiteralWithNameRef::new_dynamic(
                     i as usize,
-                    prefix_string::decode(8, buf)?,
-                ))
+                    prefix_string::decode_limited(8, buf, max_encoded_string_size)?,
+                )
+                .with_never_indexed_if(f & 0b0010 != 0))
             }
             (f, _) => Err(ParseError::InvalidPrefix(f)),
         }
@@ -361,16 +389,42 @@ impl LiteralWithNameRef {
 
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
         match self {
-            LiteralWithNameRef::Static { index, value } => {
-                prefix_int::encode(4, 0b0101, *index as u64, buf);
+            LiteralWithNameRef::Static {
+                index,
+                value,
+                never_indexed,
+            } => {
+                prefix_int::encode(
+                    4,
+                    0b0101 | (u8::from(*never_indexed) << 1),
+                    *index as u64,
+                    buf,
+                );
                 prefix_string::encode(8, 0, value, buf)?;
             }
-            LiteralWithNameRef::Dynamic { index, value } => {
-                prefix_int::encode(4, 0b0100, *index as u64, buf);
+            LiteralWithNameRef::Dynamic {
+                index,
+                value,
+                never_indexed,
+            } => {
+                prefix_int::encode(
+                    4,
+                    0b0100 | (u8::from(*never_indexed) << 1),
+                    *index as u64,
+                    buf,
+                );
                 prefix_string::encode(8, 0, value, buf)?;
             }
         }
         Ok(())
+    }
+
+    fn with_never_indexed_if(self, never_indexed: bool) -> Self {
+        if never_indexed {
+            self.with_never_indexed()
+        } else {
+            self
+        }
     }
 }
 
@@ -378,6 +432,7 @@ impl LiteralWithNameRef {
 pub struct LiteralWithPostBaseNameRef {
     pub index: usize,
     pub value: Vec<u8>,
+    pub never_indexed: bool,
 }
 
 impl LiteralWithPostBaseNameRef {
@@ -385,29 +440,44 @@ impl LiteralWithPostBaseNameRef {
         LiteralWithPostBaseNameRef {
             index,
             value: value.into(),
+            never_indexed: false,
         }
     }
 
+    pub fn with_never_indexed(mut self) -> Self {
+        self.never_indexed = true;
+        self
+    }
+
     pub fn decode<R: Buf>(buf: &mut R) -> Result<Self, ParseError> {
+        Self::decode_limited(buf, usize::MAX)
+    }
+
+    pub(crate) fn decode_limited<R: Buf>(
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<Self, ParseError> {
         match prefix_int::decode(3, buf)? {
-            (f, i) if f & 0b1111_0000 == 0 => {
+            (f, i) if f & 0b11110 == 0 => {
                 if i > (usize::MAX as u64) {
                     return Err(ParseError::Integer(
                         crate::qpack::prefix_int::Error::Overflow,
                     ));
                 }
 
-                Ok(LiteralWithPostBaseNameRef::new(
+                let mut literal = LiteralWithPostBaseNameRef::new(
                     i as usize,
-                    prefix_string::decode(8, buf)?,
-                ))
+                    prefix_string::decode_limited(8, buf, max_encoded_string_size)?,
+                );
+                literal.never_indexed = f & 1 != 0;
+                Ok(literal)
             }
             (f, _) => Err(ParseError::InvalidPrefix(f)),
         }
     }
 
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
-        prefix_int::encode(3, 0b0000, self.index as u64, buf);
+        prefix_int::encode(3, u8::from(self.never_indexed), self.index as u64, buf);
         prefix_string::encode(8, 0, &self.value, buf)?;
         Ok(())
     }
@@ -417,6 +487,7 @@ impl LiteralWithPostBaseNameRef {
 pub struct Literal {
     pub name: Vec<u8>,
     pub value: Vec<u8>,
+    pub never_indexed: bool,
 }
 
 impl Literal {
@@ -424,23 +495,39 @@ impl Literal {
         Literal {
             name: name.into(),
             value: value.into(),
+            never_indexed: false,
         }
     }
 
+    pub fn with_never_indexed(mut self) -> Self {
+        self.never_indexed = true;
+        self
+    }
+
     pub fn decode<R: Buf>(buf: &mut R) -> Result<Self, ParseError> {
+        Self::decode_limited(buf, usize::MAX)
+    }
+
+    pub(crate) fn decode_limited<R: Buf>(
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<Self, ParseError> {
         if buf.remaining() < 1 {
             return Err(ParseError::Integer(prefix_int::Error::UnexpectedEnd));
         } else if buf.chunk()[0] & 0b1110_0000 != 0b0010_0000 {
             return Err(ParseError::InvalidPrefix(buf.chunk()[0]));
         }
-        Ok(Literal::new(
-            prefix_string::decode(4, buf)?,
-            prefix_string::decode(8, buf)?,
-        ))
+        let never_indexed = buf.chunk()[0] & 0b0001_0000 != 0;
+        let mut literal = Literal::new(
+            prefix_string::decode_limited(4, buf, max_encoded_string_size)?,
+            prefix_string::decode_limited(8, buf, max_encoded_string_size)?,
+        );
+        literal.never_indexed = never_indexed;
+        Ok(literal)
     }
 
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
-        prefix_string::encode(4, 0b0010, &self.name, buf)?;
+        prefix_string::encode(4, 0b0010 | u8::from(self.never_indexed), &self.name, buf)?;
         prefix_string::encode(8, 0, &self.value, buf)?;
         Ok(())
     }
@@ -491,6 +578,16 @@ mod test {
     }
 
     #[test]
+    fn literal_with_name_ref_preserves_never_indexed() {
+        let field = LiteralWithNameRef::new_dynamic(42, "foo").with_never_indexed();
+        let mut buf = vec![];
+        field.encode(&mut buf).unwrap();
+
+        assert_ne!(buf[0] & 0b0010_0000, 0);
+        assert_eq!(LiteralWithNameRef::decode(&mut Cursor::new(buf)), Ok(field));
+    }
+
+    #[test]
     fn literal_with_post_base_name_ref() {
         let field = LiteralWithPostBaseNameRef::new(42, "foo");
         let mut buf = vec![];
@@ -500,12 +597,35 @@ mod test {
     }
 
     #[test]
+    fn literal_with_post_base_name_ref_preserves_never_indexed() {
+        let field = LiteralWithPostBaseNameRef::new(42, "foo").with_never_indexed();
+        let mut buf = vec![];
+        field.encode(&mut buf).unwrap();
+
+        assert_ne!(buf[0] & 0b0000_1000, 0);
+        assert_eq!(
+            LiteralWithPostBaseNameRef::decode(&mut Cursor::new(buf)),
+            Ok(field)
+        );
+    }
+
+    #[test]
     fn literal() {
         let field = Literal::new("foo", "bar");
         let mut buf = vec![];
         field.encode(&mut buf).unwrap();
         let mut read = Cursor::new(&buf);
         assert_eq!(Literal::decode(&mut read), Ok(field));
+    }
+
+    #[test]
+    fn literal_preserves_never_indexed() {
+        let field = Literal::new("foo", "bar").with_never_indexed();
+        let mut buf = vec![];
+        field.encode(&mut buf).unwrap();
+
+        assert_ne!(buf[0] & 0b0001_0000, 0);
+        assert_eq!(Literal::decode(&mut Cursor::new(buf)), Ok(field));
     }
 
     #[test]

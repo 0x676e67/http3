@@ -11,7 +11,7 @@ pub struct Error {
 #[derive(Clone, Debug)]
 struct EncodeValue {
     buffer: &'static [u8],
-    bit_count: u32,
+    bit_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -28,23 +28,22 @@ impl HuffmanEncoder {
         }
     }
 
-    fn ensure_free_space(&mut self, bit_count: u32) {
+    fn ensure_free_space(&mut self, bit_count: usize) {
         let mut end_range = self.buffer_pos.clone();
         end_range.forwards(bit_count);
         end_range.forwards(0);
 
         // buffer still has enough space to work on
-        if self.buffer.len() > end_range.byte as usize {
+        if self.buffer.len() > end_range.byte {
             return;
         }
 
         // optimisation to grow capacity before pushing data
-        if self.buffer.capacity() <= end_range.byte as usize {
-            self.buffer.reserve(((7 * end_range.byte) / 4) as usize);
+        if self.buffer.capacity() <= end_range.byte {
+            self.buffer.reserve(end_range.byte.saturating_mul(7) / 4);
         }
 
-        let forward =
-            end_range.byte as usize - self.buffer.len() + if end_range.bit > 0 { 1 } else { 0 };
+        let forward = end_range.byte - self.buffer.len() + if end_range.bit > 0 { 1 } else { 0 };
         for _ in 0..forward {
             // push filler value that will end huffman decoding if not
             // modified
@@ -91,21 +90,21 @@ fn write_bits(out: &mut [u8], pos: &BitWindow, value: u8) {
 
     if (pos.bit + pos.count) <= 8 {
         // Bits to be written to fit in a single byte
-        debug_assert_eq!(out[pos.byte as usize] | PAD_LEFT[pos.bit as usize], 255);
-        let pad_left = out[pos.byte as usize] | PAD_RIGHT[(8 - pos.bit) as usize];
-        let shifted = value << (8 - pos.bit - pos.count) | PAD_LEFT[pos.bit as usize];
-        let pad_right = PAD_RIGHT[(8 - pos.count - pos.bit) as usize];
-        out[pos.byte as usize] = (pad_left & shifted) | pad_right;
+        debug_assert_eq!(out[pos.byte] | PAD_LEFT[pos.bit], 255);
+        let pad_left = out[pos.byte] | PAD_RIGHT[8 - pos.bit];
+        let shifted = value << (8 - pos.bit - pos.count) | PAD_LEFT[pos.bit];
+        let pad_right = PAD_RIGHT[8 - pos.count - pos.bit];
+        out[pos.byte] = (pad_left & shifted) | pad_right;
     } else {
         // Bits to be written to span two bytes
-        debug_assert_eq!(out[pos.byte as usize] | PAD_LEFT[pos.bit as usize], 255);
+        debug_assert_eq!(out[pos.byte] | PAD_LEFT[pos.bit], 255);
         let split = 8 - pos.bit;
-        let pad_left = out[pos.byte as usize] | PAD_RIGHT[split as usize];
-        let shifted = (value >> (pos.count - split)) | PAD_LEFT[pos.bit as usize];
-        out[pos.byte as usize] = pad_left & shifted;
+        let pad_left = out[pos.byte] | PAD_RIGHT[split];
+        let shifted = (value >> (pos.count - split)) | PAD_LEFT[pos.bit];
+        out[pos.byte] = pad_left & shifted;
 
         let rem = 8 - (pos.count - split);
-        out[(pos.byte + 1) as usize] = (value << rem) | PAD_RIGHT[rem as usize];
+        out[pos.byte + 1] = (value << rem) | PAD_RIGHT[rem];
     }
 }
 
