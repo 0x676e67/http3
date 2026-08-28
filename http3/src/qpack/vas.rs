@@ -2,15 +2,60 @@
  * Maps QPACK's growing insertion sequence onto positions in the retained
  * dynamic-table window.
  *
- * RFC absolute indices start at zero. This mapper stores one-based insertion
- * numbers because Required Insert Count and Base are counts: insertion number
- * N corresponds to RFC absolute index N - 1. Relative and post-base indices,
- * along with the backing container positions, start at zero.
+ * This mapper uses three coordinate spaces. Internal insertion numbers start
+ * at 1, RFC absolute indices start at 0, and container positions start at 0
+ * within the retained window. Insertion number N therefore has RFC absolute
+ * index N - 1.
  *
- * For example, after 21 insertions and 15 evictions, insertion numbers 16
- * through 21 occupy container positions 0 through 5. Relative index 0 selects
- * insertion 21. With Base 17, relative index 0 selects insertion 17 and
- * post-base index 0 selects insertion 18.
+ * The retained window moves only toward later insertions:
+ *
+ * Origin                 Retained window                 Next insertion
+ *   |                           |                              |
+ *   v                           v                              v
+ * +-----------------------------+==============================+--->
+ * | dropped entries             | dynamic-table entries        |  Growth
+ * +-----------------------------+==============================+--->
+ *                               ^                              ^
+ *                        dropping point                 insertion point
+ *
+ * `inserted` is the lifetime insertion count, `dropped` is the number of
+ * entries removed from the front, and `delta = inserted - dropped` is the
+ * number of retained entries.
+ *
+ * After 21 insertions and 15 drops, six entries remain:
+ *
+ * Oldest retained                                  Newest retained
+ *       |                                                |
+ *       v                                                v
+ * +------+------+------+------+------+------+
+ * |  16  |  17  |  18  |  19  |  20  |  21  | Internal insertion number
+ * +------+------+------+------+------+------+
+ * |  15  |  16  |  17  |  18  |  19  |  20  | RFC absolute index
+ * +------+------+------+------+------+------+
+ * |   0  |   1  |   2  |   3  |   4  |   5  | Container position
+ * +------+------+------+------+------+------+
+ * |   5  |   4  |   3  |   2  |   1  |   0  | Encoder-stream relative index
+ * +------+------+------+------+------+------+
+ *
+ * Field-line references use Base instead of the current insertion point. For
+ * Base 17, relative index 0 selects absolute index 16, while post-base index 0
+ * selects absolute index 17:
+ *
+ * Base 17 separates the second and third columns below:
+ * +------+------+------+------+------+------+
+ * |  16  |  17  |  18  |  19  |  20  |  21  | Internal insertion number
+ * +------+------+------+------+------+------+
+ * |  15  |  16  |  17  |  18  |  19  |  20  | RFC absolute index
+ * +------+------+------+------+------+------+
+ * |   1  |   0  |  --  |  --  |  --  |  --  | Field-line relative index
+ * +------+------+------+------+------+------+
+ * |  --  |  --  |   0  |   1  |   2  |   3  | Post-base index
+ * +------+------+------+------+------+------+
+ * |   0  |   1  |   2  |   3  |   4  |   5  | Container position
+ * +------+------+------+------+------+------+
+ *
+ * The field-line formulas are `absolute = Base - index - 1` for a relative
+ * reference and `absolute = Base + index` for a post-base reference.
  *
  * https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.4
  * https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.5
@@ -222,14 +267,20 @@ mod tests {
     #[test]
     fn test_post_base_index() {
         /*
-         * Base index: D
-         * Target value: B
+         * No entries have been dropped, so RFC absolute indices and container
+         * positions are equal. Base 4 splits the two field-line index spaces:
          *
-         * VAS: ]GFEDCBA]
-         * abs:  1234567
-         * rel:  3210---
-         * pst:  ----012
-         * pos:  0123456
+         * Base 4 is the divider shown below:
+         *
+         * Internal insertion number: 1 2 3 4 | 5 6 7
+         * RFC absolute index:         0 1 2 3 | 4 5 6
+         * Field-line relative index: 3 2 1 0 | - - -
+         * Post-base index:            - - - - | 0 1 2
+         * Container position:         0 1 2 3 | 4 5 6
+         *
+         * Post-base index 1 therefore resolves to absolute index 5 and
+         * container position 5.
+         * https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.6
          */
         let mut vas = VirtualAddressSpace::default();
         (0..7).for_each(|_| {
@@ -237,6 +288,33 @@ mod tests {
         });
 
         assert_eq!(vas.post_base(4, 1), Ok(5));
+    }
+
+    #[test]
+    fn documented_index_spaces_match_mapper() {
+        let mut vas = VirtualAddressSpace::default();
+        for _ in 0..21 {
+            vas.add().unwrap();
+        }
+        for _ in 0..15 {
+            vas.drop().unwrap();
+        }
+
+        assert_eq!(vas.total_inserted(), 21);
+        assert_eq!(vas.dropped, 15);
+        assert_eq!(vas.delta, 6);
+        assert_eq!(vas.index(0), Ok(16));
+        assert_eq!(vas.index(5), Ok(21));
+        assert!(vas.evicted(15));
+        assert!(!vas.evicted(16));
+        assert_eq!(vas.relative(0), Ok(5));
+        assert_eq!(vas.relative(5), Ok(0));
+        assert_eq!(vas.relative_base(17, 0), Ok(1));
+        assert_eq!(vas.relative_base(17, 1), Ok(0));
+        assert_eq!(vas.relative_base(17, 2), Err(Error::RelativeIndex(2)));
+        assert_eq!(vas.post_base(17, 0), Ok(2));
+        assert_eq!(vas.post_base(17, 3), Ok(5));
+        assert_eq!(vas.post_base(17, 4), Err(Error::PostbaseIndex(4)));
     }
 
     #[test]
