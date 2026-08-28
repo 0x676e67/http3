@@ -774,7 +774,7 @@ mod tests {
     }
 
     /**
-     * https://www.rfc-editor.org/rfc/rfc9204.html#name-dynamic-table-capacity-and-
+     * https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.2
      * "This mechanism can be used to completely clear entries from the
      *  dynamic table by setting a maximum size of 0, which can subsequently
      *  be restored."
@@ -790,7 +790,7 @@ mod tests {
     // Test duplicated fields
 
     /**
-     * https://www.rfc-editor.org/rfc/rfc9204.html#name-dynamic-table
+     * https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2
      * "The dynamic table can contain duplicate entries (i.e., entries with
      *  the same name and same value).  Therefore, duplicate entries MUST NOT
      *  be treated as an error by a decoder."
@@ -825,7 +825,7 @@ mod tests {
     }
 
     /**
-     * https://www.rfc-editor.org/rfc/rfc9204.html#name-dynamic-table-capacity-and-
+     * https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.2
      * "Before a new entry is added to the dynamic table, entries are evicted
      *  from the end of the dynamic table until the size of the dynamic table
      *  is less than or equal to (maximum size - new entry size) or until the
@@ -851,7 +851,7 @@ mod tests {
     }
 
     /**
-     * https://www.rfc-editor.org/rfc/rfc9204.html#name-dynamic-table-capacity-and-
+     * https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.2
      * "It is an error if the encoder attempts to add an entry that is
      * larger than the dynamic table capacity; the decoder MUST treat
      * this as a connection error of type QPACK_ENCODER_STREAM_ERROR."
@@ -875,7 +875,7 @@ mod tests {
     }
 
     /**
-     * https://www.rfc-editor.org/rfc/rfc9204.html#name-dynamic-table-capacity-and-
+     * https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.2
      * "This mechanism can be used to completely clear entries from the
      *  dynamic table by setting a maximum size of 0, which can subsequently
      *  be restored."
@@ -1607,7 +1607,8 @@ mod tests {
                     absolute: 3,
                 }
             );
-            // This field section references foo3 (absolute index 3).
+            // This field section references foo3, the third insertion
+            // (absolute index 2).
             encoder.commit(3);
         }
 

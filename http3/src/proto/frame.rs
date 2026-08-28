@@ -452,11 +452,18 @@ macro_rules! setting_identifiers {
 }
 
 setting_identifiers! {
-    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-5>
+    /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` from
+    /// [RFC 9204 Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
     QPACK_MAX_TABLE_CAPACITY = 0x1,
-    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-5>
+    /// `SETTINGS_QPACK_BLOCKED_STREAMS` from
+    /// [RFC 9204 Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
     QPACK_MAX_BLOCKED_STREAMS = 0x7,
-    /// <https://datatracker.ietf.org/doc/html/rfc9114#section-7.2.4.1>
+    /// `SETTINGS_MAX_FIELD_SECTION_SIZE` from
+    /// [RFC 9114 Section 7.2.4.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1).
+    ///
+    /// The associated constant keeps its historical HTTP/2 name for API
+    /// compatibility; HTTP/3 renamed the setting without changing code point
+    /// `0x06`.
     MAX_HEADER_LIST_SIZE = 0x6,
     /// <https://datatracker.ietf.org/doc/html/rfc9220#section-5>
     ENABLE_CONNECT_PROTOCOL = 0x8,

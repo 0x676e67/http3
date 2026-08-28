@@ -1,72 +1,25 @@
 /*
- * https://www.rfc-editor.org/rfc/rfc9204.html#name-absolute-indexing
- * https://www.rfc-editor.org/rfc/rfc9204.html#name-relative-indexing
- * https://www.rfc-editor.org/rfc/rfc9204.html#name-post-base-indexing
- */
-
-/*
- *  # Virtually infinite address space mapper.
+ * Maps QPACK's growing insertion sequence onto positions in the retained
+ * dynamic-table window.
  *
- *  It can be described as an infinitive growable list, with a visibility
- *  window that can only move in the direction of insertion.
+ * RFC absolute indices start at zero. This mapper stores one-based insertion
+ * numbers because Required Insert Count and Base are counts: insertion number
+ * N corresponds to RFC absolute index N - 1. Relative and post-base indices,
+ * along with the backing container positions, start at zero.
  *
- *  Origin          Visible window
- *  /\         /===========^===========\
- *  ++++-------+ - + - + - + - + - + - +
- *  ||||       |   |   |   |   |   |   |  ==> Grow direction
- *  ++++-------+ - + - + - + - + - + - +
- *  \================v==================/
- *           Full Virtual Space
+ * For example, after 21 insertions and 15 evictions, insertion numbers 16
+ * through 21 occupy container positions 0 through 5. Relative index 0 selects
+ * insertion 21. With Base 17, relative index 0 selects insertion 17 and
+ * post-base index 0 selects insertion 18.
  *
- *
- *  QPACK indexing is 1-based for absolute index, and 0-based for relative's.
- *  Container (ex: list) indexing is 0-based.
- *
- *
- *  # Basics
- *
- *  inserted: number of insertion
- *  dropped : number of drop
- *  delta   : count of available elements
- *
- *  abs: absolute index
- *  rel: relative index
- *  pos: real index in memory container
- *  pst: post-base relative index (only with base index)
- *
- *    first      oldest              latest
- *    element    insertion           insertion
- *    (not       available           available
- *    available) |                   |
- *    |          |                   |
- *    v          v                   v
- *  + - +------+ - + - + - + - + - + - +  inserted: 21
- *  | a |      | p | q | r | s | t | u |  dropped: 15
- *  + - +------+ - + - + - + - + - + - +  delta: 21 - 15: 6 ^          ^                   ^ | |
- *    |
- * abs:-      abs:16              abs:21
- * rel:-      rel:5               rel:0
- * pos:-      pos:0               pos:6
- *
- *
- * # Base index
- * A base index can arbitrary shift the relative index.
- * The base index itself is an absolute index.
- *
- *                       base index: 17
- *                       |
- *                       v
- *  + - +------+ - + - + - + - + - + - +  inserted: 21
- *  | a |      | p | q | r | s | t | u |  dropped: 15
- *  + - +------+ - + - + - + - + - + - +  delta: 21 - 15: 6 ^          ^       ^           ^ | |
- *    |           |
- * abs:-      abs:16  abs:18      abs:21
- * rel:-      rel:2   rel:0       rel:-
- * pst:-      pst:-   pst:-       pst:2
- * pos:-      pos:0   pos:2       pos:6
+ * https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.4
+ * https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.5
+ * https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.6
+ * https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.2
  */
 
 pub type RelativeIndex = usize;
+/// Internal one-based insertion number, equal to the RFC absolute index plus one.
 pub type AbsoluteIndex = usize;
 
 #[derive(Debug, PartialEq)]

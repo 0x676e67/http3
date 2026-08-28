@@ -34,13 +34,15 @@ pub struct Config {
 /// HTTP/3 Settings
 #[derive(Debug, Clone, Copy)]
 pub struct Settings {
-    /// The MAX_FIELD_SECTION_SIZE in HTTP/3 refers to the maximum size of the dynamic table used
-    /// in HPACK compression. HPACK is the compression algorithm used in HTTP/3 to reduce the
-    /// size of the header fields in HTTP requests and responses.
-
-    /// In HTTP/3, the MAX_FIELD_SECTION_SIZE is set to 12.
-    /// This means that the dynamic table used for HPACK compression can have a maximum size of
-    /// 2^12 bytes, which is 4KB.
+    /// Largest uncompressed field section this endpoint is willing to accept.
+    ///
+    /// Each field contributes its name and value lengths plus 32 bytes. The
+    /// value is advertised as `SETTINGS_MAX_FIELD_SECTION_SIZE`. Omitting the
+    /// setting means unlimited; this implementation advertises the largest
+    /// QUIC variable-length integer by default.
+    ///
+    /// See [RFC 9114 Section 4.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2)
+    /// and [Section 7.2.4.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1).
     pub(crate) max_field_section_size: u64,
 
     /// https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1
@@ -60,10 +62,14 @@ pub struct Settings {
     /// QPACK dynamic table capacity the encoder is permitted to use, in bytes.
     /// Sent as SETTINGS_QPACK_MAX_TABLE_CAPACITY (0x1).
     /// When unset, the setting is omitted and the protocol default of 0 applies.
+    ///
+    /// See [RFC 9204 Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
     pub(crate) qpack_max_table_capacity: Option<u64>,
 
     /// Maximum number of blocked streams the decoder is willing to tolerate.
     /// Sent as SETTINGS_QPACK_BLOCKED_STREAMS (0x7).
+    ///
+    /// See [RFC 9204 Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
     /// When unset, the setting is omitted and the protocol default of 0 applies.
     pub(crate) qpack_blocked_streams: Option<u64>,
 }
@@ -168,7 +174,8 @@ impl TryFrom<Config> for frame::Settings {
             }
         }
 
-        //  Grease Settings (https://www.rfc-editor.org/rfc/rfc9114.html#name-defined-settings-parameters)
+        // GREASE settings are reserved by RFC 9114 Section 7.2.4.1.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
         //# Setting identifiers of the format 0x1f * N + 0x21 for non-negative
         //# integer values of N are reserved to exercise the requirement that

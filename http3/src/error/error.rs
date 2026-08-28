@@ -87,17 +87,17 @@ pub enum StreamError {
     /// The error occurred on the connection
     #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     ConnectionError(ConnectionError),
-    /// Error is used when violating the MAX_FIELD_SECTION_SIZE
+    /// A field section exceeds the configured size limit.
     ///
-    /// This can mean different things depending on the context
-    /// When sending a request, this means, that the request cannot be sent because the header is
-    /// larger then permitted by the server When receiving a request, this means, that the
-    /// server sent a
+    /// On send, the peer's advertised limit would be exceeded. On receive, the
+    /// decoded field section is larger than the local limit.
+    ///
+    /// See [RFC 9114 Section 4.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2).
     #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     HeaderTooBig {
-        /// The actual size of the header block
+        /// The uncompressed size of the field section
         actual_size: u64,
-        /// The maximum size of the header block
+        /// The applicable field section size limit
         max_size: u64,
     },
     /// Received a GoAway frame from the remote

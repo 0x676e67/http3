@@ -12,7 +12,7 @@
 //! B: bytes::Buf,
 //! {
 //!     let mut server_builder = http3::server::builder();
-//!     // Set the maximum header size
+//!     // Set the maximum field section size
 //!     server_builder.max_field_section_size(1000);
 //!     // do not send grease types
 //!     server_builder.send_grease(false);
@@ -63,11 +63,14 @@ impl Builder {
         self
     }
 
-    /// Set the maximum header size this client is willing to accept
+    /// Sets the largest uncompressed field section this server will accept.
     ///
-    /// See [header size constraints] section of the specification for details.
+    /// The value is advertised to the client as
+    /// `SETTINGS_MAX_FIELD_SECTION_SIZE`. Each field contributes its name and
+    /// value lengths plus 32 bytes. By default, the server advertises the
+    /// largest value the setting can encode.
     ///
-    /// [header size constraints]: https://www.rfc-editor.org/rfc/rfc9114.html#name-header-size-constraints
+    /// See [RFC 9114 Section 4.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2).
     pub fn max_field_section_size(&mut self, value: u64) -> &mut Self {
         self.config.settings.max_field_section_size = value;
         self
