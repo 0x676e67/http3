@@ -192,7 +192,8 @@ macro_rules! decl_fields {
             $(
             HeaderField {
                 name: Cow::Borrowed($key),
-                value: Cow::Borrowed($value)
+                value: Cow::Borrowed($value),
+                sensitive: false,
             },
         )* ]
     }

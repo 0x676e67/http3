@@ -17,6 +17,7 @@ pub enum Error {
     NoTrackingData,
     InvalidTrackingCount,
     InvalidInsertCountIncrement,
+    AddressSpaceOverflow,
 }
 
 pub struct DynamicTableDecoder<'a> {
@@ -212,7 +213,7 @@ impl<'a> DynamicTableEncoder<'a> {
         Ok(result)
     }
 
-    fn find_name(&mut self, name: &[u8]) -> DynamicLookupResult {
+    pub(super) fn find_name(&mut self, name: &[u8]) -> DynamicLookupResult {
         if let Some(index) = StaticTable::find_name(name) {
             return DynamicLookupResult::Static(index);
         }
@@ -430,6 +431,12 @@ impl DynamicTable {
         self.vas.total_inserted()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_empty_insert_count_for_test(&mut self, insert_count: usize) {
+        assert!(self.fields.is_empty());
+        self.vas = VirtualAddressSpace::with_counters(insert_count, insert_count, 0);
+    }
+
     /// Applies a Section Acknowledgment to the earliest outstanding dynamic
     /// field section on `stream_id`.
     ///
@@ -515,16 +522,21 @@ impl DynamicTable {
             return Ok(None);
         }
 
-        match self.can_free(field.mem_size())? {
+        let to_evict = match self.can_free(field.mem_size())? {
             None => return Ok(None),
-            Some(to_evict) => {
-                self.evict(to_evict)?;
-            }
-        }
+            Some(to_evict) => to_evict,
+        };
+
+        // Check the lifetime insertion limit before eviction or table mutation.
+        // An implementation can limit accepted integer values, but exceeding
+        // that limit on the encoder stream is a connection error.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4
+        self.vas.ensure_can_add()?;
+        self.evict(to_evict)?;
 
         self.curr_size += field.mem_size();
         self.fields.push_back(field);
-        let absolute = self.vas.add();
+        let absolute = self.vas.add()?;
 
         Ok(Some(absolute))
     }
@@ -534,7 +546,7 @@ impl DynamicTable {
             let field = self.fields.pop_front().ok_or(Error::MaxTableSizeReached)?; //TODO better type
             self.curr_size -= field.mem_size();
 
-            self.vas.drop();
+            self.vas.drop()?;
 
             if !self.name_map.is_empty()
                 && self
@@ -726,6 +738,7 @@ impl From<vas::Error> for Error {
             vas::Error::RelativeIndex(e) => Error::BadRelativeIndex(e),
             vas::Error::PostbaseIndex(e) => Error::BadPostbaseIndex(e),
             vas::Error::Index(e) => Error::BadIndex(e),
+            vas::Error::AddressSpaceOverflow => Error::AddressSpaceOverflow,
         }
     }
 }
@@ -812,6 +825,21 @@ mod tests {
 
         table.insert(HeaderField::new("Name", "Value")).unwrap();
         assert_eq!(table.fields.len(), 1);
+    }
+
+    #[test]
+    fn insertion_limit_is_checked_before_table_mutation() {
+        let mut table = DynamicTable::new();
+        table.set_max_size(64).unwrap();
+        table.set_empty_insert_count_for_test(usize::MAX);
+
+        assert_eq!(
+            table.put_decoder(HeaderField::new("name", "value")),
+            Err(Error::AddressSpaceOverflow)
+        );
+        assert_eq!(table.total_inserted(), usize::MAX);
+        assert!(table.fields.is_empty());
+        assert_eq!(table.curr_size, 0);
     }
 
     /** functional test */

@@ -428,22 +428,34 @@ impl Decoder {
             }
             HeaderBlockField::LiteralWithNameRef => {
                 match LiteralWithNameRef::decode_limited(buf, max_encoded_string_size)? {
-                    LiteralWithNameRef::Static { index, value } => {
-                        StaticTable::get(index)?.with_value(value)
-                    }
-                    LiteralWithNameRef::Dynamic { index, value } => {
-                        table.get_relative(index)?.with_value(value)
-                    }
+                    LiteralWithNameRef::Static {
+                        index,
+                        value,
+                        never_indexed,
+                    } => StaticTable::get(index)?
+                        .with_value(value)
+                        .with_sensitive(never_indexed),
+                    LiteralWithNameRef::Dynamic {
+                        index,
+                        value,
+                        never_indexed,
+                    } => table
+                        .get_relative(index)?
+                        .with_value(value)
+                        .with_sensitive(never_indexed),
                 }
             }
             HeaderBlockField::LiteralWithPostBaseNameRef => {
                 let literal =
                     LiteralWithPostBaseNameRef::decode_limited(buf, max_encoded_string_size)?;
-                table.get_postbase(literal.index)?.with_value(literal.value)
+                table
+                    .get_postbase(literal.index)?
+                    .with_value(literal.value)
+                    .with_sensitive(literal.never_indexed)
             }
             HeaderBlockField::Literal => {
                 let literal = Literal::decode_limited(buf, max_encoded_string_size)?;
-                HeaderField::new(literal.name, literal.value)
+                HeaderField::new(literal.name, literal.value).with_sensitive(literal.never_indexed)
             }
             _ => return Err(DecoderError::UnknownPrefix(first)),
         };
@@ -483,14 +495,18 @@ pub(crate) fn decode_stateless_limited<T: Buf>(
             HeaderBlockField::LiteralWithNameRef => {
                 match LiteralWithNameRef::decode_limited(buf, max_encoded_string_size)? {
                     LiteralWithNameRef::Dynamic { .. } => return Err(DecoderError::MissingRefs(0)),
-                    LiteralWithNameRef::Static { index, value } => {
-                        StaticTable::get(index)?.with_value(value)
-                    }
+                    LiteralWithNameRef::Static {
+                        index,
+                        value,
+                        never_indexed,
+                    } => StaticTable::get(index)?
+                        .with_value(value)
+                        .with_sensitive(never_indexed),
                 }
             }
             HeaderBlockField::Literal => {
                 let literal = Literal::decode_limited(buf, max_encoded_string_size)?;
-                HeaderField::new(literal.name, literal.value)
+                HeaderField::new(literal.name, literal.value).with_sensitive(literal.never_indexed)
             }
             _ => return Err(DecoderError::UnknownPrefix(buf.chunk()[0])),
         };
@@ -693,6 +709,26 @@ mod tests {
                 DynamicTableError::MaximumTableSizeTooLarge
             ))
         );
+    }
+
+    #[test]
+    fn cumulative_insert_limit_rejects_encoder_instruction_without_mutation() {
+        let mut table = DynamicTable::new();
+        table.set_max_size(64).unwrap();
+        table.set_empty_insert_count_for_test(usize::MAX);
+        let mut decoder = Decoder::from(table);
+        let mut encoder_stream = Vec::new();
+        InsertWithoutNameRef::new("name", "value")
+            .encode(&mut encoder_stream)
+            .unwrap();
+
+        assert_eq!(
+            decoder.on_encoder_recv(&mut Cursor::new(encoder_stream), &mut Vec::new()),
+            Err(DecoderError::DynamicTable(
+                DynamicTableError::AddressSpaceOverflow
+            ))
+        );
+        assert_eq!(decoder.table.total_inserted(), usize::MAX);
     }
 
     #[test]
