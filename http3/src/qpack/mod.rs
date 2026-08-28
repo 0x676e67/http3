@@ -8,10 +8,12 @@ use bytes::{Buf, BufMut};
 use futures_util::task::AtomicWaker;
 use tokio::sync::mpsc;
 
+#[cfg(feature = "unstable")]
+pub use self::decoder::decode_stateless;
 #[cfg(test)]
 pub(crate) use self::stream::{DynamicTableSizeUpdate, InsertCountIncrement, InsertWithoutNameRef};
 pub use self::{
-    decoder::{Decoded, Decoder, DecoderError, ack_header, decode_stateless, stream_canceled},
+    decoder::{Decoded, Decoder, DecoderError, ack_header, stream_canceled},
     encoder::{EncoderError, encode_stateless},
     field::HeaderField,
 };
