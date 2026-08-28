@@ -92,6 +92,13 @@ impl InsertWithNameRef {
     }
 
     pub fn decode<R: Buf>(buf: &mut R) -> Result<Option<Self>, ParseError> {
+        Self::decode_limited(buf, usize::MAX)
+    }
+
+    pub(crate) fn decode_limited<R: Buf>(
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<Option<Self>, ParseError> {
         let (flags, index) = match prefix_int::decode(6, buf) {
             Ok((f, x)) if f & 0b10 == 0b10 => (f, x),
             Ok((f, _)) => return Err(ParseError::InvalidPrefix(f)),
@@ -102,7 +109,7 @@ impl InsertWithNameRef {
             .try_into()
             .map_err(|_e| ParseError::Integer(crate::qpack::prefix_int::Error::Overflow))?;
 
-        let value = match prefix_string::decode(8, buf) {
+        let value = match prefix_string::decode_limited(8, buf, max_encoded_string_size) {
             Ok(x) => x,
             Err(StringError::UnexpectedEnd) => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -145,12 +152,19 @@ impl InsertWithoutNameRef {
     }
 
     pub fn decode<R: Buf>(buf: &mut R) -> Result<Option<Self>, ParseError> {
-        let name = match prefix_string::decode(6, buf) {
+        Self::decode_limited(buf, usize::MAX)
+    }
+
+    pub(crate) fn decode_limited<R: Buf>(
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<Option<Self>, ParseError> {
+        let name = match prefix_string::decode_limited(6, buf, max_encoded_string_size) {
             Ok(x) => x,
             Err(StringError::UnexpectedEnd) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let value = match prefix_string::decode(8, buf) {
+        let value = match prefix_string::decode_limited(8, buf, max_encoded_string_size) {
             Ok(x) => x,
             Err(StringError::UnexpectedEnd) => return Ok(None),
             Err(e) => return Err(e.into()),

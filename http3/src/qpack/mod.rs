@@ -8,13 +8,16 @@ use bytes::{Buf, BufMut};
 use futures_util::task::AtomicWaker;
 use tokio::sync::mpsc;
 
-pub(crate) use self::encoder::Encoder;
 #[cfg(test)]
 pub(crate) use self::stream::{DynamicTableSizeUpdate, InsertCountIncrement, InsertWithoutNameRef};
 pub use self::{
     decoder::{Decoded, Decoder, DecoderError, ack_header, decode_stateless, stream_canceled},
     encoder::{EncoderError, encode_stateless},
     field::HeaderField,
+};
+pub(crate) use self::{
+    decoder::{FieldSectionPrefix, decode_stateless_limited},
+    encoder::Encoder,
 };
 use crate::quic::StreamId;
 
@@ -169,11 +172,17 @@ impl BlockedStreamRegistry {
             waker.wake();
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.streams.len()
+    }
 }
 
 struct QpackDecoderInner {
     decoder: RwLock<Decoder>,
     decoder_dynamic_table: bool,
+    max_encoded_string_size: usize,
     decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
     /// Connection-driver waker used while a request holds a read guard.
     write_waker: AtomicWaker,
@@ -199,6 +208,7 @@ impl QpackDecoder {
     ) -> Self {
         QpackDecoder(Arc::new(QpackDecoderInner {
             decoder_dynamic_table: decoder.dynamic_table_enabled(),
+            max_encoded_string_size: decoder.max_encoded_string_size(),
             decoder: RwLock::new(decoder),
             decoder_events_send,
             write_waker: AtomicWaker::new(),
@@ -375,14 +385,19 @@ impl QpackDecoder {
         cx: &mut Context<'_>,
         encoded: &mut T,
         max_size: u64,
+        prefix: &mut Option<FieldSectionPrefix>,
     ) -> Poll<Result<Decoded, DecoderError>> {
         if !self.0.decoder_dynamic_table {
-            return Poll::Ready(decode_stateless(encoded, max_size));
+            return Poll::Ready(decode_stateless_limited(
+                encoded,
+                max_size,
+                self.0.max_encoded_string_size,
+            ));
         }
 
         match self.0.decoder.try_read() {
             Ok(decoder) => {
-                let decoded = decoder.decode_header_limited(encoded, max_size);
+                let decoded = decoder.decode_header_limited(encoded, max_size, prefix);
                 return self.finish_decode(decoder, decoded);
             }
             Err(TryLockError::WouldBlock) => {}
@@ -403,7 +418,7 @@ impl QpackDecoder {
 
         match self.0.decoder.try_read() {
             Ok(decoder) => {
-                let decoded = decoder.decode_header_limited(encoded, max_size);
+                let decoded = decoder.decode_header_limited(encoded, max_size, prefix);
                 self.finish_decode(decoder, decoded)
             }
             Err(TryLockError::WouldBlock) => Poll::Pending,
