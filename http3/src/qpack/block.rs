@@ -343,6 +343,13 @@ impl LiteralWithNameRef {
     }
 
     pub fn decode<R: Buf>(buf: &mut R) -> Result<Self, ParseError> {
+        Self::decode_limited(buf, usize::MAX)
+    }
+
+    pub(crate) fn decode_limited<R: Buf>(
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<Self, ParseError> {
         match prefix_int::decode(4, buf)? {
             (f, i) if f & 0b1101 == 0b0101 => {
                 if i > (usize::MAX as u64) {
@@ -351,10 +358,11 @@ impl LiteralWithNameRef {
                     ));
                 }
 
-                Ok(
-                    LiteralWithNameRef::new_static(i as usize, prefix_string::decode(8, buf)?)
-                        .with_never_indexed_if(f & 0b0010 != 0),
+                Ok(LiteralWithNameRef::new_static(
+                    i as usize,
+                    prefix_string::decode_limited(8, buf, max_encoded_string_size)?,
                 )
+                .with_never_indexed_if(f & 0b0010 != 0))
             }
             (f, i) if f & 0b1101 == 0b0100 => {
                 if i > (usize::MAX as u64) {
@@ -363,10 +371,11 @@ impl LiteralWithNameRef {
                     ));
                 }
 
-                Ok(
-                    LiteralWithNameRef::new_dynamic(i as usize, prefix_string::decode(8, buf)?)
-                        .with_never_indexed_if(f & 0b0010 != 0),
+                Ok(LiteralWithNameRef::new_dynamic(
+                    i as usize,
+                    prefix_string::decode_limited(8, buf, max_encoded_string_size)?,
                 )
+                .with_never_indexed_if(f & 0b0010 != 0))
             }
             (f, _) => Err(ParseError::InvalidPrefix(f)),
         }
@@ -435,6 +444,13 @@ impl LiteralWithPostBaseNameRef {
     }
 
     pub fn decode<R: Buf>(buf: &mut R) -> Result<Self, ParseError> {
+        Self::decode_limited(buf, usize::MAX)
+    }
+
+    pub(crate) fn decode_limited<R: Buf>(
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<Self, ParseError> {
         match prefix_int::decode(3, buf)? {
             (f, i) if f & 0b11110 == 0 => {
                 if i > (usize::MAX as u64) {
@@ -443,8 +459,10 @@ impl LiteralWithPostBaseNameRef {
                     ));
                 }
 
-                let mut literal =
-                    LiteralWithPostBaseNameRef::new(i as usize, prefix_string::decode(8, buf)?);
+                let mut literal = LiteralWithPostBaseNameRef::new(
+                    i as usize,
+                    prefix_string::decode_limited(8, buf, max_encoded_string_size)?,
+                );
                 literal.never_indexed = f & 1 != 0;
                 Ok(literal)
             }
@@ -481,6 +499,13 @@ impl Literal {
     }
 
     pub fn decode<R: Buf>(buf: &mut R) -> Result<Self, ParseError> {
+        Self::decode_limited(buf, usize::MAX)
+    }
+
+    pub(crate) fn decode_limited<R: Buf>(
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<Self, ParseError> {
         if buf.remaining() < 1 {
             return Err(ParseError::Integer(prefix_int::Error::UnexpectedEnd));
         } else if buf.chunk()[0] & 0b1110_0000 != 0b0010_0000 {
@@ -488,8 +513,8 @@ impl Literal {
         }
         let never_indexed = buf.chunk()[0] & 0b0001_0000 != 0;
         let mut literal = Literal::new(
-            prefix_string::decode(4, buf)?,
-            prefix_string::decode(8, buf)?,
+            prefix_string::decode_limited(4, buf, max_encoded_string_size)?,
+            prefix_string::decode_limited(8, buf, max_encoded_string_size)?,
         );
         literal.never_indexed = never_indexed;
         Ok(literal)

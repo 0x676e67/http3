@@ -345,13 +345,14 @@ where
     /// Initiates the connection and opens a control stream
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn new(mut conn: C, config: Config) -> Result<Self, ConnectionError> {
-        let decoder = qpack::Decoder::new(
+        let mut decoder = qpack::Decoder::new(
             config.settings.qpack_max_table_capacity.unwrap_or(0),
             config.settings.qpack_blocked_streams.unwrap_or(0),
         )
         .map_err(|error| {
             conn.close_raw_connection_with_h3_error(invalid_qpack_decoder_configuration(error))
         })?;
+        decoder.set_max_encoded_string_size(config.qpack_decode_buffer_size);
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
         //# Endpoints SHOULD create the HTTP control stream as well as the
@@ -1181,6 +1182,11 @@ where
         self.qpack_streams.decoder.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn qpack_blocked_stream_count(&self) -> usize {
+        self.qpack_streams.blocked_streams.len()
+    }
+
     fn poll_qpack_decoder_events(&mut self, cx: &mut Context<'_>) -> Result<(), ConnectionError> {
         while let Poll::Ready(Some(event)) = self.qpack_streams.decoder_events_recv.poll_recv(cx) {
             match event {
@@ -1329,6 +1335,7 @@ pub struct RequestStream<S, B> {
     send_grease_frame: bool,
     decoder: QpackDecoder,
     decoder_guard: Option<DecoderGuard>,
+    decoder_prefix: Option<qpack::FieldSectionPrefix>,
 }
 
 impl<S, B> RequestStream<S, B>
@@ -1337,12 +1344,14 @@ where
 {
     #[allow(missing_docs)]
     pub(crate) fn new(
-        stream: FrameStream<S, B>,
+        mut stream: FrameStream<S, B>,
         max_field_section_size: u64,
+        max_qpack_decode_buffer_size: usize,
         conn_state: Arc<SharedState>,
         grease: bool,
         decoder: QpackDecoder,
     ) -> Self {
+        stream.set_max_field_section_size(max_qpack_decode_buffer_size);
         let decoder_guard = decoder.dynamic_table_enabled().then(|| DecoderGuard {
             stream_id: stream.id(),
             shared: conn_state.clone(),
@@ -1361,6 +1370,7 @@ where
             send_grease_frame: grease,
             decoder,
             decoder_guard,
+            decoder_prefix: None,
         }
     }
 }
@@ -1594,14 +1604,14 @@ where
         cx: &mut Context<'_>,
         encoded: &mut Bytes,
     ) -> Poll<Result<qpack::Decoded, qpack::DecoderError>> {
-        // QPACK decoding advances the cursor. A Pending retry must start from
-        // the beginning of the field section.
-        let original = encoded.clone();
-        match self
-            .decoder
-            .poll_decode_header(cx, encoded, self.max_field_section_size)
-        {
+        match self.decoder.poll_decode_header(
+            cx,
+            encoded,
+            self.max_field_section_size,
+            &mut self.decoder_prefix,
+        ) {
             Poll::Ready(Ok(decoded)) => {
+                self.decoder_prefix = None;
                 if let Some(decoder_guard) = self.decoder_guard.as_mut() {
                     decoder_guard.unblock();
                     if let Some(err) = decoder_guard.acknowledge(decoded.dyn_ref).err() {
@@ -1629,14 +1639,13 @@ where
                         return Poll::Ready(Err(err));
                     }
                 }
-                *encoded = original;
                 Poll::Pending
             }
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => {
-                *encoded = original;
-                Poll::Pending
+            Poll::Ready(Err(err)) => {
+                self.decoder_prefix = None;
+                Poll::Ready(Err(err))
             }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -1751,6 +1760,7 @@ where
                 send_grease_frame: self.send_grease_frame,
                 decoder: self.decoder.clone(),
                 decoder_guard: None,
+                decoder_prefix: None,
             },
             RequestStream {
                 stream: recv,
@@ -1760,6 +1770,7 @@ where
                 send_grease_frame: self.send_grease_frame,
                 decoder: self.decoder,
                 decoder_guard: self.decoder_guard,
+                decoder_prefix: self.decoder_prefix,
             },
         )
     }

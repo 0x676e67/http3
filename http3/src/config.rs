@@ -2,6 +2,8 @@ use std::convert::TryFrom;
 
 use crate::proto::{frame, varint::VarInt};
 
+pub(crate) const DEFAULT_QPACK_DECODE_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+
 /// Configures the HTTP/3 connection
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -26,6 +28,10 @@ pub struct Config {
     /// not covered by the known `Settings` fields, or appended at the end in
     /// default mode.
     pub(crate) extra_settings: Vec<(frame::SettingId, u64)>,
+
+    /// Maximum compressed QPACK input retained while decoding one field
+    /// section or encoder-stream string.
+    pub(crate) qpack_decode_buffer_size: usize,
 
     /// HTTP/3 Settings
     pub settings: Settings,
@@ -246,6 +252,7 @@ impl Default for Config {
             send_settings: true,
             settings_order: None,
             extra_settings: Vec::new(),
+            qpack_decode_buffer_size: DEFAULT_QPACK_DECODE_BUFFER_SIZE,
             settings: Default::default(),
         }
     }

@@ -73,6 +73,19 @@ impl Builder {
         self
     }
 
+    /// Limits compressed QPACK input buffered before a field section is decoded.
+    ///
+    /// This is a local memory limit, not an HTTP/3 setting. It applies to an
+    /// encoded HEADERS payload and to one encoded string on the peer's QPACK
+    /// encoder stream. The default is 16 MiB.
+    ///
+    /// See [RFC 9204, Section 7.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3)
+    /// and [Section 7.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4).
+    pub fn max_qpack_decode_buffer_size(&mut self, value: usize) -> &mut Self {
+        self.config.qpack_decode_buffer_size = value;
+        self
+    }
+
     /// Send grease values to the Client.
     /// See [setting](https://www.rfc-editor.org/rfc/rfc9114.html#settings-parameters), [frame](https://www.rfc-editor.org/rfc/rfc9114.html#frame-reserved) and [stream](https://www.rfc-editor.org/rfc/rfc9114.html#stream-grease) for more information.
     #[inline]
@@ -127,9 +140,11 @@ impl Builder {
     {
         let (sender, receiver) = mpsc::unbounded_channel();
         let max_field_section_size = self.config.settings.max_field_section_size;
+        let max_qpack_decode_buffer_size = self.config.qpack_decode_buffer_size;
         Ok(Connection {
             inner: ConnectionInner::new(conn, self.config.clone()).await?,
             max_field_section_size,
+            max_qpack_decode_buffer_size,
             request_end_send: sender,
             request_end_recv: receiver,
             ongoing_streams: HashSet::new(),

@@ -113,6 +113,7 @@ where
     pub(super) conn_state: Arc<SharedState>,
     pub(super) decoder: QpackDecoder,
     pub(super) max_field_section_size: u64, // maximum size for a header we receive
+    pub(super) max_qpack_decode_buffer_size: usize,
     // counts instances of SendRequest to close the connection when the last is dropped.
     pub(super) sender_count: Arc<AtomicUsize>,
     pub(super) _buf: PhantomData<fn(B)>,
@@ -217,6 +218,7 @@ where
             inner: connection::RequestStream::new(
                 FrameStream::new(BufRecvStream::new(stream)),
                 self.max_field_section_size,
+                self.max_qpack_decode_buffer_size,
                 self.conn_state.clone(),
                 self.send_grease_frame,
                 self.decoder.clone(),
@@ -242,6 +244,7 @@ where
             decoder: self.decoder.clone(),
             open: self.open.clone(),
             max_field_section_size: self.max_field_section_size,
+            max_qpack_decode_buffer_size: self.max_qpack_decode_buffer_size,
             sender_count: self.sender_count.clone(),
             _buf: PhantomData,
             send_grease_frame: self.send_grease_frame,
