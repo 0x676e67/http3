@@ -112,7 +112,7 @@ where
     pub(super) open: T,
     pub(super) conn_state: Arc<SharedState>,
     pub(super) decoder: QpackDecoder,
-    pub(super) max_field_section_size: u64, // maximum size for a header we receive
+    pub(super) max_field_section_size: u64, // largest field section we accept
     pub(super) max_qpack_decode_buffer_size: usize,
     // counts instances of SendRequest to close the connection when the last is dropped.
     pub(super) sender_count: Arc<AtomicUsize>,

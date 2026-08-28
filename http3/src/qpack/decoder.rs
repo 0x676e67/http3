@@ -96,9 +96,16 @@ pub fn stream_canceled<W: BufMut>(stream_id: u64, decoder: &mut W) {
 pub struct Decoded {
     /// The decoded fields
     pub fields: Vec<HeaderField>,
-    /// Whether one or more encoded fields were referencing the dynamic table
+    /// Whether the field section's Required Insert Count is non-zero.
+    ///
+    /// A successfully decoded field section with a non-zero Required Insert
+    /// Count requires a Section Acknowledgment.
+    ///
+    /// See [RFC 9204 Section 4.4.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1).
     pub dyn_ref: bool,
-    /// Decoded size, calculated as stated in "4.1.1.3. Header Size Constraints"
+    /// Uncompressed field section size, including the 32-byte overhead per field.
+    ///
+    /// See [RFC 9114 Section 4.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2).
     pub mem_size: u64,
 }
 
@@ -186,8 +193,8 @@ impl Decoder {
         self.max_blocked_streams
     }
 
-    // Decode field lines received on Request of Push stream.
-    // https://www.rfc-editor.org/rfc/rfc9204.html#name-field-line-representations
+    // Decode field lines received on a request or push stream.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5
     #[inline(always)]
     pub fn decode_header<T: Buf>(&self, buf: &mut T) -> Result<Decoded, DecoderError> {
         self.decode_header_limited(buf, u64::MAX, &mut None)
@@ -463,8 +470,8 @@ impl Decoder {
     }
 }
 
-// Decode field lines received on Request or Push stream.
-// https://www.rfc-editor.org/rfc/rfc9204.html#name-field-line-representations
+// Decode field lines received on a request or push stream.
+// https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5
 pub fn decode_stateless<T: Buf>(buf: &mut T, max_size: u64) -> Result<Decoded, DecoderError> {
     decode_stateless_limited(buf, max_size, usize::MAX)
 }
@@ -887,7 +894,7 @@ mod tests {
     }
 
     /**
-     * https://www.rfc-editor.org/rfc/rfc9204.html#name-insert-with-name-reference
+     * https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.2
      * 4.3.2.  Insert With Name Reference
      */
     #[test]
@@ -914,7 +921,7 @@ mod tests {
     }
 
     /**
-     * https://www.rfc-editor.org/rfc/rfc9204.html#name-insert-with-name-reference
+     * https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.2
      * 4.3.2.  Insert With Name Reference
      */
     #[test]
@@ -930,7 +937,7 @@ mod tests {
     }
 
     /**
-     * https://www.rfc-editor.org/rfc/rfc9204.html#name-insert-with-name-referencehtml
+     * https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.2
      * 4.3.2.  Insert With Name Reference
      */
     #[test]
@@ -954,7 +961,7 @@ mod tests {
     }
 
     /**
-     * https://www.rfc-editor.org/rfc/rfc9204.html#name-insert-with-literal-name
+     * https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.3
      * 4.3.3.  Insert with Literal Name
      */
     #[test]
@@ -988,7 +995,7 @@ mod tests {
     }
 
     /**
-     * https://www.rfc-editor.org/rfc/rfc9204.html#name-duplicate
+     * https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.4
      * 4.3.4.  Duplicate
      */
     #[test]
@@ -1017,7 +1024,7 @@ mod tests {
     }
 
     /**
-     * https://www.rfc-editor.org/rfc/rfc9204.html#name-set-dynamic-table-capacity
+     * https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.1
      * 4.3.1.  Set Dynamic Table Capacity
      */
     #[test]
@@ -1116,15 +1123,9 @@ mod tests {
         HeaderField::new(format!("foo{}", n), "bar")
     }
 
-    // Largest Reference
-    //   Base Index = 2
-    //       |
-    //     foo2   foo1
-    //    +-----+-----+
-    //    |  2  |  1  |  Absolute Index
-    //    +-----+-----+
-    //    |  0  |  1  |  Relative Index
-    //    --+---+-----+
+    // Required Insert Count and Base are both 2. Relative indices 0 and 1
+    // select foo2 (absolute index 1) and foo1 (absolute index 0), respectively.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.5
 
     #[test]
     fn decode_indexed_header_field() {
@@ -1146,17 +1147,10 @@ mod tests {
         )
     }
 
-    //      Largest Reference
-    //        Base Index = 2
-    //             |
-    // foo4 foo3  foo2  foo1
-    // +---+-----+-----+-----+
-    // | 4 |  3  |  2  |  1  |  Absolute Index
-    // +---+-----+-----+-----+
-    //           |  0  |  1  |  Relative Index
-    // +-----+-----+---+-----+
-    // | 1 |  0  |              Post-Base Index
-    // +---+-----+
+    // With Base 2, relative index 0 selects foo2 (absolute index 1), while
+    // post-base indices 0 and 1 select foo3 and foo4 (absolute indices 2 and 3).
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.5
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.6
 
     #[test]
     fn decode_post_base_indexed() {
@@ -1204,8 +1198,8 @@ mod tests {
     #[test]
     fn decode_post_base_name_ref_header_field() {
         let mut buf = vec![];
-        // Base 2 and post-base index 0 refer to absolute entry 3. The Required
-        // Insert Count must cover that entry.
+        // Base 2 and post-base index 0 refer to the third insertion, whose
+        // absolute index is 2. The Required Insert Count must cover it.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.5
         HeaderPrefix::new(3, 2, 4, TABLE_SIZE).encode(&mut buf);
@@ -1222,8 +1216,8 @@ mod tests {
     #[test]
     fn reject_post_base_name_ref_past_required_insert_count() {
         let mut buf = vec![];
-        // Required Insert Count 2 does not cover absolute entry 3, which is
-        // selected by post-base index 0 from Base 2.
+        // Required Insert Count 2 does not cover the third insertion (absolute
+        // index 2), which post-base index 0 selects from Base 2.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.5
         HeaderPrefix::new(2, 2, 4, TABLE_SIZE).encode(&mut buf);
@@ -1310,17 +1304,9 @@ mod tests {
         );
     }
 
-    // Largest Reference = 4
-    //  |            Base Index = 0
-    //  |                |
-    // foo4 foo3  foo2  foo1
-    // +---+-----+-----+-----+
-    // | 4 |  3  |  2  |  1  |  Absolute Index
-    // +---+-----+-----+-----+
-    //                          Relative Index
-    // +---+-----+-----+-----+
-    // | 2 |   2 |  1  |  0  |  Post-Base Index
-    // +---+-----+-----+-----+
+    // With Base 0, post-base indices 0 through 3 select foo1 through foo4,
+    // whose absolute indices are 0 through 3.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.6
 
     #[test]
     fn decode_single_pass_encoded() {

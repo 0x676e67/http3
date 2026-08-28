@@ -163,9 +163,11 @@ mod test {
     }
 
     #[test]
-    fn allow_62_bit() {
-        // This is the maximum value that can be encoded in with a flag size of 7 bits
-        // The value is requires more than 62 bits so the spec is fulfilled
+    fn qpack_integer_can_exceed_quic_varint_range() {
+        // QPACK prefixed integers are not capped at QUIC's 62-bit variable
+        // integer limit. The decoder accepts values that fit its u64 storage.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.1.1
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4
         let buf = vec![3, 255, 255, 255, 255, 255, 255, 255, 255, 127];
         let mut read = Cursor::new(&buf);
         let (flag, value) = super::decode(1, &mut read).expect("Value is allowed to be parsed");

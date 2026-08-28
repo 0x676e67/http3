@@ -1,72 +1,70 @@
 /*
- * https://www.rfc-editor.org/rfc/rfc9204.html#name-absolute-indexing
- * https://www.rfc-editor.org/rfc/rfc9204.html#name-relative-indexing
- * https://www.rfc-editor.org/rfc/rfc9204.html#name-post-base-indexing
- */
-
-/*
- *  # Virtually infinite address space mapper.
+ * Maps QPACK's growing insertion sequence onto positions in the retained
+ * dynamic-table window.
  *
- *  It can be described as an infinitive growable list, with a visibility
- *  window that can only move in the direction of insertion.
+ * This mapper uses three coordinate spaces. Internal insertion numbers start
+ * at 1, RFC absolute indices start at 0, and container positions start at 0
+ * within the retained window. Insertion number N therefore has RFC absolute
+ * index N - 1.
  *
- *  Origin          Visible window
- *  /\         /===========^===========\
- *  ++++-------+ - + - + - + - + - + - +
- *  ||||       |   |   |   |   |   |   |  ==> Grow direction
- *  ++++-------+ - + - + - + - + - + - +
- *  \================v==================/
- *           Full Virtual Space
+ * The retained window moves only toward later insertions:
  *
+ * Origin                 Retained window                 Next insertion
+ *   |                           |                              |
+ *   v                           v                              v
+ * +-----------------------------+==============================+--->
+ * | dropped entries             | dynamic-table entries        |  Growth
+ * +-----------------------------+==============================+--->
+ *                               ^                              ^
+ *                        dropping point                 insertion point
  *
- *  QPACK indexing is 1-based for absolute index, and 0-based for relative's.
- *  Container (ex: list) indexing is 0-based.
+ * `inserted` is the lifetime insertion count, `dropped` is the number of
+ * entries removed from the front, and `delta = inserted - dropped` is the
+ * number of retained entries.
  *
+ * After 21 insertions and 15 drops, six entries remain:
  *
- *  # Basics
+ * Oldest retained                                  Newest retained
+ *       |                                                |
+ *       v                                                v
+ * +------+------+------+------+------+------+
+ * |  16  |  17  |  18  |  19  |  20  |  21  | Internal insertion number
+ * +------+------+------+------+------+------+
+ * |  15  |  16  |  17  |  18  |  19  |  20  | RFC absolute index
+ * +------+------+------+------+------+------+
+ * |   0  |   1  |   2  |   3  |   4  |   5  | Container position
+ * +------+------+------+------+------+------+
+ * |   5  |   4  |   3  |   2  |   1  |   0  | Encoder-stream relative index
+ * +------+------+------+------+------+------+
  *
- *  inserted: number of insertion
- *  dropped : number of drop
- *  delta   : count of available elements
+ * Field-line references use Base instead of the current insertion point. For
+ * Base 17, relative index 0 selects absolute index 16, while post-base index 0
+ * selects absolute index 17:
  *
- *  abs: absolute index
- *  rel: relative index
- *  pos: real index in memory container
- *  pst: post-base relative index (only with base index)
+ * Base 17 separates the second and third columns below:
+ * +------+------+------+------+------+------+
+ * |  16  |  17  |  18  |  19  |  20  |  21  | Internal insertion number
+ * +------+------+------+------+------+------+
+ * |  15  |  16  |  17  |  18  |  19  |  20  | RFC absolute index
+ * +------+------+------+------+------+------+
+ * |   1  |   0  |  --  |  --  |  --  |  --  | Field-line relative index
+ * +------+------+------+------+------+------+
+ * |  --  |  --  |   0  |   1  |   2  |   3  | Post-base index
+ * +------+------+------+------+------+------+
+ * |   0  |   1  |   2  |   3  |   4  |   5  | Container position
+ * +------+------+------+------+------+------+
  *
- *    first      oldest              latest
- *    element    insertion           insertion
- *    (not       available           available
- *    available) |                   |
- *    |          |                   |
- *    v          v                   v
- *  + - +------+ - + - + - + - + - + - +  inserted: 21
- *  | a |      | p | q | r | s | t | u |  dropped: 15
- *  + - +------+ - + - + - + - + - + - +  delta: 21 - 15: 6 ^          ^                   ^ | |
- *    |
- * abs:-      abs:16              abs:21
- * rel:-      rel:5               rel:0
- * pos:-      pos:0               pos:6
+ * The field-line formulas are `absolute = Base - index - 1` for a relative
+ * reference and `absolute = Base + index` for a post-base reference.
  *
- *
- * # Base index
- * A base index can arbitrary shift the relative index.
- * The base index itself is an absolute index.
- *
- *                       base index: 17
- *                       |
- *                       v
- *  + - +------+ - + - + - + - + - + - +  inserted: 21
- *  | a |      | p | q | r | s | t | u |  dropped: 15
- *  + - +------+ - + - + - + - + - + - +  delta: 21 - 15: 6 ^          ^       ^           ^ | |
- *    |           |
- * abs:-      abs:16  abs:18      abs:21
- * rel:-      rel:2   rel:0       rel:-
- * pst:-      pst:-   pst:-       pst:2
- * pos:-      pos:0   pos:2       pos:6
+ * https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.4
+ * https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.5
+ * https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.6
+ * https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.2
  */
 
 pub type RelativeIndex = usize;
+/// Internal one-based insertion number, equal to the RFC absolute index plus one.
 pub type AbsoluteIndex = usize;
 
 #[derive(Debug, PartialEq)]
@@ -94,7 +92,7 @@ impl VirtualAddressSpace {
         }
     }
 
-    /// Checks whether another absolute index can be represented locally.
+    /// Checks whether another insertion can be represented locally.
     ///
     /// QPACK does not bound the lifetime Total Number of Inserts. This
     /// implementation accepts it through `usize::MAX` and rejects the next
@@ -269,14 +267,20 @@ mod tests {
     #[test]
     fn test_post_base_index() {
         /*
-         * Base index: D
-         * Target value: B
+         * No entries have been dropped, so RFC absolute indices and container
+         * positions are equal. Base 4 splits the two field-line index spaces:
          *
-         * VAS: ]GFEDCBA]
-         * abs:  1234567
-         * rel:  3210---
-         * pst:  ----012
-         * pos:  0123456
+         * Base 4 is the divider shown below:
+         *
+         * Internal insertion number: 1 2 3 4 | 5 6 7
+         * RFC absolute index:         0 1 2 3 | 4 5 6
+         * Field-line relative index: 3 2 1 0 | - - -
+         * Post-base index:            - - - - | 0 1 2
+         * Container position:         0 1 2 3 | 4 5 6
+         *
+         * Post-base index 1 therefore resolves to absolute index 5 and
+         * container position 5.
+         * https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.6
          */
         let mut vas = VirtualAddressSpace::default();
         (0..7).for_each(|_| {
@@ -284,6 +288,33 @@ mod tests {
         });
 
         assert_eq!(vas.post_base(4, 1), Ok(5));
+    }
+
+    #[test]
+    fn documented_index_spaces_match_mapper() {
+        let mut vas = VirtualAddressSpace::default();
+        for _ in 0..21 {
+            vas.add().unwrap();
+        }
+        for _ in 0..15 {
+            vas.drop().unwrap();
+        }
+
+        assert_eq!(vas.total_inserted(), 21);
+        assert_eq!(vas.dropped, 15);
+        assert_eq!(vas.delta, 6);
+        assert_eq!(vas.index(0), Ok(16));
+        assert_eq!(vas.index(5), Ok(21));
+        assert!(vas.evicted(15));
+        assert!(!vas.evicted(16));
+        assert_eq!(vas.relative(0), Ok(5));
+        assert_eq!(vas.relative(5), Ok(0));
+        assert_eq!(vas.relative_base(17, 0), Ok(1));
+        assert_eq!(vas.relative_base(17, 1), Ok(0));
+        assert_eq!(vas.relative_base(17, 2), Err(Error::RelativeIndex(2)));
+        assert_eq!(vas.post_base(17, 0), Ok(2));
+        assert_eq!(vas.post_base(17, 3), Ok(5));
+        assert_eq!(vas.post_base(17, 4), Err(Error::PostbaseIndex(4)));
     }
 
     #[test]

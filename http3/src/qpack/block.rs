@@ -3,12 +3,14 @@ use bytes::{Buf, BufMut};
 use super::{parse_error::ParseError, prefix_int, prefix_string};
 
 // 4.5. Field Line Representations
-// Single header field line. These representations reference the static table or
-// the dynamic table in a particular state, but do not modify that state.
+// Each variant represents one field line. These representations reference the
+// static table or the dynamic table in a particular state, but do not modify it.
+// https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5
 pub enum HeaderBlockField {
     // 4.5.2. Indexed Field Line
     // Entry in the static table, or in the dynamic table with an absolute index
     // less than the value of the Base.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.2
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 1 | T |      Index (6+)       |
@@ -17,14 +19,16 @@ pub enum HeaderBlockField {
     // 4.5.3. Indexed Field Line With Post-Base Index
     // Entry in the dynamic table with an absolute index greater than or equal
     // to the value of the Base.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.3
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 0 | 0 | 0 | 1 |  Index (4+)   |
     // +---+---+---+---+---------------+
     IndexedWithPostBase,
     // 4.5.4. Literal Field Line With Name Reference
-    // Entry in the dynamic table with an absolute index greater than or equal
-    // to the value of the Base.
+    // The name comes from the static table or from a dynamic entry before Base;
+    // a dynamic Name Index is relative to Base.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.4
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 0 | 1 | N | T |Name Index (4+)|
@@ -35,8 +39,9 @@ pub enum HeaderBlockField {
     // +-------------------------------+
     LiteralWithNameRef,
     // 4.5.5. Literal Field Line With Post-Base Name Reference
-    // The field name matches a name of an entry in the static table, or in the
-    // dynamic table with an absolute index less than the value of the Base.
+    // The name comes from a dynamic entry at or after Base, and Name Index uses
+    // the post-base index space.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.5
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 0 | 0 | 0 | 0 | N |NameIdx(3+)|
@@ -48,6 +53,7 @@ pub enum HeaderBlockField {
     LiteralWithPostBaseNameRef,
     // 4.5.6. Literal Field Line With Literal Name
     // Field name and field value are encoded as string literals.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.6
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 0 | 0 | 1 | N | H |NameLen(3+)|
