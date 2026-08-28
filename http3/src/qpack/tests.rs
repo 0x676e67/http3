@@ -8,11 +8,13 @@ use std::{
 };
 
 use crate::{
+    proto::headers::Header,
     qpack::{
         BlockedStreamRegistry, Decoded, DecoderError, HeaderField, QpackDecoder, QpackEvent,
+        block::{HeaderPrefix, Literal, LiteralWithNameRef, LiteralWithPostBaseNameRef},
         decoder::Decoder,
         dynamic::DynamicTable,
-        encoder::{Encoder, set_dynamic_table_size},
+        encoder::{Encoder, encode_stateless, set_dynamic_table_size},
     },
     quic::StreamId,
 };
@@ -324,4 +326,93 @@ fn codec_table_full() {
 
     let mut dec_cur = Cursor::new(&mut dec_buf);
     encoder.on_decoder_recv(&mut dec_cur).unwrap();
+}
+
+fn forward_stateless(fields: Vec<HeaderField>) -> Cursor<Vec<u8>> {
+    let headers = Header::try_from(fields).unwrap();
+    let mut encoded = Vec::new();
+    encode_stateless(&mut encoded, headers).unwrap();
+    let mut encoded = Cursor::new(encoded);
+    HeaderPrefix::decode(&mut encoded).unwrap();
+    encoded
+}
+
+#[test]
+fn forwarded_never_indexed_static_name_reference_remains_literal() {
+    let mut encoded = Vec::new();
+    HeaderPrefix::new(0, 0, 0, 0).encode(&mut encoded);
+    LiteralWithNameRef::new_static(17, "GET")
+        .with_never_indexed()
+        .encode(&mut encoded)
+        .unwrap();
+
+    let decoded = crate::qpack::decode_stateless(&mut Cursor::new(encoded), u64::MAX).unwrap();
+    assert!(decoded.fields[0].is_sensitive());
+
+    assert_eq!(
+        LiteralWithNameRef::decode(&mut forward_stateless(decoded.fields)),
+        Ok(LiteralWithNameRef::new_static(15, "GET").with_never_indexed())
+    );
+}
+
+#[test]
+fn forwarded_never_indexed_dynamic_name_reference_remains_literal() {
+    let mut table = DynamicTable::new();
+    table.set_max_size(TABLE_SIZE).unwrap();
+    table.put(HeaderField::new("x-private", "old")).unwrap();
+    let decoder = Decoder::from(table);
+    let mut encoded = Vec::new();
+    HeaderPrefix::new(1, 1, 1, TABLE_SIZE).encode(&mut encoded);
+    LiteralWithNameRef::new_dynamic(0, "secret")
+        .with_never_indexed()
+        .encode(&mut encoded)
+        .unwrap();
+
+    let decoded = decoder.decode_header(&mut Cursor::new(encoded)).unwrap();
+    assert!(decoded.fields[0].is_sensitive());
+
+    assert_eq!(
+        Literal::decode(&mut forward_stateless(decoded.fields)),
+        Ok(Literal::new("x-private", "secret").with_never_indexed())
+    );
+}
+
+#[test]
+fn forwarded_never_indexed_literal_name_remains_literal() {
+    let mut encoded = Vec::new();
+    HeaderPrefix::new(0, 0, 0, 0).encode(&mut encoded);
+    Literal::new("x-private", "secret")
+        .with_never_indexed()
+        .encode(&mut encoded)
+        .unwrap();
+
+    let decoded = crate::qpack::decode_stateless(&mut Cursor::new(encoded), u64::MAX).unwrap();
+    assert!(decoded.fields[0].is_sensitive());
+
+    assert_eq!(
+        Literal::decode(&mut forward_stateless(decoded.fields)),
+        Ok(Literal::new("x-private", "secret").with_never_indexed())
+    );
+}
+
+#[test]
+fn forwarded_never_indexed_post_base_name_reference_remains_literal() {
+    let mut table = DynamicTable::new();
+    table.set_max_size(TABLE_SIZE).unwrap();
+    table.put(HeaderField::new("x-private", "old")).unwrap();
+    let decoder = Decoder::from(table);
+    let mut encoded = Vec::new();
+    HeaderPrefix::new(1, 0, 1, TABLE_SIZE).encode(&mut encoded);
+    LiteralWithPostBaseNameRef::new(0, "secret")
+        .with_never_indexed()
+        .encode(&mut encoded)
+        .unwrap();
+
+    let decoded = decoder.decode_header(&mut Cursor::new(encoded)).unwrap();
+    assert!(decoded.fields[0].is_sensitive());
+
+    assert_eq!(
+        Literal::decode(&mut forward_stateless(decoded.fields)),
+        Ok(Literal::new("x-private", "secret").with_never_indexed())
+    );
 }

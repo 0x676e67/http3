@@ -147,6 +147,10 @@ impl Encoder {
         encoder: &mut W,
         field: &HeaderField,
     ) -> Result<Option<usize>, EncoderError> {
+        if field.is_sensitive() {
+            return Self::encode_sensitive_field(table, block, field);
+        }
+
         if let Some(index) = StaticTable::find(field) {
             Indexed::Static(index).encode(block);
             return Ok(None);
@@ -212,6 +216,43 @@ impl Encoder {
         };
         Ok(reference)
     }
+
+    fn encode_sensitive_field(
+        table: &mut DynamicTableEncoder,
+        block: &mut Vec<u8>,
+        field: &HeaderField,
+    ) -> Result<Option<usize>, EncoderError> {
+        // The N bit forbids an indexed field line and dynamic-table insertion.
+        // A name reference is still a literal representation and can be used.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.4
+        let reference = match table.find_name(&field.name) {
+            DynamicLookupResult::Static(index) => {
+                LiteralWithNameRef::new_static(index, field.value.clone())
+                    .with_never_indexed()
+                    .encode(block)?;
+                None
+            }
+            DynamicLookupResult::Relative { index, absolute } => {
+                LiteralWithNameRef::new_dynamic(index, field.value.clone())
+                    .with_never_indexed()
+                    .encode(block)?;
+                Some(absolute)
+            }
+            DynamicLookupResult::PostBase { index, absolute } => {
+                LiteralWithPostBaseNameRef::new(index, field.value.clone())
+                    .with_never_indexed()
+                    .encode(block)?;
+                Some(absolute)
+            }
+            DynamicLookupResult::NotFound => {
+                Literal::new(field.name.clone(), field.value.clone())
+                    .with_never_indexed()
+                    .encode(block)?;
+                None
+            }
+        };
+        Ok(reference)
+    }
 }
 
 impl Default for Encoder {
@@ -234,7 +275,17 @@ where
     for field in fields {
         let field = field.as_ref();
 
-        if let Some(index) = StaticTable::find(field) {
+        if field.is_sensitive() {
+            if let Some(index) = StaticTable::find_name(&field.name) {
+                LiteralWithNameRef::new_static(index, field.value.clone())
+                    .with_never_indexed()
+                    .encode(block)?;
+            } else {
+                Literal::new(field.name.clone(), field.value.clone())
+                    .with_never_indexed()
+                    .encode(block)?;
+            }
+        } else if let Some(index) = StaticTable::find(field) {
             Indexed::Static(index).encode(block);
         } else if let Some(index) = StaticTable::find_name(&field.name) {
             LiteralWithNameRef::new_static(index, field.value.clone()).encode(block)?;
@@ -420,6 +471,81 @@ mod tests {
             assert_eq!(Indexed::decode(&mut b), Ok(Indexed::Static(17)));
             assert_eq!(e.get_ref().len(), 0);
         });
+    }
+
+    #[test]
+    fn dynamic_encoder_keeps_sensitive_static_field_literal() {
+        let mut encoder = Encoder::default();
+        let field = HeaderField::new(":method", "GET").with_sensitive(true);
+        let mut block = Vec::new();
+        let mut encoder_stream = Vec::new();
+
+        assert_eq!(
+            encoder.encode(0, &mut block, &mut encoder_stream, [field]),
+            Ok(0)
+        );
+        assert!(encoder_stream.is_empty());
+
+        let mut block = Cursor::new(block);
+        HeaderPrefix::decode(&mut block).unwrap();
+        assert_eq!(
+            LiteralWithNameRef::decode(&mut block),
+            Ok(LiteralWithNameRef::new_static(15, "GET").with_never_indexed())
+        );
+    }
+
+    #[test]
+    fn dynamic_encoder_uses_sensitive_dynamic_name_without_inserting() {
+        let mut table = build_table();
+        table.put(HeaderField::new("x-private", "old")).unwrap();
+        let mut encoder = Encoder::from(table);
+        let field = HeaderField::new("x-private", "secret").with_sensitive(true);
+        let mut block = Vec::new();
+        let mut encoder_stream = Vec::new();
+
+        assert_eq!(
+            encoder.encode(0, &mut block, &mut encoder_stream, [field]),
+            Ok(1)
+        );
+        assert!(encoder_stream.is_empty());
+
+        let mut block = Cursor::new(block);
+        HeaderPrefix::decode(&mut block).unwrap();
+        assert_eq!(
+            LiteralWithNameRef::decode(&mut block),
+            Ok(LiteralWithNameRef::new_dynamic(0, "secret").with_never_indexed())
+        );
+    }
+
+    #[test]
+    fn dynamic_encoder_uses_sensitive_post_base_name_without_inserting() {
+        let mut table = DynamicTable::new();
+        table.set_max_size(TABLE_SIZE).unwrap();
+        table.set_max_blocked(1).unwrap();
+        let mut encoder = Encoder::from(table);
+        let mut block = Vec::new();
+        let mut encoder_stream = Vec::new();
+
+        assert_eq!(
+            encoder.encode(
+                0,
+                &mut block,
+                &mut encoder_stream,
+                [
+                    HeaderField::new("x-private", "old"),
+                    HeaderField::new("x-private", "secret").with_sensitive(true),
+                ],
+            ),
+            Ok(1)
+        );
+
+        let mut block = Cursor::new(block);
+        HeaderPrefix::decode(&mut block).unwrap();
+        IndexedWithPostBase::decode(&mut block).unwrap();
+        assert_eq!(
+            LiteralWithPostBaseNameRef::decode(&mut block),
+            Ok(LiteralWithPostBaseNameRef::new(0, "secret").with_never_indexed())
+        );
     }
 
     #[test]

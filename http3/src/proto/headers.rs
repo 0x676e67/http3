@@ -58,6 +58,39 @@ pub struct PseudoOrderBuilder {
     mask: u8,
 }
 
+/// Preserves QPACK's never-indexed marker for pseudo-header fields.
+///
+/// Decoded regular fields carry this information through
+/// [`HeaderValue::is_sensitive`]. Pseudo-header fields have no corresponding
+/// `HeaderValue`, so this value is stored in [`http::Extensions`] when a
+/// request or response is received and read again when it is forwarded.
+///
+/// See [RFC 9204 Section 7.1.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.1.3).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PseudoHeaderSensitivity {
+    mask: u8,
+}
+
+impl PseudoHeaderSensitivity {
+    /// Marks a pseudo-header field as sensitive or non-sensitive.
+    pub fn set_sensitive(&mut self, id: PseudoId, sensitive: bool) {
+        if sensitive {
+            self.mask |= id.mask_id();
+        } else {
+            self.mask &= !id.mask_id();
+        }
+    }
+
+    /// Returns whether the pseudo-header field must remain never-indexed.
+    pub fn is_sensitive(&self, id: PseudoId) -> bool {
+        self.mask & id.mask_id() != 0
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.mask == 0
+    }
+}
+
 // ===== impl PseudoOrder =====
 
 impl PseudoOrder {
@@ -146,9 +179,9 @@ impl Header {
         }
     }
 
-    pub fn response(status: StatusCode, fields: HeaderMap) -> Self {
+    pub fn response(status: StatusCode, fields: HeaderMap, ext: Extensions) -> Self {
         Self {
-            pseudo: Pseudo::response(status),
+            pseudo: Pseudo::response(status, ext),
             fields,
         }
     }
@@ -165,7 +198,16 @@ impl Header {
 
     pub fn into_request_parts(
         self,
-    ) -> Result<(Method, Uri, Option<Protocol>, HeaderMap), HeaderError> {
+    ) -> Result<
+        (
+            Method,
+            Uri,
+            Option<Protocol>,
+            HeaderMap,
+            PseudoHeaderSensitivity,
+        ),
+        HeaderError,
+    > {
         let mut uri = Uri::builder();
 
         if let Some(path) = self.pseudo.path {
@@ -208,10 +250,15 @@ impl Header {
             uri.build().map_err(HeaderError::InvalidRequest)?,
             self.pseudo.protocol,
             self.fields,
+            PseudoHeaderSensitivity {
+                mask: self.pseudo.sensitive,
+            },
         ))
     }
 
-    pub fn into_response_parts(self) -> Result<(StatusCode, HeaderMap), HeaderError> {
+    pub fn into_response_parts(
+        self,
+    ) -> Result<(StatusCode, HeaderMap, PseudoHeaderSensitivity), HeaderError> {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.2
         //= type=implication
         //# For responses, a single ":status" pseudo-header field is defined that
@@ -221,6 +268,9 @@ impl Header {
         Ok((
             self.pseudo.status.ok_or(HeaderError::MissingStatus)?,
             self.fields,
+            PseudoHeaderSensitivity {
+                mask: self.pseudo.sensitive,
+            },
         ))
     }
 
@@ -277,32 +327,50 @@ impl Iterator for HeaderIter {
                 match pseudo_type {
                     PseudoId::Method => {
                         if let Some(method) = pseudo.method.take() {
-                            return Some((":method", method.as_str()).into());
+                            return Some(
+                                HeaderField::from((":method", method.as_str()))
+                                    .with_sensitive(pseudo.is_sensitive(PseudoId::Method)),
+                            );
                         }
                     }
                     PseudoId::Scheme => {
                         if let Some(scheme) = pseudo.scheme.take() {
-                            return Some((":scheme", scheme.as_str().as_bytes()).into());
+                            return Some(
+                                HeaderField::from((":scheme", scheme.as_str().as_bytes()))
+                                    .with_sensitive(pseudo.is_sensitive(PseudoId::Scheme)),
+                            );
                         }
                     }
                     PseudoId::Authority => {
                         if let Some(authority) = pseudo.authority.take() {
-                            return Some((":authority", authority.as_str().as_bytes()).into());
+                            return Some(
+                                HeaderField::from((":authority", authority.as_str().as_bytes()))
+                                    .with_sensitive(pseudo.is_sensitive(PseudoId::Authority)),
+                            );
                         }
                     }
                     PseudoId::Path => {
                         if let Some(path) = pseudo.path.take() {
-                            return Some((":path", path.as_str().as_bytes()).into());
+                            return Some(
+                                HeaderField::from((":path", path.as_str().as_bytes()))
+                                    .with_sensitive(pseudo.is_sensitive(PseudoId::Path)),
+                            );
                         }
                     }
                     PseudoId::Status => {
                         if let Some(status) = pseudo.status.take() {
-                            return Some((":status", status.as_str()).into());
+                            return Some(
+                                HeaderField::from((":status", status.as_str()))
+                                    .with_sensitive(pseudo.is_sensitive(PseudoId::Status)),
+                            );
                         }
                     }
                     PseudoId::Protocol => {
                         if let Some(protocol) = pseudo.protocol.take() {
-                            return Some((":protocol", protocol.as_str().as_bytes()).into());
+                            return Some(
+                                HeaderField::from((":protocol", protocol.as_str().as_bytes()))
+                                    .with_sensitive(pseudo.is_sensitive(PseudoId::Protocol)),
+                            );
                         }
                     }
                 }
@@ -316,7 +384,9 @@ impl Iterator for HeaderIter {
                 self.last_header_name = Some(new);
             }
             if let (Some(n), v) = (&self.last_header_name, header_value) {
-                return Some((n.as_str(), v.as_bytes()).into());
+                return Some(
+                    HeaderField::from((n.as_str(), v.as_bytes())).with_sensitive(v.is_sensitive()),
+                );
             }
         }
 
@@ -331,34 +401,42 @@ impl TryFrom<Vec<HeaderField>> for Header {
         let mut pseudo = Pseudo::default();
 
         for field in headers.into_iter() {
+            let sensitive = field.is_sensitive();
             let (name, value) = field.into_inner();
             match Field::parse(name, value)? {
                 Field::Method(m) => {
                     pseudo.method = Some(m);
                     pseudo.len += 1;
+                    pseudo.set_sensitive(PseudoId::Method, sensitive);
                 }
                 Field::Scheme(s) => {
                     pseudo.scheme = Some(s);
                     pseudo.len += 1;
+                    pseudo.set_sensitive(PseudoId::Scheme, sensitive);
                 }
                 Field::Authority(a) => {
                     pseudo.authority = Some(a);
                     pseudo.len += 1;
+                    pseudo.set_sensitive(PseudoId::Authority, sensitive);
                 }
                 Field::Path(p) => {
                     pseudo.path = Some(p);
                     pseudo.len += 1;
+                    pseudo.set_sensitive(PseudoId::Path, sensitive);
                 }
                 Field::Status(s) => {
                     pseudo.status = Some(s);
                     pseudo.len += 1;
+                    pseudo.set_sensitive(PseudoId::Status, sensitive);
                 }
-                Field::Header((n, v)) => {
+                Field::Header((n, mut v)) => {
+                    v.set_sensitive(sensitive);
                     fields.append(n, v);
                 }
                 Field::Protocol(p) => {
                     pseudo.protocol = Some(p);
                     pseudo.len += 1;
+                    pseudo.set_sensitive(PseudoId::Protocol, sensitive);
                 }
             }
         }
@@ -474,6 +552,10 @@ struct Pseudo {
     // Pseudo-header field order
     order: PseudoOrder,
 
+    // QPACK never-indexed bits for pseudo-header fields. Regular fields carry
+    // the same metadata through `HeaderValue::is_sensitive`.
+    sensitive: u8,
+
     len: usize,
 }
 
@@ -535,6 +617,11 @@ impl Pseudo {
         //# CONNECT request; see Section 4.4.
         // Extract pseudo-header order from extensions, if provided.
         let order = ext.get::<PseudoOrder>().cloned().unwrap_or_default();
+        let sensitive = ext
+            .get::<PseudoHeaderSensitivity>()
+            .copied()
+            .unwrap_or_default()
+            .mask;
 
         Self {
             method: Some(method),
@@ -544,11 +631,12 @@ impl Pseudo {
             status: None,
             protocol,
             order,
+            sensitive,
             len,
         }
     }
 
-    fn response(status: StatusCode) -> Self {
+    fn response(status: StatusCode, ext: Extensions) -> Self {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
         //= type=implication
         //# Pseudo-header fields defined for requests MUST NOT appear
@@ -562,12 +650,29 @@ impl Pseudo {
             status: Some(status),
             protocol: None,
             order: Default::default(),
+            sensitive: ext
+                .get::<PseudoHeaderSensitivity>()
+                .copied()
+                .unwrap_or_default()
+                .mask,
             len: 1,
         }
     }
 
     fn len(&self) -> usize {
         self.len
+    }
+
+    fn set_sensitive(&mut self, id: PseudoId, sensitive: bool) {
+        if sensitive {
+            self.sensitive |= id.mask_id();
+        } else {
+            self.sensitive &= !id.mask_id();
+        }
+    }
+
+    fn is_sensitive(&self, id: PseudoId) -> bool {
+        self.sensitive & id.mask_id() != 0
     }
 }
 
@@ -758,11 +863,13 @@ mod tests {
             vec![
                 HeaderField {
                     name: std::borrow::Cow::Borrowed(b"set-cookie"),
-                    value: std::borrow::Cow::Borrowed(b"foo=foo")
+                    value: std::borrow::Cow::Borrowed(b"foo=foo"),
+                    sensitive: false,
                 },
                 HeaderField {
                     name: std::borrow::Cow::Borrowed(b"set-cookie"),
-                    value: std::borrow::Cow::Borrowed(b"bar=bar")
+                    value: std::borrow::Cow::Borrowed(b"bar=bar"),
+                    sensitive: false,
                 }
             ]
         );
@@ -773,9 +880,55 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![HeaderField {
                 name: std::borrow::Cow::Borrowed(b"other-header"),
-                value: std::borrow::Cow::Borrowed(b"other-header-value")
+                value: std::borrow::Cow::Borrowed(b"other-header-value"),
+                sensitive: false,
             },]
         );
+    }
+
+    #[test]
+    fn request_pseudo_sensitivity_survives_http_parts() {
+        let headers = Header::try_from(vec![
+            HeaderField::from((b":method", b"GET")).with_sensitive(true),
+            HeaderField::from((b":scheme", b"https")),
+            HeaderField::from((b":authority", b"example.com")),
+            HeaderField::from((b":path", b"/")),
+        ])
+        .unwrap();
+        let (method, uri, _protocol, fields, sensitivity) = headers.into_request_parts().unwrap();
+
+        assert!(sensitivity.is_sensitive(PseudoId::Method));
+
+        let mut extensions = Extensions::new();
+        extensions.insert(sensitivity);
+        let forwarded = Header::request(method, uri, fields, extensions).unwrap();
+        let method = forwarded
+            .into_iter()
+            .find(|field| field.name.as_ref() == b":method")
+            .unwrap();
+
+        assert!(method.is_sensitive());
+    }
+
+    #[test]
+    fn response_pseudo_sensitivity_survives_http_parts() {
+        let headers = Header::try_from(vec![
+            HeaderField::from((b":status", b"200")).with_sensitive(true),
+        ])
+        .unwrap();
+        let (status, fields, sensitivity) = headers.into_response_parts().unwrap();
+
+        assert!(sensitivity.is_sensitive(PseudoId::Status));
+
+        let mut extensions = Extensions::new();
+        extensions.insert(sensitivity);
+        let forwarded = Header::response(status, fields, extensions);
+        let status = forwarded
+            .into_iter()
+            .find(|field| field.name.as_ref() == b":status")
+            .unwrap();
+
+        assert!(status.is_sensitive());
     }
 
     #[test]

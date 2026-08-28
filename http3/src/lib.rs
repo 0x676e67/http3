@@ -57,7 +57,7 @@ mod webtransport;
 
 pub use proto::{
     frame::SettingId,
-    headers::{PseudoId, PseudoOrder, PseudoOrderBuilder},
+    headers::{PseudoHeaderSensitivity, PseudoId, PseudoOrder, PseudoOrderBuilder},
 };
 
 #[cfg(test)]
