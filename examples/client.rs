@@ -3,10 +3,12 @@ use std::{path::PathBuf, sync::Arc};
 use bytes::{Buf, Bytes};
 use futures::future;
 use http3::error::{Code, ConnectionError, StreamError};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::WebPkiSupportedAlgorithms;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls::{
+    DigitallySignedStruct, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::WebPkiSupportedAlgorithms,
+    pki_types::{CertificateDer, ServerName, UnixTime},
+};
 use rustls_native_certs::CertificateResult;
 use structopt::StructOpt;
 use tracing::{Level, error, info};

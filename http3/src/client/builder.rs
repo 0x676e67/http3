@@ -117,10 +117,12 @@ impl Builder {
     /// explicitly sends the setting with value `0`.
     ///
     /// HTTP/3 encodes this setting as a QUIC variable-length integer, so values
-    /// can range up to `2^62 - 1`. Set no more table memory than the decoder can
-    /// hold for this connection.
+    /// can range up to `2^62 - 1`. The value must also fit the target's address
+    /// space; connection setup rejects a capacity the decoder cannot represent.
+    /// Set no more table memory than the decoder can hold for this connection.
     ///
-    /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3)
+    /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3),
+    /// [Section 7.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4),
     /// and [RFC 9114, Section 7.2.4](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4).
     pub fn qpack_max_table_capacity<T: Into<Option<u64>>>(&mut self, value: T) -> &mut Self {
         self.config.settings.qpack_max_table_capacity = value.into();
