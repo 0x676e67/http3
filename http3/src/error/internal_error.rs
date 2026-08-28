@@ -60,6 +60,14 @@ impl InternalConnectionError {
                 code: Code::H3_FRAME_ERROR,
                 message: "frame payload that contains additional bytes after the identified fields or a frame payload that terminates before the end of the identified fields".to_string(),
             },
+            FrameProtocolError::ExcessiveLoad { len, limit } => InternalConnectionError {
+                // A peer can declare a field section larger than the local
+                // decode budget. HTTP/3 permits rejecting such load at the
+                // connection boundary.
+                // https://www.rfc-editor.org/rfc/rfc9114.html#section-10.5
+                code: Code::H3_EXCESSIVE_LOAD,
+                message: format!("encoded field section length {len} exceeds local limit {limit}"),
+            },
             }
     }
 }

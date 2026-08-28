@@ -557,6 +557,62 @@ async fn server_rejects_invalid_qpack_encoder_stream_instruction() {
 }
 
 #[tokio::test]
+async fn server_rejects_oversized_qpack_encoder_stream_string() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+    let (done_send, done_recv) = oneshot::channel();
+
+    let client_fut = async {
+        let connection = pair.client_inner().await;
+
+        let mut control_stream = connection.open_uni().await.unwrap();
+        let mut control = BytesMut::new();
+        StreamType::CONTROL.encode(&mut control);
+        Frame::<Bytes>::Settings(Settings::default()).encode(&mut control);
+        control_stream.write_all(&control).await.unwrap();
+
+        let mut encoder_stream = connection.open_uni().await.unwrap();
+        let mut instruction = BytesMut::new();
+        StreamType::ENCODER.encode(&mut instruction);
+        // Insert with Literal Name, followed by an encoded name length of two.
+        // The server's one-byte local decode budget rejects the instruction
+        // before waiting for either payload byte.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4
+        instruction.extend_from_slice(&[0b0100_0010]);
+        encoder_stream.write_all(&instruction).await.unwrap();
+
+        let _ = done_recv.await;
+        drop(encoder_stream);
+        drop(control_stream);
+        drop(connection);
+    };
+
+    let server_fut = async {
+        let conn = server.next().await;
+        let mut builder = server::builder();
+        builder.max_qpack_decode_buffer_size(1);
+        let mut incoming = builder.build(conn).await.unwrap();
+        assert_matches!(
+            incoming.accept().await.map(|_| ()).unwrap_err(),
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::QPACK_ENCODER_STREAM_ERROR,
+                    ..
+                }
+            }
+        );
+        done_send.send(()).unwrap();
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("QPACK encoder-stream string limit was not enforced");
+}
+
+#[tokio::test]
 async fn server_rejects_closed_qpack_encoder_stream() {
     init_tracing();
     let mut pair = Pair::default();
