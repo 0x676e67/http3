@@ -1,93 +1,107 @@
+// Independently implemented from RFC 7541 Appendix B and this crate's encoder codebook.
+// Performance background and license references:
+// https://github.com/hyperium/h2/pull/927
+// https://github.com/hyperium/h2/commit/62f878b218406964952f958462a9cc34f74061e6
+// https://github.com/hyperium/h2/blob/62f878b218406964952f958462a9cc34f74061e6/LICENSE
+
+#[cfg(test)]
 use super::BitWindow;
+use super::encode::HPACK_STRING as ENCODE_TABLE;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
+    #[cfg(test)]
     MissingBits(BitWindow),
+    #[cfg(test)]
     Unhandled(BitWindow, usize),
     Eos,
     InvalidPadding(usize),
 }
 
-#[derive(Clone, Debug)]
-enum DecodeValue {
-    Partial(&'static HuffmanDecoder),
-    Sym(u8),
-}
+#[cfg(test)]
+mod oracle {
+    use super::{BitWindow, Error};
 
-#[derive(Clone, Debug)]
-struct HuffmanDecoder {
-    lookup: usize,
-    table: &'static [DecodeValue],
-    eos: bool,
-}
+    #[derive(Clone, Debug)]
+    enum DecodeValue {
+        Partial(&'static HuffmanDecoder),
+        Sym(u8),
+    }
 
-impl HuffmanDecoder {
-    fn fetch_value(&self, bit_pos: &mut BitWindow, input: &[u8]) -> Option<u32> {
-        match read_bits(input, bit_pos.byte, bit_pos.bit, bit_pos.count) {
-            Ok(value) => Some(value as u32),
-            Err(()) => None,
+    #[derive(Clone, Debug)]
+    struct HuffmanDecoder {
+        lookup: usize,
+        table: &'static [DecodeValue],
+        eos: bool,
+    }
+
+    impl HuffmanDecoder {
+        fn fetch_value(&self, bit_pos: &mut BitWindow, input: &[u8]) -> Option<u32> {
+            match read_bits(input, bit_pos.byte, bit_pos.bit, bit_pos.count) {
+                Ok(value) => Some(value as u32),
+                Err(()) => None,
+            }
+        }
+
+        fn decode_next(&self, bit_pos: &mut BitWindow, input: &[u8]) -> Result<Option<u8>, Error> {
+            if self.eos {
+                return Err(Error::Eos);
+            }
+
+            bit_pos.forwards(self.lookup);
+
+            let value = match self.fetch_value(bit_pos, input) {
+                Some(value) => value as usize,
+                None => return Ok(None),
+            };
+
+            let at_value = match (self.table).get(value) {
+                Some(x) => x,
+                None => return Err(Error::Unhandled(bit_pos.clone(), value)),
+            };
+
+            match at_value {
+                DecodeValue::Sym(x) => Ok(Some(*x)),
+                DecodeValue::Partial(d) => d.decode_next(bit_pos, input),
+            }
         }
     }
 
-    fn decode_next(&self, bit_pos: &mut BitWindow, input: &[u8]) -> Result<Option<u8>, Error> {
-        if self.eos {
-            return Err(Error::Eos);
+    /// Read `len` bits from the `src` slice at the specified position
+    ///
+    /// Never read more than 8 bits at a time. `bit_offset` may be larger than 8.
+    pub(super) fn read_bits(
+        src: &[u8],
+        mut byte_offset: usize,
+        mut bit_offset: usize,
+        len: usize,
+    ) -> Result<u8, ()> {
+        let total_bits = src.len().checked_mul(8).ok_or(())?;
+        let end = byte_offset
+            .checked_mul(8)
+            .and_then(|offset| offset.checked_add(bit_offset))
+            .and_then(|offset| offset.checked_add(len))
+            .ok_or(())?;
+        if len == 0 || len > 8 || total_bits < end {
+            return Err(());
         }
 
-        bit_pos.forwards(self.lookup);
+        // Deal with `bit_offset` > 8
+        byte_offset += bit_offset / 8;
+        bit_offset -= (bit_offset / 8) * 8;
 
-        let value = match self.fetch_value(bit_pos, input) {
-            Some(value) => value as usize,
-            None => return Ok(None),
-        };
-
-        let at_value = match (self.table).get(value) {
-            Some(x) => x,
-            None => return Err(Error::Unhandled(bit_pos.clone(), value)),
-        };
-
-        match at_value {
-            DecodeValue::Sym(x) => Ok(Some(*x)),
-            DecodeValue::Partial(d) => d.decode_next(bit_pos, input),
-        }
-    }
-}
-
-/// Read `len` bits from the `src` slice at the specified position
-///
-/// Never read more than 8 bits at a time. `bit_offset` may be larger than 8.
-fn read_bits(
-    src: &[u8],
-    mut byte_offset: usize,
-    mut bit_offset: usize,
-    len: usize,
-) -> Result<u8, ()> {
-    let total_bits = src.len().checked_mul(8).ok_or(())?;
-    let end = byte_offset
-        .checked_mul(8)
-        .and_then(|offset| offset.checked_add(bit_offset))
-        .and_then(|offset| offset.checked_add(len))
-        .ok_or(())?;
-    if len == 0 || len > 8 || total_bits < end {
-        return Err(());
+        Ok(if bit_offset + len <= 8 {
+            // Read all the bits from a single byte
+            (src[byte_offset] << bit_offset) >> (8 - len)
+        } else {
+            // The range of bits spans over 2 bytes
+            let mut result = (src[byte_offset] as u16) << 8;
+            result |= src[byte_offset + 1] as u16;
+            ((result << bit_offset) >> (16 - len)) as u8
+        })
     }
 
-    // Deal with `bit_offset` > 8
-    byte_offset += bit_offset / 8;
-    bit_offset -= (bit_offset / 8) * 8;
-
-    Ok(if bit_offset + len <= 8 {
-        // Read all the bits from a single byte
-        (src[byte_offset] << bit_offset) >> (8 - len)
-    } else {
-        // The range of bits spans over 2 bytes
-        let mut result = (src[byte_offset] as u16) << 8;
-        result |= src[byte_offset + 1] as u16;
-        ((result << bit_offset) >> (16 - len)) as u8
-    })
-}
-
-macro_rules! bits_decode {
+    macro_rules! bits_decode {
     // general way
     (
         lookup: $count:expr, [
@@ -168,13 +182,13 @@ macro_rules! bits_decode {
     };
 }
 
-static EOF: HuffmanDecoder = HuffmanDecoder {
-    lookup: 0,
-    table: &[],
-    eos: true,
-};
+    static EOF: HuffmanDecoder = HuffmanDecoder {
+        lookup: 0,
+        table: &[],
+        eos: true,
+    };
 
-#[rustfmt::skip]
+    #[rustfmt::skip]
 bits_decode![
     HPACK_STRING => (
         lookup: 5, [ b'0', b'1', b'2', b'a', b'c', b'e', b'i', b'o', b's', b't',
@@ -294,14 +308,350 @@ bits_decode![
     END31_1 => (lookup: 2, [10, 13, 22, => EOF,]),
     ];
 
+    pub struct DecodeIter<'a> {
+        bit_pos: BitWindow,
+        content: &'a [u8],
+        symbol_end: usize,
+        finished: bool,
+    }
+
+    impl<'a> Iterator for DecodeIter<'a> {
+        type Item = Result<u8, Error>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.finished {
+                return None;
+            }
+
+            match HPACK_STRING.decode_next(&mut self.bit_pos, self.content) {
+                Ok(Some(x)) => match self.bit_pos.end() {
+                    Some(end) => {
+                        self.symbol_end = end;
+                        Some(Ok(x))
+                    }
+                    None => {
+                        self.finished = true;
+                        Some(Err(Error::MissingBits(self.bit_pos.clone())))
+                    }
+                },
+                Err(err) => {
+                    self.finished = true;
+                    Some(Err(err))
+                }
+                Ok(None) => {
+                    self.finished = true;
+                    let total_bits = match self.content.len().checked_mul(8) {
+                        Some(total_bits) => total_bits,
+                        None => return Some(Err(Error::MissingBits(self.bit_pos.clone()))),
+                    };
+                    let padding = match total_bits.checked_sub(self.symbol_end) {
+                        Some(padding) => padding,
+                        None => return Some(Err(Error::MissingBits(self.bit_pos.clone()))),
+                    };
+                    if padding == 0 {
+                        return None;
+                    }
+                    // QPACK uses the HPACK Huffman code unchanged. The EOS symbol is
+                    // forbidden in strings, and padding is at most seven one bits.
+                    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.1.2
+                    // https://www.rfc-editor.org/rfc/rfc7541.html#section-5.2
+                    if padding > 7 {
+                        return Some(Err(Error::InvalidPadding(padding)));
+                    }
+
+                    let padding_bits = match read_bits(
+                        self.content,
+                        self.symbol_end / 8,
+                        self.symbol_end % 8,
+                        padding,
+                    ) {
+                        Ok(bits) => bits,
+                        Err(()) => return Some(Err(Error::MissingBits(self.bit_pos.clone()))),
+                    };
+                    let expected = ((1u16 << padding) - 1) as u8;
+                    if padding_bits == expected {
+                        None
+                    } else {
+                        Some(Err(Error::InvalidPadding(padding)))
+                    }
+                }
+            }
+        }
+    }
+
+    pub trait HpackStringDecode {
+        fn hpack_decode(&self) -> DecodeIter<'_>;
+    }
+
+    impl HpackStringDecode for Vec<u8> {
+        fn hpack_decode(&self) -> DecodeIter<'_> {
+            self.as_slice().hpack_decode()
+        }
+    }
+
+    impl HpackStringDecode for [u8] {
+        fn hpack_decode(&self) -> DecodeIter<'_> {
+            DecodeIter {
+                bit_pos: BitWindow::new(),
+                content: self,
+                symbol_end: 0,
+                finished: false,
+            }
+        }
+    }
+
+    pub(super) fn decode(content: &[u8]) -> Result<Vec<u8>, Error> {
+        content.hpack_decode().collect()
+    }
+}
+
+const FAST_BITS: u8 = 10;
+const FAST_TABLE_LEN: usize = 1 << FAST_BITS;
+const TRIE_NODE_COUNT: usize = 256;
+const TRIE_LEAF: u16 = 1 << 15;
+const TRIE_EMPTY: u16 = u16::MAX;
+const EOS_SYMBOL: u16 = 256;
+const EOS_BITS: u32 = (1 << 30) - 1;
+const EOS_BIT_COUNT: usize = 30;
+
+struct DecoderTables {
+    fast: [u16; FAST_TABLE_LEN],
+    trie: [[u16; 2]; TRIE_NODE_COUNT],
+}
+
+static DECODER_TABLES: DecoderTables = build_tables();
+
+const fn code_for(symbol: usize) -> (u32, usize) {
+    if symbol < ENCODE_TABLE.len() {
+        let code = ENCODE_TABLE[symbol];
+        (code.bits, code.bit_count)
+    } else {
+        (EOS_BITS, EOS_BIT_COUNT)
+    }
+}
+
+const fn build_trie() -> [[u16; 2]; TRIE_NODE_COUNT] {
+    let mut trie = [[TRIE_EMPTY; 2]; TRIE_NODE_COUNT];
+    let mut next_node = 1usize;
+    let mut symbol = 0usize;
+
+    while symbol <= ENCODE_TABLE.len() {
+        let (bits, bit_count) = code_for(symbol);
+        let mut remaining = bit_count;
+        let mut node = 0usize;
+
+        while remaining != 0 {
+            remaining -= 1;
+            let branch = ((bits >> remaining) & 1) as usize;
+            if remaining == 0 {
+                assert!(trie[node][branch] == TRIE_EMPTY);
+                trie[node][branch] = TRIE_LEAF | symbol as u16;
+            } else {
+                let edge = trie[node][branch];
+                if edge == TRIE_EMPTY {
+                    assert!(next_node < TRIE_NODE_COUNT);
+                    trie[node][branch] = next_node as u16;
+                    node = next_node;
+                    next_node += 1;
+                } else {
+                    assert!(edge & TRIE_LEAF == 0);
+                    assert!((edge as usize) < TRIE_NODE_COUNT);
+                    node = edge as usize;
+                }
+            }
+        }
+        symbol += 1;
+    }
+
+    assert!(next_node == TRIE_NODE_COUNT);
+    trie
+}
+
+const fn build_tables() -> DecoderTables {
+    let trie = build_trie();
+    let mut fast = [TRIE_EMPTY; FAST_TABLE_LEN];
+    let mut prefix = 0usize;
+
+    while prefix < FAST_TABLE_LEN {
+        let mut node = 0usize;
+        let mut used = 0u8;
+        let mut terminal = false;
+
+        while used < FAST_BITS {
+            let shift = FAST_BITS - used - 1;
+            let branch = (prefix >> shift) & 1;
+            let edge = trie[node][branch];
+            used += 1;
+
+            if edge == TRIE_EMPTY {
+                terminal = true;
+                break;
+            }
+            if edge & TRIE_LEAF != 0 {
+                let symbol = edge & (TRIE_LEAF - 1);
+                if symbol < EOS_SYMBOL {
+                    fast[prefix] = (used as u16) << 8 | symbol;
+                }
+                terminal = true;
+                break;
+            }
+            node = edge as usize;
+        }
+
+        if !terminal {
+            fast[prefix] = TRIE_LEAF | node as u16;
+        }
+        assert!(fast[prefix] != TRIE_EMPTY);
+        prefix += 1;
+    }
+
+    DecoderTables { fast, trie }
+}
+
+enum Decoded {
+    Symbol { symbol: u16, bit_count: u8 },
+    Incomplete,
+}
+
+fn decode_symbol(bits: u64, bit_count: u8) -> Decoded {
+    let (mut node, mut used) = if bit_count >= FAST_BITS {
+        let prefix = (bits >> (64 - FAST_BITS)) as usize;
+        let entry = DECODER_TABLES.fast[prefix];
+        if entry == TRIE_EMPTY {
+            return Decoded::Incomplete;
+        }
+        if entry & TRIE_LEAF == 0 {
+            let encoded_count = entry >> 8;
+            let Ok(encoded_count) = u8::try_from(encoded_count) else {
+                return Decoded::Incomplete;
+            };
+            return Decoded::Symbol {
+                symbol: entry & u16::from(u8::MAX),
+                bit_count: encoded_count,
+            };
+        }
+        (usize::from(entry & (TRIE_LEAF - 1)), FAST_BITS)
+    } else {
+        (0usize, 0u8)
+    };
+
+    while used < bit_count {
+        let shift = 63 - u32::from(used);
+        let branch = ((bits >> shift) & 1) as usize;
+        let edge = DECODER_TABLES.trie[node][branch];
+        used += 1;
+
+        if edge == TRIE_EMPTY {
+            return Decoded::Incomplete;
+        }
+        if edge & TRIE_LEAF != 0 {
+            return Decoded::Symbol {
+                symbol: edge & (TRIE_LEAF - 1),
+                bit_count: used,
+            };
+        }
+        node = usize::from(edge);
+    }
+
+    Decoded::Incomplete
+}
+
 pub struct DecodeIter<'a> {
-    bit_pos: BitWindow,
     content: &'a [u8],
+    byte_pos: usize,
+    bits: u64,
+    bit_count: u8,
+    #[cfg(test)]
     symbol_end: usize,
     finished: bool,
 }
 
-impl<'a> Iterator for DecodeIter<'a> {
+impl DecodeIter<'_> {
+    fn refill(&mut self) {
+        if self.bit_count == 0 {
+            let Some(remaining) = self.content.get(self.byte_pos..) else {
+                return;
+            };
+            if let [a, b, c, d, e, f, g, h, ..] = remaining {
+                self.bits = u64::from_be_bytes([*a, *b, *c, *d, *e, *f, *g, *h]);
+                self.bit_count = 64;
+                self.byte_pos += 8;
+                return;
+            }
+        }
+
+        if self.bit_count <= 32 {
+            let Some(remaining) = self.content.get(self.byte_pos..) else {
+                return;
+            };
+            if let [a, b, c, d, ..] = remaining {
+                let value = u64::from(u32::from_be_bytes([*a, *b, *c, *d]));
+                self.bits |= value << u32::from(32 - self.bit_count);
+                self.bit_count += 32;
+                self.byte_pos += 4;
+            }
+        }
+
+        while self.bit_count < EOS_BIT_COUNT as u8 {
+            let Some(byte) = self.content.get(self.byte_pos).copied() else {
+                break;
+            };
+            self.bits |= u64::from(byte) << u32::from(56 - self.bit_count);
+            self.bit_count += 8;
+            self.byte_pos += 1;
+        }
+    }
+
+    fn consume(&mut self, count: u8) -> bool {
+        if count == 0 || count >= 64 {
+            return false;
+        }
+        let Some(remaining) = self.bit_count.checked_sub(count) else {
+            return false;
+        };
+        self.bits <<= u32::from(count);
+        self.bit_count = remaining;
+        #[cfg(test)]
+        {
+            self.symbol_end = self.symbol_end.saturating_add(usize::from(count));
+        }
+        true
+    }
+
+    fn remaining_bits(&self) -> usize {
+        let Some(unread_bytes) = self.content.len().checked_sub(self.byte_pos) else {
+            return usize::MAX;
+        };
+        let Some(unread_bits) = unread_bytes.checked_mul(8) else {
+            return usize::MAX;
+        };
+        match unread_bits.checked_add(usize::from(self.bit_count)) {
+            Some(remaining) => remaining,
+            None => usize::MAX,
+        }
+    }
+
+    fn finish_tail(&mut self) -> Option<Result<u8, Error>> {
+        self.finished = true;
+        let padding = self.remaining_bits();
+        if padding == 0 {
+            return None;
+        }
+        if padding > 7 {
+            return Some(Err(Error::InvalidPadding(padding)));
+        }
+
+        let shift = 64 - padding;
+        let expected = u64::MAX << shift;
+        if self.bits & expected == expected {
+            None
+        } else {
+            Some(Err(Error::InvalidPadding(padding)))
+        }
+    }
+}
+
+impl Iterator for DecodeIter<'_> {
     type Item = Result<u8, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -309,58 +659,31 @@ impl<'a> Iterator for DecodeIter<'a> {
             return None;
         }
 
-        match HPACK_STRING.decode_next(&mut self.bit_pos, self.content) {
-            Ok(Some(x)) => match self.bit_pos.end() {
-                Some(end) => {
-                    self.symbol_end = end;
-                    Some(Ok(x))
-                }
-                None => {
-                    self.finished = true;
-                    Some(Err(Error::MissingBits(self.bit_pos.clone())))
-                }
-            },
-            Err(err) => {
-                self.finished = true;
-                Some(Err(err))
-            }
-            Ok(None) => {
-                self.finished = true;
-                let total_bits = match self.content.len().checked_mul(8) {
-                    Some(total_bits) => total_bits,
-                    None => return Some(Err(Error::MissingBits(self.bit_pos.clone()))),
-                };
-                let padding = match total_bits.checked_sub(self.symbol_end) {
-                    Some(padding) => padding,
-                    None => return Some(Err(Error::MissingBits(self.bit_pos.clone()))),
-                };
-                if padding == 0 {
-                    return None;
-                }
-                // QPACK uses the HPACK Huffman code unchanged. The EOS symbol is
-                // forbidden in strings, and padding is at most seven one bits.
-                // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.1.2
-                // https://www.rfc-editor.org/rfc/rfc7541.html#section-5.2
-                if padding > 7 {
-                    return Some(Err(Error::InvalidPadding(padding)));
-                }
+        self.refill();
+        if self.bit_count == 0 {
+            self.finished = true;
+            return None;
+        }
 
-                let padding_bits = match read_bits(
-                    self.content,
-                    self.symbol_end / 8,
-                    self.symbol_end % 8,
-                    padding,
-                ) {
-                    Ok(bits) => bits,
-                    Err(()) => return Some(Err(Error::MissingBits(self.bit_pos.clone()))),
+        match decode_symbol(self.bits, self.bit_count) {
+            Decoded::Symbol {
+                symbol: EOS_SYMBOL, ..
+            } => {
+                self.finished = true;
+                Some(Err(Error::Eos))
+            }
+            Decoded::Symbol { symbol, bit_count } => {
+                let Ok(symbol) = u8::try_from(symbol) else {
+                    self.finished = true;
+                    return Some(Err(Error::Eos));
                 };
-                let expected = ((1u16 << padding) - 1) as u8;
-                if padding_bits == expected {
-                    None
+                if self.consume(bit_count) {
+                    Some(Ok(symbol))
                 } else {
-                    Some(Err(Error::InvalidPadding(padding)))
+                    self.finish_tail()
                 }
             }
+            Decoded::Incomplete => self.finish_tail(),
         }
     }
 }
@@ -378,8 +701,11 @@ impl HpackStringDecode for Vec<u8> {
 impl HpackStringDecode for [u8] {
     fn hpack_decode(&self) -> DecodeIter<'_> {
         DecodeIter {
-            bit_pos: BitWindow::new(),
             content: self,
+            byte_pos: 0,
+            bits: 0,
+            bit_count: 0,
+            #[cfg(test)]
             symbol_end: 0,
             finished: false,
         }
@@ -396,38 +722,41 @@ mod tests {
     #[test]
     fn test_read_bits() {
         // Basic case (within one byte, aligned with start)
-        assert_eq!(read_bits(&[0b1010_1010], 0, 0, 5), Ok(0b1_0101));
+        assert_eq!(oracle::read_bits(&[0b1010_1010], 0, 0, 5), Ok(0b1_0101));
         // Within one byte, aligned with end of byte
-        assert_eq!(read_bits(&[0b1010_1010], 0, 3, 5), Ok(0b1010));
+        assert_eq!(oracle::read_bits(&[0b1010_1010], 0, 3, 5), Ok(0b1010));
         // Within one byte, unaligned with either side
-        assert_eq!(read_bits(&[0b1010_1010], 0, 3, 3), Ok(0b10));
+        assert_eq!(oracle::read_bits(&[0b1010_1010], 0, 3, 3), Ok(0b10));
         // `len` == 0
-        assert_eq!(read_bits(&[0b1010_1010], 0, 0, 0), Err(()));
+        assert_eq!(oracle::read_bits(&[0b1010_1010], 0, 0, 0), Err(()));
         // `len` > 8
-        assert_eq!(read_bits(&[0b1010_1010], 0, 0, 9), Err(()));
+        assert_eq!(oracle::read_bits(&[0b1010_1010], 0, 0, 9), Err(()));
 
         // `bit_offset` > 7
         assert_eq!(
-            read_bits(&[0b1010_1010, 0b1010_1010], 0, 8, 8),
+            oracle::read_bits(&[0b1010_1010, 0b1010_1010], 0, 8, 8),
             Ok(0b1010_1010)
         );
         // Read spanning two bytes
         assert_eq!(
-            read_bits(&[0b1010_1010, 0b1010_1010], 0, 4, 8),
+            oracle::read_bits(&[0b1010_1010, 0b1010_1010], 0, 4, 8),
             Ok(0b1010_1010)
         );
         // Read with non-zero `byte_offset`
         assert_eq!(
-            read_bits(&[0b1010_1010, 0b1010_1010], 1, 0, 5),
+            oracle::read_bits(&[0b1010_1010, 0b1010_1010], 1, 0, 5),
             Ok(0b1_0101)
         );
         // Read with `bit_offset` > 7, unaligned with either side
         assert_eq!(
-            read_bits(&[0b1010_1010, 0b1010_1010], 0, 10, 5),
+            oracle::read_bits(&[0b1010_1010, 0b1010_1010], 0, 10, 5),
             Ok(0b1_0101)
         );
         // Read with `bit_offset` > 7 past end of input slice
-        assert_eq!(read_bits(&[0b1010_1010, 0b1010_1010], 0, 16, 5), Err(()));
+        assert_eq!(
+            oracle::read_bits(&[0b1010_1010, 0b1010_1010], 0, 16, 5),
+            Err(())
+        );
     }
 
     macro_rules! decoding {
@@ -758,6 +1087,22 @@ mod tests {
                 if let Ok(decoded) = decoded {
                     assert_eq!(decoded.hpack_encode().unwrap(), encoded);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_decoder_matches_recursive_oracle_for_short_inputs() {
+        assert_eq!(
+            <[u8]>::hpack_decode(&[]).collect::<Result<Vec<_>, _>>(),
+            oracle::decode(&[])
+        );
+
+        for value in 0u16..=u16::MAX {
+            let bytes = value.to_be_bytes();
+            for encoded in [&bytes[..1], &bytes[..]] {
+                let decoded: Result<Vec<_>, Error> = encoded.hpack_decode().collect();
+                assert_eq!(decoded, oracle::decode(encoded), "input {encoded:02x?}");
             }
         }
     }
@@ -1836,6 +2181,7 @@ mod tests {
         ];
         let expected = (0u8..=255).collect();
         let res: Result<Vec<_>, Error> = bytes.hpack_decode().collect();
+        assert_eq!(res, oracle::decode(&bytes));
         assert_eq!(res, Ok(expected));
     }
 }

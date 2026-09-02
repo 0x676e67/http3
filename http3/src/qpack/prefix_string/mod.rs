@@ -1,3 +1,4 @@
+#[cfg(test)]
 mod bitwin;
 mod decode;
 mod encode;
@@ -7,9 +8,10 @@ use std::{convert::TryInto, fmt, num::TryFromIntError};
 use bytes::{Buf, BufMut};
 
 #[cfg(test)]
+pub use self::bitwin::BitWindow;
+#[cfg(test)]
 pub use self::encode::HpackStringEncode;
 pub use self::{
-    bitwin::BitWindow,
     decode::{Error as HuffmanDecodingError, HpackStringDecode},
     encode::Error as HuffmanEncodingError,
 };

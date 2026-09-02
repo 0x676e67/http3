@@ -6,9 +6,9 @@ pub enum Error {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct EncodeValue {
-    bits: u32,
-    bit_count: usize,
+pub(super) struct EncodeValue {
+    pub(super) bits: u32,
+    pub(super) bit_count: usize,
 }
 
 pub(super) fn encoded_len(value: &[u8]) -> Result<usize, Error> {
@@ -94,7 +94,7 @@ const fn pack_code(bit_count: usize, parts: &[u8]) -> u32 {
     bits
 }
 
-const HPACK_STRING: [EncodeValue; 256] = bits_encode![
+pub(super) const HPACK_STRING: [EncodeValue; 256] = bits_encode![
     ( 13 => [0b1111_1111, 0b0001_1000]),
     ( 23 => [0b1111_1111, 0b1111_1111, 0b0101_1000]),
     ( 28 => [0b1111_1111, 0b1111_1111, 0b1111_1110, 0b0000_0010]),
