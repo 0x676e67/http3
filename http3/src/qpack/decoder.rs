@@ -653,10 +653,8 @@ mod tests {
         trailers.insert("trailer", "value".parse().unwrap());
         trailers.insert("trailer2", "value2".parse().unwrap());
         let mut buf = bytes::BytesMut::new();
-        let _ = crate::qpack::encode_stateless(
-            &mut buf,
-            crate::proto::headers::Header::trailer(trailers),
-        );
+        let headers = crate::proto::headers::Header::trailer(trailers);
+        let _ = crate::qpack::encode_stateless(&mut buf, &headers);
         let result = decode_stateless(&mut buf, 2);
         assert_eq!(result, Err(DecoderError::HeaderTooLong(44)));
     }

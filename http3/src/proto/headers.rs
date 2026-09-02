@@ -292,16 +292,6 @@ impl Header {
         self.pseudo.len() + self.fields.len()
     }
 
-    /// Borrows the normalized field section without materializing owned QPACK
-    /// fields. Pseudo-header order and sensitivity match [`HeaderIter`].
-    pub(crate) fn iter_ref(&self) -> HeaderIterRef<'_> {
-        HeaderIterRef {
-            pseudo: &self.pseudo,
-            pseudo_order_index: 0,
-            fields: self.fields.iter(),
-        }
-    }
-
     /// Sets the pseudo-header field order for this header block.
     pub fn set_pseudo_order(&mut self, order: PseudoOrder) {
         self.pseudo.order = Some(order);
@@ -313,33 +303,26 @@ impl Header {
     }
 }
 
-impl IntoIterator for Header {
-    type Item = HeaderField<'static>;
-    type IntoIter = HeaderIter;
+impl<'a> IntoIterator for &'a Header {
+    type Item = HeaderField<'a>;
+    type IntoIter = HeaderIter<'a>;
+
     fn into_iter(self) -> Self::IntoIter {
         HeaderIter {
-            pseudo: Some(self.pseudo),
+            pseudo: &self.pseudo,
             pseudo_order_index: 0,
-            last_header_name: None,
-            fields: self.fields.into_iter(),
+            fields: self.fields.iter(),
         }
     }
 }
 
-pub struct HeaderIter {
-    pseudo: Option<Pseudo>,
-    pseudo_order_index: u8,
-    last_header_name: Option<HeaderName>,
-    fields: header::IntoIter<HeaderValue>,
-}
-
-pub(crate) struct HeaderIterRef<'a> {
+pub struct HeaderIter<'a> {
     pseudo: &'a Pseudo,
     pseudo_order_index: usize,
     fields: header::Iter<'a, HeaderValue>,
 }
 
-impl<'a> Iterator for HeaderIterRef<'a> {
+impl<'a> Iterator for HeaderIter<'a> {
     type Item = HeaderField<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -365,65 +348,6 @@ impl<'a> Iterator for HeaderIterRef<'a> {
                 value.is_sensitive(),
             )
         })
-    }
-}
-
-impl Iterator for HeaderIter {
-    type Item = HeaderField<'static>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
-        //# All pseudo-header fields MUST appear in the header section before
-        //# regular header fields.
-        if let Some(ref mut pseudo) = self.pseudo {
-            if pseudo.order.is_none() {
-                if let Some(field) = pseudo.take_field(PseudoId::Method) {
-                    return Some(field);
-                }
-                if let Some(field) = pseudo.take_field(PseudoId::Scheme) {
-                    return Some(field);
-                }
-                if let Some(field) = pseudo.take_field(PseudoId::Authority) {
-                    return Some(field);
-                }
-                if let Some(field) = pseudo.take_field(PseudoId::Path) {
-                    return Some(field);
-                }
-                if let Some(field) = pseudo.take_field(PseudoId::Status) {
-                    return Some(field);
-                }
-                if let Some(field) = pseudo.take_field(PseudoId::Protocol) {
-                    return Some(field);
-                }
-            } else {
-                while let Some(pseudo_type) = pseudo
-                    .order
-                    .as_ref()
-                    .and_then(|order| order.ids.get(usize::from(self.pseudo_order_index)))
-                    .copied()
-                {
-                    self.pseudo_order_index += 1;
-                    if let Some(field) = pseudo.take_field(pseudo_type) {
-                        return Some(field);
-                    }
-                }
-            }
-        }
-
-        self.pseudo = None;
-
-        for (new_header_name, header_value) in self.fields.by_ref() {
-            if let Some(new) = new_header_name {
-                self.last_header_name = Some(new);
-            }
-            if let (Some(n), v) = (&self.last_header_name, header_value) {
-                return Some(
-                    HeaderField::from((n.as_str(), v.as_bytes())).with_sensitive(v.is_sensitive()),
-                );
-            }
-        }
-
-        None
     }
 }
 
@@ -707,36 +631,6 @@ impl Pseudo {
     }
 
     #[inline]
-    fn take_field(&mut self, id: PseudoId) -> Option<HeaderField<'static>> {
-        match id {
-            PseudoId::Method => self.method.take().map(|method| {
-                HeaderField::from((":method", method.as_str()))
-                    .with_sensitive(self.is_sensitive(id))
-            }),
-            PseudoId::Scheme => self.scheme.take().map(|scheme| {
-                HeaderField::from((":scheme", scheme.as_str().as_bytes()))
-                    .with_sensitive(self.is_sensitive(id))
-            }),
-            PseudoId::Authority => self.authority.take().map(|authority| {
-                HeaderField::from((":authority", authority.as_str().as_bytes()))
-                    .with_sensitive(self.is_sensitive(id))
-            }),
-            PseudoId::Path => self.path.take().map(|path| {
-                HeaderField::from((":path", path.as_str().as_bytes()))
-                    .with_sensitive(self.is_sensitive(id))
-            }),
-            PseudoId::Status => self.status.take().map(|status| {
-                HeaderField::from((":status", status.as_str()))
-                    .with_sensitive(self.is_sensitive(id))
-            }),
-            PseudoId::Protocol => self.protocol.take().map(|protocol| {
-                HeaderField::from((":protocol", protocol.as_str().as_bytes()))
-                    .with_sensitive(self.is_sensitive(id))
-            }),
-        }
-    }
-
-    #[inline]
     fn field_ref(&self, id: PseudoId) -> Option<HeaderField<'_>> {
         let (name, value): (&[u8], &[u8]) = match id {
             PseudoId::Method => (b":method", self.method.as_ref()?.as_str().as_bytes()),
@@ -803,21 +697,8 @@ impl fmt::Display for HeaderError {
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
-    use bytes::BytesMut;
 
     use super::*;
-    use crate::qpack;
-
-    fn assert_ref_encoding_matches_owned(headers: Header) {
-        let mut owned = BytesMut::new();
-        let owned_size = qpack::encode_stateless(&mut owned, headers.clone()).unwrap();
-
-        let mut borrowed = BytesMut::new();
-        let borrowed_size = qpack::encode_stateless(&mut borrowed, headers.iter_ref()).unwrap();
-
-        assert_eq!(borrowed, owned);
-        assert_eq!(borrowed_size, owned_size);
-    }
 
     #[test]
     fn request_has_no_authority_nor_host() {
@@ -942,8 +823,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            headers
-                .clone()
+            (&headers)
                 .into_iter()
                 .filter(|h| h.name.as_ref() == b"set-cookie")
                 .collect::<Vec<_>>(),
@@ -961,7 +841,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            headers
+            (&headers)
                 .into_iter()
                 .filter(|h| h.name.as_ref() == b"other-header")
                 .collect::<Vec<_>>(),
@@ -1044,7 +924,7 @@ mod tests {
         let mut extensions = Extensions::new();
         extensions.insert(sensitivity);
         let forwarded = Header::request(method, uri, fields, extensions).unwrap();
-        let method = forwarded
+        let method = (&forwarded)
             .into_iter()
             .find(|field| field.name.as_ref() == b":method")
             .unwrap();
@@ -1065,7 +945,7 @@ mod tests {
         let mut extensions = Extensions::new();
         extensions.insert(sensitivity);
         let forwarded = Header::response(status, fields, extensions);
-        let status = forwarded
+        let status = (&forwarded)
             .into_iter()
             .find(|field| field.name.as_ref() == b":status")
             .unwrap();
@@ -1113,7 +993,7 @@ mod tests {
         .unwrap();
         headers.set_pseudo_order(order);
 
-        let pseudo_fields: Vec<_> = headers
+        let pseudo_fields: Vec<_> = (&headers)
             .into_iter()
             .filter(|h| h.name.as_ref().starts_with(b":"))
             .map(|h| String::from_utf8_lossy(h.name.as_ref()).into_owned())
@@ -1144,7 +1024,7 @@ mod tests {
         .unwrap();
         headers.set_pseudo_order(order);
 
-        let pseudo_fields: Vec<_> = headers
+        let pseudo_fields: Vec<_> = (&headers)
             .into_iter()
             .filter(|h| h.name.as_ref().starts_with(b":"))
             .map(|h| String::from_utf8_lossy(h.name.as_ref()).into_owned())
@@ -1167,7 +1047,7 @@ mod tests {
         )
         .unwrap();
 
-        let pseudo_fields: Vec<_> = headers
+        let pseudo_fields: Vec<_> = (&headers)
             .into_iter()
             .filter(|h| h.name.as_ref().starts_with(b":"))
             .map(|h| String::from_utf8_lossy(h.name.as_ref()).into_owned())
@@ -1176,68 +1056,6 @@ mod tests {
         assert_eq!(
             pseudo_fields,
             vec![":method", ":scheme", ":authority", ":path"]
-        );
-    }
-
-    #[test]
-    fn borrowed_encoding_matches_owned_for_request_variants() {
-        assert_ref_encoding_matches_owned(
-            Header::request(
-                Method::GET,
-                Uri::from_static("https://example.com/resource"),
-                HeaderMap::new(),
-                Extensions::default(),
-            )
-            .unwrap(),
-        );
-
-        let mut fields = HeaderMap::new();
-        let mut sensitive = HeaderValue::from_static("first");
-        sensitive.set_sensitive(true);
-        fields.append("x-repeated", sensitive);
-        fields.append("x-repeated", HeaderValue::from_static("second"));
-        let mut extensions = Extensions::default();
-        extensions.insert(
-            PseudoOrder::builder()
-                .push(PseudoId::Authority)
-                .push(PseudoId::Method)
-                .push(PseudoId::Path)
-                .push(PseudoId::Scheme)
-                .build(),
-        );
-        let mut pseudo_sensitivity = PseudoHeaderSensitivity::default();
-        pseudo_sensitivity.set_sensitive(PseudoId::Authority, true);
-        extensions.insert(pseudo_sensitivity);
-        assert_ref_encoding_matches_owned(
-            Header::request(
-                Method::GET,
-                Uri::from_static("https://example.com/custom"),
-                fields,
-                extensions,
-            )
-            .unwrap(),
-        );
-
-        assert_ref_encoding_matches_owned(
-            Header::request(
-                Method::CONNECT,
-                Uri::from_static("https://example.com"),
-                HeaderMap::new(),
-                Extensions::default(),
-            )
-            .unwrap(),
-        );
-
-        let mut extensions = Extensions::default();
-        extensions.insert(Protocol::WEBSOCKET);
-        assert_ref_encoding_matches_owned(
-            Header::request(
-                Method::CONNECT,
-                Uri::from_static("https://example.com/chat"),
-                HeaderMap::new(),
-                extensions,
-            )
-            .unwrap(),
         );
     }
 }

@@ -1754,14 +1754,14 @@ fn request_encode<B: BufMut>(buf: &mut B, req: http::Request<()>) {
     } = parts;
     let headers = Header::request(method, uri, headers, extensions).unwrap();
     let mut block = BytesMut::new();
-    qpack::encode_stateless(&mut block, headers).unwrap();
+    qpack::encode_stateless(&mut block, &headers).unwrap();
     Frame::headers(block).encode_with_payload(buf);
 }
 
 fn trailers_encode<B: BufMut>(buf: &mut B, fields: HeaderMap) {
     let headers = Header::trailer(fields);
     let mut block = BytesMut::new();
-    qpack::encode_stateless(&mut block, headers).unwrap();
+    qpack::encode_stateless(&mut block, &headers).unwrap();
     Frame::headers(block).encode_with_payload(buf);
 }
 

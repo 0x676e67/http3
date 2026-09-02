@@ -1684,13 +1684,16 @@ where
         //# converted to lowercase prior to their encoding.
         let mut block = BytesMut::new();
 
-        let mem_size =
-            qpack::encode_stateless(&mut block, Header::trailer(trailers)).map_err(|_e| {
-                self.handle_connection_error_on_stream(InternalConnectionError {
-                    code: Code::H3_INTERNAL_ERROR,
-                    message: "Failed to encode trailers".to_string(),
-                })
-            })?;
+        let headers = Header::trailer(trailers);
+        let mem_size = qpack::encode_stateless(&mut block, &headers).map_err(|_e| {
+            self.handle_connection_error_on_stream(InternalConnectionError {
+                code: Code::H3_INTERNAL_ERROR,
+                message: "Failed to encode trailers".to_string(),
+            })
+        })?;
+        // Do not retain the normalized fields while the encoded block waits on
+        // QUIC backpressure.
+        drop(headers);
 
         let max_mem_size = self.settings().max_field_section_size;
 
