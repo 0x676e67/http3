@@ -13,6 +13,8 @@ pub const ESTIMATED_OVERHEAD_BYTES: usize = 32;
 pub struct HeaderField {
     pub name: Cow<'static, [u8]>,
     pub value: Cow<'static, [u8]>,
+    /// Whether this field must use a literal representation when forwarded.
+    pub sensitive: bool,
 }
 
 impl HeaderField {
@@ -24,6 +26,7 @@ impl HeaderField {
         HeaderField {
             name: Cow::Owned(name.into()),
             value: Cow::Owned(value.into()),
+            sensitive: false,
         }
     }
 
@@ -38,7 +41,30 @@ impl HeaderField {
         Self {
             name: self.name.clone(),
             value: Cow::Owned(value.into()),
+            sensitive: self.sensitive,
         }
+    }
+
+    /// Marks the field as sensitive for compression.
+    ///
+    /// This carries QPACK's never-indexed bit through the HTTP header model so
+    /// an intermediary can preserve the peer's literal-only instruction when
+    /// forwarding the field.
+    ///
+    /// See [RFC 9204, Section 4.5.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.4).
+    pub fn set_sensitive(&mut self, sensitive: bool) {
+        self.sensitive = sensitive;
+    }
+
+    /// Returns whether this field must remain a never-indexed literal.
+    pub fn is_sensitive(&self) -> bool {
+        self.sensitive
+    }
+
+    /// Returns this field with the requested compression sensitivity.
+    pub fn with_sensitive(mut self, sensitive: bool) -> Self {
+        self.set_sensitive(sensitive);
+        self
     }
 
     pub fn into_inner(self) -> (Cow<'static, [u8]>, Cow<'static, [u8]>) {
@@ -85,6 +111,7 @@ where
             // FIXME: could avoid allocation if HeaderField had a lifetime
             name: Cow::Owned(Vec::from(name.as_ref())),
             value: Cow::Owned(Vec::from(value.as_ref())),
+            sensitive: false,
         }
     }
 }
@@ -105,6 +132,7 @@ mod tests {
         let field = HeaderField {
             name: Cow::Borrowed(b"Name"),
             value: Cow::Borrowed(b"Value"),
+            sensitive: false,
         };
         assert_eq!(field.mem_size(), 4 + 5 + 32);
     }
@@ -114,12 +142,14 @@ mod tests {
         let field = HeaderField {
             name: Cow::Borrowed(b"Name"),
             value: Cow::Borrowed(b"Value"),
+            sensitive: true,
         };
         assert_eq!(
             field.with_value("New value"),
             HeaderField {
                 name: Cow::Borrowed(b"Name"),
                 value: Cow::Borrowed(b"New value"),
+                sensitive: true,
             }
         );
     }

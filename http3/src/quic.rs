@@ -198,6 +198,9 @@ pub trait SendStreamUnframed<B: Buf>: SendStream<B> {
     /// Attempts to write data into the stream.
     ///
     /// Returns the number of bytes written.
+    /// When `buf` is non-empty, an implementation that cannot currently make
+    /// progress must return [`Poll::Pending`] and arrange to wake the task.
+    /// Returning `Poll::Ready(Ok(0))` means the stream cannot make progress.
     ///
     /// `buf` is advanced by the number of bytes written.
     fn poll_send<D: Buf>(

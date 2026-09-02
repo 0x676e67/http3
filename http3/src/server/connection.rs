@@ -45,6 +45,7 @@ where
     /// TODO: temporarily break encapsulation for `WebTransportSession`
     pub inner: ConnectionInner<C, B>,
     pub(super) max_field_section_size: u64,
+    pub(super) max_qpack_decode_buffer_size: usize,
     // List of all incoming streams that are currently running.
     pub(super) ongoing_streams: HashSet<StreamId>,
     // Let the streams tell us when they are no longer running.
@@ -102,7 +103,10 @@ where
     pub fn poll_accept_request_stream(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<C::BidiStream>, ConnectionError>> {
+    ) -> Poll<Result<Option<C::BidiStream>, ConnectionError>>
+    where
+        C::SendStream: quic::SendStreamUnframed<B>,
+    {
         self.poll_accept_request_stream_internal(cx)
     }
 }
@@ -118,7 +122,10 @@ where
     /// response. This method will return `None` when the connection receives a GOAWAY frame and
     /// all requests have been completed.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub async fn accept(&mut self) -> Result<Option<RequestResolver<C, B>>, ConnectionError> {
+    pub async fn accept(&mut self) -> Result<Option<RequestResolver<C, B>>, ConnectionError>
+    where
+        C::SendStream: quic::SendStreamUnframed<B>,
+    {
         // Accept the incoming stream
         let stream = match poll_fn(|cx| self.poll_accept_request_stream_internal(cx)).await? {
             Some(s) => FrameStream::new(BufRecvStream::new(s)),
@@ -140,13 +147,15 @@ where
 
     fn create_resolver_internal(
         &self,
-        stream: FrameStream<C::BidiStream, B>,
+        mut stream: FrameStream<C::BidiStream, B>,
     ) -> RequestResolver<C, B> {
+        stream.set_max_field_section_size(self.max_qpack_decode_buffer_size);
         RequestResolver {
             frame_stream: stream,
             request_end_send: self.request_end_send.clone(),
             send_grease_frame: self.inner.send_grease_frame,
             max_field_section_size: self.max_field_section_size,
+            max_qpack_decode_buffer_size: self.max_qpack_decode_buffer_size,
             shared: self.inner.shared.clone(),
             decoder: self.inner.qpack_decoder(),
         }
@@ -173,7 +182,10 @@ where
     fn poll_accept_request_stream_internal(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<C::BidiStream>, ConnectionError>> {
+    ) -> Poll<Result<Option<C::BidiStream>, ConnectionError>>
+    where
+        C::SendStream: quic::SendStreamUnframed<B>,
+    {
         let _ = self.poll_control(cx)?;
         let _ = self.poll_requests_completion(cx);
         loop {
@@ -217,10 +229,22 @@ where
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub(crate) fn poll_control(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), ConnectionError>> {
+    pub(crate) fn poll_control(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectionError>>
+    where
+        C::SendStream: quic::SendStreamUnframed<B>,
+    {
+        self.inner.poll_accept_recv(cx)?;
+        // Both peer QPACK streams carry connection-level state and are critical.
+        // Drive them before waiting for another request stream.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3
+        if let Poll::Ready(Err(err)) = self.inner.poll_qpack_decoder_stream(cx) {
+            return Poll::Ready(Err(err));
+        }
+        if let Poll::Ready(Err(err)) = self.inner.poll_qpack_encoder_stream(cx) {
+            return Poll::Ready(Err(err));
+        }
+
         while (self.poll_next_control(cx)?).is_ready() {}
         Poll::Pending
     }

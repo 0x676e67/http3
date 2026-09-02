@@ -77,13 +77,29 @@ impl Builder {
         self
     }
 
-    /// Set the maximum header size this client is willing to accept
+    /// Sets the largest uncompressed field section this client will accept.
     ///
-    /// See [header size constraints] section of the specification for details.
+    /// The value is advertised to the server as
+    /// `SETTINGS_MAX_FIELD_SECTION_SIZE`. Each field contributes its name and
+    /// value lengths plus 32 bytes. By default, the client advertises the
+    /// largest value the setting can encode.
     ///
-    /// [header size constraints]: https://www.rfc-editor.org/rfc/rfc9114.html#name-header-size-constraints
+    /// See [RFC 9114 Section 4.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2).
     pub fn max_field_section_size(&mut self, value: u64) -> &mut Self {
         self.config.settings.max_field_section_size = value;
+        self
+    }
+
+    /// Limits compressed QPACK input buffered before a field section is decoded.
+    ///
+    /// This is a local memory limit, not an HTTP/3 setting. It applies to an
+    /// encoded HEADERS payload and to one encoded string on the peer's QPACK
+    /// encoder stream. The default is 16 MiB.
+    ///
+    /// See [RFC 9204, Section 7.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3)
+    /// and [Section 7.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4).
+    pub fn max_qpack_decode_buffer_size(&mut self, value: usize) -> &mut Self {
+        self.config.qpack_decode_buffer_size = value;
         self
     }
 
@@ -115,6 +131,15 @@ impl Builder {
     /// Sent as `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (0x1). When this is not called,
     /// the setting is omitted and the protocol default of `0` applies. Passing `0`
     /// explicitly sends the setting with value `0`.
+    ///
+    /// HTTP/3 encodes this setting as a QUIC variable-length integer, so values
+    /// can range up to `2^62 - 1`. The value must also fit the target's address
+    /// space; connection setup rejects a capacity the decoder cannot represent.
+    /// Set no more table memory than the decoder can hold for this connection.
+    ///
+    /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3),
+    /// [Section 7.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4),
+    /// and [RFC 9114, Section 7.2.4](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4).
     pub fn qpack_max_table_capacity<T: Into<Option<u64>>>(&mut self, value: T) -> &mut Self {
         self.config.settings.qpack_max_table_capacity = value.into();
         self
@@ -125,6 +150,14 @@ impl Builder {
     /// Sent as `SETTINGS_QPACK_BLOCKED_STREAMS` (0x7). When this is not called,
     /// the setting is omitted and the protocol default of `0` applies. Passing `0`
     /// explicitly sends the setting with value `0`.
+    ///
+    /// HTTP/3 encodes this setting as a QUIC variable-length integer, and QPACK
+    /// sets no smaller limit. Each blocked stream needs decoder bookkeeping, so
+    /// choose a value that fits the connection's memory budget.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2),
+    /// [Section 7.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3), and
+    /// [RFC 9114, Section 7.2.4](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4).
     pub fn qpack_blocked_streams<T: Into<Option<u64>>>(&mut self, value: T) -> &mut Self {
         self.config.settings.qpack_blocked_streams = value.into();
         self
@@ -169,6 +202,7 @@ impl Builder {
             conn_state: inner.shared.clone(),
             decoder: inner.qpack_decoder(),
             max_field_section_size: self.config.settings.max_field_section_size,
+            max_qpack_decode_buffer_size: self.config.qpack_decode_buffer_size,
             sender_count: Arc::new(AtomicUsize::new(1)),
             send_grease_frame: self.config.send_grease,
             _buf: PhantomData,
