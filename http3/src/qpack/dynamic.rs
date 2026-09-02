@@ -27,7 +27,7 @@ pub struct DynamicTableDecoder<'a> {
 }
 
 impl<'a> DynamicTableDecoder<'a> {
-    pub(super) fn get_relative(&self, index: usize) -> Result<&HeaderField, Error> {
+    pub(super) fn get_relative(&self, index: usize) -> Result<&HeaderField<'static>, Error> {
         // A field section cannot reference an insertion newer than its declared
         // Required Insert Count.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
@@ -44,7 +44,7 @@ impl<'a> DynamicTableDecoder<'a> {
             .ok_or(Error::BadIndex(real_index))
     }
 
-    pub(super) fn get_postbase(&self, index: usize) -> Result<&HeaderField, Error> {
+    pub(super) fn get_postbase(&self, index: usize) -> Result<&HeaderField<'static>, Error> {
         // Post-base references are also bounded by Required Insert Count.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
         self.base
@@ -103,7 +103,7 @@ impl<'a> DynamicTableEncoder<'a> {
         self.committed = true;
     }
 
-    pub(super) fn find(&mut self, field: &HeaderField) -> DynamicLookupResult {
+    pub(super) fn find(&mut self, field: &HeaderField<'static>) -> DynamicLookupResult {
         self.lookup_result(self.table.field_map.get(field).cloned())
     }
 
@@ -133,7 +133,10 @@ impl<'a> DynamicTableEncoder<'a> {
         }
     }
 
-    pub(super) fn insert(&mut self, field: &HeaderField) -> Result<DynamicInsertionResult, Error> {
+    pub(super) fn insert(
+        &mut self,
+        field: &HeaderField<'static>,
+    ) -> Result<DynamicInsertionResult, Error> {
         // A newly inserted entry is not known to the decoder yet. Referencing
         // it is allowed only when this stream can consume a blocked-stream
         // slot (or already consumes one).
@@ -300,11 +303,11 @@ impl TrackedStream {
 
 #[derive(Default)]
 pub struct DynamicTable {
-    fields: VecDeque<HeaderField>,
+    fields: VecDeque<HeaderField<'static>>,
     curr_size: usize,
     max_size: usize,
     vas: VirtualAddressSpace,
-    field_map: HashMap<HeaderField, usize>,
+    field_map: HashMap<HeaderField<'static>, usize>,
     name_map: HashMap<Cow<'static, [u8]>, usize>,
     track_map: BTreeMap<usize, usize>,
     track_blocks: HashMap<u64, TrackedStream>,
@@ -379,7 +382,7 @@ impl DynamicTable {
         Ok(())
     }
 
-    pub(super) fn put(&mut self, field: HeaderField) -> Result<(), Error> {
+    pub(super) fn put(&mut self, field: HeaderField<'static>) -> Result<(), Error> {
         let index = match self.insert(field.clone())? {
             Some(index) => index,
             None => return Ok(()),
@@ -399,12 +402,12 @@ impl DynamicTable {
     ///
     /// See [RFC 9204, Section 3.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2)
     /// and [Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3).
-    pub(super) fn put_decoder(&mut self, field: HeaderField) -> Result<(), Error> {
+    pub(super) fn put_decoder(&mut self, field: HeaderField<'static>) -> Result<(), Error> {
         self.insert(field)?.ok_or(Error::MaxTableSizeReached)?;
         Ok(())
     }
 
-    fn update_maps(&mut self, field: HeaderField, index: usize) {
+    fn update_maps(&mut self, field: HeaderField<'static>, index: usize) {
         self.field_map
             .entry(field.clone())
             .and_modify(|e| *e = index)
@@ -420,7 +423,7 @@ impl DynamicTable {
             .or_insert(index);
     }
 
-    pub(super) fn get_relative(&self, index: usize) -> Result<&HeaderField, Error> {
+    pub(super) fn get_relative(&self, index: usize) -> Result<&HeaderField<'static>, Error> {
         let real_index = self.vas.relative(index)?;
         self.fields
             .get(real_index)
@@ -517,7 +520,7 @@ impl DynamicTable {
         Ok(())
     }
 
-    fn insert(&mut self, field: HeaderField) -> Result<Option<usize>, Error> {
+    fn insert(&mut self, field: HeaderField<'static>) -> Result<Option<usize>, Error> {
         if self.max_size == 0 {
             return Ok(None);
         }
@@ -896,7 +899,7 @@ mod tests {
         assert_eq!(table.insert(field), Err(Error::MaxTableSizeReached));
     }
 
-    fn insert_fields(table: &mut DynamicTable, fields: Vec<HeaderField>) {
+    fn insert_fields(table: &mut DynamicTable, fields: Vec<HeaderField<'static>>) {
         for field in fields {
             table.insert(field).unwrap();
         }

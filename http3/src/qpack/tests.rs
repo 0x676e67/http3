@@ -383,7 +383,7 @@ fn codec_table_full() {
     encoder.on_decoder_recv(&mut dec_cur).unwrap();
 }
 
-fn forward_stateless(fields: Vec<HeaderField>) -> Cursor<Vec<u8>> {
+fn forward_stateless(fields: Vec<HeaderField<'static>>) -> Cursor<Vec<u8>> {
     let headers = Header::try_from(fields).unwrap();
     let mut encoded = Vec::new();
     encode_stateless(&mut encoded, headers).unwrap();

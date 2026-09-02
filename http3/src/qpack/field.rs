@@ -9,37 +9,17 @@ use std::{
  */
 pub const ESTIMATED_OVERHEAD_BYTES: usize = 32;
 
-/// A non-owning field view used while encoding an already-normalized HTTP
-/// header section.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct HeaderFieldRef<'a> {
-    pub(crate) name: &'a [u8],
-    pub(crate) value: &'a [u8],
-    pub(crate) sensitive: bool,
-}
-
-impl HeaderFieldRef<'_> {
-    #[inline]
-    pub(crate) fn mem_size(self) -> usize {
-        self.name.len() + self.value.len() + ESTIMATED_OVERHEAD_BYTES
-    }
-
-    #[inline]
-    pub(crate) fn is_sensitive(self) -> bool {
-        self.sensitive
-    }
-}
-
+/// A QPACK header field that can own or borrow its name and value.
 #[derive(Debug, PartialEq, Clone, Hash, Eq)]
-pub struct HeaderField {
-    pub name: Cow<'static, [u8]>,
-    pub value: Cow<'static, [u8]>,
+pub struct HeaderField<'a> {
+    pub name: Cow<'a, [u8]>,
+    pub value: Cow<'a, [u8]>,
     /// Whether this field must use a literal representation when forwarded.
     pub sensitive: bool,
 }
 
-impl HeaderField {
-    pub fn new<T, S>(name: T, value: S) -> HeaderField
+impl HeaderField<'static> {
+    pub fn new<T, S>(name: T, value: S) -> Self
     where
         T: Into<Vec<u8>>,
         S: Into<Vec<u8>>,
@@ -48,6 +28,16 @@ impl HeaderField {
             name: Cow::Owned(name.into()),
             value: Cow::Owned(value.into()),
             sensitive: false,
+        }
+    }
+}
+
+impl<'a> HeaderField<'a> {
+    pub(crate) fn borrowed(name: &'a [u8], value: &'a [u8], sensitive: bool) -> Self {
+        Self {
+            name: Cow::Borrowed(name),
+            value: Cow::Borrowed(value),
+            sensitive,
         }
     }
 
@@ -88,18 +78,18 @@ impl HeaderField {
         self
     }
 
-    pub fn into_inner(self) -> (Cow<'static, [u8]>, Cow<'static, [u8]>) {
+    pub fn into_inner(self) -> (Cow<'a, [u8]>, Cow<'a, [u8]>) {
         (self.name, self.value)
     }
 }
 
-impl AsRef<HeaderField> for HeaderField {
-    fn as_ref(&self) -> &Self {
+impl<'a, 'b: 'a> AsRef<HeaderField<'a>> for HeaderField<'b> {
+    fn as_ref(&self) -> &HeaderField<'a> {
         self
     }
 }
 
-impl Display for HeaderField {
+impl Display for HeaderField<'_> {
     fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
         write!(
             f,
@@ -111,8 +101,8 @@ impl Display for HeaderField {
     }
 }
 
-impl From<HeaderField> for String {
-    fn from(field: HeaderField) -> String {
+impl From<HeaderField<'_>> for String {
+    fn from(field: HeaderField<'_>) -> String {
         format!(
             "{}\t{}",
             String::from_utf8_lossy(&field.name),
@@ -121,7 +111,7 @@ impl From<HeaderField> for String {
     }
 }
 
-impl<N, V> From<(N, V)> for HeaderField
+impl<N, V> From<(N, V)> for HeaderField<'static>
 where
     N: AsRef<[u8]>,
     V: AsRef<[u8]>,
@@ -129,7 +119,8 @@ where
     fn from(header: (N, V)) -> Self {
         let (name, value) = header;
         Self {
-            // FIXME: could avoid allocation if HeaderField had a lifetime
+            // Generic tuple conversion produces an owned field. Borrowed HTTP
+            // header iteration constructs `HeaderField<'_>` directly.
             name: Cow::Owned(Vec::from(name.as_ref())),
             value: Cow::Owned(Vec::from(value.as_ref())),
             sensitive: false,

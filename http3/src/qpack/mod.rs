@@ -19,8 +19,7 @@ pub use self::{
 };
 pub(crate) use self::{
     decoder::{FieldSectionPrefix, decode_stateless_limited},
-    encoder::{Encoder, encode_stateless_ref},
-    field::HeaderFieldRef,
+    encoder::Encoder,
 };
 use crate::quic::StreamId;
 

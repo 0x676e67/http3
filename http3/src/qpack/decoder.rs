@@ -95,7 +95,7 @@ pub fn stream_canceled<W: BufMut>(stream_id: u64, decoder: &mut W) {
 #[derive(PartialEq, Debug)]
 pub struct Decoded {
     /// The decoded fields
-    pub fields: Vec<HeaderField>,
+    pub fields: Vec<HeaderField<'static>>,
     /// Whether the field section's Required Insert Count is non-zero.
     ///
     /// A successfully decoded field section with a non-zero Required Insert
@@ -422,7 +422,7 @@ impl Decoder {
         table: &DynamicTableDecoder,
         buf: &mut R,
         max_encoded_string_size: usize,
-    ) -> Result<HeaderField, DecoderError> {
+    ) -> Result<HeaderField<'static>, DecoderError> {
         let first = buf.chunk()[0];
         let field = match HeaderBlockField::decode(first) {
             HeaderBlockField::Indexed => match Indexed::decode(buf)? {
@@ -548,7 +548,7 @@ impl From<DynamicTable> for Decoder {
 
 #[derive(PartialEq)]
 enum Instruction {
-    Insert(HeaderField),
+    Insert(HeaderField<'static>),
     TableSizeUpdate(usize),
 }
 
@@ -988,7 +988,7 @@ mod tests {
         );
     }
 
-    fn insert_fields(table: &mut DynamicTable, fields: Vec<HeaderField>) {
+    fn insert_fields(table: &mut DynamicTable, fields: Vec<HeaderField<'static>>) {
         for field in fields {
             table.put(field).unwrap();
         }
@@ -1119,7 +1119,7 @@ mod tests {
         assert!(!decoded.dyn_ref);
     }
 
-    fn field(n: usize) -> HeaderField {
+    fn field(n: usize) -> HeaderField<'static> {
         HeaderField::new(format!("foo{}", n), "bar")
     }
 

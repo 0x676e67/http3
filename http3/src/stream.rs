@@ -40,13 +40,13 @@ where
     Ok(())
 }
 
-// Ordinary frame headers need at most a handful of QUIC varints. SETTINGS is
-// connection-scoped and uses the spill representation below, so request streams
-// do not carry storage sized for an arbitrarily large SETTINGS frame.
-const WRITE_BUF_INLINE_SIZE: usize = 64;
+// SETTINGS is connection-scoped and uses the spill representation below, so
+// request streams only carry enough inline storage for a stream type and the
+// largest ordinary frame prefix.
+const WRITE_BUF_ENCODE_SIZE: usize = StreamType::MAX_ENCODED_SIZE + Frame::MAX_ENCODED_SIZE;
 
 enum EncodedHeader {
-    Inline([u8; WRITE_BUF_INLINE_SIZE]),
+    Inline([u8; WRITE_BUF_ENCODE_SIZE]),
     Heap(Bytes),
 }
 
@@ -74,7 +74,7 @@ where
 {
     fn inline(frame: Option<Frame<B>>) -> Self {
         Self {
-            buf: EncodedHeader::Inline([0; WRITE_BUF_INLINE_SIZE]),
+            buf: EncodedHeader::Inline([0; WRITE_BUF_ENCODE_SIZE]),
             len: 0,
             pos: 0,
             frame,
@@ -163,7 +163,7 @@ where
         let Some(end) = len.checked_add(payload_len) else {
             return;
         };
-        if end > WRITE_BUF_INLINE_SIZE || payload.chunk().len() < payload_len {
+        if end > WRITE_BUF_ENCODE_SIZE || payload.chunk().len() < payload_len {
             return;
         }
 
@@ -884,7 +884,7 @@ mod tests {
         UniStreamHeader::Control(large_settings()).encode(&mut expected);
 
         let mut wbuf = WriteBuf::<Bytes>::from(UniStreamHeader::Control(large_settings()));
-        assert!(wbuf.len > WRITE_BUF_INLINE_SIZE);
+        assert!(wbuf.len > WRITE_BUF_ENCODE_SIZE);
         let mut encoded = wbuf.copy_to_bytes(wbuf.remaining());
         assert_eq!(encoded.as_ref(), expected.as_ref());
 
@@ -904,7 +904,7 @@ mod tests {
 
         let mut wbuf =
             WriteBuf::<Bytes>::from((StreamType::CONTROL, Frame::Settings(large_settings())));
-        assert!(wbuf.len > WRITE_BUF_INLINE_SIZE);
+        assert!(wbuf.len > WRITE_BUF_ENCODE_SIZE);
         let mut encoded = wbuf.copy_to_bytes(wbuf.remaining());
         assert_eq!(encoded.as_ref(), expected.as_ref());
 
@@ -933,7 +933,7 @@ mod tests {
 
             let wbuf = WriteBuf::from(frame);
             assert!(matches!(&wbuf.buf, EncodedHeader::Inline(_)));
-            assert!(wbuf.len <= WRITE_BUF_INLINE_SIZE);
+            assert!(wbuf.len <= WRITE_BUF_ENCODE_SIZE);
         }
 
         assert_inline(Frame::Data(Bytes::from_static(b"data")));
@@ -992,10 +992,10 @@ mod tests {
 
     #[test]
     fn large_headers_keep_their_separate_payload() {
-        let payload = Bytes::from(vec![0x5a; WRITE_BUF_INLINE_SIZE]);
+        let payload = Bytes::from(vec![0x5a; WRITE_BUF_ENCODE_SIZE]);
         let write_buf = WriteBuf::from(Frame::<Bytes>::Headers(payload.clone()));
 
-        assert!(write_buf.len < WRITE_BUF_INLINE_SIZE);
+        assert!(write_buf.len < WRITE_BUF_ENCODE_SIZE);
         assert_eq!(write_buf.chunk().len(), write_buf.len);
         assert_eq!(
             write_buf
@@ -1010,10 +1010,10 @@ mod tests {
 
     #[test]
     fn headers_coalescing_respects_the_inline_boundary() {
-        let payload = Bytes::from(vec![0x5a; WRITE_BUF_INLINE_SIZE - 2]);
+        let payload = Bytes::from(vec![0x5a; WRITE_BUF_ENCODE_SIZE - 2]);
         let write_buf = WriteBuf::from(Frame::<Bytes>::Headers(payload));
-        assert_eq!(write_buf.len, WRITE_BUF_INLINE_SIZE);
-        assert_eq!(write_buf.chunk().len(), WRITE_BUF_INLINE_SIZE);
+        assert_eq!(write_buf.len, WRITE_BUF_ENCODE_SIZE);
+        assert_eq!(write_buf.chunk().len(), WRITE_BUF_ENCODE_SIZE);
         assert_eq!(
             write_buf
                 .frame
@@ -1023,10 +1023,10 @@ mod tests {
             Some(0)
         );
 
-        let payload = Bytes::from(vec![0x5a; WRITE_BUF_INLINE_SIZE - 1]);
+        let payload = Bytes::from(vec![0x5a; WRITE_BUF_ENCODE_SIZE - 1]);
         let write_buf = WriteBuf::from(Frame::<Bytes>::Headers(payload.clone()));
         assert_eq!(write_buf.chunk().len(), write_buf.len);
-        assert_eq!(write_buf.remaining(), WRITE_BUF_INLINE_SIZE + 1);
+        assert_eq!(write_buf.remaining(), WRITE_BUF_ENCODE_SIZE + 1);
         assert_eq!(
             write_buf
                 .frame
@@ -1036,10 +1036,10 @@ mod tests {
             Some(payload.len())
         );
 
-        let payload = Bytes::from(vec![0x5a; WRITE_BUF_INLINE_SIZE - 3]);
+        let payload = Bytes::from(vec![0x5a; WRITE_BUF_ENCODE_SIZE - 3]);
         let write_buf = WriteBuf::from((StreamType::ENCODER, Frame::<Bytes>::Headers(payload)));
-        assert_eq!(write_buf.len, WRITE_BUF_INLINE_SIZE);
-        assert_eq!(write_buf.chunk().len(), WRITE_BUF_INLINE_SIZE);
+        assert_eq!(write_buf.len, WRITE_BUF_ENCODE_SIZE);
+        assert_eq!(write_buf.chunk().len(), WRITE_BUF_ENCODE_SIZE);
         assert_eq!(
             write_buf
                 .frame
@@ -1049,13 +1049,13 @@ mod tests {
             Some(0)
         );
 
-        let payload = Bytes::from(vec![0x5a; WRITE_BUF_INLINE_SIZE - 2]);
+        let payload = Bytes::from(vec![0x5a; WRITE_BUF_ENCODE_SIZE - 2]);
         let write_buf = WriteBuf::from((
             StreamType::ENCODER,
             Frame::<Bytes>::Headers(payload.clone()),
         ));
         assert_eq!(write_buf.chunk().len(), write_buf.len);
-        assert_eq!(write_buf.remaining(), WRITE_BUF_INLINE_SIZE + 1);
+        assert_eq!(write_buf.remaining(), WRITE_BUF_ENCODE_SIZE + 1);
         assert_eq!(
             write_buf
                 .frame

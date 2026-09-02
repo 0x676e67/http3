@@ -13,10 +13,7 @@ use http::{
 };
 use smallvec::SmallVec;
 
-use crate::{
-    ext::Protocol,
-    qpack::{HeaderField, HeaderFieldRef},
-};
+use crate::{ext::Protocol, qpack::HeaderField};
 
 define_enum_with_values! {
     /// Represents the order of HTTP/3 pseudo-header fields in the header block.
@@ -317,7 +314,7 @@ impl Header {
 }
 
 impl IntoIterator for Header {
-    type Item = HeaderField;
+    type Item = HeaderField<'static>;
     type IntoIter = HeaderIter;
     fn into_iter(self) -> Self::IntoIter {
         HeaderIter {
@@ -343,7 +340,7 @@ pub(crate) struct HeaderIterRef<'a> {
 }
 
 impl<'a> Iterator for HeaderIterRef<'a> {
-    type Item = HeaderFieldRef<'a>;
+    type Item = HeaderField<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // Pseudo-header fields always precede regular fields. Missing fields
@@ -361,16 +358,18 @@ impl<'a> Iterator for HeaderIterRef<'a> {
             }
         }
 
-        self.fields.next().map(|(name, value)| HeaderFieldRef {
-            name: name.as_str().as_bytes(),
-            value: value.as_bytes(),
-            sensitive: value.is_sensitive(),
+        self.fields.next().map(|(name, value)| {
+            HeaderField::borrowed(
+                name.as_str().as_bytes(),
+                value.as_bytes(),
+                value.is_sensitive(),
+            )
         })
     }
 }
 
 impl Iterator for HeaderIter {
-    type Item = HeaderField;
+    type Item = HeaderField<'static>;
 
     fn next(&mut self) -> Option<Self::Item> {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
@@ -428,9 +427,9 @@ impl Iterator for HeaderIter {
     }
 }
 
-impl TryFrom<Vec<HeaderField>> for Header {
+impl TryFrom<Vec<HeaderField<'static>>> for Header {
     type Error = HeaderError;
-    fn try_from(headers: Vec<HeaderField>) -> Result<Self, Self::Error> {
+    fn try_from(headers: Vec<HeaderField<'static>>) -> Result<Self, Self::Error> {
         let mut fields = HeaderMap::with_capacity(headers.len());
         let mut pseudo = Pseudo::default();
 
@@ -708,7 +707,7 @@ impl Pseudo {
     }
 
     #[inline]
-    fn take_field(&mut self, id: PseudoId) -> Option<HeaderField> {
+    fn take_field(&mut self, id: PseudoId) -> Option<HeaderField<'static>> {
         match id {
             PseudoId::Method => self.method.take().map(|method| {
                 HeaderField::from((":method", method.as_str()))
@@ -738,7 +737,7 @@ impl Pseudo {
     }
 
     #[inline]
-    fn field_ref(&self, id: PseudoId) -> Option<HeaderFieldRef<'_>> {
+    fn field_ref(&self, id: PseudoId) -> Option<HeaderField<'_>> {
         let (name, value): (&[u8], &[u8]) = match id {
             PseudoId::Method => (b":method", self.method.as_ref()?.as_str().as_bytes()),
             PseudoId::Scheme => (b":scheme", self.scheme.as_ref()?.as_str().as_bytes()),
@@ -747,11 +746,7 @@ impl Pseudo {
             PseudoId::Status => (b":status", self.status.as_ref()?.as_str().as_bytes()),
             PseudoId::Protocol => (b":protocol", self.protocol.as_ref()?.as_str().as_bytes()),
         };
-        Some(HeaderFieldRef {
-            name,
-            value,
-            sensitive: self.is_sensitive(id),
-        })
+        Some(HeaderField::borrowed(name, value, self.is_sensitive(id)))
     }
 }
 
@@ -818,7 +813,7 @@ mod tests {
         let owned_size = qpack::encode_stateless(&mut owned, headers.clone()).unwrap();
 
         let mut borrowed = BytesMut::new();
-        let borrowed_size = qpack::encode_stateless_ref(&mut borrowed, headers.iter_ref()).unwrap();
+        let borrowed_size = qpack::encode_stateless(&mut borrowed, headers.iter_ref()).unwrap();
 
         assert_eq!(borrowed, owned);
         assert_eq!(borrowed_size, owned_size);

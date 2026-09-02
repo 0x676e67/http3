@@ -187,13 +187,12 @@ where
         //# more cookie-pairs, before compression.
 
         let mut block = BytesMut::new();
-        let mem_size =
-            qpack::encode_stateless_ref(&mut block, headers.iter_ref()).map_err(|_e| {
-                self.handle_connection_error_on_stream(InternalConnectionError {
-                    code: Code::H3_INTERNAL_ERROR,
-                    message: "Failed to encode headers".to_string(),
-                })
-            })?;
+        let mem_size = qpack::encode_stateless(&mut block, headers.iter_ref()).map_err(|_e| {
+            self.handle_connection_error_on_stream(InternalConnectionError {
+                code: Code::H3_INTERNAL_ERROR,
+                message: "Failed to encode headers".to_string(),
+            })
+        })?;
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
         //# An implementation that

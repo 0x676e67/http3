@@ -3,7 +3,7 @@ use std::{cmp, io::Cursor};
 use bytes::{Buf, BufMut};
 
 use super::{
-    HeaderField, HeaderFieldRef,
+    HeaderField,
     block::{
         HeaderPrefix, Indexed, IndexedWithPostBase, Literal, LiteralWithNameRef,
         LiteralWithPostBaseNameRef,
@@ -69,7 +69,7 @@ impl Encoder {
     where
         W: BufMut,
         T: IntoIterator<Item = H>,
-        H: AsRef<HeaderField>,
+        H: AsRef<HeaderField<'static>>,
     {
         let mut required_ref = 0;
         let mut block_buf = Vec::new();
@@ -145,7 +145,7 @@ impl Encoder {
         table: &mut DynamicTableEncoder,
         block: &mut Vec<u8>,
         encoder: &mut W,
-        field: &HeaderField,
+        field: &HeaderField<'static>,
     ) -> Result<Option<usize>, EncoderError> {
         if field.is_sensitive() {
             return Self::encode_sensitive_field(table, block, field);
@@ -220,7 +220,7 @@ impl Encoder {
     fn encode_sensitive_field(
         table: &mut DynamicTableEncoder,
         block: &mut Vec<u8>,
-        field: &HeaderField,
+        field: &HeaderField<'static>,
     ) -> Result<Option<usize>, EncoderError> {
         // The N bit forbids an indexed field line and dynamic-table insertion.
         // A name reference is still a literal representation and can be used.
@@ -263,11 +263,20 @@ impl Default for Encoder {
     }
 }
 
-pub fn encode_stateless<W, T, H>(block: &mut W, fields: T) -> Result<u64, EncoderError>
+/// Encodes a field section without dynamic-table references.
+///
+/// The returned value is the uncompressed field section size, including the
+/// 32-byte overhead defined for each field by
+/// [HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
+///
+/// # Errors
+///
+/// Returns an error if a field cannot be represented by the QPACK encoder.
+pub fn encode_stateless<'a, W, T, H>(block: &mut W, fields: T) -> Result<u64, EncoderError>
 where
     W: BufMut,
     T: IntoIterator<Item = H>,
-    H: AsRef<HeaderField>,
+    H: AsRef<HeaderField<'a>>,
 {
     let mut size = 0;
 
@@ -275,21 +284,6 @@ where
     for field in fields {
         let field = field.as_ref();
         encode_stateless_parts(block, &field.name, &field.value, field.is_sensitive())?;
-        size += field.mem_size() as u64;
-    }
-    Ok(size)
-}
-
-pub(crate) fn encode_stateless_ref<'a, W, T>(block: &mut W, fields: T) -> Result<u64, EncoderError>
-where
-    W: BufMut,
-    T: IntoIterator<Item = HeaderFieldRef<'a>>,
-{
-    let mut size = 0;
-
-    HeaderPrefix::new(0, 0, 0, 0).encode(block);
-    for field in fields {
-        encode_stateless_parts(block, field.name, field.value, field.is_sensitive())?;
         size += field.mem_size() as u64;
     }
     Ok(size)
@@ -443,8 +437,8 @@ mod tests {
 
     #[allow(clippy::type_complexity)]
     fn check_encode_field(
-        init_fields: &[HeaderField],
-        field: &[HeaderField],
+        init_fields: &[HeaderField<'static>],
+        field: &[HeaderField<'static>],
         check: &dyn Fn(&mut Cursor<&mut Vec<u8>>, &mut Cursor<&mut Vec<u8>>),
     ) {
         let mut table = build_table();
@@ -455,8 +449,8 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn check_encode_field_table(
         table: &mut DynamicTable,
-        init_fields: &[HeaderField],
-        field: &[HeaderField],
+        init_fields: &[HeaderField<'static>],
+        field: &[HeaderField<'static>],
         stream_id: u64,
         check: &dyn Fn(&mut Cursor<&mut Vec<u8>>, &mut Cursor<&mut Vec<u8>>),
     ) {
