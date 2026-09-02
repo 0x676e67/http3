@@ -858,7 +858,8 @@ mod tests {
         let mut owned = Vec::with_capacity(64);
         owned.extend_from_slice(b"owned-value");
         let owned_ptr = owned.as_ptr();
-        let borrowed_ptr = b"0".as_ptr();
+        let borrowed: &'static [u8] = b"0";
+        let borrowed_ptr = borrowed.as_ptr();
         let headers = Header::try_from(vec![
             HeaderField {
                 name: Cow::Borrowed(b":status"),
@@ -867,7 +868,7 @@ mod tests {
             },
             HeaderField {
                 name: Cow::Borrowed(b"content-length"),
-                value: Cow::Borrowed(b"0"),
+                value: Cow::Borrowed(borrowed),
                 sensitive: true,
             },
             HeaderField {
