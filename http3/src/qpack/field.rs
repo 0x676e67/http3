@@ -9,6 +9,27 @@ use std::{
  */
 pub const ESTIMATED_OVERHEAD_BYTES: usize = 32;
 
+/// A non-owning field view used while encoding an already-normalized HTTP
+/// header section.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HeaderFieldRef<'a> {
+    pub(crate) name: &'a [u8],
+    pub(crate) value: &'a [u8],
+    pub(crate) sensitive: bool,
+}
+
+impl HeaderFieldRef<'_> {
+    #[inline]
+    pub(crate) fn mem_size(self) -> usize {
+        self.name.len() + self.value.len() + ESTIMATED_OVERHEAD_BYTES
+    }
+
+    #[inline]
+    pub(crate) fn is_sensitive(self) -> bool {
+        self.sensitive
+    }
+}
+
 #[derive(Debug, PartialEq, Clone, Hash, Eq)]
 pub struct HeaderField {
     pub name: Cow<'static, [u8]>,

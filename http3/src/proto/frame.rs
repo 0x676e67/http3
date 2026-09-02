@@ -4,7 +4,6 @@ use std::{
 };
 
 use bytes::{Buf, BufMut, Bytes};
-use smallvec::SmallVec;
 #[cfg(feature = "tracing")]
 use tracing::trace;
 
@@ -556,19 +555,12 @@ setting_identifiers! {
     WEBTRANSPORT_MAX_SESSIONS = 0x2b603743,
 }
 
-const SETTINGS_INLINE: usize = 16;
-
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Settings {
-    entries: SmallVec<[(SettingId, u64); SETTINGS_INLINE]>,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            entries: SmallVec::new(),
-        }
-    }
+    // SETTINGS is exchanged once per connection. Keeping its variable-length
+    // storage out of the generic `Frame` layout avoids making every request
+    // stream carry the largest possible inline SETTINGS representation.
+    entries: Vec<(SettingId, u64)>,
 }
 
 impl FrameHeader for Settings {
@@ -713,6 +705,7 @@ mod tests {
     use assert_matches::assert_matches;
 
     use super::*;
+    use crate::stream::WriteBuf;
 
     fn frame_header(ty: FrameType, len: u64) -> Cursor<Vec<u8>> {
         let mut wire = Vec::new();
@@ -882,6 +875,30 @@ mod tests {
             ],
             Frame::Settings(recv_settings),
         );
+    }
+
+    #[test]
+    fn write_buf_streams_push_promise_payload_once() {
+        let payload = Bytes::from(vec![0x2a; 128]);
+        let expected = Frame::<Bytes>::PushPromise(PushPromise {
+            id: 7,
+            encoded: payload.clone(),
+        });
+        let mut write = WriteBuf::<Bytes>::from(Frame::<Bytes>::PushPromise(PushPromise {
+            id: 7,
+            encoded: payload,
+        }));
+        let mut wire = write.copy_to_bytes(write.remaining());
+
+        assert_eq!(Frame::<PayloadLen>::decode(&mut wire).unwrap(), expected);
+        assert!(!wire.has_remaining());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn cold_settings_do_not_expand_hot_frames() {
+        assert!(std::mem::size_of::<Settings>() <= 32);
+        assert!(std::mem::size_of::<Frame<Bytes>>() <= 64);
     }
 
     #[test]

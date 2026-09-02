@@ -19,7 +19,8 @@ pub use self::{
 };
 pub(crate) use self::{
     decoder::{FieldSectionPrefix, decode_stateless_limited},
-    encoder::Encoder,
+    encoder::{Encoder, encode_stateless_ref},
+    field::HeaderFieldRef,
 };
 use crate::quic::StreamId;
 
@@ -226,6 +227,24 @@ impl QpackDecoder {
     /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3).
     pub(crate) fn dynamic_table_enabled(&self) -> bool {
         self.0.decoder_dynamic_table
+    }
+
+    /// Decodes without entering the async shared-decoder path when dynamic
+    /// table references were disabled for this connection.
+    pub(crate) fn try_decode_stateless<T: Buf>(
+        &self,
+        encoded: &mut T,
+        max_size: u64,
+    ) -> Option<Result<Decoded, DecoderError>> {
+        if self.0.decoder_dynamic_table {
+            None
+        } else {
+            Some(decode_stateless_limited(
+                encoded,
+                max_size,
+                self.0.max_encoded_string_size,
+            ))
+        }
     }
 
     /// Queues a blocked field section for the connection driver.

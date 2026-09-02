@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::{Buf, BufMut, Bytes};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::{future, ready};
 use pin_project_lite::pin_project;
 use tokio::io::ReadBuf;
@@ -15,7 +15,7 @@ use crate::{
     frame::FrameStream,
     proto::{
         coding::Encode,
-        frame::{Frame, Settings},
+        frame::{Frame, FrameHeader, Settings},
         stream::StreamType,
         varint::VarInt,
     },
@@ -40,11 +40,18 @@ where
     Ok(())
 }
 
-// Must be large enough to encode a full SETTINGS frame (stream type + frame header + all entries).
-// 16 settings × 16 bytes each (worst-case varint) + stream type + frame header = ~272 bytes.
-const WRITE_BUF_ENCODE_SIZE: usize = 512;
+// Ordinary frame headers need at most a handful of QUIC varints. SETTINGS is
+// connection-scoped and uses the spill representation below, so request streams
+// do not carry storage sized for an arbitrarily large SETTINGS frame.
+const WRITE_BUF_INLINE_SIZE: usize = 64;
 
-/// Wrap frames to encode their header on the stack before sending them on the wire
+enum EncodedHeader {
+    Inline([u8; WRITE_BUF_INLINE_SIZE]),
+    Heap(Bytes),
+}
+
+/// Wrap frames to encode their header inline before sending them on the wire.
+/// Connection-scoped SETTINGS uses growable storage when it exceeds the inline prefix.
 ///
 /// Implements `Buf` so wire data is seamlessly available for transport layer transmits:
 /// `Buf::chunk()` will yield the encoded header, then the payload. For unidirectional streams,
@@ -55,7 +62,7 @@ const WRITE_BUF_ENCODE_SIZE: usize = 512;
 /// ergonomy advantage: `WriteBuf` doesn't have to appear in public associated types. On the other
 /// hand, QUIC implementers have to call `into()`, which will encode the header in `Self::buf`.
 pub struct WriteBuf<B> {
-    buf: [u8; WRITE_BUF_ENCODE_SIZE],
+    buf: EncodedHeader,
     len: usize,
     pos: usize,
     frame: Option<Frame<B>>,
@@ -65,24 +72,112 @@ impl<B> WriteBuf<B>
 where
     B: Buf,
 {
-    fn encode_stream_type(&mut self, ty: StreamType) {
-        let mut buf_mut = &mut self.buf[self.len..];
-
-        ty.encode(&mut buf_mut);
-        self.len = WRITE_BUF_ENCODE_SIZE - buf_mut.remaining_mut();
+    fn inline(frame: Option<Frame<B>>) -> Self {
+        Self {
+            buf: EncodedHeader::Inline([0; WRITE_BUF_INLINE_SIZE]),
+            len: 0,
+            pos: 0,
+            frame,
+        }
     }
 
-    fn encode_value(&mut self, value: impl Encode) {
-        let mut buf_mut = &mut self.buf[self.len..];
-        value.encode(&mut buf_mut);
-        self.len = WRITE_BUF_ENCODE_SIZE - buf_mut.remaining_mut();
+    fn heap(encoded: Bytes, frame: Option<Frame<B>>) -> Self {
+        Self {
+            len: encoded.len(),
+            buf: EncodedHeader::Heap(encoded),
+            pos: 0,
+            frame,
+        }
+    }
+
+    fn encode_heap(value: &impl Encode, capacity: usize) -> Bytes {
+        let mut encoded = BytesMut::with_capacity(capacity);
+        value.encode(&mut encoded);
+        encoded.freeze()
+    }
+
+    fn encode_stream_type(&mut self, ty: StreamType) {
+        self.encode_value(&ty);
+    }
+
+    fn encode_value(&mut self, value: &impl Encode) {
+        match &mut self.buf {
+            EncodedHeader::Inline(buf) => {
+                let tail = &mut buf[self.len..];
+                let initial = tail.remaining_mut();
+                let mut buf_mut = tail;
+                value.encode(&mut buf_mut);
+                self.len += initial - buf_mut.remaining_mut();
+            }
+            EncodedHeader::Heap(buf) => {
+                let mut encoded = BytesMut::with_capacity(
+                    buf.len().saturating_add(VarInt::MAX_SIZE.saturating_mul(3)),
+                );
+                encoded.extend_from_slice(buf);
+                value.encode(&mut encoded);
+                self.len = encoded.len();
+                *buf = encoded.freeze();
+            }
+        }
     }
 
     fn encode_frame_header(&mut self) {
-        if let Some(frame) = self.frame.as_ref() {
-            let mut buf_mut = &mut self.buf[self.len..];
-            frame.encode(&mut buf_mut);
-            self.len = WRITE_BUF_ENCODE_SIZE - buf_mut.remaining_mut();
+        if let Some(frame) = self.frame.take() {
+            match &mut self.buf {
+                EncodedHeader::Inline(buf) => {
+                    let tail = &mut buf[self.len..];
+                    let initial = tail.remaining_mut();
+                    let mut buf_mut = tail;
+                    Self::encode_frame_prefix(&frame, &mut buf_mut);
+                    self.len += initial - buf_mut.remaining_mut();
+                }
+                EncodedHeader::Heap(buf) => {
+                    let mut encoded = BytesMut::with_capacity(
+                        buf.len().saturating_add(VarInt::MAX_SIZE.saturating_mul(3)),
+                    );
+                    encoded.extend_from_slice(buf);
+                    Self::encode_frame_prefix(&frame, &mut encoded);
+                    self.len = encoded.len();
+                    *buf = encoded.freeze();
+                }
+            }
+            self.frame = Some(frame);
+        }
+    }
+
+    /// Keeps a small HEADERS frame in one contiguous chunk. Quinn otherwise
+    /// observes the frame prefix and QPACK block as two writes, each requiring
+    /// a separate trip through its send-stream state.
+    fn coalesce_small_headers(&mut self) {
+        let Self {
+            buf: EncodedHeader::Inline(buf),
+            len,
+            frame: Some(Frame::Headers(payload)),
+            ..
+        } = self
+        else {
+            return;
+        };
+
+        let payload_len = payload.remaining();
+        let Some(end) = len.checked_add(payload_len) else {
+            return;
+        };
+        if end > WRITE_BUF_INLINE_SIZE || payload.chunk().len() < payload_len {
+            return;
+        }
+
+        buf[*len..end].copy_from_slice(&payload.chunk()[..payload_len]);
+        *len = end;
+        payload.advance(payload_len);
+    }
+
+    fn encode_frame_prefix<T: BufMut>(frame: &Frame<B>, buf: &mut T) {
+        match frame {
+            // PUSH_PROMISE carries a separately streamed QPACK field section.
+            // Only its frame header and Push ID belong in the prefix.
+            Frame::PushPromise(push) => push.encode_header(buf),
+            _ => frame.encode(buf),
         }
     }
 }
@@ -92,12 +187,7 @@ where
     B: Buf,
 {
     fn from(ty: StreamType) -> Self {
-        let mut me = Self {
-            buf: [0; WRITE_BUF_ENCODE_SIZE],
-            len: 0,
-            pos: 0,
-            frame: None,
-        };
+        let mut me = Self::inline(None);
         me.encode_stream_type(ty);
         me
     }
@@ -108,15 +198,21 @@ where
     B: Buf,
 {
     fn from(header: UniStreamHeader) -> Self {
-        let mut this = Self {
-            buf: [0; WRITE_BUF_ENCODE_SIZE],
-            len: 0,
-            pos: 0,
-            frame: None,
-        };
-
-        this.encode_value(header);
-        this
+        match header {
+            UniStreamHeader::Control(settings) => {
+                let capacity = settings
+                    .len()
+                    .saturating_add(VarInt::MAX_SIZE.saturating_mul(3));
+                let header = UniStreamHeader::Control(settings);
+                let encoded = Self::encode_heap(&header, capacity);
+                Self::heap(encoded, None)
+            }
+            header => {
+                let mut this = Self::inline(None);
+                this.encode_value(&header);
+                this
+            }
+        }
     }
 }
 
@@ -154,14 +250,9 @@ where
     B: Buf,
 {
     fn from(header: BidiStreamHeader) -> Self {
-        let mut this = Self {
-            buf: [0; WRITE_BUF_ENCODE_SIZE],
-            len: 0,
-            pos: 0,
-            frame: None,
-        };
+        let mut this = Self::inline(None);
 
-        this.encode_value(header);
+        this.encode_value(&header);
         this
     }
 }
@@ -186,14 +277,18 @@ where
     B: Buf,
 {
     fn from(frame: Frame<B>) -> Self {
-        let mut me = Self {
-            buf: [0; WRITE_BUF_ENCODE_SIZE],
-            len: 0,
-            pos: 0,
-            frame: Some(frame),
-        };
-        me.encode_frame_header();
-        me
+        if let Frame::Settings(settings) = &frame {
+            let capacity = settings
+                .len()
+                .saturating_add(VarInt::MAX_SIZE.saturating_mul(2));
+            let encoded = Self::encode_heap(&frame, capacity);
+            Self::heap(encoded, None)
+        } else {
+            let mut this = Self::inline(Some(frame));
+            this.encode_frame_header();
+            this.coalesce_small_headers();
+            this
+        }
     }
 }
 
@@ -203,15 +298,21 @@ where
 {
     fn from(ty_stream: (StreamType, Frame<B>)) -> Self {
         let (ty, frame) = ty_stream;
-        let mut me = Self {
-            buf: [0; WRITE_BUF_ENCODE_SIZE],
-            len: 0,
-            pos: 0,
-            frame: Some(frame),
-        };
-        me.encode_value(ty);
-        me.encode_frame_header();
-        me
+        if let Frame::Settings(settings) = &frame {
+            let capacity = settings
+                .len()
+                .saturating_add(VarInt::MAX_SIZE.saturating_mul(3));
+            let mut encoded = BytesMut::with_capacity(capacity);
+            ty.encode(&mut encoded);
+            frame.encode(&mut encoded);
+            Self::heap(encoded.freeze(), None)
+        } else {
+            let mut this = Self::inline(Some(frame));
+            this.encode_value(&ty);
+            this.encode_frame_header();
+            this.coalesce_small_headers();
+            this
+        }
     }
 }
 
@@ -230,7 +331,10 @@ where
 
     fn chunk(&self) -> &[u8] {
         if self.len - self.pos > 0 {
-            &self.buf[self.pos..self.len]
+            match &self.buf {
+                EncodedHeader::Inline(buf) => &buf[self.pos..self.len],
+                EncodedHeader::Heap(buf) => &buf[self.pos..self.len],
+            }
         } else if let Some(payload) = self.frame.as_ref().and_then(|f| f.payload()) {
             payload.chunk()
         } else {
@@ -725,7 +829,17 @@ fn convert_to_std_io_error(error: StreamErrorIncoming) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::coding::BufExt;
+    use crate::proto::{coding::BufExt, frame::SettingId, push::PushId};
+
+    fn large_settings() -> Settings {
+        let mut settings = Settings::default();
+        for index in 0..32 {
+            settings
+                .insert(SettingId(0x21 + 0x1f * index), index)
+                .unwrap();
+        }
+        settings
+    }
 
     #[test]
     fn write_wt_uni_header() {
@@ -762,6 +876,200 @@ mod tests {
         let wbuf = WriteBuf::<Bytes>::from((StreamType::ENCODER, Frame::Goaway(VarInt(2))));
 
         assert_eq!(wbuf.chunk(), b"\x02\x07\x01\x02");
+    }
+
+    #[test]
+    fn write_buf_spills_large_settings() {
+        let mut expected = BytesMut::new();
+        UniStreamHeader::Control(large_settings()).encode(&mut expected);
+
+        let mut wbuf = WriteBuf::<Bytes>::from(UniStreamHeader::Control(large_settings()));
+        assert!(wbuf.len > WRITE_BUF_INLINE_SIZE);
+        let mut encoded = wbuf.copy_to_bytes(wbuf.remaining());
+        assert_eq!(encoded.as_ref(), expected.as_ref());
+
+        assert_eq!(encoded.get_var().unwrap(), 0);
+        assert!(matches!(
+            Frame::<crate::proto::frame::PayloadLen>::decode(&mut encoded),
+            Ok(Frame::Settings(_))
+        ));
+        assert!(!encoded.has_remaining());
+    }
+
+    #[test]
+    fn write_buf_spills_large_settings_after_stream_type() {
+        let mut expected = BytesMut::new();
+        StreamType::CONTROL.encode(&mut expected);
+        Frame::<Bytes>::Settings(large_settings()).encode(&mut expected);
+
+        let mut wbuf =
+            WriteBuf::<Bytes>::from((StreamType::CONTROL, Frame::Settings(large_settings())));
+        assert!(wbuf.len > WRITE_BUF_INLINE_SIZE);
+        let mut encoded = wbuf.copy_to_bytes(wbuf.remaining());
+        assert_eq!(encoded.as_ref(), expected.as_ref());
+
+        assert_eq!(encoded.get_var().unwrap(), 0);
+        assert!(matches!(
+            Frame::<crate::proto::frame::PayloadLen>::decode(&mut encoded),
+            Ok(Frame::Settings(_))
+        ));
+        assert!(!encoded.has_remaining());
+    }
+
+    #[test]
+    fn every_non_settings_frame_prefix_fits_inline_storage() {
+        fn assert_inline(frame: Frame<Bytes>) {
+            match &frame {
+                Frame::Settings(_) => panic!("SETTINGS must use heap storage"),
+                Frame::Data(_)
+                | Frame::Headers(_)
+                | Frame::CancelPush(_)
+                | Frame::PushPromise(_)
+                | Frame::Goaway(_)
+                | Frame::MaxPushId(_)
+                | Frame::WebTransportStream(_)
+                | Frame::Grease => {}
+            }
+
+            let wbuf = WriteBuf::from(frame);
+            assert!(matches!(&wbuf.buf, EncodedHeader::Inline(_)));
+            assert!(wbuf.len <= WRITE_BUF_INLINE_SIZE);
+        }
+
+        assert_inline(Frame::Data(Bytes::from_static(b"data")));
+        assert_inline(Frame::Headers(Bytes::from_static(b"headers")));
+        assert_inline(Frame::CancelPush(
+            PushId::try_from(VarInt::MAX.into_inner()).unwrap(),
+        ));
+        assert_inline(Frame::Goaway(VarInt::MAX));
+        assert_inline(Frame::MaxPushId(
+            PushId::try_from(VarInt::MAX.into_inner()).unwrap(),
+        ));
+        assert_inline(Frame::WebTransportStream(SessionId::from_varint(
+            VarInt::MAX,
+        )));
+        assert_inline(Frame::Grease);
+    }
+
+    #[test]
+    fn small_headers_are_one_inline_chunk() {
+        let payload = Bytes::from_static(b"small qpack block");
+        let payload_len = payload.len();
+        let mut expected = BytesMut::new();
+        Frame::<Bytes>::Headers(payload.clone()).encode_with_payload(&mut expected);
+
+        let mut write_buf = WriteBuf::from(Frame::<Bytes>::Headers(payload));
+
+        assert!(matches!(&write_buf.buf, EncodedHeader::Inline(_)));
+        assert_eq!(write_buf.chunk(), expected.as_ref());
+        assert_eq!(write_buf.remaining(), expected.len());
+        assert_eq!(
+            write_buf
+                .frame
+                .as_ref()
+                .and_then(Frame::payload)
+                .map(Buf::remaining),
+            Some(0)
+        );
+
+        let prefix_len = expected.len() - payload_len;
+        write_buf.advance(1);
+        assert_eq!(write_buf.chunk(), &expected[1..]);
+        assert_eq!(write_buf.remaining(), expected.len() - 1);
+
+        write_buf.advance(prefix_len - 1);
+        assert_eq!(write_buf.chunk(), &expected[prefix_len..]);
+        assert_eq!(write_buf.remaining(), payload_len);
+
+        write_buf.advance(3);
+        assert_eq!(write_buf.chunk(), &expected[prefix_len + 3..]);
+        assert_eq!(write_buf.remaining(), payload_len - 3);
+
+        write_buf.advance(payload_len - 3);
+        assert_eq!(write_buf.remaining(), 0);
+        assert!(write_buf.chunk().is_empty());
+    }
+
+    #[test]
+    fn large_headers_keep_their_separate_payload() {
+        let payload = Bytes::from(vec![0x5a; WRITE_BUF_INLINE_SIZE]);
+        let write_buf = WriteBuf::from(Frame::<Bytes>::Headers(payload.clone()));
+
+        assert!(write_buf.len < WRITE_BUF_INLINE_SIZE);
+        assert_eq!(write_buf.chunk().len(), write_buf.len);
+        assert_eq!(
+            write_buf
+                .frame
+                .as_ref()
+                .and_then(Frame::payload)
+                .map(Buf::remaining),
+            Some(payload.len())
+        );
+        assert_eq!(write_buf.remaining(), write_buf.len + payload.len());
+    }
+
+    #[test]
+    fn headers_coalescing_respects_the_inline_boundary() {
+        let payload = Bytes::from(vec![0x5a; WRITE_BUF_INLINE_SIZE - 2]);
+        let write_buf = WriteBuf::from(Frame::<Bytes>::Headers(payload));
+        assert_eq!(write_buf.len, WRITE_BUF_INLINE_SIZE);
+        assert_eq!(write_buf.chunk().len(), WRITE_BUF_INLINE_SIZE);
+        assert_eq!(
+            write_buf
+                .frame
+                .as_ref()
+                .and_then(Frame::payload)
+                .map(Buf::remaining),
+            Some(0)
+        );
+
+        let payload = Bytes::from(vec![0x5a; WRITE_BUF_INLINE_SIZE - 1]);
+        let write_buf = WriteBuf::from(Frame::<Bytes>::Headers(payload.clone()));
+        assert_eq!(write_buf.chunk().len(), write_buf.len);
+        assert_eq!(write_buf.remaining(), WRITE_BUF_INLINE_SIZE + 1);
+        assert_eq!(
+            write_buf
+                .frame
+                .as_ref()
+                .and_then(Frame::payload)
+                .map(Buf::remaining),
+            Some(payload.len())
+        );
+
+        let payload = Bytes::from(vec![0x5a; WRITE_BUF_INLINE_SIZE - 3]);
+        let write_buf = WriteBuf::from((StreamType::ENCODER, Frame::<Bytes>::Headers(payload)));
+        assert_eq!(write_buf.len, WRITE_BUF_INLINE_SIZE);
+        assert_eq!(write_buf.chunk().len(), WRITE_BUF_INLINE_SIZE);
+        assert_eq!(
+            write_buf
+                .frame
+                .as_ref()
+                .and_then(Frame::payload)
+                .map(Buf::remaining),
+            Some(0)
+        );
+
+        let payload = Bytes::from(vec![0x5a; WRITE_BUF_INLINE_SIZE - 2]);
+        let write_buf = WriteBuf::from((
+            StreamType::ENCODER,
+            Frame::<Bytes>::Headers(payload.clone()),
+        ));
+        assert_eq!(write_buf.chunk().len(), write_buf.len);
+        assert_eq!(write_buf.remaining(), WRITE_BUF_INLINE_SIZE + 1);
+        assert_eq!(
+            write_buf
+                .frame
+                .as_ref()
+                .and_then(Frame::payload)
+                .map(Buf::remaining),
+            Some(payload.len())
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn write_buf_stays_small_on_64_bit_targets() {
+        assert!(std::mem::size_of::<WriteBuf<Bytes>>() <= 192);
     }
 
     #[test]

@@ -393,30 +393,30 @@ impl LiteralWithNameRef {
                 index,
                 value,
                 never_indexed,
-            } => {
-                prefix_int::encode(
-                    4,
-                    0b0101 | (u8::from(*never_indexed) << 1),
-                    *index as u64,
-                    buf,
-                );
-                prefix_string::encode(8, 0, value, buf)?;
-            }
+            } => Self::encode_parts(*index, value, *never_indexed, true, buf)?,
             LiteralWithNameRef::Dynamic {
                 index,
                 value,
                 never_indexed,
-            } => {
-                prefix_int::encode(
-                    4,
-                    0b0100 | (u8::from(*never_indexed) << 1),
-                    *index as u64,
-                    buf,
-                );
-                prefix_string::encode(8, 0, value, buf)?;
-            }
+            } => Self::encode_parts(*index, value, *never_indexed, false, buf)?,
         }
         Ok(())
+    }
+
+    pub(crate) fn encode_parts<W: BufMut>(
+        index: usize,
+        value: &[u8],
+        never_indexed: bool,
+        is_static: bool,
+        buf: &mut W,
+    ) -> Result<(), prefix_string::Error> {
+        prefix_int::encode(
+            4,
+            if is_static { 0b0101 } else { 0b0100 } | (u8::from(never_indexed) << 1),
+            index as u64,
+            buf,
+        );
+        prefix_string::encode(8, 0, value, buf)
     }
 
     fn with_never_indexed_if(self, never_indexed: bool) -> Self {
@@ -527,9 +527,18 @@ impl Literal {
     }
 
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
-        prefix_string::encode(4, 0b0010 | u8::from(self.never_indexed), &self.name, buf)?;
-        prefix_string::encode(8, 0, &self.value, buf)?;
+        Self::encode_parts(&self.name, &self.value, self.never_indexed, buf)?;
         Ok(())
+    }
+
+    pub(crate) fn encode_parts<W: BufMut>(
+        name: &[u8],
+        value: &[u8],
+        never_indexed: bool,
+        buf: &mut W,
+    ) -> Result<(), prefix_string::Error> {
+        prefix_string::encode(4, 0b0010 | u8::from(never_indexed), name, buf)?;
+        prefix_string::encode(8, 0, value, buf)
     }
 }
 

@@ -1599,6 +1599,15 @@ where
     }
 
     #[inline(always)]
+    pub(crate) fn try_decode_header_stateless(
+        &self,
+        encoded: &mut Bytes,
+    ) -> Option<Result<qpack::Decoded, qpack::DecoderError>> {
+        self.decoder
+            .try_decode_stateless(encoded, self.max_field_section_size)
+    }
+
+    #[inline(always)]
     pub(crate) fn poll_decode_header(
         &mut self,
         cx: &mut Context<'_>,

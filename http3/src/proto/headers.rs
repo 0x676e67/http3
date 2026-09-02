@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     convert::TryFrom,
     fmt,
     iter::{IntoIterator, Iterator},
@@ -12,7 +13,10 @@ use http::{
 };
 use smallvec::SmallVec;
 
-use crate::{ext::Protocol, qpack::HeaderField};
+use crate::{
+    ext::Protocol,
+    qpack::{HeaderField, HeaderFieldRef},
+};
 
 define_enum_with_values! {
     /// Represents the order of HTTP/3 pseudo-header fields in the header block.
@@ -48,7 +52,7 @@ define_enum_with_values! {
 /// and correct ordering.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct PseudoOrder {
-    ids: SmallVec<[PseudoId; PseudoId::DEFAULT_STACK_SIZE]>,
+    ids: [PseudoId; PseudoId::DEFAULT_STACK_SIZE],
 }
 
 /// A builder for constructing a [`PseudoOrder`].
@@ -108,7 +112,7 @@ impl Default for PseudoOrder {
     #[inline]
     fn default() -> Self {
         PseudoOrder {
-            ids: SmallVec::from(PseudoId::DEFAULT_IDS),
+            ids: PseudoId::DEFAULT_IDS,
         }
     }
 }
@@ -149,7 +153,12 @@ impl PseudoOrderBuilder {
         if self.ids.len() != PseudoId::DEFAULT_IDS.len() {
             self = self.extend(PseudoId::DEFAULT_IDS);
         }
-        PseudoOrder { ids: self.ids }
+
+        let mut ids = PseudoId::DEFAULT_IDS;
+        for (target, source) in ids.iter_mut().zip(self.ids) {
+            *target = source;
+        }
+        PseudoOrder { ids }
     }
 }
 
@@ -286,9 +295,19 @@ impl Header {
         self.pseudo.len() + self.fields.len()
     }
 
+    /// Borrows the normalized field section without materializing owned QPACK
+    /// fields. Pseudo-header order and sensitivity match [`HeaderIter`].
+    pub(crate) fn iter_ref(&self) -> HeaderIterRef<'_> {
+        HeaderIterRef {
+            pseudo: &self.pseudo,
+            pseudo_order_index: 0,
+            fields: self.fields.iter(),
+        }
+    }
+
     /// Sets the pseudo-header field order for this header block.
     pub fn set_pseudo_order(&mut self, order: PseudoOrder) {
-        self.pseudo.order = order;
+        self.pseudo.order = Some(order);
     }
 
     #[cfg(test)]
@@ -303,6 +322,7 @@ impl IntoIterator for Header {
     fn into_iter(self) -> Self::IntoIter {
         HeaderIter {
             pseudo: Some(self.pseudo),
+            pseudo_order_index: 0,
             last_header_name: None,
             fields: self.fields.into_iter(),
         }
@@ -311,8 +331,42 @@ impl IntoIterator for Header {
 
 pub struct HeaderIter {
     pseudo: Option<Pseudo>,
+    pseudo_order_index: u8,
     last_header_name: Option<HeaderName>,
     fields: header::IntoIter<HeaderValue>,
+}
+
+pub(crate) struct HeaderIterRef<'a> {
+    pseudo: &'a Pseudo,
+    pseudo_order_index: usize,
+    fields: header::Iter<'a, HeaderValue>,
+}
+
+impl<'a> Iterator for HeaderIterRef<'a> {
+    type Item = HeaderFieldRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Pseudo-header fields always precede regular fields. Missing fields
+        // are skipped so the same order works for requests and responses.
+        while self.pseudo_order_index < PseudoId::DEFAULT_STACK_SIZE {
+            let index = self.pseudo_order_index;
+            self.pseudo_order_index += 1;
+            let id = self
+                .pseudo
+                .order
+                .as_ref()
+                .map_or(PseudoId::DEFAULT_IDS[index], |order| order.ids[index]);
+            if let Some(field) = self.pseudo.field_ref(id) {
+                return Some(field);
+            }
+        }
+
+        self.fields.next().map(|(name, value)| HeaderFieldRef {
+            name: name.as_str().as_bytes(),
+            value: value.as_bytes(),
+            sensitive: value.is_sensitive(),
+        })
+    }
 }
 
 impl Iterator for HeaderIter {
@@ -323,55 +377,35 @@ impl Iterator for HeaderIter {
         //# All pseudo-header fields MUST appear in the header section before
         //# regular header fields.
         if let Some(ref mut pseudo) = self.pseudo {
-            for pseudo_type in &pseudo.order {
-                match pseudo_type {
-                    PseudoId::Method => {
-                        if let Some(method) = pseudo.method.take() {
-                            return Some(
-                                HeaderField::from((":method", method.as_str()))
-                                    .with_sensitive(pseudo.is_sensitive(PseudoId::Method)),
-                            );
-                        }
-                    }
-                    PseudoId::Scheme => {
-                        if let Some(scheme) = pseudo.scheme.take() {
-                            return Some(
-                                HeaderField::from((":scheme", scheme.as_str().as_bytes()))
-                                    .with_sensitive(pseudo.is_sensitive(PseudoId::Scheme)),
-                            );
-                        }
-                    }
-                    PseudoId::Authority => {
-                        if let Some(authority) = pseudo.authority.take() {
-                            return Some(
-                                HeaderField::from((":authority", authority.as_str().as_bytes()))
-                                    .with_sensitive(pseudo.is_sensitive(PseudoId::Authority)),
-                            );
-                        }
-                    }
-                    PseudoId::Path => {
-                        if let Some(path) = pseudo.path.take() {
-                            return Some(
-                                HeaderField::from((":path", path.as_str().as_bytes()))
-                                    .with_sensitive(pseudo.is_sensitive(PseudoId::Path)),
-                            );
-                        }
-                    }
-                    PseudoId::Status => {
-                        if let Some(status) = pseudo.status.take() {
-                            return Some(
-                                HeaderField::from((":status", status.as_str()))
-                                    .with_sensitive(pseudo.is_sensitive(PseudoId::Status)),
-                            );
-                        }
-                    }
-                    PseudoId::Protocol => {
-                        if let Some(protocol) = pseudo.protocol.take() {
-                            return Some(
-                                HeaderField::from((":protocol", protocol.as_str().as_bytes()))
-                                    .with_sensitive(pseudo.is_sensitive(PseudoId::Protocol)),
-                            );
-                        }
+            if pseudo.order.is_none() {
+                if let Some(field) = pseudo.take_field(PseudoId::Method) {
+                    return Some(field);
+                }
+                if let Some(field) = pseudo.take_field(PseudoId::Scheme) {
+                    return Some(field);
+                }
+                if let Some(field) = pseudo.take_field(PseudoId::Authority) {
+                    return Some(field);
+                }
+                if let Some(field) = pseudo.take_field(PseudoId::Path) {
+                    return Some(field);
+                }
+                if let Some(field) = pseudo.take_field(PseudoId::Status) {
+                    return Some(field);
+                }
+                if let Some(field) = pseudo.take_field(PseudoId::Protocol) {
+                    return Some(field);
+                }
+            } else {
+                while let Some(pseudo_type) = pseudo
+                    .order
+                    .as_ref()
+                    .and_then(|order| order.ids.get(usize::from(self.pseudo_order_index)))
+                    .copied()
+                {
+                    self.pseudo_order_index += 1;
+                    if let Some(field) = pseudo.take_field(pseudo_type) {
+                        return Some(field);
                     }
                 }
             }
@@ -456,11 +490,7 @@ enum Field {
 }
 
 impl Field {
-    fn parse<N, V>(name: N, value: V) -> Result<Self, HeaderError>
-    where
-        N: AsRef<[u8]>,
-        V: AsRef<[u8]> + Send + 'static,
-    {
+    fn parse(name: Cow<'static, [u8]>, value: Cow<'static, [u8]>) -> Result<Self, HeaderError> {
         let name = name.as_ref();
         if name.is_empty() {
             return Err(HeaderError::InvalidHeaderName("name is empty".into()));
@@ -482,13 +512,15 @@ impl Field {
         //# treated as malformed.
 
         if name[0] != b':' {
+            let shared_value = match value {
+                Cow::Borrowed(value) => bytes::Bytes::from_static(value),
+                Cow::Owned(value) => bytes::Bytes::from(value),
+            };
+            let diagnostic = shared_value.clone();
             return Ok(Field::Header((
                 HeaderName::from_lowercase(name).map_err(|_| HeaderError::invalid_name(name))?,
-                {
-                    let shared_value = bytes::Bytes::from_owner(value);
-                    HeaderValue::from_maybe_shared(shared_value.clone())
-                        .map_err(|_| HeaderError::invalid_value(name, shared_value))?
-                },
+                HeaderValue::from_maybe_shared(shared_value)
+                    .map_err(|_| HeaderError::invalid_value(name, diagnostic))?,
             )));
         }
 
@@ -550,7 +582,7 @@ struct Pseudo {
     protocol: Option<Protocol>,
 
     // Pseudo-header field order
-    order: PseudoOrder,
+    order: Option<PseudoOrder>,
 
     // QPACK never-indexed bits for pseudo-header fields. Regular fields carry
     // the same metadata through `HeaderValue::is_sensitive`.
@@ -616,7 +648,7 @@ impl Pseudo {
         //# :scheme, and :path pseudo-header fields, unless the request is a
         //# CONNECT request; see Section 4.4.
         // Extract pseudo-header order from extensions, if provided.
-        let order = ext.get::<PseudoOrder>().cloned().unwrap_or_default();
+        let order = ext.get::<PseudoOrder>().cloned();
         let sensitive = ext
             .get::<PseudoHeaderSensitivity>()
             .copied()
@@ -649,7 +681,7 @@ impl Pseudo {
             path: None,
             status: Some(status),
             protocol: None,
-            order: Default::default(),
+            order: None,
             sensitive: ext
                 .get::<PseudoHeaderSensitivity>()
                 .copied()
@@ -673,6 +705,53 @@ impl Pseudo {
 
     fn is_sensitive(&self, id: PseudoId) -> bool {
         self.sensitive & id.mask_id() != 0
+    }
+
+    #[inline]
+    fn take_field(&mut self, id: PseudoId) -> Option<HeaderField> {
+        match id {
+            PseudoId::Method => self.method.take().map(|method| {
+                HeaderField::from((":method", method.as_str()))
+                    .with_sensitive(self.is_sensitive(id))
+            }),
+            PseudoId::Scheme => self.scheme.take().map(|scheme| {
+                HeaderField::from((":scheme", scheme.as_str().as_bytes()))
+                    .with_sensitive(self.is_sensitive(id))
+            }),
+            PseudoId::Authority => self.authority.take().map(|authority| {
+                HeaderField::from((":authority", authority.as_str().as_bytes()))
+                    .with_sensitive(self.is_sensitive(id))
+            }),
+            PseudoId::Path => self.path.take().map(|path| {
+                HeaderField::from((":path", path.as_str().as_bytes()))
+                    .with_sensitive(self.is_sensitive(id))
+            }),
+            PseudoId::Status => self.status.take().map(|status| {
+                HeaderField::from((":status", status.as_str()))
+                    .with_sensitive(self.is_sensitive(id))
+            }),
+            PseudoId::Protocol => self.protocol.take().map(|protocol| {
+                HeaderField::from((":protocol", protocol.as_str().as_bytes()))
+                    .with_sensitive(self.is_sensitive(id))
+            }),
+        }
+    }
+
+    #[inline]
+    fn field_ref(&self, id: PseudoId) -> Option<HeaderFieldRef<'_>> {
+        let (name, value): (&[u8], &[u8]) = match id {
+            PseudoId::Method => (b":method", self.method.as_ref()?.as_str().as_bytes()),
+            PseudoId::Scheme => (b":scheme", self.scheme.as_ref()?.as_str().as_bytes()),
+            PseudoId::Authority => (b":authority", self.authority.as_ref()?.as_str().as_bytes()),
+            PseudoId::Path => (b":path", self.path.as_ref()?.as_str().as_bytes()),
+            PseudoId::Status => (b":status", self.status.as_ref()?.as_str().as_bytes()),
+            PseudoId::Protocol => (b":protocol", self.protocol.as_ref()?.as_str().as_bytes()),
+        };
+        Some(HeaderFieldRef {
+            name,
+            value,
+            sensitive: self.is_sensitive(id),
+        })
     }
 }
 
@@ -729,8 +808,21 @@ impl fmt::Display for HeaderError {
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
+    use bytes::BytesMut;
 
     use super::*;
+    use crate::qpack;
+
+    fn assert_ref_encoding_matches_owned(headers: Header) {
+        let mut owned = BytesMut::new();
+        let owned_size = qpack::encode_stateless(&mut owned, headers.clone()).unwrap();
+
+        let mut borrowed = BytesMut::new();
+        let borrowed_size = qpack::encode_stateless_ref(&mut borrowed, headers.iter_ref()).unwrap();
+
+        assert_eq!(borrowed, owned);
+        assert_eq!(borrowed_size, owned_size);
+    }
 
     #[test]
     fn request_has_no_authority_nor_host() {
@@ -887,6 +979,61 @@ mod tests {
     }
 
     #[test]
+    fn decoded_regular_fields_preserve_borrowed_and_owned_values() {
+        let mut owned = Vec::with_capacity(64);
+        owned.extend_from_slice(b"owned-value");
+        let owned_ptr = owned.as_ptr();
+        let borrowed_ptr = b"0".as_ptr();
+        let headers = Header::try_from(vec![
+            HeaderField {
+                name: Cow::Borrowed(b":status"),
+                value: Cow::Borrowed(b"200"),
+                sensitive: false,
+            },
+            HeaderField {
+                name: Cow::Borrowed(b"content-length"),
+                value: Cow::Borrowed(b"0"),
+                sensitive: true,
+            },
+            HeaderField {
+                name: Cow::Borrowed(b"x-owned"),
+                value: Cow::Owned(owned),
+                sensitive: false,
+            },
+        ])
+        .unwrap();
+
+        let (status, fields, _) = headers.into_response_parts().unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fields["content-length"], "0");
+        assert!(fields["content-length"].is_sensitive());
+        assert_eq!(fields["x-owned"], "owned-value");
+        assert_eq!(fields["content-length"].as_bytes().as_ptr(), borrowed_ptr);
+        assert_eq!(fields["x-owned"].as_bytes().as_ptr(), owned_ptr);
+    }
+
+    #[test]
+    fn decoded_regular_field_errors_preserve_diagnostics() {
+        let borrowed = Header::try_from(vec![HeaderField {
+            name: Cow::Borrowed(b"x-invalid"),
+            value: Cow::Borrowed(b"bad\nvalue"),
+            sensitive: false,
+        }])
+        .unwrap_err();
+        let owned = Header::try_from(vec![HeaderField {
+            name: Cow::Owned(b"x-invalid".to_vec()),
+            value: Cow::Owned(b"bad\nvalue".to_vec()),
+            sensitive: false,
+        }])
+        .unwrap_err();
+
+        assert_matches!(borrowed, HeaderError::InvalidHeaderValue(_));
+        assert_matches!(owned, HeaderError::InvalidHeaderValue(_));
+        assert_eq!(borrowed.to_string(), owned.to_string());
+    }
+
+    #[test]
     fn request_pseudo_sensitivity_survives_http_parts() {
         let headers = Header::try_from(vec![
             HeaderField::from((b":method", b"GET")).with_sensitive(true),
@@ -935,7 +1082,9 @@ mod tests {
     fn test_pseudo_order_default() {
         let order = PseudoOrder::builder().build();
         assert_eq!(order.ids.len(), PseudoId::DEFAULT_STACK_SIZE);
-        assert_eq!(order.ids.as_slice(), PseudoId::DEFAULT_IDS);
+        assert_eq!(order.ids, PseudoId::DEFAULT_IDS);
+        assert!(std::mem::size_of::<PseudoOrder>() <= 8);
+        assert!(std::mem::size_of::<Option<PseudoOrder>>() <= 8);
     }
 
     #[test]
@@ -1032,6 +1181,68 @@ mod tests {
         assert_eq!(
             pseudo_fields,
             vec![":method", ":scheme", ":authority", ":path"]
+        );
+    }
+
+    #[test]
+    fn borrowed_encoding_matches_owned_for_request_variants() {
+        assert_ref_encoding_matches_owned(
+            Header::request(
+                Method::GET,
+                Uri::from_static("https://example.com/resource"),
+                HeaderMap::new(),
+                Extensions::default(),
+            )
+            .unwrap(),
+        );
+
+        let mut fields = HeaderMap::new();
+        let mut sensitive = HeaderValue::from_static("first");
+        sensitive.set_sensitive(true);
+        fields.append("x-repeated", sensitive);
+        fields.append("x-repeated", HeaderValue::from_static("second"));
+        let mut extensions = Extensions::default();
+        extensions.insert(
+            PseudoOrder::builder()
+                .push(PseudoId::Authority)
+                .push(PseudoId::Method)
+                .push(PseudoId::Path)
+                .push(PseudoId::Scheme)
+                .build(),
+        );
+        let mut pseudo_sensitivity = PseudoHeaderSensitivity::default();
+        pseudo_sensitivity.set_sensitive(PseudoId::Authority, true);
+        extensions.insert(pseudo_sensitivity);
+        assert_ref_encoding_matches_owned(
+            Header::request(
+                Method::GET,
+                Uri::from_static("https://example.com/custom"),
+                fields,
+                extensions,
+            )
+            .unwrap(),
+        );
+
+        assert_ref_encoding_matches_owned(
+            Header::request(
+                Method::CONNECT,
+                Uri::from_static("https://example.com"),
+                HeaderMap::new(),
+                Extensions::default(),
+            )
+            .unwrap(),
+        );
+
+        let mut extensions = Extensions::default();
+        extensions.insert(Protocol::WEBSOCKET);
+        assert_ref_encoding_matches_owned(
+            Header::request(
+                Method::CONNECT,
+                Uri::from_static("https://example.com/chat"),
+                HeaderMap::new(),
+                extensions,
+            )
+            .unwrap(),
         );
     }
 }

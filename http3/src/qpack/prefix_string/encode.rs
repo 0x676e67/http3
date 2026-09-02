@@ -387,6 +387,12 @@ pub trait HpackStringEncode {
 
 impl HpackStringEncode for Vec<u8> {
     fn hpack_encode(&self) -> Result<Vec<u8>, Error> {
+        self.as_slice().hpack_encode()
+    }
+}
+
+impl HpackStringEncode for [u8] {
+    fn hpack_encode(&self) -> Result<Vec<u8>, Error> {
         let mut encoder = HuffmanEncoder::new();
         for code in self {
             encoder.put(*code)?;

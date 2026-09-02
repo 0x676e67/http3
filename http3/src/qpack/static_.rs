@@ -18,7 +18,11 @@ impl StaticTable {
     }
 
     pub fn find(field: &HeaderField) -> Option<usize> {
-        match (&field.name[..], &field.value[..]) {
+        Self::find_parts(&field.name, &field.value)
+    }
+
+    pub(crate) fn find_parts(name: &[u8], value: &[u8]) -> Option<usize> {
+        match (name, value) {
             (b":authority", b"") => Some(0),
             (b":path", b"/") => Some(1),
             (b"age", b"0") => Some(2),

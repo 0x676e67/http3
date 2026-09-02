@@ -3,7 +3,7 @@ use std::{cmp, io::Cursor};
 use bytes::{Buf, BufMut};
 
 use super::{
-    HeaderField,
+    HeaderField, HeaderFieldRef,
     block::{
         HeaderPrefix, Indexed, IndexedWithPostBase, Literal, LiteralWithNameRef,
         LiteralWithPostBaseNameRef,
@@ -274,28 +274,48 @@ where
     HeaderPrefix::new(0, 0, 0, 0).encode(block);
     for field in fields {
         let field = field.as_ref();
-
-        if field.is_sensitive() {
-            if let Some(index) = StaticTable::find_name(&field.name) {
-                LiteralWithNameRef::new_static(index, field.value.clone())
-                    .with_never_indexed()
-                    .encode(block)?;
-            } else {
-                Literal::new(field.name.clone(), field.value.clone())
-                    .with_never_indexed()
-                    .encode(block)?;
-            }
-        } else if let Some(index) = StaticTable::find(field) {
-            Indexed::Static(index).encode(block);
-        } else if let Some(index) = StaticTable::find_name(&field.name) {
-            LiteralWithNameRef::new_static(index, field.value.clone()).encode(block)?;
-        } else {
-            Literal::new(field.name.clone(), field.value.clone()).encode(block)?;
-        }
-
+        encode_stateless_parts(block, &field.name, &field.value, field.is_sensitive())?;
         size += field.mem_size() as u64;
     }
     Ok(size)
+}
+
+pub(crate) fn encode_stateless_ref<'a, W, T>(block: &mut W, fields: T) -> Result<u64, EncoderError>
+where
+    W: BufMut,
+    T: IntoIterator<Item = HeaderFieldRef<'a>>,
+{
+    let mut size = 0;
+
+    HeaderPrefix::new(0, 0, 0, 0).encode(block);
+    for field in fields {
+        encode_stateless_parts(block, field.name, field.value, field.is_sensitive())?;
+        size += field.mem_size() as u64;
+    }
+    Ok(size)
+}
+
+#[inline]
+fn encode_stateless_parts<W: BufMut>(
+    block: &mut W,
+    name: &[u8],
+    value: &[u8],
+    sensitive: bool,
+) -> Result<(), EncoderError> {
+    if sensitive {
+        if let Some(index) = StaticTable::find_name(name) {
+            LiteralWithNameRef::encode_parts(index, value, true, true, block)?;
+        } else {
+            Literal::encode_parts(name, value, true, block)?;
+        }
+    } else if let Some(index) = StaticTable::find_parts(name, value) {
+        Indexed::Static(index).encode(block);
+    } else if let Some(index) = StaticTable::find_name(name) {
+        LiteralWithNameRef::encode_parts(index, value, false, true, block)?;
+    } else {
+        Literal::encode_parts(name, value, false, block)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
