@@ -188,7 +188,7 @@ fn shared_decoder_queues_blocked_header_for_connection_driver() {
     let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
 
     assert_eq!(
-        decoder.poll_decode_header(&mut cx, &mut block_cur, u64::MAX, &mut None),
+        decoder.poll_decode_field_section(&mut cx, &mut block_cur, u64::MAX, &mut None),
         Poll::Ready(Err(DecoderError::MissingRefs(1)))
     );
     assert!(decoder_wakers.try_recv().is_err());
@@ -229,7 +229,7 @@ fn decoder_update_releases_blocked_stream_budget_before_request_repoll() {
     let decoder = QpackDecoder::new(Decoder::new(TABLE_SIZE as u64, 1).unwrap(), events_send);
     let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
     assert_eq!(
-        decoder.poll_decode_header(
+        decoder.poll_decode_field_section(
             &mut cx,
             &mut Cursor::new(first_field_section),
             u64::MAX,
@@ -273,7 +273,7 @@ fn decoder_update_releases_blocked_stream_budget_before_request_repoll() {
         Ok(2)
     );
     assert_eq!(
-        decoder.poll_decode_header(
+        decoder.poll_decode_field_section(
             &mut cx,
             &mut Cursor::new(second_field_section),
             u64::MAX,

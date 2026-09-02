@@ -1548,7 +1548,7 @@ where
             }
         }
 
-        let decode_result = match self.poll_decode_header(cx, &mut trailers) {
+        let decode_result = match self.poll_decode_field_section(cx, &mut trailers) {
             Poll::Ready(decode_result) => decode_result,
             Poll::Pending => {
                 self.trailers = Some(trailers);
@@ -1599,23 +1599,14 @@ where
     }
 
     #[inline(always)]
-    pub(crate) fn try_decode_header_stateless(
-        &self,
-        encoded: &mut Bytes,
-    ) -> Option<Result<qpack::Decoded, qpack::DecoderError>> {
-        self.decoder
-            .try_decode_stateless(encoded, self.max_field_section_size)
-    }
-
-    #[inline(always)]
-    pub(crate) fn poll_decode_header(
+    pub(crate) fn poll_decode_field_section(
         &mut self,
         cx: &mut Context<'_>,
-        encoded: &mut Bytes,
+        field_section: &mut Bytes,
     ) -> Poll<Result<qpack::Decoded, qpack::DecoderError>> {
-        match self.decoder.poll_decode_header(
+        match self.decoder.poll_decode_field_section(
             cx,
-            encoded,
+            field_section,
             self.max_field_section_size,
             &mut self.decoder_prefix,
         ) {

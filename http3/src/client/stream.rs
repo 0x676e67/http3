@@ -140,15 +140,8 @@ where
             }
         };
 
-        // Dynamic-table decoding can wait for the connection driver. The
-        // default stateless path completes synchronously and avoids retaining a
-        // cloned field section in a second async state.
         let decode_result =
-            if let Some(result) = self.inner.try_decode_header_stateless(&mut encoded) {
-                result
-            } else {
-                future::poll_fn(|cx| self.inner.poll_decode_header(cx, &mut encoded)).await
-            };
+            future::poll_fn(|cx| self.inner.poll_decode_field_section(cx, &mut encoded)).await;
         let decoded = match decode_result {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
             //# An HTTP/3 implementation MAY impose a limit on the maximum size of
