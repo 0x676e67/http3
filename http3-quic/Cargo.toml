@@ -20,7 +20,6 @@ http3 = { workspace = true }
 bytes = { workspace = true }
 quic = { workspace = true, features = ["futures-io"], optional = true  }
 quinn = { workspace = true, features = ["futures-io"], optional = true }
-tokio-util = { workspace = true }
 futures-util = { workspace = true }
 http3-datagram = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
