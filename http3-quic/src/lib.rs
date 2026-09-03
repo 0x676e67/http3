@@ -31,7 +31,6 @@ use quic::ReadError;
 pub use quic::{AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
 #[cfg(all(feature = "quinn", not(feature = "quic")))]
 pub use quinn as quic;
-use tokio_util::sync::ReusableBoxFuture;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -356,30 +355,14 @@ where
 ///
 /// Implements a [`quic::RecvStream`] backed by a [`quinn::RecvStream`].
 pub struct RecvStream {
-    stream: Option<quic::RecvStream>,
-    read_chunk_fut: ReadChunkFuture,
+    stream: quic::RecvStream,
     is_0rtt: bool,
-    pending_stop: Option<VarInt>,
 }
-
-type ReadChunkFuture = ReusableBoxFuture<
-    'static,
-    (
-        quic::RecvStream,
-        Result<Option<quic::Chunk>, quic::ReadError>,
-    ),
->;
 
 impl RecvStream {
     fn new(stream: quic::RecvStream) -> Self {
         let is_0rtt = stream.is_0rtt();
-        Self {
-            stream: Some(stream),
-            // Should only allocate once the first time it's used
-            read_chunk_fut: ReusableBoxFuture::new(async { unreachable!() }),
-            is_0rtt,
-            pending_stop: None,
-        }
+        Self { stream, is_0rtt }
     }
 }
 
@@ -391,18 +374,8 @@ impl http3::quic::RecvStream for RecvStream {
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
-        if let Some(mut stream) = self.stream.take() {
-            self.read_chunk_fut.set(async move {
-                let chunk = stream.read_chunk(usize::MAX, true).await;
-                (stream, chunk)
-            })
-        };
-
-        let (mut stream, chunk) = ready!(self.read_chunk_fut.poll(cx));
-        if let Some(error_code) = self.pending_stop.take() {
-            let _ = stream.stop(error_code);
-        }
-        self.stream = Some(stream);
+        let mut read_chunk = std::pin::pin!(self.stream.read_chunk(usize::MAX, true));
+        let chunk = ready!(read_chunk.as_mut().poll(cx));
         Poll::Ready(Ok(chunk
             .map_err(convert_read_error_to_stream_error)?
             .map(|c| c.bytes)))
@@ -411,16 +384,12 @@ impl http3::quic::RecvStream for RecvStream {
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn stop_sending(&mut self, error_code: u64) {
         let error_code = VarInt::from_u64(error_code).expect("invalid error_code");
-        if let Some(stream) = self.stream.as_mut() {
-            let _ = stream.stop(error_code);
-        } else {
-            self.pending_stop = Some(error_code);
-        }
+        let _ = self.stream.stop(error_code);
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn recv_id(&self) -> StreamId {
-        let num: u64 = self.stream.as_ref().unwrap().id().into();
+        let num: u64 = self.stream.id().into();
 
         num.try_into().expect("invalid stream id")
     }

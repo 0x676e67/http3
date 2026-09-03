@@ -382,24 +382,25 @@ impl QpackDecoder {
     /// means that the driver currently holds the write lock.
     ///
     /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
-    pub(crate) fn poll_decode_header<T: Buf>(
+    pub(crate) fn poll_decode_field_section<T: Buf>(
         &self,
         cx: &mut Context<'_>,
-        encoded: &mut T,
-        max_size: u64,
+        field_section: &mut T,
+        max_field_section_size: u64,
         prefix: &mut Option<FieldSectionPrefix>,
     ) -> Poll<Result<Decoded, DecoderError>> {
         if !self.0.decoder_dynamic_table {
             return Poll::Ready(decode_stateless_limited(
-                encoded,
-                max_size,
+                field_section,
+                max_field_section_size,
                 self.0.max_encoded_string_size,
             ));
         }
 
         match self.0.decoder.try_read() {
             Ok(decoder) => {
-                let decoded = decoder.decode_header_limited(encoded, max_size, prefix);
+                let decoded =
+                    decoder.decode_header_limited(field_section, max_field_section_size, prefix);
                 return self.finish_decode(decoder, decoded);
             }
             Err(TryLockError::WouldBlock) => {}
@@ -420,7 +421,8 @@ impl QpackDecoder {
 
         match self.0.decoder.try_read() {
             Ok(decoder) => {
-                let decoded = decoder.decode_header_limited(encoded, max_size, prefix);
+                let decoded =
+                    decoder.decode_header_limited(field_section, max_field_section_size, prefix);
                 self.finish_decode(decoder, decoded)
             }
             Err(TryLockError::WouldBlock) => Poll::Pending,

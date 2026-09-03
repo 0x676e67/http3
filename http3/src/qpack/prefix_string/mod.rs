@@ -68,7 +68,7 @@ pub(crate) fn decode_limited<B: Buf>(
         payload.into_iter().collect()
     } else {
         let mut decoded = Vec::new();
-        for byte in payload.into_iter().collect::<Vec<u8>>().hpack_decode() {
+        for byte in payload.as_ref().hpack_decode() {
             decoded.push(byte?);
         }
         decoded
@@ -77,7 +77,7 @@ pub(crate) fn decode_limited<B: Buf>(
 }
 
 pub fn encode<B: BufMut>(size: u8, flags: u8, value: &[u8], buf: &mut B) -> Result<(), Error> {
-    let encoded = Vec::from(value).hpack_encode()?;
+    let encoded = value.hpack_encode()?;
     prefix_int::encode(size - 1, flags << 1 | 1, encoded.len().try_into()?, buf);
     for byte in encoded {
         buf.write(byte);
@@ -194,5 +194,19 @@ mod tests {
         );
         assert_eq!(usize::try_from(read.position()).unwrap(), prefix_len);
         assert_eq!(read.remaining(), 0);
+    }
+
+    #[test]
+    fn huffman_payload_decodes_from_borrowed_bytes() {
+        // RFC 7541 Appendix C.4.1 encodes "www.example.com" as these
+        // twelve Huffman octets.
+        // https://www.rfc-editor.org/rfc/rfc7541.html#appendix-C.4.1
+        let mut encoded = Cursor::new(vec![
+            0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        ]);
+
+        let decoded = decode(8, &mut encoded).unwrap();
+
+        assert_eq!(decoded, b"www.example.com");
     }
 }

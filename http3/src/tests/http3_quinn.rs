@@ -22,7 +22,6 @@ use http3::{
 };
 use quinn::ReadError;
 pub use quinn::{self, AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
-use tokio_util::sync::ReusableBoxFuture;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -344,30 +343,14 @@ where
 ///
 /// Implements a [`quic::RecvStream`] backed by a [`quinn::RecvStream`].
 pub struct RecvStream {
-    stream: Option<quinn::RecvStream>,
-    read_chunk_fut: ReadChunkFuture,
+    stream: quinn::RecvStream,
     is_0rtt: bool,
-    pending_stop: Option<VarInt>,
 }
-
-type ReadChunkFuture = ReusableBoxFuture<
-    'static,
-    (
-        quinn::RecvStream,
-        Result<Option<quinn::Chunk>, quinn::ReadError>,
-    ),
->;
 
 impl RecvStream {
     fn new(stream: quinn::RecvStream) -> Self {
         let is_0rtt = stream.is_0rtt();
-        Self {
-            stream: Some(stream),
-            // Should only allocate once the first time it's used
-            read_chunk_fut: ReusableBoxFuture::new(async { unreachable!() }),
-            is_0rtt,
-            pending_stop: None,
-        }
+        Self { stream, is_0rtt }
     }
 }
 
@@ -379,18 +362,8 @@ impl quic::RecvStream for RecvStream {
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
-        if let Some(mut stream) = self.stream.take() {
-            self.read_chunk_fut.set(async move {
-                let chunk = stream.read_chunk(usize::MAX, true).await;
-                (stream, chunk)
-            })
-        };
-
-        let (mut stream, chunk) = ready!(self.read_chunk_fut.poll(cx));
-        if let Some(error_code) = self.pending_stop.take() {
-            let _ = stream.stop(error_code);
-        }
-        self.stream = Some(stream);
+        let mut read_chunk = std::pin::pin!(self.stream.read_chunk(usize::MAX, true));
+        let chunk = ready!(read_chunk.as_mut().poll(cx));
         Poll::Ready(Ok(chunk
             .map_err(convert_read_error_to_stream_error)?
             .map(|c| c.bytes)))
@@ -399,16 +372,12 @@ impl quic::RecvStream for RecvStream {
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn stop_sending(&mut self, error_code: u64) {
         let error_code = VarInt::from_u64(error_code).expect("invalid error_code");
-        if let Some(stream) = self.stream.as_mut() {
-            let _ = stream.stop(error_code);
-        } else {
-            self.pending_stop = Some(error_code);
-        }
+        let _ = self.stream.stop(error_code);
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn recv_id(&self) -> StreamId {
-        let num: u64 = self.stream.as_ref().unwrap().id().into();
+        let num: u64 = self.stream.id().into();
 
         num.try_into().expect("invalid stream id")
     }
@@ -564,5 +533,84 @@ where
             }
             Err(err) => Poll::Ready(Err(convert_write_error_to_stream_error(err))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures_util::future::poll_fn;
+
+    use super::*;
+    use crate::{quic::RecvStream as _, tests::Pair};
+
+    async fn connected_recv_stream() -> (
+        RecvStream,
+        quinn::SendStream,
+        quinn::Connection,
+        quinn::Connection,
+    ) {
+        let mut pair = Pair::default();
+        let server = pair.server();
+        let (client, server) = tokio::join!(pair.client_inner(), async {
+            server.endpoint.accept().await.unwrap().await.unwrap()
+        });
+
+        let (mut send, _) = client.open_bi().await.unwrap();
+        send.write_all(b"seed").await.unwrap();
+        let (_, recv) = server.accept_bi().await.unwrap();
+        let mut recv = RecvStream::new(recv);
+        let seed = poll_fn(|cx| recv.poll_data(cx)).await.unwrap().unwrap();
+        assert_eq!(seed, Bytes::from_static(b"seed"));
+
+        (recv, send, client, server)
+    }
+
+    #[tokio::test]
+    async fn recv_stream_wakes_after_pending_read() {
+        let (mut recv, mut send, _client, _server) = connected_recv_stream().await;
+
+        let read = poll_fn(|cx| recv.poll_data(cx));
+        let write = async {
+            tokio::task::yield_now().await;
+            send.write_all(b"payload").await.unwrap();
+            send.finish().unwrap();
+        };
+        let (data, ()) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(read, write) })
+                .await
+                .expect("pending read was not woken");
+
+        assert_eq!(data.unwrap().unwrap(), Bytes::from_static(b"payload"));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), poll_fn(|cx| recv.poll_data(cx)))
+                .await
+                .expect("receive stream did not reach EOF")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn recv_stream_stop_after_pending_preserves_error_code() {
+        const ERROR_CODE: u64 = 0x10c;
+
+        let (mut recv, send, _client, _server) = connected_recv_stream().await;
+        poll_fn(|cx| match recv.poll_data(cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(result) => panic!("read unexpectedly completed: {result:?}"),
+        })
+        .await;
+
+        recv.stop_sending(ERROR_CODE);
+        assert!(poll_fn(|cx| recv.poll_data(cx)).await.unwrap().is_none());
+        drop(recv);
+
+        let stopped = tokio::time::timeout(Duration::from_secs(5), send.stopped())
+            .await
+            .expect("peer did not receive STOP_SENDING")
+            .unwrap();
+        assert_eq!(stopped, Some(VarInt::from_u64(ERROR_CODE).unwrap()));
     }
 }

@@ -61,4 +61,3 @@ tracing-subscriber = { workspace = true, features = [
     "tracing-log",
 ] }
 futures = { workspace = true }
-tokio-util = { workspace = true }

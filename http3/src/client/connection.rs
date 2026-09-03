@@ -167,14 +167,6 @@ where
             })
         })?;
 
-        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-        //= type=implication
-        //# A
-        //# client MUST send only a single request on a given stream.
-        let mut stream = future::poll_fn(|cx| self.open.poll_open_bidi(cx))
-            .await
-            .map_err(|e| self.handle_quic_stream_error(e))?;
-
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
         //= type=TODO
         //# Characters in field names MUST be
@@ -187,12 +179,23 @@ where
         //# more cookie-pairs, before compression.
 
         let mut block = BytesMut::new();
-        let mem_size = qpack::encode_stateless(&mut block, headers).map_err(|_e| {
+        let mem_size = qpack::encode_stateless(&mut block, &headers).map_err(|_e| {
             self.handle_connection_error_on_stream(InternalConnectionError {
                 code: Code::H3_INTERNAL_ERROR,
                 message: "Failed to encode headers".to_string(),
             })
         })?;
+        // Do not retain the normalized fields while waiting for QUIC stream
+        // credit or write backpressure.
+        drop(headers);
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+        //= type=implication
+        //# A
+        //# client MUST send only a single request on a given stream.
+        let mut stream = future::poll_fn(|cx| self.open.poll_open_bidi(cx))
+            .await
+            .map_err(|e| self.handle_quic_stream_error(e))?;
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
         //# An implementation that

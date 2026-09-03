@@ -10,15 +10,19 @@ pub enum Error {
 pub struct StaticTable {}
 
 impl StaticTable {
-    pub fn get(index: usize) -> Result<&'static HeaderField, Error> {
+    pub fn get(index: usize) -> Result<&'static HeaderField<'static>, Error> {
         match PREDEFINED_HEADERS.get(index) {
             Some(f) => Ok(f),
             None => Err(Error::Unknown(index)),
         }
     }
 
-    pub fn find(field: &HeaderField) -> Option<usize> {
-        match (&field.name[..], &field.value[..]) {
+    pub fn find(field: &HeaderField<'_>) -> Option<usize> {
+        Self::find_parts(&field.name, &field.value)
+    }
+
+    pub(crate) fn find_parts(name: &[u8], value: &[u8]) -> Option<usize> {
+        match (name, value) {
             (b":authority", b"") => Some(0),
             (b":path", b"/") => Some(1),
             (b"age", b"0") => Some(2),
@@ -199,7 +203,7 @@ macro_rules! decl_fields {
     }
 }
 
-const PREDEFINED_HEADERS: [HeaderField; 99] = decl_fields![
+const PREDEFINED_HEADERS: [HeaderField<'static>; 99] = decl_fields![
     (b":authority", b""),
     (b":path", b"/"),
     (b"age", b"0"),

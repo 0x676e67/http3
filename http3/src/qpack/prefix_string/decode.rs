@@ -296,7 +296,7 @@ bits_decode![
 
 pub struct DecodeIter<'a> {
     bit_pos: BitWindow,
-    content: &'a Vec<u8>,
+    content: &'a [u8],
     symbol_end: usize,
     finished: bool,
 }
@@ -370,6 +370,12 @@ pub trait HpackStringDecode {
 }
 
 impl HpackStringDecode for Vec<u8> {
+    fn hpack_decode(&self) -> DecodeIter<'_> {
+        self.as_slice().hpack_decode()
+    }
+}
+
+impl HpackStringDecode for [u8] {
     fn hpack_decode(&self) -> DecodeIter<'_> {
         DecodeIter {
             bit_pos: BitWindow::new(),

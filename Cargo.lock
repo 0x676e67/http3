@@ -1329,7 +1329,6 @@ dependencies = [
  "rustls",
  "smallvec",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1353,7 +1352,6 @@ dependencies = [
  "http3-datagram",
  "quic",
  "quinn",
- "tokio-util",
  "tracing",
 ]
 
