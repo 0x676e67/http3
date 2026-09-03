@@ -6,7 +6,7 @@
 
 #[cfg(test)]
 use super::BitWindow;
-use super::encode::HPACK_STRING as ENCODE_TABLE;
+use super::encode::{ENCODE_CODE_LENGTHS, ENCODE_CODES};
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -422,9 +422,8 @@ struct DecoderTables {
 static DECODER_TABLES: DecoderTables = build_tables();
 
 const fn code_for(symbol: usize) -> (u32, usize) {
-    if symbol < ENCODE_TABLE.len() {
-        let code = ENCODE_TABLE[symbol];
-        (code.bits, code.bit_count)
+    if symbol < ENCODE_CODES.len() {
+        (ENCODE_CODES[symbol], ENCODE_CODE_LENGTHS[symbol] as usize)
     } else {
         (EOS_BITS, EOS_BIT_COUNT)
     }
@@ -435,7 +434,7 @@ const fn build_trie() -> [[u16; 2]; TRIE_NODE_COUNT] {
     let mut next_node = 1usize;
     let mut symbol = 0usize;
 
-    while symbol <= ENCODE_TABLE.len() {
+    while symbol <= ENCODE_CODES.len() {
         let (bits, bit_count) = code_for(symbol);
         let mut remaining = bit_count;
         let mut node = 0usize;

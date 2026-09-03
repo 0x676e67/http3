@@ -5,18 +5,12 @@ pub enum Error {
     EncodedLengthOverflow,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct EncodeValue {
-    pub(super) bits: u32,
-    pub(super) bit_count: usize,
-}
-
 pub(super) fn encoded_len(value: &[u8]) -> Result<usize, Error> {
     let mut encoded_len = 0usize;
     let mut pending_bits = 0usize;
 
     for code in value {
-        let bit_count = pending_bits + HPACK_STRING[*code as usize].bit_count;
+        let bit_count = pending_bits + usize::from(ENCODE_CODE_LENGTHS[usize::from(*code)]);
         encoded_len = encoded_len
             .checked_add(bit_count / 8)
             .ok_or(Error::EncodedLengthOverflow)?;
@@ -36,9 +30,10 @@ pub(super) fn encode_into<B: BufMut>(value: &[u8], buf: &mut B) {
     let mut pending_bits = 0usize;
 
     for code in value {
-        let encode_value = &HPACK_STRING[*code as usize];
-        pending = (pending << encode_value.bit_count) | u64::from(encode_value.bits);
-        pending_bits += encode_value.bit_count;
+        let index = usize::from(*code);
+        let bit_count = usize::from(ENCODE_CODE_LENGTHS[index]);
+        pending = (pending << bit_count) | u64::from(ENCODE_CODES[index]);
+        pending_bits += bit_count;
 
         if pending_bits >= 32 {
             let trailing_bits = pending_bits - 32;
@@ -64,14 +59,19 @@ pub(super) fn encode_into<B: BufMut>(value: &[u8], buf: &mut B) {
     }
 }
 
-macro_rules! bits_encode {
+// Independently split from this crate's existing codebook so the length-only pass
+// touches a 256-byte table and the encoder's complete codebook occupies 1,280 bytes.
+// Performance background and license references:
+// https://github.com/hyperium/h2/pull/949
+// https://github.com/hyperium/h2/commit/cb9574bb2c18d1904eca74e98b31c8986b0d8b32
+// https://github.com/hyperium/h2/blob/cb9574bb2c18d1904eca74e98b31c8986b0d8b32/src/hpack/huffman/table.rs
+// https://github.com/hyperium/h2/blob/cb9574bb2c18d1904eca74e98b31c8986b0d8b32/LICENSE
+macro_rules! define_encode_tables {
     [ $( ( $len:expr => [ $( $byte:expr ),* ] ), )* ] => {
-        [ $(
-            EncodeValue{
-                bits: pack_code($len, &[ $( $byte as u8 ),* ]),
-                bit_count: $len
-            } ,
-        )* ]
+        pub(super) const ENCODE_CODES: [u32; 256] = [ $(
+            pack_code($len, &[ $( $byte as u8 ),* ]),
+        )* ];
+        pub(super) const ENCODE_CODE_LENGTHS: [u8; 256] = [ $( $len, )* ];
     }
 }
 
@@ -94,7 +94,7 @@ const fn pack_code(bit_count: usize, parts: &[u8]) -> u32 {
     bits
 }
 
-pub(super) const HPACK_STRING: [EncodeValue; 256] = bits_encode![
+define_encode_tables![
     ( 13 => [0b1111_1111, 0b0001_1000]),
     ( 23 => [0b1111_1111, 0b1111_1111, 0b0101_1000]),
     ( 28 => [0b1111_1111, 0b1111_1111, 0b1111_1110, 0b0000_0010]),
