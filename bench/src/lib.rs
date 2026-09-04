@@ -1,4 +1,4 @@
-//! Internal API shared by the benchmark controller and isolated role executables.
+//! Internal API shared by the benchmark controller and its isolated process roles.
 
 use std::ffi::{CString, OsString, c_char, c_int};
 
@@ -26,7 +26,7 @@ unsafe extern "C" {
 /// Runs the native nghttp3/ngtcp2 Client compiled by this package's build script.
 #[doc(hidden)]
 pub fn run_nghttp3_client(args: impl Iterator<Item = OsString>) -> anyhow::Result<c_int> {
-    let mut encoded = vec![CString::new("http3-bench-nghttp3-client")?];
+    let mut encoded = vec![CString::new("nghttp3")?];
     for argument in args {
         encoded.push(CString::new(argument.to_string_lossy().as_bytes())?);
     }

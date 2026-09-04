@@ -1,6 +1,6 @@
 //! Criterion group construction and environment-driven benchmark selection.
 
-use std::env;
+use std::{env, path::Path};
 
 use anyhow::{Context, Result, bail};
 use bytesize::ByteSize;
@@ -19,9 +19,6 @@ const MAX_CONCURRENCY: usize = 100;
 const BANDWIDTH_BODY_THRESHOLD: usize = 64 * 1024;
 const TEST_REQUESTS: usize = 4;
 const TEST_IN_FLIGHT: usize = 2;
-const HTTP3_CLIENT_EXE: &str = env!("CARGO_BIN_EXE_http3-bench-http3-client");
-const H3_CLIENT_EXE: &str = env!("CARGO_BIN_EXE_http3-bench-h3-client");
-const NGHTTP3_CLIENT_EXE: &str = env!("CARGO_BIN_EXE_http3-bench-nghttp3-client");
 
 struct Config {
     cases: Vec<Case>,
@@ -75,21 +72,22 @@ impl Config {
 
 pub(crate) fn run(criterion: &mut Criterion) -> Result<()> {
     let config = Config::from_env()?;
-    run_groups(criterion, &config)
+    let executable = env::current_exe().context("could not locate the benchmark executable")?;
+    run_groups(criterion, &config, &executable)
 }
 
-fn run_groups(criterion: &mut Criterion, config: &Config) -> Result<()> {
+fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> Result<()> {
     let runners = [
         ClientRunner {
-            executable: HTTP3_CLIENT_EXE,
+            executable,
             library: Http3Library::Http3,
         },
         ClientRunner {
-            executable: H3_CLIENT_EXE,
+            executable,
             library: Http3Library::H3,
         },
         ClientRunner {
-            executable: NGHTTP3_CLIENT_EXE,
+            executable,
             library: Http3Library::Nghttp3,
         },
     ];
@@ -146,7 +144,7 @@ fn run_groups(criterion: &mut Criterion, config: &Config) -> Result<()> {
             let benchmark_id = BenchmarkId::from_parameter(library.name());
             group.bench_with_input(benchmark_id, &case, |bencher, &case| {
                 server.get_or_insert_with(|| {
-                    ServerGuard::start(case.body_bytes).unwrap_or_else(|error| {
+                    ServerGuard::start(executable, case.body_bytes).unwrap_or_else(|error| {
                         panic!("could not start {library} benchmark server: {error:#}")
                     })
                 });

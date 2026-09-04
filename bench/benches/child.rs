@@ -1,7 +1,9 @@
 //! Child Client/Server lifecycle, timeout, and result-collection boundaries.
 
 use std::{
+    ffi::OsStr,
     io::{BufRead, BufReader},
+    path::Path,
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
     thread,
@@ -20,7 +22,38 @@ use wait_timeout::ChildExt;
 
 const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-const SERVER_EXE: &str = env!("CARGO_BIN_EXE_http3-bench-server");
+pub(crate) const CHILD_MARKER: &str = "--http3-bench-child";
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ChildRole {
+    Client(Http3Library),
+    Server,
+}
+
+impl ChildRole {
+    pub(crate) fn parse(value: &OsStr) -> Result<Self> {
+        match value.to_str() {
+            Some("http3") => Ok(Self::Client(Http3Library::Http3)),
+            Some("h3") => Ok(Self::Client(Http3Library::H3)),
+            Some("nghttp3") => Ok(Self::Client(Http3Library::Nghttp3)),
+            Some("server") => Ok(Self::Server),
+            _ => bail!("unsupported internal benchmark role {value:?}"),
+        }
+    }
+
+    fn argument(self) -> &'static str {
+        match self {
+            Self::Client(library) => library.name(),
+            Self::Server => "server",
+        }
+    }
+
+    fn command(self, executable: &Path) -> Command {
+        let mut command = Command::new(executable);
+        command.arg(CHILD_MARKER).arg(self.argument());
+        command
+    }
+}
 
 struct ChildCleanupGuard {
     child: Option<Child>,
@@ -63,12 +96,12 @@ impl Drop for ChildCleanupGuard {
     }
 }
 
-pub(crate) struct ClientRunner {
-    pub executable: &'static str,
+pub(crate) struct ClientRunner<'a> {
+    pub executable: &'a Path,
     pub library: Http3Library,
 }
 
-impl ClientRunner {
+impl ClientRunner<'_> {
     pub(crate) fn run_iterations(&self, iterations: u64, case: Case) -> Result<Duration> {
         let mut measured = Duration::ZERO;
         for _ in 0..iterations {
@@ -81,7 +114,7 @@ impl ClientRunner {
     }
 
     fn run_once(&self, case: Case) -> Result<Duration> {
-        let mut command = Command::new(self.executable);
+        let mut command = ChildRole::Client(self.library).command(self.executable);
         command
             .arg(case.requests.to_string())
             .arg(case.body_bytes.to_string())
@@ -144,10 +177,11 @@ pub(crate) struct ServerGuard {
 }
 
 impl ServerGuard {
-    pub(crate) fn start(body_bytes: usize) -> Result<Self> {
+    pub(crate) fn start(executable: &Path, body_bytes: usize) -> Result<Self> {
         let mut child = ChildCleanupGuard {
             child: Some(
-                Command::new(SERVER_EXE)
+                ChildRole::Server
+                    .command(executable)
                     .arg(body_bytes.to_string())
                     .current_dir(workspace_root())
                     .stdin(Stdio::piped())

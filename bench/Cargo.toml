@@ -41,34 +41,6 @@ test = false
 bench = false
 doc = false
 
-[[bin]]
-name = "http3-bench-http3-client"
-path = "src/bin/http3.rs"
-test = false
-bench = false
-doc = false
-
-[[bin]]
-name = "http3-bench-h3-client"
-path = "src/bin/h3.rs"
-test = false
-bench = false
-doc = false
-
-[[bin]]
-name = "http3-bench-nghttp3-client"
-path = "src/bin/nghttp3.rs"
-test = false
-bench = false
-doc = false
-
-[[bin]]
-name = "http3-bench-server"
-path = "src/bin/server.rs"
-test = false
-bench = false
-doc = false
-
 [[bench]]
 name = "clients"
 harness = false
