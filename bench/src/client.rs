@@ -17,7 +17,7 @@ use tokio::{
 };
 
 use super::{
-    case::{ALPN_H3, SERVER_ADDR, SERVER_NAME, Topology, workspace_root},
+    case::{ALPN_H3, SERVER_ADDR, SERVER_NAME, workspace_root},
     result::{ClientResult, MEASUREMENT_PROFILE, RESULT_SCHEMA},
 };
 
@@ -28,43 +28,6 @@ pub struct ReadyConnection<S> {
     pub sender: S,
     pub driver: JoinHandle<Result<()>>,
     pub quic_connection: quinn::Connection,
-}
-
-#[derive(Default)]
-#[doc(hidden)]
-pub struct TransferStats {
-    pub completed: usize,
-    pub received_bytes: usize,
-}
-
-impl TransferStats {
-    fn add(&mut self, other: Self) -> Result<()> {
-        self.completed = self
-            .completed
-            .checked_add(other.completed)
-            .context("completed request count overflowed usize")?;
-        self.received_bytes = self
-            .received_bytes
-            .checked_add(other.received_bytes)
-            .context("response byte count overflowed usize")?;
-        Ok(())
-    }
-}
-
-struct TimedTransferStats {
-    transfer: TransferStats,
-    finished_at: Instant,
-}
-
-impl TimedTransferStats {
-    fn add(&mut self, other: Self) -> Result<()> {
-        self.transfer.add(other.transfer)?;
-        // Workers and connections overlap, so the batch ends at the latest
-        // completion. Summing their durations would double-count parallel work
-        // and favor Clients with a different task layout.
-        self.finished_at = self.finished_at.max(other.finished_at);
-        Ok(())
-    }
 }
 
 #[doc(hidden)]
@@ -81,17 +44,17 @@ pub trait Adapter: Send + 'static {
         sender: &mut Self::Sender,
         request_uri: Uri,
         expected_body_size: usize,
-    ) -> impl Future<Output = Result<TransferStats>> + Send;
+    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 #[doc(hidden)]
 pub fn run_from_args<A: Adapter>(mut args: impl Iterator<Item = String>) -> Result<()> {
-    let connections = parse_positive(&mut args, "connections")?;
-    let sockets = parse_positive(&mut args, "UDP sockets")?;
-    let topology = Topology::new(connections, sockets)?;
-    let requests_per_connection = parse_positive(&mut args, "requests-per-connection")?;
+    let requests = parse_positive(&mut args, "requests")?;
     let expected_body_size = parse_nonnegative(&mut args, "expected-body-bytes")?;
-    let in_flight = parse_positive(&mut args, "in-flight-per-connection")?;
+    let in_flight = parse_positive(&mut args, "in-flight")?;
+    if in_flight > requests {
+        bail!("in-flight requests cannot exceed total requests");
+    }
     if let Some(extra) = args.next() {
         bail!("unexpected internal client argument {extra:?}");
     }
@@ -99,135 +62,77 @@ pub fn run_from_args<A: Adapter>(mut args: impl Iterator<Item = String>) -> Resu
         .enable_all()
         .build()
         .context("could not create current-thread client runtime")?;
-    let result = runtime.block_on(run_client::<A>(
-        topology,
-        requests_per_connection,
-        expected_body_size,
-        in_flight,
-    ))?;
+    let result = runtime.block_on(run_client::<A>(requests, expected_body_size, in_flight))?;
 
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 
 async fn run_client<A: Adapter>(
-    topology: Topology,
-    requests_per_connection: usize,
+    requests: usize,
     expected_body_size: usize,
     in_flight: usize,
 ) -> Result<ClientResult> {
-    let connections = topology.connections;
-    let expected_requests = connections
-        .checked_mul(requests_per_connection)
-        .context("total request count overflowed usize")?;
-    let expected_bytes = expected_requests
+    let expected_bytes = requests
         .checked_mul(expected_body_size)
         .context("total response byte count overflowed usize")?;
 
     let client_config = client_config()?;
-    let mut endpoints = Vec::with_capacity(topology.sockets);
-    for _ in 0..topology.sockets {
-        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse()?)?;
-        endpoint.set_default_client_config(client_config.clone());
-        endpoints.push(endpoint);
-    }
-
-    let mut connecting = JoinSet::new();
-    for connection in 0..connections {
-        let endpoint = endpoints[topology.endpoint_for_connection(connection)].clone();
-        connecting.spawn(async move { connect::<A>(&endpoint).await });
-    }
-    let mut ready = Vec::with_capacity(connections);
-    while let Some(connection) = connecting.join_next().await {
-        ready.push(connection.context("Client connection setup task failed")??);
-    }
-    let mut connection_tasks = JoinSet::new();
-    let mut drivers = Vec::with_capacity(connections);
-    let mut quic_connections = Vec::with_capacity(connections);
-    let worker_count_per_connection = requests_per_connection.min(in_flight);
-    let total_worker_count = connections
-        .checked_mul(worker_count_per_connection)
-        .context("total request worker count overflowed usize")?;
-    let (prepared_tx, mut prepared_rx) = mpsc::channel(total_worker_count);
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse()?)?;
+    endpoint.set_default_client_config(client_config);
+    let connection = connect::<A>(&endpoint).await?;
+    let driver = connection.driver;
+    let quic_connection = connection.quic_connection;
+    let sender_guard = connection.sender;
+    let worker_count = requests.min(in_flight);
+    let requests_per_worker = requests / worker_count;
+    let workers_with_extra_request = requests % worker_count;
+    let (prepared_tx, mut prepared_rx) = mpsc::channel(worker_count);
     let (start_tx, start_rx) = watch::channel(false);
-    let mut sender_guards = Vec::with_capacity(connections);
-    for connection in ready {
-        drivers.push(connection.driver);
-        quic_connections.push(connection.quic_connection);
-        let request_sender = connection.sender.clone();
-        sender_guards.push(connection.sender);
-        connection_tasks.spawn(run_connection_requests::<A>(
-            request_sender,
-            requests_per_connection,
+    let mut workers = JoinSet::new();
+    for worker_index in 0..worker_count {
+        let assigned_requests =
+            requests_per_worker + usize::from(worker_index < workers_with_extra_request);
+        workers.spawn(run_request_worker::<A>(
+            sender_guard.clone(),
+            assigned_requests,
             expected_body_size,
-            in_flight,
             prepared_tx.clone(),
             start_rx.clone(),
         ));
     }
     drop(prepared_tx);
     drop(start_rx);
-    for _ in 0..total_worker_count {
-        tokio::select! {
-            prepared = prepared_rx.recv() => {
-                prepared.context("request workers exited before reaching the start barrier")?;
-            }
-            result = connection_tasks.join_next() => {
-                let result = result.context(
-                    "connection tasks exited before request workers reached the start barrier",
-                )?;
-                result.context("connection task failed")??;
-                bail!("connection task exited before the benchmark started");
-            }
-        }
+    for _ in 0..worker_count {
+        prepared_rx
+            .recv()
+            .await
+            .context("request workers exited before reaching the start barrier")?;
     }
     let benchmark_started = Instant::now();
     start_tx
         .send(true)
         .context("request workers exited before the benchmark started")?;
 
-    let mut timed_transfer: Option<TimedTransferStats> = None;
-    while let Some(result) = connection_tasks.join_next().await {
-        let result = result.context("connection task failed")??;
-        if let Some(transfer) = &mut timed_transfer {
-            transfer.add(result)?;
-        } else {
-            timed_transfer = Some(result);
-        }
+    let mut finished_at = None;
+    while let Some(result) = workers.join_next().await {
+        let worker_finished_at = result.context("request worker failed")??;
+        // Workers overlap, so the batch ends at the latest completion. Summing
+        // their durations would double-count parallel request work.
+        finished_at = Some(finished_at.map_or(worker_finished_at, |current: Instant| {
+            current.max(worker_finished_at)
+        }));
     }
-    let TimedTransferStats {
-        transfer,
-        finished_at,
-    } = timed_transfer.context("benchmark did not run any request workers")?;
+    let finished_at = finished_at.context("connection did not run any request workers")?;
     let elapsed = finished_at
         .checked_duration_since(benchmark_started)
         .context("benchmark finish timestamp preceded its start")?;
-    let path_max_udp_payload_size_per_connection = quic_connections
-        .iter()
-        .map(|connection| usize::from(connection.stats().path.current_mtu))
-        .collect();
-    drop(sender_guards);
-    drop(quic_connections);
+    let path_max_udp_payload_size = usize::from(quic_connection.stats().path.current_mtu);
+    drop(sender_guard);
+    drop(quic_connection);
 
-    for driver in drivers {
-        driver.await.context("HTTP/3 connection driver failed")??;
-    }
-    for endpoint in &endpoints {
-        endpoint.wait_idle().await;
-    }
-
-    if transfer.completed != expected_requests {
-        bail!(
-            "expected {expected_requests} completed requests, got {}",
-            transfer.completed
-        );
-    }
-    if transfer.received_bytes != expected_bytes {
-        bail!(
-            "expected {expected_bytes} response bytes, got {}",
-            transfer.received_bytes
-        );
-    }
+    driver.await.context("HTTP/3 connection driver failed")??;
+    endpoint.wait_idle().await;
 
     Ok(ClientResult {
         schema: RESULT_SCHEMA.to_owned(),
@@ -235,14 +140,12 @@ async fn run_client<A: Adapter>(
         quic_backend: "quinn".to_owned(),
         transport_profile: "quinn-default-pmtud".to_owned(),
         measurement_profile: MEASUREMENT_PROFILE.to_owned(),
-        path_max_udp_payload_size_per_connection,
-        udp_sockets: topology.sockets,
-        connections,
-        requests_per_connection,
-        in_flight_per_connection: in_flight,
+        path_max_udp_payload_size,
+        requests,
+        in_flight,
         response_body_bytes: expected_body_size,
-        completed: transfer.completed,
-        received_bytes: transfer.received_bytes,
+        completed: requests,
+        received_bytes: expected_bytes,
         elapsed_ns: duration_ns(elapsed)?,
     })
 }
@@ -281,53 +184,13 @@ async fn connect<A: Adapter>(endpoint: &quinn::Endpoint) -> Result<ReadyConnecti
     A::connect(connection).await
 }
 
-async fn run_connection_requests<A: Adapter>(
-    sender: A::Sender,
-    requests_per_connection: usize,
-    expected_body_size: usize,
-    in_flight: usize,
-    prepared: mpsc::Sender<()>,
-    start: watch::Receiver<bool>,
-) -> Result<TimedTransferStats> {
-    let worker_count = requests_per_connection.min(in_flight);
-    let requests_per_worker = requests_per_connection / worker_count;
-    let workers_with_extra_request = requests_per_connection % worker_count;
-    let mut workers = JoinSet::new();
-
-    for worker_index in 0..worker_count {
-        let assigned_requests =
-            requests_per_worker + usize::from(worker_index < workers_with_extra_request);
-        workers.spawn(run_request_worker::<A>(
-            sender.clone(),
-            assigned_requests,
-            expected_body_size,
-            prepared.clone(),
-            start.clone(),
-        ));
-    }
-    drop(sender);
-    drop(prepared);
-    drop(start);
-
-    let mut timed_transfer: Option<TimedTransferStats> = None;
-    while let Some(result) = workers.join_next().await {
-        let result = result.context("request worker failed")??;
-        if let Some(transfer) = &mut timed_transfer {
-            transfer.add(result)?;
-        } else {
-            timed_transfer = Some(result);
-        }
-    }
-    timed_transfer.context("connection did not run any request workers")
-}
-
 async fn run_request_worker<A: Adapter>(
     mut sender: A::Sender,
     assigned_requests: usize,
     expected_body_size: usize,
     prepared: mpsc::Sender<()>,
     mut start: watch::Receiver<bool>,
-) -> Result<TimedTransferStats> {
+) -> Result<Instant> {
     let request_uri = Uri::from_static(REQUEST_URI);
     prepared
         .send(())
@@ -340,19 +203,13 @@ async fn run_request_worker<A: Adapter>(
             .await
             .context("benchmark start barrier closed before release")?;
     }
-    let mut transfer = TransferStats::default();
     for _ in 0..assigned_requests {
-        transfer
-            .add(A::send_request(&mut sender, request_uri.clone(), expected_body_size).await?)?;
+        A::send_request(&mut sender, request_uri.clone(), expected_body_size).await?;
     }
     // This timestamp defines the throughput denominator. Taking it after
     // JoinSet aggregation would charge Rust-only scheduler unwinding and make
     // the cross-stack comparison unfair.
-    let finished_at = Instant::now();
-    Ok(TimedTransferStats {
-        transfer,
-        finished_at,
-    })
+    Ok(Instant::now())
 }
 
 fn parse_positive(args: &mut impl Iterator<Item = String>, name: &str) -> Result<usize> {
@@ -416,7 +273,7 @@ macro_rules! client_adapter {
                 sender: &mut Self::Sender,
                 request_uri: http::Uri,
                 expected_body_size: usize,
-            ) -> anyhow::Result<$crate::client::TransferStats> {
+            ) -> anyhow::Result<()> {
                 use anyhow::Context as _;
                 use bytes::Buf as _;
 
@@ -459,10 +316,7 @@ macro_rules! client_adapter {
                     anyhow::bail!("expected {expected_body_size} response bytes, got {received}");
                 }
 
-                Ok($crate::client::TransferStats {
-                    completed: 1,
-                    received_bytes: received,
-                })
+                Ok(())
             }
         }
     };

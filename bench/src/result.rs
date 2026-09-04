@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::case::{Case, Http3Library};
 
-pub(crate) const RESULT_SCHEMA: &str = "http3-client-bench-v8";
+pub(crate) const RESULT_SCHEMA: &str = "http3-client-bench-v9";
 
 /// Timed region shared by every Client implementation.
 pub const MEASUREMENT_PROFILE: &str = "post-local-setup-to-last-complete-response";
@@ -20,15 +20,13 @@ pub struct ClientResult {
     pub(crate) quic_backend: String,
     pub(crate) transport_profile: String,
     pub(crate) measurement_profile: String,
-    pub(crate) connections: usize,
-    pub(crate) udp_sockets: usize,
-    pub(crate) requests_per_connection: usize,
-    pub(crate) in_flight_per_connection: usize,
+    pub(crate) requests: usize,
+    pub(crate) in_flight: usize,
     pub(crate) response_body_bytes: usize,
     pub(crate) completed: usize,
     pub(crate) received_bytes: usize,
     pub(crate) elapsed_ns: u64,
-    pub(crate) path_max_udp_payload_size_per_connection: Vec<usize>,
+    pub(crate) path_max_udp_payload_size: usize,
 }
 
 impl ClientResult {
@@ -66,41 +64,24 @@ impl ClientResult {
             &self.measurement_profile,
             MEASUREMENT_PROFILE,
         )?;
-        check_number("connections", self.connections, case.topology.connections)?;
-        check_number("udp_sockets", self.udp_sockets, case.topology.sockets)?;
-        check_number(
-            "requests_per_connection",
-            self.requests_per_connection,
-            case.requests_per_connection,
-        )?;
-        check_number(
-            "in_flight_per_connection",
-            self.in_flight_per_connection,
-            case.in_flight_per_connection,
-        )?;
+        check_number("requests", self.requests, case.requests)?;
+        check_number("in_flight", self.in_flight, case.in_flight)?;
         check_number(
             "response_body_bytes",
             self.response_body_bytes,
-            case.workload.body_bytes,
+            case.body_bytes,
         )?;
-        check_number("completed", self.completed, case.expected_requests()?)?;
+        check_number("completed", self.completed, case.requests)?;
         check_number(
             "received_bytes",
             self.received_bytes,
             case.expected_bytes()?,
         )?;
-        if self.path_max_udp_payload_size_per_connection.len() != self.connections {
+        if !(1200..=65_527).contains(&self.path_max_udp_payload_size) {
             bail!(
-                "expected one path MTU per connection, got {}",
-                self.path_max_udp_payload_size_per_connection.len()
+                "client reported invalid path MTU {}",
+                self.path_max_udp_payload_size
             );
-        }
-        if let Some(payload_size) = self
-            .path_max_udp_payload_size_per_connection
-            .iter()
-            .find(|&&payload_size| !(1200..=65_527).contains(&payload_size))
-        {
-            bail!("client reported invalid path MTU {payload_size}");
         }
         if self.elapsed_ns == 0 {
             bail!("client reported a zero-length measured interval");

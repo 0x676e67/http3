@@ -12,12 +12,15 @@
 # first build. Each sample ends when the last complete response is validated;
 # task aggregation, extra receive draining, final result checks, and shutdown
 # are not included in its elapsed time.
+# Each Client uses one HTTP/3 connection and one UDP socket. Concurrent
+# requests use streams on that connection, following RFC 9114 Section 3.3:
+# https://www.rfc-editor.org/rfc/rfc9114.html#section-3.3
 #
 # Default body-size cases:
-#   bash bench/run-balanced.sh --topologies 4/1 -- --noplot
+#   bash bench/run-balanced.sh -- --noplot
 # Custom body-size cases:
-#   bash bench/run-balanced.sh --topologies 4/1 \
-#     --body-sizes 0B,64KiB,1MiB -- --noplot
+#   bash bench/run-balanced.sh --body-sizes 0B,64KiB,1MiB \
+#     --concurrency 32 -- --noplot
 
 set -euo pipefail
 
@@ -26,10 +29,11 @@ usage() {
 Usage: run-balanced.sh [options] [-- <criterion arguments>]
 
 Options:
-  --topologies VALUE   Comma-separated connections/sockets pairs (default: 1/1,4/1).
-                       The shared comparison supports 1-4 connections and 1 socket;
-                       request and in-flight totals must divide evenly.
   --body-sizes VALUE   Comma-separated IEC response sizes, up to 100 MiB.
+  --concurrency VALUE  Maximum concurrent request streams on the one connection.
+                       Range: 1-100. By default the benchmark chooses it from
+                       the body size; it cannot exceed a case's request count.
+                       The Server advertises a fixed 1000-stream credit window.
   -h, --help           Show this help.
 
 The Clients always run once in this fixed order: http3, h3, nghttp3. Cargo
@@ -45,26 +49,33 @@ Default body sizes:
 
 Examples:
   bash bench/run-balanced.sh -- --noplot
-  bash bench/run-balanced.sh --topologies 4/1 \
-    --body-sizes 0B,64KiB,1MiB -- \
+  bash bench/run-balanced.sh --body-sizes 0B,64KiB,1MiB --concurrency 32 -- \
     --sample-size 20 --measurement-time 60 --noplot
 EOF
 }
 
-topologies='1/1,4/1'
 body_sizes=
+concurrency=
 criterion_args=()
 
 while (($# > 0)); do
   case $1 in
-    --topologies)
-      (($# >= 2)) || { echo '--topologies requires a value' >&2; exit 2; }
-      topologies=$2
-      shift 2
-      ;;
     --body-sizes)
       (($# >= 2)) || { echo '--body-sizes requires a value' >&2; exit 2; }
       body_sizes=$2
+      shift 2
+      ;;
+    --concurrency)
+      (($# >= 2)) || { echo '--concurrency requires a value' >&2; exit 2; }
+      [[ $2 =~ ^[1-9][0-9]*$ ]] || {
+        echo '--concurrency must be a positive integer' >&2
+        exit 2
+      }
+      ((10#$2 <= 100)) || {
+        echo '--concurrency cannot exceed 100' >&2
+        exit 2
+      }
+      concurrency=$2
       shift 2
       ;;
     --)
@@ -96,11 +107,15 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo_root=$(cd "$script_dir/.." && pwd -P)
 cd "$repo_root"
 
-export HTTP3_BENCH_TOPOLOGIES=$topologies
 if [[ -n $body_sizes ]]; then
   export HTTP3_BENCH_BODY_SIZES=$body_sizes
 else
   unset HTTP3_BENCH_BODY_SIZES || true
+fi
+if [[ -n $concurrency ]]; then
+  export HTTP3_BENCH_CONCURRENCY=$concurrency
+else
+  unset HTTP3_BENCH_CONCURRENCY || true
 fi
 
 echo 'Running HTTP/3 Clients in fixed order: http3, h3, nghttp3'

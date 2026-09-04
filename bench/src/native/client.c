@@ -42,8 +42,7 @@
  *
  * This benchmark replaces the example's libev socket layer with a
  * single-threaded Windows/Linux polling loop. One unconnected UDP socket
- * serves one to four connections, demultiplexed by QUIC Destination
- * Connection ID.
+ * serves one QUIC connection and passes every datagram directly to ngtcp2.
  */
 
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
@@ -118,10 +117,6 @@
 #define POLL_CAP_MS 10
 #define MAX_RX_BURST 256
 #define CLIENT_CONNECTION_ID_LENGTH 16
-#define MAX_BENCH_CONNECTIONS 4
-#define MAX_LOCAL_CIDS_PER_CONNECTION 10
-#define MAX_CID_ROUTES                                                     \
-  (MAX_BENCH_CONNECTIONS * MAX_LOCAL_CIDS_PER_CONNECTION)
 
 _Static_assert(RX_CAPACITY >= NGTCP2_MAX_UDP_PAYLOAD_SIZE,
                "CONNECTION_CLOSE needs the ngtcp2 client minimum buffer");
@@ -159,18 +154,10 @@ typedef enum rx_drain_result {
 } rx_drain_result;
 
 typedef struct bench_config {
-  size_t connections;
-  size_t udp_sockets;
-  uint64_t requests_per_connection;
+  uint64_t requests;
   uint64_t expected_body_bytes;
   size_t inflight;
 } bench_config;
-
-typedef struct cid_route {
-  ngtcp2_cid cid;
-  client *owner;
-  bool active;
-} cid_route;
 
 struct udp_endpoint {
   socket_handle fd;
@@ -178,14 +165,12 @@ struct udp_endpoint {
   socklen_t local_addrlen;
   struct sockaddr_storage remote_addr;
   socklen_t remote_addrlen;
-  cid_route routes[MAX_CID_ROUTES];
   uint8_t rxbuf[RX_CAPACITY];
 };
 
 struct response_state {
   int64_t stream_id;
   uint64_t body_bytes;
-  bool active;
   bool complete;
   bool headers_begin;
   bool headers_end;
@@ -213,9 +198,7 @@ struct client {
   size_t active;
 
   bool handshake_completed;
-  bool tls_validated;
   bool nghttp3_ready;
-  bool measurement_started;
   bool fatal;
   char fatal_reason[384];
 
@@ -393,68 +376,6 @@ static void set_fatal(client *c, const char *fmt, ...) {
   va_end(ap);
 }
 
-static bool cid_matches_bytes(const ngtcp2_cid *cid, const uint8_t *data,
-                              size_t datalen) {
-  return cid->datalen == datalen && memcmp(cid->data, data, datalen) == 0;
-}
-
-static int endpoint_register_cid(udp_endpoint *endpoint, client *owner,
-                                 const ngtcp2_cid *cid) {
-  size_t i;
-  size_t free_slot = MAX_CID_ROUTES;
-
-  for (i = 0; i < MAX_CID_ROUTES; ++i) {
-    cid_route *route = &endpoint->routes[i];
-    if (!route->active) {
-      if (free_slot == MAX_CID_ROUTES) {
-        free_slot = i;
-      }
-      continue;
-    }
-    if (ngtcp2_cid_eq(&route->cid, cid)) {
-      set_fatal(owner, "duplicate local QUIC connection ID");
-      return -1;
-    }
-  }
-
-  if (free_slot == MAX_CID_ROUTES) {
-    set_fatal(owner, "local QUIC connection ID routing table is full");
-    return -1;
-  }
-  endpoint->routes[free_slot].cid = *cid;
-  endpoint->routes[free_slot].owner = owner;
-  endpoint->routes[free_slot].active = true;
-  return 0;
-}
-
-static int endpoint_remove_cid(udp_endpoint *endpoint, client *owner,
-                               const ngtcp2_cid *cid) {
-  size_t i;
-  for (i = 0; i < MAX_CID_ROUTES; ++i) {
-    cid_route *route = &endpoint->routes[i];
-    if (route->active && route->owner == owner &&
-        ngtcp2_cid_eq(&route->cid, cid)) {
-      route->active = false;
-      route->owner = NULL;
-      return 0;
-    }
-  }
-  set_fatal(owner, "retired an unknown local QUIC connection ID");
-  return -1;
-}
-
-static client *endpoint_find_client(const udp_endpoint *endpoint,
-                                    const uint8_t *dcid, size_t dcidlen) {
-  size_t i;
-  for (i = 0; i < MAX_CID_ROUTES; ++i) {
-    const cid_route *route = &endpoint->routes[i];
-    if (route->active && cid_matches_bytes(&route->cid, dcid, dcidlen)) {
-      return route->owner;
-    }
-  }
-  return NULL;
-}
-
 static int set_nghttp3_failure(client *c, const char *where, int rv) {
   set_fatal(c, "%s: %s (%d)", where, nghttp3_strerror(rv), rv);
   ngtcp2_ccerr_set_application_error(
@@ -493,7 +414,7 @@ static bool parse_u64(nghttp3_vec value, uint64_t *result) {
 static response_state *checked_response(client *c, int64_t stream_id,
                                         void *stream_user_data) {
   response_state *r = (response_state *)stream_user_data;
-  if (r == NULL || !r->active || r->stream_id != stream_id) {
+  if (r == NULL || r->stream_id != stream_id) {
     set_fatal(c, "event for unknown response stream %" PRId64, stream_id);
     return NULL;
   }
@@ -650,8 +571,8 @@ static int on_nghttp3_end_stream(
   if (r == NULL) {
     return NGHTTP3_ERR_CALLBACK_FAILURE;
   }
-  if (r->complete || !r->headers_end || !r->status_seen ||
-      !r->content_length_seen || r->body_bytes != c->expected_body_bytes) {
+  if (r->complete || !r->headers_end ||
+      r->body_bytes != c->expected_body_bytes) {
     set_fatal(c, "incomplete response at end_stream on stream %" PRId64,
               stream_id);
     return NGHTTP3_ERR_CALLBACK_FAILURE;
@@ -970,7 +891,6 @@ static int validate_tls_connection(client *c) {
               cipher_name != NULL ? cipher_name : "(null)");
     return -1;
   }
-  c->tls_validated = true;
   return 0;
 }
 
@@ -1014,19 +934,16 @@ static int quic_get_new_connection_id(
     return NGTCP2_ERR_CALLBACK_FAILURE;
   }
   cid->datalen = cidlen;
-  return endpoint_register_cid(c->endpoint, c, cid) == 0
-           ? 0
-           : NGTCP2_ERR_CALLBACK_FAILURE;
+  return 0;
 }
 
 static int quic_remove_connection_id(ngtcp2_conn *conn,
                                      const ngtcp2_cid *cid,
                                      void *user_data) {
-  client *c = (client *)user_data;
   (void)conn;
-  return endpoint_remove_cid(c->endpoint, c, cid) == 0
-           ? 0
-           : NGTCP2_ERR_CALLBACK_FAILURE;
+  (void)cid;
+  (void)user_data;
+  return 0;
 }
 
 static int quic_extend_max_local_streams_bidi(ngtcp2_conn *conn,
@@ -1054,8 +971,7 @@ static nghttp3_nv make_nv(const char *name, const char *value) {
 }
 
 static int fill_request_window(client *c) {
-  while (c->measurement_started && c->started < c->target_requests &&
-         c->active < c->inflight_limit) {
+  while (c->started < c->target_requests && c->active < c->inflight_limit) {
     response_state *r;
     nghttp3_nv headers[4];
     int64_t stream_id;
@@ -1074,7 +990,6 @@ static int fill_request_window(client *c) {
     r = &c->responses[c->started];
     memset(r, 0, sizeof(*r));
     r->stream_id = stream_id;
-    r->active = true;
     headers[0] = make_nv(":method", "GET");
     headers[1] = make_nv(":scheme", "https");
     headers[2] = make_nv(":authority", "localhost:4433");
@@ -1268,11 +1183,7 @@ static int drive_tx(client *c) {
   }
 }
 
-static bool all_clients_phase_done(const client *clients, size_t connections,
-                                   run_phase phase);
-
-static rx_drain_result drain_rx(udp_endpoint *endpoint, client *clients,
-                                size_t connections,
+static rx_drain_result drain_rx(udp_endpoint *endpoint, client *c,
                                 bool stop_at_benchmark_completion) {
   size_t packet_count;
   for (packet_count = 0; packet_count < MAX_RX_BURST; ++packet_count) {
@@ -1282,39 +1193,22 @@ static rx_drain_result drain_rx(udp_endpoint *endpoint, client *clients,
       endpoint->fd, endpoint->rxbuf, sizeof(endpoint->rxbuf),
       (struct sockaddr *)&remote_addr, &remote_addrlen);
     int socket_error;
-    ngtcp2_version_cid version_cid;
-    client *c;
     ngtcp2_path path;
     ngtcp2_pkt_info pi;
     uint64_t ts;
-    int decode_rv;
     int rv;
-    uint64_t completed_before;
 
     if (nread == SOCKET_CALL_ERROR) {
       socket_error = socket_last_error();
       if (socket_error_would_block(socket_error)) {
         return RX_DRAIN_IDLE;
       }
-      set_fatal(&clients[0], "recvfrom: socket error %d", socket_error);
+      set_fatal(c, "recvfrom: socket error %d", socket_error);
       return RX_DRAIN_FAILED;
     }
     if (nread == 0) {
       continue;
     }
-
-    decode_rv = ngtcp2_pkt_decode_version_cid(
-      &version_cid, endpoint->rxbuf, (size_t)nread,
-      CLIENT_CONNECTION_ID_LENGTH);
-    if (decode_rv != 0 && decode_rv != NGTCP2_ERR_VERSION_NEGOTIATION) {
-      continue;
-    }
-    c = endpoint_find_client(endpoint, version_cid.dcid,
-                             version_cid.dcidlen);
-    if (c == NULL) {
-      continue;
-    }
-    completed_before = c->completed;
 
     memset(&path, 0, sizeof(path));
     path.local.addr = (struct sockaddr *)&endpoint->local_addr;
@@ -1329,9 +1223,8 @@ static rx_drain_result drain_rx(udp_endpoint *endpoint, client *clients,
     if (rv != 0) {
       if (!c->last_error.error_code) {
         if (rv == NGTCP2_ERR_CRYPTO) {
-          ngtcp2_ccerr_set_tls_alert(&c->last_error,
-                                     ngtcp2_conn_get_tls_alert2(c->qconn),
-                                     NULL, 0);
+          ngtcp2_ccerr_set_tls_alert(
+            &c->last_error, ngtcp2_conn_get_tls_alert2(c->qconn), NULL, 0);
         } else {
           ngtcp2_ccerr_set_liberr(&c->last_error, rv, NULL, 0);
         }
@@ -1344,9 +1237,7 @@ static rx_drain_result drain_rx(udp_endpoint *endpoint, client *clients,
     }
     c->last_progress_ns = ts;
     if (stop_at_benchmark_completion &&
-        completed_before < c->target_requests &&
-        c->completed == c->target_requests &&
-        all_clients_phase_done(clients, connections, RUN_PHASE_BENCHMARK)) {
+        c->completed == c->target_requests) {
       return RX_DRAIN_BENCHMARK_COMPLETE;
     }
   }
@@ -1392,22 +1283,9 @@ static bool client_phase_done(const client *c, run_phase phase) {
   return false;
 }
 
-static bool all_clients_phase_done(const client *clients, size_t connections,
-                                   run_phase phase) {
-  size_t i;
-  for (i = 0; i < connections; ++i) {
-    if (!client_phase_done(&clients[i], phase)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-static int run_until_phase(client *clients, size_t connections,
-                           run_phase phase) {
-  udp_endpoint *endpoint = clients[0].endpoint;
+static int run_until_phase(client *c, run_phase phase) {
+  udp_endpoint *endpoint = c->endpoint;
   socket_pollfd pfd;
-  size_t i;
   bool force_zero_timeout = false;
   bool benchmark = phase == RUN_PHASE_BENCHMARK;
 
@@ -1418,33 +1296,22 @@ static int run_until_phase(client *clients, size_t connections,
     bool pending_tx = false;
     force_zero_timeout = false;
 
-    for (i = 0; i < connections; ++i) {
-      client *c = &clients[i];
-      if (c->fatal) {
-        return -1;
-      }
+    if (c->fatal) {
+      return -1;
     }
-    if (all_clients_phase_done(clients, connections, phase)) {
+    if (client_phase_done(c, phase)) {
       return 0;
     }
-    for (i = 0; i < connections; ++i) {
-      client *c = &clients[i];
-      bool phase_done = client_phase_done(c, phase);
-      int client_timeout;
-
-      if (now - c->last_progress_ns >= NO_PROGRESS_NS) {
-        if (!phase_done) {
-          set_fatal(c,
-                    "connection %zu made no protocol progress for 30 seconds",
-                    i);
-          return -1;
-        }
-      }
-      if (handle_expiry(c, now) != 0 ||
-          (benchmark && !phase_done && fill_request_window(c) != 0)) {
-        return -1;
-      }
-      client_timeout = drive_tx(c);
+    if (now - c->last_progress_ns >= NO_PROGRESS_NS) {
+      set_fatal(c, "connection made no protocol progress for 30 seconds");
+      return -1;
+    }
+    if (handle_expiry(c, now) != 0 ||
+        (benchmark && fill_request_window(c) != 0)) {
+      return -1;
+    }
+    {
+      int client_timeout = drive_tx(c);
       if (client_timeout < 0) {
         return -1;
       }
@@ -1452,9 +1319,7 @@ static int run_until_phase(client *clients, size_t connections,
         force_zero_timeout = true;
         timeout = 0;
       }
-      if (c->pending_tx_len != 0) {
-        pending_tx = true;
-      }
+      pending_tx = c->pending_tx_len != 0;
       if (!force_zero_timeout) {
         client_timeout = poll_timeout_ms(c, timestamp_ns());
         if (client_timeout < timeout) {
@@ -1471,18 +1336,17 @@ static int run_until_phase(client *clients, size_t connections,
     }
     poll_result = socket_poll_one(&pfd, timeout);
     if (poll_result == SOCKET_CALL_ERROR) {
-      set_fatal(&clients[0], "poll: socket error %d", socket_last_error());
+      set_fatal(c, "poll: socket error %d", socket_last_error());
       return -1;
     }
     if (poll_result > 0) {
       if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-        set_fatal(&clients[0], "poll returned socket error flags 0x%x",
+        set_fatal(c, "poll returned socket error flags 0x%x",
                   (unsigned int)(unsigned short)pfd.revents);
         return -1;
       }
       if (pfd.revents & SOCKET_READ_EVENT) {
-        rx_drain_result drain_result =
-          drain_rx(endpoint, clients, connections, benchmark);
+        rx_drain_result drain_result = drain_rx(endpoint, c, benchmark);
         if (drain_result == RX_DRAIN_FAILED) {
           return -1;
         }
@@ -1494,21 +1358,13 @@ static int run_until_phase(client *clients, size_t connections,
         }
       }
       if (pfd.revents & SOCKET_WRITE_EVENT) {
-        pending_tx = false;
-        for (i = 0; i < connections; ++i) {
-          client *c = &clients[i];
-          if (c->pending_tx_len == 0) {
-            continue;
-          }
+        if (c->pending_tx_len != 0) {
           int drive_result = drive_tx(c);
           if (drive_result < 0) {
             return -1;
           }
           if (drive_result > 0) {
             force_zero_timeout = true;
-          }
-          if (c->pending_tx_len != 0) {
-            pending_tx = true;
           }
         }
       }
@@ -1611,15 +1467,6 @@ static int send_connection_close_best_effort(client *c,
               (unsigned int)(unsigned short)pfd.revents);
       return -1;
     }
-  }
-}
-
-static void close_connections_best_effort(client *clients,
-                                          size_t connections) {
-  uint64_t close_started = timestamp_ns();
-  size_t i;
-  for (i = 0; i < connections; ++i) {
-    (void)send_connection_close_best_effort(&clients[i], close_started);
   }
 }
 
@@ -1781,9 +1628,6 @@ static int init_quic(client *c) {
     set_fatal(c, "ngtcp2_conn_client_new: %s (%d)", ngtcp2_strerror(rv), rv);
     return -1;
   }
-  if (endpoint_register_cid(c->endpoint, c, &scid) != 0) {
-    return -1;
-  }
   ngtcp2_conn_set_tls_native_handle(c->qconn, c->ssl);
   return 0;
 }
@@ -1792,18 +1636,18 @@ static int client_init(client *c, udp_endpoint *endpoint,
                        const bench_config *config, SSL_CTX *ssl_ctx) {
   memset(c, 0, sizeof(*c));
   c->endpoint = endpoint;
-  c->target_requests = config->requests_per_connection;
+  c->target_requests = config->requests;
   c->expected_body_bytes = config->expected_body_bytes;
   c->inflight_limit = config->inflight;
   c->last_progress_ns = timestamp_ns();
   ngtcp2_ccerr_default(&c->last_error);
 
-  if (config->requests_per_connection > SIZE_MAX / sizeof(response_state)) {
+  if (config->requests > SIZE_MAX / sizeof(response_state)) {
     set_fatal(c, "response state allocation overflow");
     return -1;
   }
   c->responses = (response_state *)malloc(
-    (size_t)config->requests_per_connection * sizeof(response_state));
+    (size_t)config->requests * sizeof(response_state));
   if (c->responses == NULL) {
     set_fatal(c, "could not allocate response state");
     return -1;
@@ -1856,32 +1700,20 @@ static bool parse_nonnegative_u64_arg(const char *text, uint64_t *value) {
 }
 
 static int parse_args(int argc, char **argv, bench_config *config) {
-  uint64_t connections;
-  uint64_t udp_sockets;
   uint64_t inflight;
-  if (argc != 6 ||
-      !parse_positive_u64_arg(argv[1], &connections) ||
-      connections > MAX_BENCH_CONNECTIONS || connections > SIZE_MAX ||
-      !parse_positive_u64_arg(argv[2], &udp_sockets) ||
-      udp_sockets > SIZE_MAX ||
-      !parse_positive_u64_arg(argv[3], &config->requests_per_connection) ||
-      !parse_nonnegative_u64_arg(argv[4], &config->expected_body_bytes) ||
-      !parse_positive_u64_arg(argv[5], &inflight) || inflight > SIZE_MAX) {
+  if (argc != 4 || !parse_positive_u64_arg(argv[1], &config->requests) ||
+      config->requests > SIZE_MAX ||
+      !parse_nonnegative_u64_arg(argv[2], &config->expected_body_bytes) ||
+      !parse_positive_u64_arg(argv[3], &inflight) || inflight > SIZE_MAX) {
     fprintf(stderr,
-            "usage: %s <connections:1..4> <udp-sockets> "
-            "<requests-per-connection> <expected-body-bytes> "
-            "<inflight-per-connection>\n",
+            "usage: %s <requests> <expected-body-bytes> <inflight>\n",
             argv[0]);
     return -1;
   }
-  if (udp_sockets != 1) {
-    fprintf(stderr,
-            "udp-sockets must be 1; the nghttp3 client currently shares one "
-            "UDP socket across all connections\n");
+  if (inflight > config->requests) {
+    fprintf(stderr, "inflight cannot exceed requests\n");
     return -1;
   }
-  config->connections = (size_t)connections;
-  config->udp_sockets = (size_t)udp_sockets;
   config->inflight = (size_t)inflight;
   return 0;
 }
@@ -1946,18 +1778,12 @@ static SSL_CTX *create_tls_context(void) {
 int http3_bench_nghttp3_main(int argc, char **argv) {
   bench_config config;
   udp_endpoint endpoint;
+  client c;
   SSL_CTX *ssl_ctx = NULL;
-  client *clients = NULL;
-  size_t initialized_clients = 0;
-  size_t i;
   uint64_t setup_finished;
   uint64_t benchmark_started;
-  uint64_t benchmark_finished;
   uint64_t expected_total_bytes;
-  uint64_t total_requests;
-  uint64_t completed = 0;
-  uint64_t received_bytes = 0;
-  size_t path_max_udp_payload_sizes[MAX_BENCH_CONNECTIONS];
+  size_t path_max_udp_payload_size;
   uint64_t elapsed_ns;
   const ngtcp2_info *qver;
   const nghttp3_info *hver;
@@ -1988,22 +1814,18 @@ int http3_bench_nghttp3_main(int argc, char **argv) {
 
   memset(&endpoint, 0, sizeof(endpoint));
   endpoint.fd = INVALID_SOCKET_HANDLE;
+  memset(&c, 0, sizeof(c));
 
   if (monotonic_clock_init() != 0) {
     fprintf(stderr, "monotonic clock initialization failed\n");
     return EXIT_FAILURE;
   }
-  if (config.requests_per_connection > UINT64_MAX / config.connections) {
-    fprintf(stderr, "total request count overflow\n");
-    return EXIT_FAILURE;
-  }
-  total_requests = config.requests_per_connection * config.connections;
   if (config.expected_body_bytes != 0 &&
-      total_requests > UINT64_MAX / config.expected_body_bytes) {
+      config.requests > UINT64_MAX / config.expected_body_bytes) {
     fprintf(stderr, "expected total response byte count overflow\n");
     return EXIT_FAILURE;
   }
-  expected_total_bytes = total_requests * config.expected_body_bytes;
+  expected_total_bytes = config.requests * config.expected_body_bytes;
   if (socket_runtime_init() != 0) {
     fprintf(stderr, "socket runtime initialization failed\n");
     return EXIT_FAILURE;
@@ -2014,115 +1836,66 @@ int http3_bench_nghttp3_main(int argc, char **argv) {
     goto cleanup_socket_runtime;
   }
 
-  clients = (client *)calloc(config.connections, sizeof(client));
-  if (clients == NULL) {
-    fprintf(stderr, "could not allocate clients\n");
-    goto cleanup_ctx;
+  if (create_udp_endpoint(&endpoint, &c) != 0) {
+    fprintf(stderr, "UDP endpoint init failed: %s\n", c.fatal_reason);
+    goto cleanup_client;
   }
-  if (create_udp_endpoint(&endpoint, &clients[0]) != 0) {
-    fprintf(stderr, "UDP endpoint init failed: %s\n",
-            clients[0].fatal_reason);
-    goto cleanup_clients;
+  if (client_init(&c, &endpoint, &config, ssl_ctx) != 0) {
+    fprintf(stderr, "client init failed: %s\n", c.fatal_reason);
+    goto cleanup_client;
   }
-  for (i = 0; i < config.connections; ++i) {
-    if (client_init(&clients[i], &endpoint, &config, ssl_ctx) != 0) {
-      fprintf(stderr, "client %zu init failed: %s\n", i,
-              clients[i].fatal_reason);
-      initialized_clients = i + 1;
-      goto cleanup_clients;
+  if (run_until_phase(&c, RUN_PHASE_READY) != 0) {
+    if (c.fatal) {
+      fprintf(stderr, "client handshake failed: %s\n", c.fatal_reason);
     }
-    initialized_clients = i + 1;
-  }
-  if (run_until_phase(clients, config.connections, RUN_PHASE_READY) != 0) {
-    for (i = 0; i < config.connections; ++i) {
-      if (clients[i].fatal) {
-        fprintf(stderr, "client %zu handshake failed: %s\n", i,
-                clients[i].fatal_reason);
-      }
-    }
-    goto cleanup_clients;
+    goto cleanup_client;
   }
   setup_finished = timestamp_ns();
 
-  for (i = 0; i < config.connections; ++i) {
-    clients[i].measurement_started = true;
-    clients[i].last_progress_ns = setup_finished;
-  }
+  c.last_progress_ns = setup_finished;
   benchmark_started = timestamp_ns();
-  if (run_until_phase(clients, config.connections, RUN_PHASE_BENCHMARK) != 0) {
-    for (i = 0; i < config.connections; ++i) {
-      if (clients[i].fatal) {
-        fprintf(stderr, "client %zu benchmark failed: %s\n", i,
-                clients[i].fatal_reason);
-      }
+  if (run_until_phase(&c, RUN_PHASE_BENCHMARK) != 0) {
+    if (c.fatal) {
+      fprintf(stderr, "client benchmark failed: %s\n", c.fatal_reason);
     }
-    goto cleanup_clients;
+    goto cleanup_client;
   }
-  benchmark_finished = 0;
-  for (i = 0; i < config.connections; ++i) {
-    path_max_udp_payload_sizes[i] =
-      ngtcp2_conn_get_path_max_tx_udp_payload_size2(clients[i].qconn);
-  }
-  close_connections_best_effort(clients, config.connections);
+  path_max_udp_payload_size =
+    ngtcp2_conn_get_path_max_tx_udp_payload_size2(c.qconn);
+  (void)send_connection_close_best_effort(&c, timestamp_ns());
 
-  for (i = 0; i < config.connections; ++i) {
-    if (!clients[i].tls_validated ||
-        clients[i].started != config.requests_per_connection ||
-        clients[i].completed != config.requests_per_connection ||
-        clients[i].active != 0 ||
-        clients[i].measurement_finished_ns <= benchmark_started) {
-      fprintf(stderr,
-              "client %zu final validation failed: started=%" PRIu64
-              " completed=%" PRIu64 " active=%zu bytes=%" PRIu64 "\n",
-              i, clients[i].started, clients[i].completed, clients[i].active,
-              clients[i].received_bytes);
-      goto cleanup_clients;
-    }
-    /* Connections overlap on one event loop, so the batch ends at the latest
-       per-connection completion.  Summing connection durations would
-       double-count concurrent work and produce an unfair statistic. */
-    if (clients[i].measurement_finished_ns > benchmark_finished) {
-      benchmark_finished = clients[i].measurement_finished_ns;
-    }
-    completed += clients[i].completed;
-    received_bytes += clients[i].received_bytes;
-  }
-  if (completed != total_requests || received_bytes != expected_total_bytes) {
-    fprintf(stderr, "aggregate final validation failed\n");
-    goto cleanup_clients;
+  if (c.started != config.requests || c.completed != config.requests ||
+      c.active != 0 ||
+      c.received_bytes != expected_total_bytes ||
+      c.measurement_finished_ns <= benchmark_started) {
+    fprintf(stderr,
+            "client final validation failed: started=%" PRIu64
+            " completed=%" PRIu64 " active=%zu bytes=%" PRIu64 "\n",
+            c.started, c.completed, c.active, c.received_bytes);
+    goto cleanup_client;
   }
 
-  elapsed_ns = benchmark_finished - benchmark_started;
-  printf("{\"schema\":\"http3-client-bench-v8\","
+  elapsed_ns = c.measurement_finished_ns - benchmark_started;
+  printf("{\"schema\":\"http3-client-bench-v9\","
          "\"http3_library\":\"nghttp3\","
          "\"quic_backend\":\"ngtcp2\","
          "\"transport_profile\":"
          "\"ngtcp2-1350b-1mib-stream-10mib-connection\","
          "\"measurement_profile\":"
          "\"post-local-setup-to-last-complete-response\","
-         "\"connections\":%zu,\"udp_sockets\":%zu,"
-         "\"requests_per_connection\":%" PRIu64 ","
-         "\"in_flight_per_connection\":%zu,"
+         "\"requests\":%" PRIu64 ","
+         "\"in_flight\":%zu,"
          "\"response_body_bytes\":%" PRIu64 ","
          "\"completed\":%" PRIu64 ",\"received_bytes\":%" PRIu64 ","
          "\"elapsed_ns\":%" PRIu64 ","
-         "\"path_max_udp_payload_size_per_connection\":[",
-         config.connections, config.udp_sockets, config.requests_per_connection,
-         config.inflight, config.expected_body_bytes, completed, received_bytes,
-         elapsed_ns);
-  for (i = 0; i < config.connections; ++i) {
-    printf("%s%zu", i == 0 ? "" : ",", path_max_udp_payload_sizes[i]);
-  }
-  puts("]}");
+         "\"path_max_udp_payload_size\":%zu}\n",
+         config.requests, config.inflight, config.expected_body_bytes,
+         c.completed, c.received_bytes, elapsed_ns, path_max_udp_payload_size);
   exit_code = EXIT_SUCCESS;
 
-cleanup_clients:
-  for (i = 0; i < initialized_clients; ++i) {
-    client_free(&clients[i]);
-  }
+cleanup_client:
+  client_free(&c);
   free_udp_endpoint(&endpoint);
-  free(clients);
-cleanup_ctx:
   SSL_CTX_free(ssl_ctx);
 cleanup_socket_runtime:
   socket_runtime_cleanup();

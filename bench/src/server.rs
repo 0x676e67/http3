@@ -14,7 +14,7 @@ use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::task::JoinSet;
 
-use super::case::{ALPN_H3, SERVER_ADDR, SERVER_WORKERS, workspace_root};
+use super::case::{ALPN_H3, SERVER_ADDR, SERVER_MAX_BIDI_STREAMS, SERVER_WORKERS, workspace_root};
 
 pub(crate) fn run_from_args(mut args: impl Iterator<Item = String>) -> Result<()> {
     let body_bytes = args
@@ -60,13 +60,17 @@ async fn run_server(
         .with_single_cert(vec![cert], key)?;
     tls_config.alpn_protocols = vec![ALPN_H3.to_vec()];
 
-    let server_config =
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.max_concurrent_bidi_streams(SERVER_MAX_BIDI_STREAMS.into());
+    let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config)?));
+    server_config.transport_config(Arc::new(transport_config));
 
     let endpoint = quinn::Endpoint::server(server_config, SERVER_ADDR.parse()?)?;
     println!(
-        "http3-bench-server-v1 address={SERVER_ADDR} body_bytes={body_bytes} \
-         transport=quinn-default workers={SERVER_WORKERS}"
+        "http3-bench-server-v2 address={SERVER_ADDR} body_bytes={body_bytes} \
+         max_concurrent_bidi_streams={SERVER_MAX_BIDI_STREAMS} transport=quinn \
+         workers={SERVER_WORKERS}"
     );
     std::io::stdout().flush()?;
 

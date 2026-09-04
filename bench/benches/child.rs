@@ -2,7 +2,6 @@
 
 use std::{
     io::{BufRead, BufReader},
-    path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
     thread,
@@ -11,16 +10,16 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use http3_bench::{
-    case::{Case, Http3Library, SERVER_ADDR, SERVER_WORKERS, workspace_root},
+    case::{
+        Case, Http3Library, MAX_BODY_BYTES, SERVER_ADDR, SERVER_MAX_BIDI_STREAMS, SERVER_WORKERS,
+        workspace_root,
+    },
     result::ClientResult,
 };
 use wait_timeout::ChildExt;
 
 const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-const HTTP3_CLIENT_EXE: &str = env!("CARGO_BIN_EXE_http3-bench-http3-client");
-const H3_CLIENT_EXE: &str = env!("CARGO_BIN_EXE_http3-bench-h3-client");
-const NGHTTP3_CLIENT_EXE: &str = env!("CARGO_BIN_EXE_http3-bench-nghttp3-client");
 const SERVER_EXE: &str = env!("CARGO_BIN_EXE_http3-bench-server");
 
 struct ChildCleanupGuard {
@@ -28,10 +27,6 @@ struct ChildCleanupGuard {
 }
 
 impl ChildCleanupGuard {
-    fn new(child: Child) -> Self {
-        Self { child: Some(child) }
-    }
-
     fn child_mut(&mut self) -> Result<&mut Child> {
         self.child
             .as_mut()
@@ -69,38 +64,11 @@ impl Drop for ChildCleanupGuard {
 }
 
 pub(crate) struct ClientRunner {
-    executable: PathBuf,
-    library: Http3Library,
+    pub executable: &'static str,
+    pub library: Http3Library,
 }
 
 impl ClientRunner {
-    pub(crate) fn rust(library: Http3Library) -> Result<Self> {
-        let executable = PathBuf::from(match library {
-            Http3Library::Http3 => HTTP3_CLIENT_EXE,
-            Http3Library::H3 => H3_CLIENT_EXE,
-            Http3Library::Nghttp3 => bail!("nghttp3 cannot use the Rust child runner"),
-        });
-        Self::new(executable, library)
-    }
-
-    pub(crate) fn nghttp3() -> Result<Self> {
-        Self::new(PathBuf::from(NGHTTP3_CLIENT_EXE), Http3Library::Nghttp3)
-    }
-
-    fn new(executable: PathBuf, library: Http3Library) -> Result<Self> {
-        if !executable.is_file() {
-            bail!(
-                "{} benchmark client does not exist: {}",
-                library,
-                executable.display()
-            );
-        }
-        Ok(Self {
-            executable,
-            library,
-        })
-    }
-
     pub(crate) fn run_iterations(&self, iterations: u64, case: Case) -> Result<Duration> {
         let mut measured = Duration::ZERO;
         for _ in 0..iterations {
@@ -113,22 +81,22 @@ impl ClientRunner {
     }
 
     fn run_once(&self, case: Case) -> Result<Duration> {
-        let mut command = Command::new(&self.executable);
+        let mut command = Command::new(self.executable);
         command
-            .arg(case.topology.connections.to_string())
-            .arg(case.topology.sockets.to_string())
-            .arg(case.requests_per_connection.to_string())
-            .arg(case.workload.body_bytes.to_string())
-            .arg(case.in_flight_per_connection.to_string())
+            .arg(case.requests.to_string())
+            .arg(case.body_bytes.to_string())
+            .arg(case.in_flight.to_string())
             .current_dir(workspace_root())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = ChildCleanupGuard::new(
-            command
-                .spawn()
-                .with_context(|| format!("could not run {} client", self.library))?,
-        );
+        let mut child = ChildCleanupGuard {
+            child: Some(
+                command
+                    .spawn()
+                    .with_context(|| format!("could not run {} client", self.library))?,
+            ),
+        };
         if child
             .child_mut()?
             .wait_timeout(client_timeout(case))
@@ -177,23 +145,18 @@ pub(crate) struct ServerGuard {
 
 impl ServerGuard {
     pub(crate) fn start(body_bytes: usize) -> Result<Self> {
-        let executable = PathBuf::from(SERVER_EXE);
-        if !executable.is_file() {
-            bail!(
-                "Cargo did not build the benchmark server at {}",
-                executable.display()
-            );
-        }
-        let mut child = ChildCleanupGuard::new(
-            Command::new(executable)
-                .arg(body_bytes.to_string())
-                .current_dir(workspace_root())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .context("could not start benchmark server")?,
-        );
+        let mut child = ChildCleanupGuard {
+            child: Some(
+                Command::new(SERVER_EXE)
+                    .arg(body_bytes.to_string())
+                    .current_dir(workspace_root())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .context("could not start benchmark server")?,
+            ),
+        };
         let stdin = child
             .child_mut()?
             .stdin
@@ -220,8 +183,9 @@ impl ServerGuard {
             }
         };
         let expected = format!(
-            "http3-bench-server-v1 address={SERVER_ADDR} body_bytes={body_bytes} \
-             transport=quinn-default workers={SERVER_WORKERS}"
+            "http3-bench-server-v2 address={SERVER_ADDR} body_bytes={body_bytes} \
+             max_concurrent_bidi_streams={SERVER_MAX_BIDI_STREAMS} transport=quinn \
+             workers={SERVER_WORKERS}"
         );
         if ready.trim() != expected {
             let status = child
@@ -278,7 +242,7 @@ impl Drop for ServerGuard {
 }
 
 fn client_timeout(case: Case) -> Duration {
-    if case.workload.body_bytes >= 100 * 1024 * 1024 {
+    if case.body_bytes >= MAX_BODY_BYTES {
         Duration::from_secs(10 * 60)
     } else {
         Duration::from_secs(2 * 60)

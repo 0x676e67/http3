@@ -1,11 +1,16 @@
 <#
 .SYNOPSIS
-Runs the HTTP/3 Client comparison with explicit topology and body-size cases.
+Runs the HTTP/3 Client comparison with explicit body-size cases.
 
 .DESCRIPTION
 Runs http3, h3, and nghttp3 once in that fixed order. Body sizes use IEC units;
 the default cases are 0 B, 1 KiB, 10 KiB, 64 KiB, 128 KiB, 1 MiB, 2 MiB,
 4 MiB, and 100 MiB.
+
+Every Client uses one HTTP/3 connection and one UDP socket. Concurrent requests
+use streams on that connection, matching RFC 9114 Section 3.3 guidance against
+opening multiple same-configuration connections to one IP address and UDP port:
+https://www.rfc-editor.org/rfc/rfc9114.html#section-3.3
 
 Cargo builds the native nghttp3/ngtcp2 Client automatically before Criterion;
 no separately prepared executable is required. Building it requires CMake,
@@ -24,14 +29,16 @@ Each sample starts after local HTTP/3 setup and ends when the last complete
 response has been validated. Task aggregation, extra receive draining, final
 result checks, and connection shutdown are outside the measured interval.
 
-.PARAMETER Topologies
-Comma-separated connections/sockets pairs. The default is 1/1,4/1. The native
-comparison currently accepts one shared socket and 1-4 connections; generated
-request and in-flight totals must divide evenly across the connection count.
-
 .PARAMETER BodySizes
 Optional comma-separated response sizes such as 0B,64KiB,1MiB. Omitting this
 parameter uses the default cases listed above. The maximum size is 100 MiB.
+
+.PARAMETER Concurrency
+Optional maximum number of concurrent request streams on the single HTTP/3
+connection. Omitting it uses the body-size-adaptive default selected by the
+benchmark. The supported range is 1-100, and it cannot exceed the generated
+request count for any selected case. The Server advertises a fixed 1000-stream
+bidirectional credit window, leaving headroom above the supported Client load.
 
 .PARAMETER CriterionArgs
 Arguments forwarded to Criterion after Cargo's -- separator. This includes
@@ -46,15 +53,15 @@ Shows this complete parameter and example reference without building the benchma
 
 .EXAMPLE
 .\bench\run-balanced.ps1 `
-  -Topologies '4/1' `
   -BodySizes '0B,64KiB,1MiB' `
+  -Concurrency 32 `
   -CriterionArgs @('--sample-size', '20', '--measurement-time', '60', '--noplot')
 #>
 
 [CmdletBinding()]
 param(
-    [string]$Topologies = '1/1,4/1',
     [string]$BodySizes = '',
+    [Nullable[int]]$Concurrency = $null,
     [string[]]$CriterionArgs = @(),
     [Alias('h')]
     [switch]$Help
@@ -63,23 +70,34 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-if ($Help -or ($CriterionArgs.Count -eq 1 -and $CriterionArgs[0] -eq '--help')) {
+if ($Help) {
     Get-Help -Name $PSCommandPath -Full
     return
 }
 
 $savedBodySizes = $env:HTTP3_BENCH_BODY_SIZES
-$savedTopologies = $env:HTTP3_BENCH_TOPOLOGIES
+$savedConcurrency = $env:HTTP3_BENCH_CONCURRENCY
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 Push-Location -Path $repoRoot
 try {
-    $env:HTTP3_BENCH_TOPOLOGIES = $Topologies
     if ([string]::IsNullOrWhiteSpace($BodySizes)) {
         Remove-Item Env:HTTP3_BENCH_BODY_SIZES -ErrorAction SilentlyContinue
     }
     else {
         $env:HTTP3_BENCH_BODY_SIZES = $BodySizes
+    }
+    if ($null -eq $Concurrency) {
+        Remove-Item Env:HTTP3_BENCH_CONCURRENCY -ErrorAction SilentlyContinue
+    }
+    elseif ($Concurrency -le 0) {
+        throw 'Concurrency must be greater than zero'
+    }
+    elseif ($Concurrency -gt 100) {
+        throw 'Concurrency cannot exceed 100'
+    }
+    else {
+        $env:HTTP3_BENCH_CONCURRENCY = $Concurrency.ToString()
     }
 
     $rustcVersion = & rustc --version
@@ -99,6 +117,6 @@ try {
 }
 finally {
     $env:HTTP3_BENCH_BODY_SIZES = $savedBodySizes
-    $env:HTTP3_BENCH_TOPOLOGIES = $savedTopologies
+    $env:HTTP3_BENCH_CONCURRENCY = $savedConcurrency
     Pop-Location
 }
