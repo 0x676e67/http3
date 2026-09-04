@@ -43,6 +43,11 @@ benchmark. The supported range is 1-100, and it cannot exceed the generated
 request count for any selected case. The Server advertises a fixed 1000-stream
 bidirectional credit window, leaving headroom above the supported Client load.
 
+.PARAMETER ExtraHeaders
+Optional separate x-http3-bench: benchmark-value field lines. The benchmark
+field is defined as list-valued; the supported range is 0-64, and the Server
+validates every line after decoding each request.
+
 .PARAMETER CriterionArgs
 Arguments forwarded to Criterion after Cargo's -- separator. This includes
 --sample-size and --measurement-time; when present they override the per-case
@@ -59,6 +64,7 @@ Shows this complete parameter and example reference without building the benchma
   -BodySizes '0B,64KiB,1MiB' `
   -Requests 20000 `
   -Concurrency 32 `
+  -ExtraHeaders 16 `
   -CriterionArgs @('--sample-size', '20', '--measurement-time', '60', '--noplot')
 #>
 
@@ -67,6 +73,7 @@ param(
     [string]$BodySizes = '',
     [Nullable[int]]$Requests = $null,
     [Nullable[int]]$Concurrency = $null,
+    [Nullable[int]]$ExtraHeaders = $null,
     [string[]]$CriterionArgs = @(),
     [Alias('h')]
     [switch]$Help
@@ -83,6 +90,7 @@ if ($Help) {
 $savedBodySizes = $env:HTTP3_BENCH_BODY_SIZES
 $savedRequests = $env:HTTP3_BENCH_REQUESTS
 $savedConcurrency = $env:HTTP3_BENCH_CONCURRENCY
+$savedExtraHeaders = $env:HTTP3_BENCH_EXTRA_HEADERS
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 Push-Location -Path $repoRoot
@@ -117,6 +125,18 @@ try {
     else {
         $env:HTTP3_BENCH_CONCURRENCY = $Concurrency.ToString()
     }
+    if ($null -eq $ExtraHeaders) {
+        Remove-Item Env:HTTP3_BENCH_EXTRA_HEADERS -ErrorAction SilentlyContinue
+    }
+    elseif ($ExtraHeaders -lt 0) {
+        throw 'ExtraHeaders must be non-negative'
+    }
+    elseif ($ExtraHeaders -gt 64) {
+        throw 'ExtraHeaders cannot exceed 64'
+    }
+    else {
+        $env:HTTP3_BENCH_EXTRA_HEADERS = $ExtraHeaders.ToString()
+    }
 
     $rustcVersion = & rustc --version
     if ($LASTEXITCODE -ne 0) {
@@ -137,5 +157,6 @@ finally {
     $env:HTTP3_BENCH_BODY_SIZES = $savedBodySizes
     $env:HTTP3_BENCH_REQUESTS = $savedRequests
     $env:HTTP3_BENCH_CONCURRENCY = $savedConcurrency
+    $env:HTTP3_BENCH_EXTRA_HEADERS = $savedExtraHeaders
     Pop-Location
 }
