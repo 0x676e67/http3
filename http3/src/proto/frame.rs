@@ -210,22 +210,22 @@ impl Frame<PayloadLen> {
         frame
     }
 
-    /// Decodes only the type and length of a HEADERS frame.
+    /// Decodes only the type and length of a DATA or HEADERS frame.
     ///
     /// The caller uses a non-consuming cursor and commits the returned byte count
-    /// only when this is a HEADERS frame. Its payload can then remain on the QUIC
-    /// receive path and be processed incrementally.
+    /// only for these streaming payloads. Both common frame types share the
+    /// prefix parser instead of probing HEADERS and then parsing DATA again.
     ///
-    /// See [RFC 9114, Section 7.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.2).
-    pub(crate) fn decode_headers_prefix<T: Buf>(
+    /// See [RFC 9114, Section 7.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1).
+    pub(crate) fn decode_payload_prefix<T: Buf>(
         buf: &mut T,
-    ) -> Result<Option<PayloadLen>, FrameError> {
+    ) -> Result<Option<(FrameType, PayloadLen)>, FrameError> {
         let remaining = buf.remaining();
         let incomplete = remaining
             .checked_add(1)
             .ok_or(FrameError::InvalidFrameValue)?;
         let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(incomplete))?;
-        if ty != FrameType::HEADERS {
+        if !matches!(ty, FrameType::DATA | FrameType::HEADERS) {
             return Ok(None);
         }
 
@@ -236,7 +236,7 @@ impl Frame<PayloadLen> {
         // separately enforces the configured limit on the whole field section.
         let max_addressable = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
         let len = payload_len(encoded_len, max_addressable)?;
-        Ok(Some(PayloadLen(len)))
+        Ok(Some((ty, PayloadLen(len))))
     }
 
     /// Decodes the type and payload length only when the next frame is unknown.
@@ -933,7 +933,7 @@ mod tests {
         encoded.write_var(u64::from(u32::MAX) + 1);
 
         assert_matches!(
-            Frame::decode_headers_prefix(&mut Cursor::new(&encoded)),
+            Frame::decode_payload_prefix(&mut Cursor::new(&encoded)),
             Err(FrameError::ExcessiveLoad {
                 limit: usize::MAX,
                 ..

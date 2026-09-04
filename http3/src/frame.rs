@@ -8,7 +8,7 @@ use crate::{
     buf::BufList,
     error::Code,
     proto::{
-        frame::{self, Frame, PayloadLen, SettingsError},
+        frame::{self, Frame, FrameType, PayloadLen, SettingsError},
         push::InvalidPushId,
         stream::StreamId,
     },
@@ -145,19 +145,19 @@ where
                     }
                 }
             } else {
-                let headers = {
+                let prefix = {
                     let mut cursor = self.stream.buf_mut().cursor();
-                    let decoded = Frame::decode_headers_prefix(&mut cursor);
+                    let decoded = Frame::decode_payload_prefix(&mut cursor);
                     (cursor.position(), decoded)
                 };
 
-                match headers {
-                    (consumed, Ok(Some(PayloadLen(len)))) => {
+                match prefix {
+                    (consumed, Ok(Some((ty, PayloadLen(len))))) => {
                         // Incremental consumption must not relax the public
                         // limit on a whole encoded field section. Decoded
                         // fields still accumulate until HEADERS is complete.
                         // https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4
-                        if len > self.decoder.max_field_section_size {
+                        if ty == FrameType::HEADERS && len > self.decoder.max_field_section_size {
                             return Poll::Ready(Err(FrameStreamError::Proto(
                                 FrameProtocolError::ExcessiveLoad {
                                     len: len as u64,
@@ -168,20 +168,18 @@ where
                         self.stream.buf_mut().advance(consumed);
                         self.remaining_data = len;
                         self.data_until_eos = false;
-                        return Poll::Ready(Ok(Some(Frames::Headers)));
+                        let frame = if ty == FrameType::HEADERS {
+                            Frames::Headers
+                        } else {
+                            Frames::Frame(Frame::Data(PayloadLen(len)))
+                        };
+                        return Poll::Ready(Ok(Some(frame)));
                     }
                     (_, Err(frame::FrameError::Incomplete(_))) => {}
-                    // A malformed HEADERS prefix violates the HTTP/3 frame layout.
+                    // A malformed prefix violates the HTTP/3 frame layout.
                     // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
                     (_, Err(error)) => return Poll::Ready(Err(map_frame_error(error))),
                     (_, Ok(None)) => match self.decoder.decode_one(self.stream.buf_mut())? {
-                        Some(DecodedFrame::Frame(Frame::Data(PayloadLen(len)))) => {
-                            self.remaining_data = len;
-                            self.data_until_eos = false;
-                            return Poll::Ready(Ok(Some(Frames::Frame(Frame::Data(PayloadLen(
-                                len,
-                            ))))));
-                        }
                         Some(DecodedFrame::Frame(frame @ Frame::WebTransportStream(_))) => {
                             self.remaining_data = usize::MAX;
                             self.data_until_eos = true;
@@ -1020,6 +1018,50 @@ mod tests {
             Ok(Some(bytes)) if bytes == b"der"[..]
         );
         assert!(stream.has_data());
+    }
+
+    #[tokio::test]
+    async fn streaming_prefixes_accept_split_nonminimal_varints() {
+        for ty in [0u8, 1] {
+            // Both type and length use legal two-byte encodings. Splitting
+            // either integer must leave the prefix intact until it is complete.
+            let prefix = [0x40, ty, 0x40, 4];
+            for split in 1..prefix.len() {
+                let mut recv = FakeRecv::default();
+                recv.chunk(Bytes::copy_from_slice(&prefix[..split]))
+                    .pending_when_empty();
+                let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+                // The encoded field-section budget must not limit DATA.
+                stream.set_max_field_section_size(if ty == 0 { 0 } else { 4 });
+                let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+                assert!(matches!(stream.poll_next_frame(&mut cx), Poll::Pending));
+                assert_eq!(stream.stream.buf().remaining(), split);
+
+                let mut rest = BytesMut::from(&prefix[split..]);
+                rest.put_slice(b"body");
+                Frame::headers(Bytes::new()).encode_with_payload(&mut rest);
+                stream.stream.buf_mut().push(rest.freeze());
+                match ty {
+                    0 => {
+                        assert_poll_matches!(
+                            |cx| stream.poll_next_frame(cx),
+                            Ok(Some(Frames::Frame(Frame::Data(PayloadLen(4)))))
+                        );
+                    }
+                    _ => {
+                        assert_poll_matches!(
+                            |cx| stream.poll_next_frame(cx),
+                            Ok(Some(Frames::Headers))
+                        );
+                    }
+                }
+                assert_poll_matches!(
+                    |cx| to_bytes(stream.poll_data_chunk(cx, usize::MAX)),
+                    Ok(Some(bytes)) if bytes == b"body"[..]
+                );
+                assert_poll_matches!(|cx| stream.poll_next_frame(cx), Ok(Some(Frames::Headers)));
+            }
+        }
     }
 
     #[tokio::test]
