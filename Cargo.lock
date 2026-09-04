@@ -164,9 +164,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.18.0"
+version = "1.17.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce2b2dcc879c3bae0d371e77c99f2238400ef24ec001394befa67b6e543add9e"
+checksum = "00bdb5da18dac48ca2cc7cd4a98e533e8635a58e2361d13a1a4ee3888e0d72f1"
 dependencies = [
  "aws-lc-sys",
  "untrusted 0.7.1",
@@ -175,9 +175,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.44.0"
+version = "0.43.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f09fae7be8bb3174e05c6afdb34199e6dc0c7c04ba9fa237b1967adfbde27483"
+checksum = "43103168cc76fe62678a375e722fc9cb3a0146159ac5828bc4f0dfd755c2224c"
 dependencies = [
  "bindgen",
  "cc",
@@ -207,6 +207,33 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "bench"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "aws-lc-rs",
+ "aws-lc-sys",
+ "bytes",
+ "bytesize",
+ "cc",
+ "criterion",
+ "h3 0.0.8 (git+https://github.com/hyperium/h3?rev=704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1)",
+ "h3-quinn 0.0.10 (git+https://github.com/hyperium/h3?rev=704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1)",
+ "http",
+ "http3",
+ "http3-quic",
+ "nghttp3-sys",
+ "ngtcp2-sys",
+ "quinn",
+ "quinn-proto",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wait-timeout",
+]
 
 [[package]]
 name = "bindgen"
@@ -1491,33 +1518,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "http3-bench"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "aws-lc-rs",
- "aws-lc-sys",
- "bytes",
- "bytesize",
- "cc",
- "criterion",
- "h3 0.0.8 (git+https://github.com/hyperium/h3?rev=704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1)",
- "h3-quinn 0.0.10 (git+https://github.com/hyperium/h3?rev=704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1)",
- "http",
- "http3",
- "http3-quic",
- "nghttp3-sys",
- "ngtcp2-sys",
- "quinn",
- "quinn-proto",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "wait-timeout",
-]
-
-[[package]]
 name = "http3-datagram"
 version = "0.0.2"
 dependencies = [
@@ -2088,6 +2088,8 @@ dependencies = [
 [[package]]
 name = "nghttp3-sys"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e9412a5b9f3ad9e170e085ee9e511986a8e83425bebd48987a518a3204a3eef"
 dependencies = [
  "bindgen",
  "cmake",
@@ -2097,6 +2099,8 @@ dependencies = [
 [[package]]
 name = "ngtcp2"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26c4d99b3a4ab6b958a5958fdd1f241ddb0334dcc6e8853e6222d0b329739685"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys",
@@ -2109,6 +2113,8 @@ dependencies = [
 [[package]]
 name = "ngtcp2-sys"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf62d961ed1802863baa278374a3293e748f27eb2b88a245ceb8f950a2ace287"
 dependencies = [
  "aws-lc-sys",
  "bindgen",
@@ -3078,9 +3084,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
  "aws-lc-rs",
  "ring",

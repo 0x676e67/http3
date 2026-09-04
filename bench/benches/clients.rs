@@ -3,16 +3,16 @@
 use std::{env, ffi::OsString};
 
 use anyhow::{Context, Result};
+use bench::case::Http3Library;
 use criterion::{Criterion, criterion_group};
-use http3_bench::case::Http3Library;
 
 mod child;
 mod runner;
 
 use child::{CHILD_MARKER, ChildRole};
 
-http3_bench::client_adapter!(Http3Client, http3, http3_quic, "http3");
-http3_bench::client_adapter!(H3Client, h3, h3_quinn, "h3");
+bench::client_adapter!(Http3Client, http3, http3_quic, "http3");
+bench::client_adapter!(H3Client, h3, h3_quinn, "h3");
 
 fn clients(criterion: &mut Criterion) {
     runner::run(criterion)
@@ -47,20 +47,20 @@ fn run() -> Result<i32> {
 fn run_child(role: ChildRole, args: impl Iterator<Item = OsString>) -> Result<i32> {
     match role {
         ChildRole::Client(Http3Library::Http3) => {
-            http3_bench::run_client::<Http3Client>(string_args(args)?.into_iter())
+            bench::run_client::<Http3Client>(string_args(args)?.into_iter())
                 .context("http3 benchmark client failed")?;
             Ok(0)
         }
         ChildRole::Client(Http3Library::H3) => {
-            http3_bench::run_client::<H3Client>(string_args(args)?.into_iter())
+            bench::run_client::<H3Client>(string_args(args)?.into_iter())
                 .context("h3 benchmark client failed")?;
             Ok(0)
         }
         ChildRole::Client(Http3Library::Nghttp3) => {
-            http3_bench::run_nghttp3_client(args).context("nghttp3 benchmark client failed")
+            bench::run_nghttp3_client(args).context("nghttp3 benchmark client failed")
         }
         ChildRole::Server => {
-            http3_bench::run_server(string_args(args)?.into_iter())
+            bench::run_server(string_args(args)?.into_iter())
                 .context("HTTP/3 benchmark server failed")?;
             Ok(0)
         }
