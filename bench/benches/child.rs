@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use http3_bench::{
+use bench::{
     case::{
         Case, Http3Library, MAX_BODY_BYTES, SERVER_ADDR, SERVER_MAX_BIDI_STREAMS, SERVER_WORKERS,
         workspace_root,

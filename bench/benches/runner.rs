@@ -3,12 +3,12 @@
 use std::{env, path::Path};
 
 use anyhow::{Context, Result, bail};
-use bytesize::ByteSize;
-use criterion::{BenchmarkId, Criterion, SamplingMode, Throughput};
-use http3_bench::{
+use bench::{
     case::{Case, DEFAULT_BODY_BYTES, Http3Library, MAX_BODY_BYTES, MAX_REQUESTS},
     result::MEASUREMENT_PROFILE,
 };
+use bytesize::ByteSize;
+use criterion::{BenchmarkId, Criterion, SamplingMode, Throughput};
 
 use super::child::{ClientRunner, ServerGuard};
 
@@ -169,7 +169,7 @@ fn criterion_arg_present(name: &str) -> bool {
     env::args().any(|argument| argument == name || argument.starts_with(&format!("{name}=")))
 }
 
-fn throughput(case: http3_bench::case::Case) -> Result<Throughput> {
+fn throughput(case: bench::case::Case) -> Result<Throughput> {
     if case.body_bytes < BANDWIDTH_BODY_THRESHOLD {
         Ok(Throughput::Elements(case.requests.try_into()?))
     } else {

@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .file("src/native/client.c")
         .include(required_path("DEP_NGTCP2_INCLUDE")?)
         .include(required_path("DEP_NGHTTP3_INCLUDE")?)
-        .include(required_path("DEP_AWS_LC_0_44_0_INCLUDE")?)
+        .include(required_path("DEP_AWS_LC_0_43_0_INCLUDE")?)
         .define("NGTCP2_STATICLIB", None)
         .define("NGHTTP3_STATICLIB", None)
         .opt_level(3)

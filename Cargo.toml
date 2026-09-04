@@ -66,8 +66,3 @@ tracing-tree = "0.4"
 opt-level = 3
 codegen-units = 1
 incremental = false
-
-[patch.crates-io]
-nghttp3-sys = { path = "interop/crates/nghttp3-sys" }
-ngtcp2 = { path = "interop/crates/ngtcp2" }
-ngtcp2-sys = { path = "interop/crates/ngtcp2-sys" }

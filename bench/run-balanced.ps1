@@ -15,9 +15,8 @@ https://www.rfc-editor.org/rfc/rfc9114.html#section-3.3
 Cargo builds the native nghttp3/ngtcp2 Client automatically before Criterion;
 no separately prepared executable is required. Building it requires CMake,
 LLVM/libclang, NASM, and the Visual Studio 2022 MSVC C/C++ build tools.
-The ngtcp2 and nghttp3 sources are Git submodules; clone with
---recurse-submodules or run `git submodule update --init --recursive` from the
-repository root before the first build.
+The published ngtcp2-sys and nghttp3-sys crates include the required C sources,
+so repository submodules are not needed for this benchmark.
 
 The Rust Clients use a Tokio current-thread runtime, while the nghttp3 Client
 uses one synchronous event-loop thread. This script intentionally sets no CPU
@@ -129,7 +128,7 @@ try {
     }
 
     Write-Host 'Running HTTP/3 Clients in fixed order: http3, h3, nghttp3'
-    & cargo bench -p http3-bench --bench clients -- @CriterionArgs
+    & cargo bench -p bench --bench clients -- @CriterionArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Criterion failed with exit code $LASTEXITCODE"
     }

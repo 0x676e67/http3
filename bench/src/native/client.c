@@ -122,7 +122,7 @@
 
 #if !defined(OPENSSL_IS_AWSLC) || !defined(AWSLC_API_VERSION) ||              \
   AWSLC_API_VERSION != 35
-#error "AWS-LC 5.5.0-compatible headers are required"
+#error "AWS-LC API version 35 headers are required"
 #endif
 
 #define SERVER_HOST "127.0.0.1"
@@ -2194,9 +2194,11 @@ int http3_bench_nghttp3_main(int argc, char **argv) {
   }
   aws_lc_runtime_version = OpenSSL_version(OPENSSL_VERSION);
   if (aws_lc_runtime_version == NULL ||
-      strcmp(aws_lc_runtime_version, "AWS-LC 5.5.0") != 0) {
+      strcmp(aws_lc_runtime_version,
+             AWSLC_VERSION_NAME " " AWSLC_VERSION_NUMBER_STRING) != 0) {
     fprintf(stderr,
-            "AWS-LC runtime version mismatch: expected AWS-LC 5.5.0, got %s\n",
+            "AWS-LC runtime version mismatch: expected %s %s, got %s\n",
+            AWSLC_VERSION_NAME, AWSLC_VERSION_NUMBER_STRING,
             aws_lc_runtime_version != NULL ? aws_lc_runtime_version : "null");
     return EXIT_FAILURE;
   }

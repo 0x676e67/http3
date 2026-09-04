@@ -1,5 +1,5 @@
 [package]
-name = "http3-bench"
+name = "bench"
 version = "0.0.0"
 publish = false
 autobenches = false
@@ -11,13 +11,16 @@ build = "build.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-aws-lc-rs = "=1.18.0"
-aws-lc-sys = { version = "=0.44.0", features = ["ssl"] }
+# Match the AWS-LC versions used by the published ngtcp2 0.2.0 bindings.
+aws-lc-rs = "=1.17.3"
+aws-lc-sys = { version = "=0.43.0", features = ["ssl"] }
 bytesize = "=2.3.1"
 bytes = { workspace = true }
 http = { workspace = true }
 http3 = { workspace = true }
 http3-quic = { path = "../http3-quic", default-features = false, features = ["quinn"] }
+# The latest crates.io releases predate fixes in this reviewed upstream baseline.
+# https://github.com/hyperium/h3/commit/704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1
 h3 = { git = "https://github.com/hyperium/h3", rev = "704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1" }
 h3-quinn = { git = "https://github.com/hyperium/h3", rev = "704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1" }
 nghttp3-sys = { workspace = true }
