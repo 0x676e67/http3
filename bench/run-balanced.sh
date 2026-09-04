@@ -20,7 +20,7 @@
 #   bash bench/run-balanced.sh -- --noplot
 # Custom body-size cases:
 #   bash bench/run-balanced.sh --body-sizes 0B,64KiB,1MiB \
-#     --concurrency 32 -- --noplot
+#     --requests 20000 --concurrency 32 -- --noplot
 
 set -euo pipefail
 
@@ -30,6 +30,8 @@ Usage: run-balanced.sh [options] [-- <criterion arguments>]
 
 Options:
   --body-sizes VALUE   Comma-separated IEC response sizes, up to 100 MiB.
+  --requests VALUE     Requests per Criterion iteration, from 1 to 20000.
+                       By default the benchmark chooses it from the body size.
   --concurrency VALUE  Maximum concurrent request streams on the one connection.
                        Range: 1-100. By default the benchmark chooses it from
                        the body size; it cannot exceed a case's request count.
@@ -49,12 +51,14 @@ Default body sizes:
 
 Examples:
   bash bench/run-balanced.sh -- --noplot
-  bash bench/run-balanced.sh --body-sizes 0B,64KiB,1MiB --concurrency 32 -- \
+  bash bench/run-balanced.sh --body-sizes 0B,64KiB,1MiB \
+    --requests 20000 --concurrency 32 -- \
     --sample-size 20 --measurement-time 60 --noplot
 EOF
 }
 
 body_sizes=
+requests=
 concurrency=
 criterion_args=()
 
@@ -63,6 +67,19 @@ while (($# > 0)); do
     --body-sizes)
       (($# >= 2)) || { echo '--body-sizes requires a value' >&2; exit 2; }
       body_sizes=$2
+      shift 2
+      ;;
+    --requests)
+      (($# >= 2)) || { echo '--requests requires a value' >&2; exit 2; }
+      [[ $2 =~ ^[1-9][0-9]*$ ]] || {
+        echo '--requests must be a positive integer' >&2
+        exit 2
+      }
+      ((10#$2 <= 20000)) || {
+        echo '--requests cannot exceed 20000' >&2
+        exit 2
+      }
+      requests=$2
       shift 2
       ;;
     --concurrency)
@@ -111,6 +128,11 @@ if [[ -n $body_sizes ]]; then
   export HTTP3_BENCH_BODY_SIZES=$body_sizes
 else
   unset HTTP3_BENCH_BODY_SIZES || true
+fi
+if [[ -n $requests ]]; then
+  export HTTP3_BENCH_REQUESTS=$requests
+else
+  unset HTTP3_BENCH_REQUESTS || true
 fi
 if [[ -n $concurrency ]]; then
   export HTTP3_BENCH_CONCURRENCY=$concurrency

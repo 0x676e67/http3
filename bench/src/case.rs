@@ -11,6 +11,7 @@ pub const SERVER_WORKERS: usize = 8;
 /// making Quinn prebuild an impractically large remote-stream state table.
 pub const SERVER_MAX_BIDI_STREAMS: u32 = 1000;
 pub const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
+pub const MAX_REQUESTS: usize = 20_000;
 pub const DEFAULT_BODY_BYTES: [usize; 9] = [
     0,
     1024,
@@ -40,8 +41,8 @@ impl Case {
     pub fn for_body(body_bytes: usize) -> Self {
         let requests = (640 * 1024 * 1024_usize)
             .checked_div(body_bytes)
-            .unwrap_or(200_000)
-            .clamp(32, 200_000);
+            .unwrap_or(MAX_REQUESTS)
+            .clamp(32, MAX_REQUESTS);
         let in_flight = (64 * 1024 * 1024_usize)
             .checked_div(body_bytes)
             .unwrap_or(100)

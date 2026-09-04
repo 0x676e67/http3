@@ -6,13 +6,14 @@ use anyhow::{Context, Result, bail};
 use bytesize::ByteSize;
 use criterion::{BenchmarkId, Criterion, SamplingMode, Throughput};
 use http3_bench::{
-    case::{Case, DEFAULT_BODY_BYTES, Http3Library, MAX_BODY_BYTES},
+    case::{Case, DEFAULT_BODY_BYTES, Http3Library, MAX_BODY_BYTES, MAX_REQUESTS},
     result::MEASUREMENT_PROFILE,
 };
 
 use super::child::{ClientRunner, ServerGuard};
 
 const BODY_SIZES_ENV: &str = "HTTP3_BENCH_BODY_SIZES";
+const REQUESTS_ENV: &str = "HTTP3_BENCH_REQUESTS";
 const CONCURRENCY_ENV: &str = "HTTP3_BENCH_CONCURRENCY";
 const MAX_CONCURRENCY: usize = 100;
 const BANDWIDTH_BODY_THRESHOLD: usize = 64 * 1024;
@@ -24,6 +25,7 @@ const NGHTTP3_CLIENT_EXE: &str = env!("CARGO_BIN_EXE_http3-bench-nghttp3-client"
 
 struct Config {
     cases: Vec<Case>,
+    requests: Option<usize>,
     concurrency: Option<usize>,
     test_mode: bool,
     sample_size_from_cli: bool,
@@ -36,6 +38,17 @@ impl Config {
             Ok(value) => parse_cases(&value)?,
             Err(env::VarError::NotPresent) => DEFAULT_BODY_BYTES.map(Case::for_body).to_vec(),
             Err(error) => return Err(error).context("could not read benchmark body sizes"),
+        };
+        let requests = match env::var(REQUESTS_ENV) {
+            Ok(value) => {
+                let requests = parse_positive(&value, REQUESTS_ENV)?;
+                if requests > MAX_REQUESTS {
+                    bail!("{REQUESTS_ENV} cannot exceed {MAX_REQUESTS}");
+                }
+                Some(requests)
+            }
+            Err(env::VarError::NotPresent) => None,
+            Err(error) => return Err(error).context("could not read benchmark request count"),
         };
         let concurrency = match env::var(CONCURRENCY_ENV) {
             Ok(value) => {
@@ -51,6 +64,7 @@ impl Config {
 
         Ok(Self {
             cases,
+            requests,
             concurrency,
             test_mode: criterion_arg_present("--test"),
             sample_size_from_cli: criterion_arg_present("--sample-size"),
@@ -99,6 +113,10 @@ fn run_groups(criterion: &mut Criterion, config: &Config) -> Result<()> {
         } else {
             default_case
         };
+        if let Some(requests) = config.requests {
+            case.requests = requests;
+            case.in_flight = case.in_flight.min(requests);
+        }
         if let Some(concurrency) = config.concurrency {
             if concurrency > case.requests {
                 bail!(
@@ -109,8 +127,8 @@ fn run_groups(criterion: &mut Criterion, config: &Config) -> Result<()> {
             case.in_flight = concurrency;
         }
         let group_name = format!(
-            "http3-client/{MEASUREMENT_PROFILE}/{case}/concurrency-{}",
-            case.in_flight
+            "http3-client/{MEASUREMENT_PROFILE}/{case}/requests-{}/concurrency-{}",
+            case.requests, case.in_flight
         );
         let mut group = criterion.benchmark_group(&group_name);
         group.sampling_mode(SamplingMode::Flat);

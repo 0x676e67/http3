@@ -33,6 +33,10 @@ result checks, and connection shutdown are outside the measured interval.
 Optional comma-separated response sizes such as 0B,64KiB,1MiB. Omitting this
 parameter uses the default cases listed above. The maximum size is 100 MiB.
 
+.PARAMETER Requests
+Optional request count per Criterion iteration. Omitting it uses the
+body-size-adaptive default. The supported range is 1-20000.
+
 .PARAMETER Concurrency
 Optional maximum number of concurrent request streams on the single HTTP/3
 connection. Omitting it uses the body-size-adaptive default selected by the
@@ -54,6 +58,7 @@ Shows this complete parameter and example reference without building the benchma
 .EXAMPLE
 .\bench\run-balanced.ps1 `
   -BodySizes '0B,64KiB,1MiB' `
+  -Requests 20000 `
   -Concurrency 32 `
   -CriterionArgs @('--sample-size', '20', '--measurement-time', '60', '--noplot')
 #>
@@ -61,6 +66,7 @@ Shows this complete parameter and example reference without building the benchma
 [CmdletBinding()]
 param(
     [string]$BodySizes = '',
+    [Nullable[int]]$Requests = $null,
     [Nullable[int]]$Concurrency = $null,
     [string[]]$CriterionArgs = @(),
     [Alias('h')]
@@ -76,6 +82,7 @@ if ($Help) {
 }
 
 $savedBodySizes = $env:HTTP3_BENCH_BODY_SIZES
+$savedRequests = $env:HTTP3_BENCH_REQUESTS
 $savedConcurrency = $env:HTTP3_BENCH_CONCURRENCY
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
@@ -86,6 +93,18 @@ try {
     }
     else {
         $env:HTTP3_BENCH_BODY_SIZES = $BodySizes
+    }
+    if ($null -eq $Requests) {
+        Remove-Item Env:HTTP3_BENCH_REQUESTS -ErrorAction SilentlyContinue
+    }
+    elseif ($Requests -le 0) {
+        throw 'Requests must be greater than zero'
+    }
+    elseif ($Requests -gt 20000) {
+        throw 'Requests cannot exceed 20000'
+    }
+    else {
+        $env:HTTP3_BENCH_REQUESTS = $Requests.ToString()
     }
     if ($null -eq $Concurrency) {
         Remove-Item Env:HTTP3_BENCH_CONCURRENCY -ErrorAction SilentlyContinue
@@ -117,6 +136,7 @@ try {
 }
 finally {
     $env:HTTP3_BENCH_BODY_SIZES = $savedBodySizes
+    $env:HTTP3_BENCH_REQUESTS = $savedRequests
     $env:HTTP3_BENCH_CONCURRENCY = $savedConcurrency
     Pop-Location
 }
