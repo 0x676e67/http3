@@ -151,6 +151,9 @@
 #define CLOSE_FLUSH_NS (100ULL * NGTCP2_MILLISECONDS)
 #define POLL_CAP_MS 10
 #define CLIENT_CONNECTION_ID_LENGTH 16
+#define MAX_EXTRA_HEADERS 64
+#define EXTRA_HEADER_NAME "x-http3-bench"
+#define EXTRA_HEADER_VALUE "benchmark-value"
 
 _Static_assert(RX_CAPACITY >= NGTCP2_MAX_UDP_PAYLOAD_SIZE,
                "CONNECTION_CLOSE needs the ngtcp2 client minimum buffer");
@@ -193,6 +196,7 @@ typedef struct bench_config {
   uint64_t requests;
   uint64_t expected_body_bytes;
   size_t inflight;
+  size_t extra_headers;
 } bench_config;
 
 struct udp_endpoint {
@@ -239,6 +243,7 @@ struct client {
   uint64_t received_bytes;
   uint64_t measurement_finished_ns;
   size_t inflight_limit;
+  size_t extra_headers;
   size_t active;
 
   bool handshake_completed;
@@ -1102,9 +1107,10 @@ static nghttp3_nv make_nv(const char *name, const char *value) {
 static int fill_request_window(client *c) {
   while (c->started < c->target_requests && c->active < c->inflight_limit) {
     response_state *r;
-    nghttp3_nv headers[4];
+    nghttp3_nv headers[4 + MAX_EXTRA_HEADERS];
     int64_t stream_id;
     int rv;
+    size_t i;
 
     rv = ngtcp2_conn_open_bidi_stream(c->qconn, &stream_id, NULL);
     if (rv == NGTCP2_ERR_STREAM_ID_BLOCKED) {
@@ -1123,8 +1129,11 @@ static int fill_request_window(client *c) {
     headers[1] = make_nv(":scheme", "https");
     headers[2] = make_nv(":authority", "localhost:4433");
     headers[3] = make_nv(":path", REQUEST_PATH);
-    rv = nghttp3_conn_submit_request(c->nghttp3_conn, stream_id, headers, 4,
-                                     NULL, r);
+    for (i = 0; i < c->extra_headers; ++i) {
+      headers[4 + i] = make_nv(EXTRA_HEADER_NAME, EXTRA_HEADER_VALUE);
+    }
+    rv = nghttp3_conn_submit_request(c->nghttp3_conn, stream_id, headers,
+                                     4 + c->extra_headers, NULL, r);
     if (rv != 0) {
       set_nghttp3_failure(c, "nghttp3_conn_submit_request", rv);
       return -1;
@@ -2056,6 +2065,7 @@ static int client_init(client *c, udp_endpoint *endpoint,
   c->target_requests = config->requests;
   c->expected_body_bytes = config->expected_body_bytes;
   c->inflight_limit = config->inflight;
+  c->extra_headers = config->extra_headers;
   c->last_progress_ns = timestamp_ns();
   ngtcp2_ccerr_default(&c->last_error);
 
@@ -2118,12 +2128,16 @@ static bool parse_nonnegative_u64_arg(const char *text, uint64_t *value) {
 
 static int parse_args(int argc, char **argv, bench_config *config) {
   uint64_t inflight;
-  if (argc != 4 || !parse_positive_u64_arg(argv[1], &config->requests) ||
+  uint64_t extra_headers;
+  if (argc != 5 || !parse_positive_u64_arg(argv[1], &config->requests) ||
       config->requests > SIZE_MAX ||
       !parse_nonnegative_u64_arg(argv[2], &config->expected_body_bytes) ||
-      !parse_positive_u64_arg(argv[3], &inflight) || inflight > SIZE_MAX) {
+      !parse_positive_u64_arg(argv[3], &inflight) || inflight > SIZE_MAX ||
+      !parse_nonnegative_u64_arg(argv[4], &extra_headers) ||
+      extra_headers > MAX_EXTRA_HEADERS) {
     fprintf(stderr,
-            "usage: %s <requests> <expected-body-bytes> <inflight>\n",
+            "usage: %s <requests> <expected-body-bytes> <inflight> "
+            "<extra-request-headers>\n",
             argv[0]);
     return -1;
   }
@@ -2132,6 +2146,7 @@ static int parse_args(int argc, char **argv, bench_config *config) {
     return -1;
   }
   config->inflight = (size_t)inflight;
+  config->extra_headers = (size_t)extra_headers;
   return 0;
 }
 
@@ -2295,7 +2310,7 @@ int http3_bench_nghttp3_main(int argc, char **argv) {
   }
 
   elapsed_ns = c.measurement_finished_ns - benchmark_started;
-  printf("{\"schema\":\"http3-client-bench-v10\","
+  printf("{\"schema\":\"http3-client-bench-v11\","
          "\"http3_library\":\"nghttp3\","
          "\"quic_backend\":\"ngtcp2\","
          "\"transport_profile\":"
@@ -2304,12 +2319,14 @@ int http3_bench_nghttp3_main(int argc, char **argv) {
          "\"post-local-setup-to-last-complete-response\","
          "\"requests\":%" PRIu64 ","
          "\"in_flight\":%zu,"
+         "\"extra_request_headers\":%zu,"
          "\"response_body_bytes\":%" PRIu64 ","
          "\"completed\":%" PRIu64 ",\"received_bytes\":%" PRIu64 ","
          "\"elapsed_ns\":%" PRIu64 ","
          "\"path_max_udp_payload_size\":%zu}\n",
-         config.requests, config.inflight, config.expected_body_bytes,
-         c.completed, c.received_bytes, elapsed_ns, path_max_udp_payload_size);
+         config.requests, config.inflight, config.extra_headers,
+         config.expected_body_bytes, c.completed, c.received_bytes, elapsed_ns,
+         path_max_udp_payload_size);
   exit_code = EXIT_SUCCESS;
 
 cleanup_client:

@@ -119,6 +119,7 @@ impl ClientRunner<'_> {
             .arg(case.requests.to_string())
             .arg(case.body_bytes.to_string())
             .arg(case.in_flight.to_string())
+            .arg(case.extra_headers.to_string())
             .current_dir(workspace_root())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -177,12 +178,15 @@ pub(crate) struct ServerGuard {
 }
 
 impl ServerGuard {
-    pub(crate) fn start(executable: &Path, body_bytes: usize) -> Result<Self> {
+    pub(crate) fn start(executable: &Path, case: Case) -> Result<Self> {
+        let body_bytes = case.body_bytes;
+        let extra_headers = case.extra_headers;
         let mut child = ChildCleanupGuard {
             child: Some(
                 ChildRole::Server
                     .command(executable)
                     .arg(body_bytes.to_string())
+                    .arg(extra_headers.to_string())
                     .current_dir(workspace_root())
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
@@ -217,7 +221,8 @@ impl ServerGuard {
             }
         };
         let expected = format!(
-            "http3-bench-server-v2 address={SERVER_ADDR} body_bytes={body_bytes} \
+            "http3-bench-server-v3 address={SERVER_ADDR} body_bytes={body_bytes} \
+             extra_request_headers={extra_headers} \
              max_concurrent_bidi_streams={SERVER_MAX_BIDI_STREAMS} transport=quinn \
              workers={SERVER_WORKERS}"
         );

@@ -10,6 +10,15 @@ pub const SERVER_WORKERS: usize = 8;
 pub const SERVER_MAX_BIDI_STREAMS: u32 = 1000;
 pub const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
 pub const MAX_REQUESTS: usize = 20_000;
+pub const MAX_EXTRA_HEADERS: usize = 64;
+/// Benchmark-only list field with `1#token` syntax.
+///
+/// Each value is deliberately sent as a separate field line so the configured
+/// count produces the same QPACK shape in every Client. This is valid for a
+/// list-valued field under RFC 9110 Section 5.3.
+/// https://www.rfc-editor.org/rfc/rfc9110.html#section-5.3
+pub const EXTRA_HEADER_NAME: http::HeaderName = http::HeaderName::from_static("x-http3-bench");
+pub const EXTRA_HEADER_VALUE: http::HeaderValue = http::HeaderValue::from_static("benchmark-value");
 pub const DEFAULT_BODY_BYTES: [usize; 9] = [
     0,
     1024,
@@ -33,6 +42,7 @@ pub struct Case {
     pub body_bytes: usize,
     pub requests: usize,
     pub in_flight: usize,
+    pub extra_headers: usize,
 }
 
 impl Case {
@@ -49,6 +59,7 @@ impl Case {
             body_bytes,
             requests,
             in_flight,
+            extra_headers: 0,
         }
     }
 

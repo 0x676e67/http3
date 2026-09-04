@@ -14,7 +14,10 @@ use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::task::JoinSet;
 
-use super::case::{ALPN_H3, SERVER_ADDR, SERVER_MAX_BIDI_STREAMS, SERVER_WORKERS, workspace_root};
+use super::case::{
+    ALPN_H3, EXTRA_HEADER_NAME, EXTRA_HEADER_VALUE, MAX_EXTRA_HEADERS, SERVER_ADDR,
+    SERVER_MAX_BIDI_STREAMS, SERVER_WORKERS, workspace_root,
+};
 
 pub(crate) fn run_from_args(mut args: impl Iterator<Item = String>) -> Result<()> {
     let body_bytes = args
@@ -22,6 +25,14 @@ pub(crate) fn run_from_args(mut args: impl Iterator<Item = String>) -> Result<()
         .context("missing server response body size")?
         .parse::<usize>()
         .context("invalid server response body size")?;
+    let extra_headers = args
+        .next()
+        .context("missing extra request header count")?
+        .parse::<usize>()
+        .context("invalid extra request header count")?;
+    if extra_headers > MAX_EXTRA_HEADERS {
+        bail!("extra request headers cannot exceed {MAX_EXTRA_HEADERS}");
+    }
     if let Some(extra) = args.next() {
         bail!("unexpected internal server argument {extra:?}");
     }
@@ -38,11 +49,12 @@ pub(crate) fn run_from_args(mut args: impl Iterator<Item = String>) -> Result<()
         let _ = std::io::stdin().read(&mut byte);
         let _ = shutdown_tx.send(());
     });
-    runtime.block_on(run_server(body_bytes, shutdown_rx))
+    runtime.block_on(run_server(body_bytes, extra_headers, shutdown_rx))
 }
 
 async fn run_server(
     body_bytes: usize,
+    extra_headers: usize,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<()> {
     let body = Bytes::from(vec![b'A'; body_bytes]);
@@ -68,7 +80,8 @@ async fn run_server(
 
     let endpoint = quinn::Endpoint::server(server_config, SERVER_ADDR.parse()?)?;
     println!(
-        "http3-bench-server-v2 address={SERVER_ADDR} body_bytes={body_bytes} \
+        "http3-bench-server-v3 address={SERVER_ADDR} body_bytes={body_bytes} \
+         extra_request_headers={extra_headers} \
          max_concurrent_bidi_streams={SERVER_MAX_BIDI_STREAMS} transport=quinn \
          workers={SERVER_WORKERS}"
     );
@@ -87,7 +100,7 @@ async fn run_server(
                     return Ok(());
                 };
                 let body = body.clone();
-                connections.spawn(serve_connection(incoming, body));
+                connections.spawn(serve_connection(incoming, body, extra_headers));
             }
             completed = connections.join_next(), if !connections.is_empty() => {
                 completed
@@ -125,7 +138,11 @@ async fn shutdown_connections(
     Ok(())
 }
 
-async fn serve_connection(incoming: quinn::Incoming, body: Bytes) -> Result<()> {
+async fn serve_connection(
+    incoming: quinn::Incoming,
+    body: Bytes,
+    extra_headers: usize,
+) -> Result<()> {
     let connection = incoming.await?;
     let mut builder = http3::server::builder();
     builder.send_grease(false);
@@ -138,7 +155,7 @@ async fn serve_connection(incoming: quinn::Incoming, body: Bytes) -> Result<()> 
         tokio::select! {
             accepted = connection.accept() => match accepted {
                 Ok(Some(resolver)) => {
-                    requests.spawn(respond(resolver, body.clone()));
+                    requests.spawn(respond(resolver, body.clone(), extra_headers));
                 }
                 Ok(None) => {
                     drain_tasks(&mut requests, "benchmark server request").await?;
@@ -169,6 +186,7 @@ async fn drain_tasks(tasks: &mut JoinSet<Result<()>>, name: &str) -> Result<()> 
 async fn respond(
     resolver: RequestResolver<http3_quic::Connection, Bytes>,
     body: Bytes,
+    extra_headers: usize,
 ) -> Result<()> {
     let (request, mut stream) = resolver.resolve_request().await?;
     if request.version() != http::Version::HTTP_3 {
@@ -186,6 +204,20 @@ async fn respond(
             != Some("/")
     {
         bail!("benchmark request used unexpected URI {}", request.uri());
+    }
+    let benchmark_headers = request.headers().get_all(&EXTRA_HEADER_NAME);
+    let actual_extra_headers = benchmark_headers.iter().count();
+    if actual_extra_headers != extra_headers {
+        bail!(
+            "benchmark request contained {actual_extra_headers} extra headers, expected \
+             {extra_headers}"
+        );
+    }
+    if benchmark_headers
+        .iter()
+        .any(|value| value != EXTRA_HEADER_VALUE)
+    {
+        bail!("benchmark request contained an unexpected extra header value");
     }
     // Validate the request half before reporting a successful response so a missing FIN cannot be
     // hidden by a Client that exits as soon as it receives the response body.
