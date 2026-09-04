@@ -128,15 +128,14 @@ fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> 
         },
     ];
 
-    for runner in &runners {
-        let library = runner.library;
-        let mut group = criterion.benchmark_group(library.name());
-        group.sampling_mode(SamplingMode::Flat);
-        if !config.test_mode && !config.sample_size_from_cli {
-            group.sample_size(10);
-        }
-
-        for &case in &cases {
+    for &case in &cases {
+        for runner in &runners {
+            let library = runner.library;
+            let mut group = criterion.benchmark_group(format!("{library}/{case}"));
+            group.sampling_mode(SamplingMode::Flat);
+            if !config.test_mode && !config.sample_size_from_cli {
+                group.sample_size(10);
+            }
             if !config.test_mode && !config.measurement_time_from_cli {
                 group.measurement_time(case.measurement_time());
             }
@@ -144,8 +143,8 @@ fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> 
 
             let mut server = None;
             let benchmark_id = BenchmarkId::from_parameter(format!(
-                "{case}/requests-{}/concurrency-{}",
-                case.requests, case.in_flight
+                "requests-{}/concurrency-{}",
+                case.requests, case.in_flight,
             ));
             group.bench_with_input(benchmark_id, &case, |bencher, &case| {
                 server.get_or_insert_with(|| {
@@ -164,8 +163,8 @@ fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> 
             if let Some(mut server) = server {
                 server.finish()?;
             }
+            group.finish();
         }
-        group.finish();
     }
     Ok(())
 }

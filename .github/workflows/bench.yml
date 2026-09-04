@@ -48,14 +48,17 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           output=$(bash "$GITHUB_WORKSPACE/bench/run-balanced.sh" \
-            --body-sizes 0B \
+            --body-sizes 0B,1KiB \
             --requests 5000 \
             -- --list)
           printf '%s\n' "$output"
           expected=$(printf '%s\n' \
             'http3/0 B/requests-5000/concurrency-100: benchmark' \
             'h3/0 B/requests-5000/concurrency-100: benchmark' \
-            'nghttp3/0 B/requests-5000/concurrency-100: benchmark')
+            'nghttp3/0 B/requests-5000/concurrency-100: benchmark' \
+            'http3/1 KiB/requests-5000/concurrency-100: benchmark' \
+            'h3/1 KiB/requests-5000/concurrency-100: benchmark' \
+            'nghttp3/1 KiB/requests-5000/concurrency-100: benchmark')
           actual=$(printf '%s\n' "$output" | grep ': benchmark$')
           test "$actual" = "$expected"
         env:
