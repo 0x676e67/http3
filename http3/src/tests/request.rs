@@ -86,6 +86,202 @@ async fn get() {
 }
 
 #[tokio::test]
+async fn client_dynamic_qpack_request_round_trip() {
+    const TABLE_CAPACITY: u64 = 256;
+
+    init_tracing();
+    let mut pair = Pair::default();
+    let mut transport_server = pair.server();
+
+    let client_fut = async {
+        let mut builder = client::builder();
+        builder
+            .qpack_encoder_table_capacity(TABLE_CAPACITY as usize)
+            .send_grease(false);
+        let (mut driver, mut send) = builder
+            .build::<_, _, Bytes>(pair.client().await)
+            .await
+            .expect("client init");
+        let encoder = driver
+            .inner
+            .dynamic_qpack_encoder()
+            .expect("dynamic QPACK encoder");
+
+        future::poll_fn(|cx| {
+            if let std::task::Poll::Ready(error) = driver.poll_close(cx) {
+                panic!("connection closed before QPACK encoder became ready: {error:?}");
+            }
+            encoder
+                .dynamic_ready()
+                .unwrap()
+                .then_some(())
+                .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
+        })
+        .await;
+
+        for request_index in 0..2 {
+            if request_index == 1 {
+                future::poll_fn(|cx| {
+                    if let std::task::Poll::Ready(error) = driver.poll_close(cx) {
+                        panic!("connection closed before QPACK insert acknowledgment: {error:?}");
+                    }
+                    encoder
+                        .has_acknowledged_all_insertions()
+                        .unwrap()
+                        .then_some(())
+                        .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
+                })
+                .await;
+            }
+
+            let mut request = Box::pin(async {
+                let mut stream = send
+                    .send_request(
+                        Request::get("http://localhost/dynamic")
+                            .header("x-repeated", "stable-value")
+                            .body(())
+                            .unwrap(),
+                    )
+                    .await
+                    .expect("send request");
+                stream.finish().await.expect("finish request");
+                let response = stream.recv_response().await.expect("receive response");
+                assert_eq!(response.status(), StatusCode::OK);
+            });
+            future::poll_fn(|cx| {
+                if let std::task::Poll::Ready(result) = request.as_mut().poll(cx) {
+                    return std::task::Poll::Ready(result);
+                }
+                if let std::task::Poll::Ready(error) = driver.poll_close(cx) {
+                    panic!("connection closed during dynamic QPACK request: {error:?}");
+                }
+                std::task::Poll::Pending
+            })
+            .await;
+        }
+
+        drop(send);
+        future::poll_fn(|cx| driver.poll_close(cx)).await
+    };
+
+    let server_fut = async {
+        let mut builder = server::builder();
+        builder
+            .qpack_max_table_capacity(TABLE_CAPACITY)
+            .send_grease(false);
+        let mut incoming = builder
+            .build(transport_server.next().await)
+            .await
+            .expect("server init");
+
+        for _ in 0..2 {
+            let resolver = incoming.accept().await.expect("accept dynamic request");
+            let (request, mut stream) = resolver
+                .expect("request stream")
+                .resolve_request()
+                .await
+                .expect("decode dynamic request");
+            assert_eq!(request.headers()["x-repeated"], "stable-value");
+            stream
+                .send_response(Response::builder().status(200).body(()).unwrap())
+                .await
+                .expect("send response");
+            stream.finish().await.expect("finish response");
+        }
+
+        let error = match incoming.accept().await {
+            Err(error) => error,
+            Ok(_) => panic!("server accepted another request"),
+        };
+        assert!(error.is_h3_no_error(), "{error:?}");
+    };
+
+    let ((), client_result) = tokio::select! {
+        biased;
+        _ = tokio::time::sleep(Duration::from_secs(5)) => {
+            panic!("dynamic QPACK request timed out")
+        }
+        result = async { tokio::join!(server_fut, client_fut) } => result,
+    };
+    assert!(client_result.is_h3_no_error(), "{client_result:?}");
+}
+
+#[tokio::test]
+async fn server_rejects_blocked_request_when_advertised_limit_is_zero() {
+    const TABLE_CAPACITY: u64 = 34;
+
+    init_tracing();
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+
+    let client_fut = async {
+        let connection = pair.client_inner().await;
+
+        let mut control_stream = connection.open_uni().await.unwrap();
+        let mut control = BytesMut::new();
+        StreamType::CONTROL.encode(&mut control);
+        Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut control);
+        control_stream.write_all(&control).await.unwrap();
+
+        // Keep the peer encoder stream open, but leave insertion 1 in transit.
+        let mut encoder_stream = connection.open_uni().await.unwrap();
+        let mut encoder_header = BytesMut::new();
+        StreamType::ENCODER.encode(&mut encoder_header);
+        encoder_stream.write_all(&encoder_header).await.unwrap();
+
+        let (mut request_send, _request_recv) = connection.open_bi().await.unwrap();
+        // MaxEntries is 1. Encoded RIC 2 reconstructs to Required Insert Count
+        // 1, so this field section would block while the decoder Insert Count
+        // remains 0.
+        let mut request = BytesMut::new();
+        Frame::headers(vec![0x02, 0x00, 0x80]).encode_with_payload(&mut request);
+        request_send.write_all(&request).await.unwrap();
+
+        assert_matches!(
+            connection.closed().await,
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code,
+                ..
+            }) if error_code.into_inner() == Code::QPACK_DECOMPRESSION_FAILED.value()
+        );
+    };
+
+    let server_fut = async {
+        let conn = server.next().await;
+        let mut incoming = server::builder()
+            .qpack_max_table_capacity(TABLE_CAPACITY)
+            .build(conn)
+            .await
+            .unwrap();
+        let resolver = incoming.accept().await.unwrap().unwrap();
+        assert_matches!(
+            resolver.resolve_request().await.map(|_| ()),
+            Err(StreamError::ConnectionError(ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::QPACK_DECOMPRESSION_FAILED,
+                    ..
+                }
+            }))
+        );
+        assert_matches!(
+            incoming.accept().await.map(|_| ()).unwrap_err(),
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::QPACK_DECOMPRESSION_FAILED,
+                    ..
+                }
+            }
+        );
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(server_fut, client_fut);
+    })
+    .await
+    .expect("blocked request did not close the connection");
+}
+
+#[tokio::test]
 async fn client_rejects_huffman_eos_in_response_field_section() {
     init_tracing();
     let mut pair = Pair::default();

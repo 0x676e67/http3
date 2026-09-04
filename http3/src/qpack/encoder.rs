@@ -56,28 +56,42 @@ impl std::fmt::Display for EncoderError {
 
 pub struct Encoder {
     table: DynamicTable,
+    max_table_capacity: usize,
 }
 
 impl Encoder {
-    pub fn encode<W, T, H>(
+    #[cfg(test)]
+    pub(super) fn has_acknowledged_all_insertions(&self) -> bool {
+        let total = self.table.total_inserted();
+        total > 0 && self.table.is_known_received(total)
+    }
+
+    pub(super) fn field_section_is_blocked(&self, required_insert_count: usize) -> bool {
+        !self.table.is_known_received(required_insert_count)
+    }
+
+    pub fn encode<'a, W, E, T, H>(
         &mut self,
         stream_id: u64,
         block: &mut W,
-        encoder_buf: &mut W,
+        encoder_buf: &mut E,
         fields: T,
     ) -> Result<usize, EncoderError>
     where
         W: BufMut,
+        E: BufMut,
         T: IntoIterator<Item = H>,
-        H: AsRef<HeaderField<'static>>,
+        H: AsRef<HeaderField<'a>>,
     {
+        let max_table_capacity = self.max_table_capacity;
         let mut required_ref = 0;
         let mut block_buf = Vec::new();
         let mut encoder = self.table.encoder(stream_id);
 
         for field in fields {
+            let field = field.as_ref();
             if let Some(reference) =
-                Self::encode_field(&mut encoder, &mut block_buf, encoder_buf, field.as_ref())?
+                Self::encode_field(&mut encoder, &mut block_buf, encoder_buf, field)?
             {
                 required_ref = cmp::max(required_ref, reference);
             }
@@ -87,7 +101,7 @@ impl Encoder {
             required_ref,
             encoder.base(),
             encoder.total_inserted(),
-            encoder.max_size(),
+            max_table_capacity,
         )
         .encode(block);
         block.put(block_buf.as_slice());
@@ -95,6 +109,26 @@ impl Encoder {
         encoder.commit(required_ref);
 
         Ok(required_ref)
+    }
+
+    pub(super) fn configure<W: BufMut>(
+        &mut self,
+        encoder_buf: &mut W,
+        max_table_capacity: usize,
+        capacity: usize,
+        max_blocked_streams: u64,
+    ) -> Result<(), EncoderError> {
+        if capacity > max_table_capacity {
+            return Err(DynamicTableError::MaximumTableSizeTooLarge.into());
+        }
+        self.max_table_capacity = max_table_capacity;
+        self.table.set_max_blocked(max_blocked_streams)?;
+        set_dynamic_table_size(&mut self.table, encoder_buf, capacity)
+    }
+
+    pub(super) fn cancel_stream(&mut self, stream_id: u64) -> Result<(), EncoderError> {
+        self.table.cancel_stream(stream_id)?;
+        Ok(())
     }
 
     /// Applies instructions received on the peer's QPACK decoder stream.
@@ -145,7 +179,7 @@ impl Encoder {
         table: &mut DynamicTableEncoder,
         block: &mut Vec<u8>,
         encoder: &mut W,
-        field: &HeaderField<'static>,
+        field: &HeaderField<'_>,
     ) -> Result<Option<usize>, EncoderError> {
         if field.is_sensitive() {
             return Self::encode_sensitive_field(table, block, field);
@@ -220,7 +254,7 @@ impl Encoder {
     fn encode_sensitive_field(
         table: &mut DynamicTableEncoder,
         block: &mut Vec<u8>,
-        field: &HeaderField<'static>,
+        field: &HeaderField<'_>,
     ) -> Result<Option<usize>, EncoderError> {
         // The N bit forbids an indexed field line and dynamic-table insertion.
         // A name reference is still a literal representation and can be used.
@@ -259,6 +293,7 @@ impl Default for Encoder {
     fn default() -> Self {
         Self {
             table: DynamicTable::new(),
+            max_table_capacity: 0,
         }
     }
 }
@@ -317,7 +352,11 @@ fn encode_stateless_parts<W: BufMut>(
 #[cfg(test)]
 impl From<DynamicTable> for Encoder {
     fn from(table: DynamicTable) -> Encoder {
-        Encoder { table }
+        let max_table_capacity = table.max_mem_size();
+        Encoder {
+            table,
+            max_table_capacity,
+        }
     }
 }
 
@@ -928,6 +967,46 @@ mod tests {
     }
 
     #[test]
+    fn field_section_prefix_uses_peer_maximum_not_current_capacity() {
+        const PEER_MAXIMUM: usize = 4096;
+        const CURRENT_CAPACITY: usize = 64;
+
+        let mut encoder = Encoder::default();
+        let mut encoder_stream = Vec::new();
+        encoder
+            .configure(&mut encoder_stream, PEER_MAXIMUM, CURRENT_CAPACITY, 1)
+            .unwrap();
+        encoder_stream.clear();
+
+        let mut final_block = Vec::new();
+        for insertion in 1..=9 {
+            let mut block = Vec::new();
+            encoder
+                .encode(
+                    0,
+                    &mut block,
+                    &mut encoder_stream,
+                    [HeaderField::new("x", insertion.to_string())],
+                )
+                .unwrap();
+            encoder_stream.clear();
+
+            if insertion == 9 {
+                final_block = block;
+            } else {
+                let mut acknowledgment = Vec::new();
+                HeaderAck(0).encode(&mut acknowledgment);
+                encoder
+                    .on_decoder_recv(&mut Cursor::new(acknowledgment))
+                    .unwrap();
+            }
+        }
+
+        let prefix = HeaderPrefix::decode(&mut Cursor::new(final_block)).unwrap();
+        assert_eq!(prefix.get(8, PEER_MAXIMUM).unwrap().0, 9);
+    }
+
+    #[test]
     fn decoder_accept_truncated() {
         let mut buf = vec![];
         StreamCancel(2321).encode(&mut buf);
@@ -1049,9 +1128,7 @@ mod tests {
             Ok(Some(Action::ReceivedRefIncrement(4)))
         );
 
-        let mut encoder = Encoder {
-            table: build_table_with_size(4),
-        };
+        let mut encoder = Encoder::from(build_table_with_size(4));
 
         let mut cur = Cursor::new(&buf);
         assert_eq!(encoder.on_decoder_recv(&mut cur), Ok(()));
@@ -1065,9 +1142,7 @@ mod tests {
         for increment in [0, 2] {
             let mut buf = vec![];
             InsertCountIncrement(increment).encode(&mut buf);
-            let mut encoder = Encoder {
-                table: build_table_with_size(1),
-            };
+            let mut encoder = Encoder::from(build_table_with_size(1));
 
             assert_eq!(
                 encoder.on_decoder_recv(&mut Cursor::new(buf)),

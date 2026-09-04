@@ -89,6 +89,25 @@ impl Builder {
         self
     }
 
+    /// Set the QPACK dynamic table capacity the client encoder may use, in bytes.
+    ///
+    /// Sent as `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (0x1). When this is not
+    /// called, the setting is omitted and the protocol default of `0` applies.
+    /// The blocked-stream limit remains `0`, so a client may reference only
+    /// entries the server has already acknowledged.
+    ///
+    /// HTTP/3 encodes this setting as a QUIC variable-length integer. The value
+    /// must also fit the target's address space and the connection's memory
+    /// budget.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2),
+    /// [Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3),
+    /// and [Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
+    pub fn qpack_max_table_capacity<T: Into<Option<u64>>>(&mut self, value: T) -> &mut Self {
+        self.config.settings.qpack_max_table_capacity = value.into();
+        self
+    }
+
     /// Send grease values to the Client.
     /// See [setting](https://www.rfc-editor.org/rfc/rfc9114.html#settings-parameters), [frame](https://www.rfc-editor.org/rfc/rfc9114.html#frame-reserved) and [stream](https://www.rfc-editor.org/rfc/rfc9114.html#stream-grease) for more information.
     #[inline]

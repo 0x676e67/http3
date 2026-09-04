@@ -22,8 +22,8 @@ use crate::{
     },
     frame::FrameStream,
     proto::{frame::Frame, headers::Header, push::PushId},
-    qpack::{self, QpackDecoder},
-    quic::{self, StreamId},
+    qpack::{self, QpackDecoder, QpackEncoder},
+    quic::{self, SendStream, StreamId},
     shared_state::{ConnectionState, SharedState},
     stream::{self, BufRecvStream},
 };
@@ -46,6 +46,12 @@ fn take_qpack_encode_buffer(buffer: &mut BytesMut) -> Bytes {
     } else {
         buffer.split().freeze()
     }
+}
+
+fn field_section_size(headers: &Header) -> Option<u64> {
+    headers.into_iter().try_fold(0_u64, |size, field| {
+        size.checked_add(u64::try_from(field.mem_size()).ok()?)
+    })
 }
 
 /// HTTP/3 request sender
@@ -132,7 +138,8 @@ where
 {
     pub(super) open: T,
     pub(super) conn_state: Arc<SharedState>,
-    pub(super) decoder: QpackDecoder,
+    pub(super) decoder: Option<QpackDecoder>,
+    pub(super) encoder: Option<QpackEncoder>,
     pub(super) max_field_section_size: u64, // largest field section we accept
     pub(super) max_qpack_decode_buffer_size: usize,
     // counts instances of SendRequest to close the connection when the last is dropped.
@@ -200,50 +207,111 @@ where
         //# ([COOKIES]) MAY be split into separate field lines, each with one or
         //# more cookie-pairs, before compression.
 
-        let mem_size = match qpack::encode_stateless(&mut self.qpack_encode_buffer, &headers) {
-            Ok(mem_size) => mem_size,
-            Err(_e) => {
-                clear_qpack_encode_buffer(&mut self.qpack_encode_buffer);
-                return Err(
-                    self.handle_connection_error_on_stream(InternalConnectionError {
-                        code: Code::H3_INTERNAL_ERROR,
-                        message: "Failed to encode headers".to_string(),
-                    }),
-                );
-            }
+        let dynamic_encoder = match self.encoder.as_ref() {
+            Some(encoder) => match encoder.dynamic_ready() {
+                Ok(true) => Some(encoder),
+                Ok(false) => None,
+                Err(error) => {
+                    return Err(self.handle_connection_error_on_stream(
+                        InternalConnectionError::new(
+                            Code::H3_INTERNAL_ERROR,
+                            format!("failed to access QPACK encoder: {error}"),
+                        ),
+                    ));
+                }
+            },
+            None => None,
         };
-        // Do not retain the normalized fields while waiting for QUIC stream
-        // credit or write backpressure.
-        drop(headers);
-        let block = take_qpack_encode_buffer(&mut self.qpack_encode_buffer);
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+        //# An implementation that has received this parameter SHOULD NOT send
+        //# an HTTP message header that exceeds the indicated size, as the peer
+        //# will likely refuse to process it.
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+        //# An HTTP implementation MUST NOT send frames or requests that would be
+        //# invalid based on its current understanding of the peer's settings.
+        let peer_max_field_section_size = self.settings().max_field_section_size;
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
         //= type=implication
         //# A
         //# client MUST send only a single request on a given stream.
-        let mut stream = future::poll_fn(|cx| self.open.poll_open_bidi(cx))
-            .await
-            .map_err(|e| self.handle_quic_stream_error(e))?;
+        let mut stream;
+        if let Some(encoder) = dynamic_encoder {
+            // Dynamic references are tracked by the actual QUIC request stream
+            // ID. Check the peer's limit before mutating the encoder table.
+            let mem_size = field_section_size(&headers).ok_or_else(|| {
+                self.handle_connection_error_on_stream(InternalConnectionError::new(
+                    Code::H3_INTERNAL_ERROR,
+                    "request field section size overflowed".to_string(),
+                ))
+            })?;
+            stream = future::poll_fn(|cx| self.open.poll_open_bidi(cx))
+                .await
+                .map_err(|e| self.handle_quic_stream_error(e))?;
+            if mem_size > peer_max_field_section_size {
+                return Err(StreamError::HeaderTooBig {
+                    actual_size: mem_size,
+                    max_size: peer_max_field_section_size,
+                });
+            }
 
-        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
-        //# An implementation that
-        //# has received this parameter SHOULD NOT send an HTTP message header
-        //# that exceeds the indicated size, as the peer will likely refuse to
-        //# process it.
-        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
-        //# An HTTP implementation MUST NOT send frames or requests that would be
-        //# invalid based on its current understanding of the peer's settings.
-        let peer_max_field_section_size = self.settings().max_field_section_size;
-        if mem_size > peer_max_field_section_size {
-            return Err(StreamError::HeaderTooBig {
-                actual_size: mem_size,
-                max_size: peer_max_field_section_size,
-            });
+            let encoder_instructions_queued =
+                match encoder.encode(stream.send_id(), &mut self.qpack_encode_buffer, &headers) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        clear_qpack_encode_buffer(&mut self.qpack_encode_buffer);
+                        return Err(self.handle_connection_error_on_stream(
+                            InternalConnectionError::new(
+                                Code::H3_INTERNAL_ERROR,
+                                format!("failed to encode request headers: {error}"),
+                            ),
+                        ));
+                    }
+                };
+            drop(headers);
+            let block = take_qpack_encode_buffer(&mut self.qpack_encode_buffer);
+            if encoder_instructions_queued {
+                self.waker().wake();
+            }
+
+            // Keep dynamic references tracked once encoding commits. A canceled
+            // write may already be peer-visible and can still produce a Section
+            // Acknowledgment or Stream Cancellation.
+            stream::write(&mut stream, Frame::Headers(block))
+                .await
+                .map_err(|error| self.handle_quic_stream_error(error))?;
+        } else {
+            let mem_size = match qpack::encode_stateless(&mut self.qpack_encode_buffer, &headers) {
+                Ok(mem_size) => mem_size,
+                Err(_error) => {
+                    clear_qpack_encode_buffer(&mut self.qpack_encode_buffer);
+                    return Err(self.handle_connection_error_on_stream(
+                        InternalConnectionError::new(
+                            Code::H3_INTERNAL_ERROR,
+                            "failed to encode request headers".to_string(),
+                        ),
+                    ));
+                }
+            };
+
+            // Keep the default path encoded before waiting for stream credit.
+            drop(headers);
+            let block = take_qpack_encode_buffer(&mut self.qpack_encode_buffer);
+            stream = future::poll_fn(|cx| self.open.poll_open_bidi(cx))
+                .await
+                .map_err(|e| self.handle_quic_stream_error(e))?;
+            if mem_size > peer_max_field_section_size {
+                return Err(StreamError::HeaderTooBig {
+                    actual_size: mem_size,
+                    max_size: peer_max_field_section_size,
+                });
+            }
+
+            stream::write(&mut stream, Frame::Headers(block))
+                .await
+                .map_err(|e| self.handle_quic_stream_error(e))?;
         }
-
-        stream::write(&mut stream, Frame::Headers(block))
-            .await
-            .map_err(|e| self.handle_quic_stream_error(e))?;
 
         let request_stream = RequestStream {
             inner: connection::RequestStream::new(
@@ -273,6 +341,7 @@ where
         Self {
             conn_state: self.conn_state.clone(),
             decoder: self.decoder.clone(),
+            encoder: self.encoder.clone(),
             open: self.open.clone(),
             max_field_section_size: self.max_field_section_size,
             max_qpack_decode_buffer_size: self.max_qpack_decode_buffer_size,
@@ -440,11 +509,7 @@ where
             return Poll::Ready(err);
         }
 
-        if let Poll::Ready(Err(err)) = self.inner.poll_qpack_decoder_stream(cx) {
-            return Poll::Ready(err);
-        }
-
-        if let Poll::Ready(Err(err)) = self.inner.poll_qpack_encoder_stream(cx) {
+        if let Err(err) = self.inner.poll_qpack(cx) {
             return Poll::Ready(err);
         }
 

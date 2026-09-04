@@ -18,7 +18,7 @@ use tracing::{instrument, trace, warn};
 
 use super::request::RequestResolver;
 use crate::{
-    connection::ConnectionInner,
+    connection::{ConnectionInner, RequestDecodeState},
     error::{Code, ConnectionError, internal_error::InternalConnectionError},
     frame::FrameStream,
     proto::{
@@ -150,14 +150,19 @@ where
         mut stream: FrameStream<C::BidiStream, B>,
     ) -> RequestResolver<C, B> {
         stream.set_max_field_section_size(self.max_qpack_decode_buffer_size);
+        let decode_state = RequestDecodeState::new(
+            stream.id(),
+            &self.inner.shared,
+            self.max_qpack_decode_buffer_size,
+            self.inner.dynamic_qpack_decoder(),
+        );
         RequestResolver {
             frame_stream: stream,
             request_end_send: self.request_end_send.clone(),
             send_grease_frame: self.inner.send_grease_frame,
             max_field_section_size: self.max_field_section_size,
-            max_qpack_decode_buffer_size: self.max_qpack_decode_buffer_size,
             shared: self.inner.shared.clone(),
-            decoder: self.inner.qpack_decoder(),
+            decode_state,
         }
     }
 
@@ -234,16 +239,9 @@ where
         C::SendStream: quic::SendStreamUnframed<B>,
     {
         self.inner.poll_accept_recv(cx)?;
-        // Both peer QPACK streams carry connection-level state and are critical.
-        // Drive them before waiting for another request stream.
-        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
-        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3
-        if let Poll::Ready(Err(err)) = self.inner.poll_qpack_decoder_stream(cx) {
-            return Poll::Ready(Err(err));
-        }
-        if let Poll::Ready(Err(err)) = self.inner.poll_qpack_encoder_stream(cx) {
-            return Poll::Ready(Err(err));
-        }
+        // QPACK critical streams carry connection-level state and must keep
+        // progressing while the server waits for another request stream.
+        self.inner.poll_qpack(cx)?;
 
         while (self.poll_next_control(cx)?).is_ready() {}
         Poll::Pending

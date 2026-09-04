@@ -103,6 +103,21 @@ impl Builder {
         self
     }
 
+    /// Set the maximum dynamic-table capacity used to encode requests.
+    ///
+    /// The default is `0`, which keeps request encoding stateless. A non-zero
+    /// value enables dynamic request compression after the peer advertises a
+    /// non-zero `SETTINGS_QPACK_MAX_TABLE_CAPACITY`; the smaller value is used.
+    /// This does not change the decoder capacity advertised by
+    /// [`qpack_max_table_capacity`](Self::qpack_max_table_capacity).
+    ///
+    /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3)
+    /// and [Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
+    pub fn qpack_encoder_table_capacity(&mut self, value: usize) -> &mut Self {
+        self.config.qpack_encoder_table_capacity = value;
+        self
+    }
+
     /// Just like in HTTP/2, HTTP/3 also uses the concept of "grease"
     /// to prevent potential interoperability issues in the future.
     /// In HTTP/3, the concept of grease is used to ensure that the protocol can evolve
@@ -200,7 +215,8 @@ impl Builder {
         let send_request = SendRequest {
             open,
             conn_state: inner.shared.clone(),
-            decoder: inner.qpack_decoder(),
+            decoder: inner.dynamic_qpack_decoder(),
+            encoder: inner.dynamic_qpack_encoder(),
             max_field_section_size: self.config.settings.max_field_section_size,
             max_qpack_decode_buffer_size: self.config.qpack_decode_buffer_size,
             sender_count: Arc::new(AtomicUsize::new(1)),

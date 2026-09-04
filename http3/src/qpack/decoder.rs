@@ -40,6 +40,13 @@ pub enum DecoderError {
     UnexpectedEnd,
     HeaderTooLong(u64),
     BufSize(TryFromIntError),
+    Internal(&'static str),
+}
+
+impl DecoderError {
+    pub(crate) fn is_internal(&self) -> bool {
+        matches!(self, Self::Internal(_))
+    }
 }
 
 impl std::error::Error for DecoderError {}
@@ -80,6 +87,7 @@ impl std::fmt::Display for DecoderError {
             DecoderError::UnexpectedEnd => write!(f, "unexpected end"),
             DecoderError::HeaderTooLong(_) => write!(f, "header too long"),
             DecoderError::BufSize(_) => write!(f, "number in buffer wrong size"),
+            DecoderError::Internal(message) => f.write_str(message),
         }
     }
 }

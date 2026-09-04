@@ -154,12 +154,17 @@ where
                 });
             }
             Ok(decoded) => decoded,
-            Err(_e) => {
+            Err(error) => {
+                let code = if error.is_internal() {
+                    Code::H3_INTERNAL_ERROR
+                } else {
+                    Code::QPACK_DECOMPRESSION_FAILED
+                };
                 return Err(
-                    self.handle_connection_error_on_stream(InternalConnectionError {
-                        code: Code::QPACK_DECOMPRESSION_FAILED,
-                        message: "Failed to decode headers".to_string(),
-                    }),
+                    self.handle_connection_error_on_stream(InternalConnectionError::new(
+                        code,
+                        format!("failed to decode response headers: {error}"),
+                    )),
                 );
             }
         };
