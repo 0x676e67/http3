@@ -53,6 +53,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .flag_if_supported("/external:W0");
     } else {
         build
+            .define("_GNU_SOURCE", None)
             .define("_POSIX_C_SOURCE", Some("200809L"))
             .flag_if_supported("-std=c11");
     }

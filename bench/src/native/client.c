@@ -37,13 +37,35 @@
  * cross-checked against curl's fixed ngtcp2 backend sources:
  * https://github.com/curl/curl/blob/69a224d6b48edb43df29cb69881ca8edc90f1527/lib/vquic/cf-ngtcp2.c
  * https://github.com/curl/curl/blob/69a224d6b48edb43df29cb69881ca8edc90f1527/lib/vquic/cf-ngtcp2-cmn.c
+ * https://github.com/curl/curl/blob/69a224d6b48edb43df29cb69881ca8edc90f1527/lib/vquic/vquic.c
+ * https://github.com/curl/curl/blob/69a224d6b48edb43df29cb69881ca8edc90f1527/lib/cf-socket.c
  * curl license:
  * https://github.com/curl/curl/blob/69a224d6b48edb43df29cb69881ca8edc90f1527/COPYING
  *
+ * Linux UDP batching and offload limits are aligned with the exact Quinn
+ * crates used by the Rust clients:
+ * https://github.com/quinn-rs/quinn/blob/a96949f6cd257c665f544626af4e8ce668a40b30/quinn-udp/src/unix.rs
+ * https://github.com/quinn-rs/quinn/blob/a7499b8439e393a6299330111d9c8564cd96c464/quinn/src/connection.rs
+ * https://github.com/quinn-rs/quinn/blob/a7499b8439e393a6299330111d9c8564cd96c464/quinn/src/endpoint.rs
+ * https://github.com/quinn-rs/quinn/blob/a7499b8439e393a6299330111d9c8564cd96c464/quinn/src/lib.rs
+ * https://github.com/quinn-rs/quinn/blob/0343120eb7ccdd067a7e975613b96190c8562bf7/quinn-proto/src/config/mod.rs
+ * https://github.com/quinn-rs/quinn/blob/a96949f6cd257c665f544626af4e8ce668a40b30/LICENSE-APACHE
+ * https://github.com/quinn-rs/quinn/blob/a96949f6cd257c665f544626af4e8ce668a40b30/LICENSE-MIT
+ * https://github.com/quinn-rs/quinn/blob/a7499b8439e393a6299330111d9c8564cd96c464/LICENSE-APACHE
+ * https://github.com/quinn-rs/quinn/blob/a7499b8439e393a6299330111d9c8564cd96c464/LICENSE-MIT
+ * https://github.com/quinn-rs/quinn/blob/0343120eb7ccdd067a7e975613b96190c8562bf7/LICENSE-APACHE
+ * https://github.com/quinn-rs/quinn/blob/0343120eb7ccdd067a7e975613b96190c8562bf7/LICENSE-MIT
+ *
  * This benchmark replaces the example's libev socket layer with a
  * single-threaded Windows/Linux polling loop. One unconnected UDP socket
- * serves one QUIC connection and passes every datagram directly to ngtcp2.
+ * serves one QUIC connection. Linux batches receive syscalls and uses UDP
+ * GRO/GSO when the kernel supports them; all platforms retain a per-datagram
+ * fallback.
  */
+
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
@@ -58,6 +80,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/udp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -108,18 +131,31 @@
 #define REQUEST_PATH "/"
 #define CA_PATH "examples/ca.cert"
 #define TLS_CIPHER "TLS_AES_128_GCM_SHA256"
-#define TX_CAPACITY 1350
+#define MAX_TX_UDP_PAYLOAD_SIZE 1350
+/* Quinn caps each transmit at 10 GSO segments even when Linux supports 64. */
+#define TX_AGGREGATE_MAX_SEGMENTS 10
+#define TX_DATAGRAMS_PER_TURN 20
+#define RX_GRO_MAX_SEGMENTS 64
+#define TX_BATCH_CAPACITY                                              \
+  (TX_AGGREGATE_MAX_SEGMENTS * MAX_TX_UDP_PAYLOAD_SIZE)
 #define RX_CAPACITY 65535
+#define RX_BATCH_SIZE 32
+#define RX_SCALAR_BURST_SIZE 256
+#define RX_TIME_BOUND_NS (50ULL * NGTCP2_MICROSECONDS)
+#define RX_GRO_SEGMENT_CAPACITY 1472
+#define RX_MESSAGE_CAPACITY                                              \
+  (RX_GRO_MAX_SEGMENTS * RX_GRO_SEGMENT_CAPACITY)
 #define STREAM_RECEIVE_WINDOW (1024 * 1024)
 #define CONNECTION_RECEIVE_WINDOW (10 * 1024 * 1024)
 #define NO_PROGRESS_NS (30ULL * NGTCP2_SECONDS)
 #define CLOSE_FLUSH_NS (100ULL * NGTCP2_MILLISECONDS)
 #define POLL_CAP_MS 10
-#define MAX_RX_BURST 256
 #define CLIENT_CONNECTION_ID_LENGTH 16
 
 _Static_assert(RX_CAPACITY >= NGTCP2_MAX_UDP_PAYLOAD_SIZE,
                "CONNECTION_CLOSE needs the ngtcp2 client minimum buffer");
+_Static_assert(RX_MESSAGE_CAPACITY >= RX_CAPACITY,
+               "GRO receive slots must hold a full UDP datagram");
 
 #if defined(_WIN32)
 typedef SOCKET socket_handle;
@@ -166,6 +202,11 @@ struct udp_endpoint {
   struct sockaddr_storage remote_addr;
   socklen_t remote_addrlen;
   uint8_t rxbuf[RX_CAPACITY];
+#if defined(__linux__)
+  uint8_t (*rx_batch_storage)[RX_MESSAGE_CAPACITY];
+  bool recvmmsg_supported;
+  bool gso_supported;
+#endif
 };
 
 struct response_state {
@@ -202,8 +243,10 @@ struct client {
   bool fatal;
   char fatal_reason[384];
 
-  uint8_t txbuf[TX_CAPACITY];
+  uint8_t txbuf[TX_BATCH_CAPACITY];
   size_t pending_tx_len;
+  size_t pending_tx_offset;
+  size_t pending_tx_segment_size;
   struct sockaddr_storage pending_remote_addr;
   socklen_t pending_remote_addrlen;
   bool pending_tx_needs_pacing_update;
@@ -302,6 +345,86 @@ static int socket_send_datagram(socket_handle fd, const uint8_t *data,
   return rv;
 #endif
 }
+
+#if defined(__linux__) && defined(UDP_SEGMENT)
+static int socket_send_gso(socket_handle fd, const uint8_t *data,
+                           size_t datalen, size_t segment_size,
+                           const struct sockaddr *remote_addr,
+                           socklen_t remote_addrlen) {
+  struct iovec iov;
+  struct msghdr msg;
+  struct cmsghdr *cmsg;
+  union {
+    struct cmsghdr align;
+    uint8_t bytes[CMSG_SPACE(sizeof(uint16_t))];
+  } control;
+  uint16_t segment_size_u16;
+  ssize_t rv;
+
+  if (datalen == 0 || datalen > INT_MAX || segment_size == 0 ||
+      segment_size > UINT16_MAX ||
+      1 + (datalen - 1) / segment_size > TX_AGGREGATE_MAX_SEGMENTS) {
+    errno = EMSGSIZE;
+    return SOCKET_CALL_ERROR;
+  }
+
+  memset(&msg, 0, sizeof(msg));
+  memset(&control, 0, sizeof(control));
+  iov.iov_base = (void *)data;
+  iov.iov_len = datalen;
+  msg.msg_name = (void *)remote_addr;
+  msg.msg_namelen = remote_addrlen;
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = control.bytes;
+  msg.msg_controllen = sizeof(control.bytes);
+  cmsg = CMSG_FIRSTHDR(&msg);
+  if (cmsg == NULL) {
+    errno = EINVAL;
+    return SOCKET_CALL_ERROR;
+  }
+  cmsg->cmsg_level = SOL_UDP;
+  cmsg->cmsg_type = UDP_SEGMENT;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(segment_size_u16));
+  segment_size_u16 = (uint16_t)segment_size;
+  memcpy(CMSG_DATA(cmsg), &segment_size_u16, sizeof(segment_size_u16));
+
+  do {
+    rv = sendmsg(fd, &msg, 0);
+  } while (rv == SOCKET_CALL_ERROR && errno == EINTR);
+  if (rv > INT_MAX) {
+    errno = EOVERFLOW;
+    return SOCKET_CALL_ERROR;
+  }
+  return (int)rv;
+}
+
+static bool socket_error_disables_gso(int error) {
+  return error == EIO || error == EINVAL || error == ENOPROTOOPT ||
+      error == EOPNOTSUPP;
+}
+
+static bool socket_supports_gso(void) {
+  struct sockaddr_in local_addr;
+  socket_handle fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  int segment_size = 1500;
+  bool supported = false;
+
+  if (fd == INVALID_SOCKET_HANDLE) {
+    return false;
+  }
+  memset(&local_addr, 0, sizeof(local_addr));
+  local_addr.sin_family = AF_INET;
+  local_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (bind(fd, (const struct sockaddr *)&local_addr, sizeof(local_addr)) == 0 &&
+      setsockopt(fd, SOL_UDP, UDP_SEGMENT, &segment_size,
+                 sizeof(segment_size)) == 0) {
+    supported = true;
+  }
+  socket_close(fd);
+  return supported;
+}
+#endif
 
 static int socket_receive_datagram(socket_handle fd, uint8_t *data,
                                    size_t datalen,
@@ -1006,8 +1129,10 @@ static int fill_request_window(client *c) {
   return 0;
 }
 
-static ngtcp2_ssize write_nghttp3_packet(client *c, ngtcp2_path *path,
-                                         ngtcp2_pkt_info *pi, uint64_t ts) {
+static ngtcp2_ssize write_nghttp3_packet(
+  ngtcp2_conn *conn, ngtcp2_path *path, ngtcp2_pkt_info *pi, uint8_t *dest,
+  size_t destlen, ngtcp2_tstamp ts, void *user_data) {
+  client *c = (client *)user_data;
   nghttp3_vec nghttp3_vecs[16];
   ngtcp2_vec qvec[16];
   size_t i;
@@ -1020,8 +1145,7 @@ static ngtcp2_ssize write_nghttp3_packet(client *c, ngtcp2_path *path,
     ngtcp2_ssize nwrite;
     uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
 
-    if (c->nghttp3_conn != NULL &&
-        ngtcp2_conn_get_max_data_left2(c->qconn) != 0) {
+    if (c->nghttp3_conn != NULL && ngtcp2_conn_get_max_data_left2(conn) != 0) {
       nghttp3_vec_count = nghttp3_conn_writev_stream(
         c->nghttp3_conn, &stream_id, &fin, nghttp3_vecs,
         sizeof(nghttp3_vecs) / sizeof(nghttp3_vecs[0]));
@@ -1038,9 +1162,9 @@ static ngtcp2_ssize write_nghttp3_packet(client *c, ngtcp2_path *path,
     if (fin) {
       flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
     }
-    nwrite = ngtcp2_conn_writev_stream(
-      c->qconn, path, pi, c->txbuf, sizeof(c->txbuf), &datalen, flags,
-      stream_id, qvec, (size_t)nghttp3_vec_count, ts);
+    nwrite = ngtcp2_conn_writev_stream(conn, path, pi, dest, destlen, &datalen,
+                                       flags, stream_id, qvec,
+                                       (size_t)nghttp3_vec_count, ts);
     if (nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
       nghttp3_conn_block_stream(c->nghttp3_conn, stream_id);
       continue;
@@ -1080,123 +1204,253 @@ static ngtcp2_ssize write_nghttp3_packet(client *c, ngtcp2_path *path,
 }
 
 static int send_pending(client *c) {
-  int nwrite;
-  int socket_error;
   if (c->pending_tx_len == 0) {
     return 0;
   }
-  nwrite = socket_send_datagram(
-    c->endpoint->fd, c->txbuf, c->pending_tx_len,
-    (const struct sockaddr *)&c->pending_remote_addr,
-    c->pending_remote_addrlen);
-  if (nwrite == SOCKET_CALL_ERROR) {
-    socket_error = socket_last_error();
-    if (socket_error_would_block(socket_error)) {
-      return 1;
+
+  if (c->pending_tx_offset > c->pending_tx_len ||
+      c->pending_tx_segment_size == 0) {
+    set_fatal(c, "invalid pending UDP batch state");
+    return -1;
+  }
+
+  while (c->pending_tx_offset < c->pending_tx_len) {
+    size_t remaining = c->pending_tx_len - c->pending_tx_offset;
+    size_t datalen = remaining < c->pending_tx_segment_size
+        ? remaining
+        : c->pending_tx_segment_size;
+    int nwrite;
+    int socket_error;
+
+#if defined(__linux__) && defined(UDP_SEGMENT)
+    if (c->endpoint->gso_supported && c->pending_tx_offset == 0 &&
+        remaining > c->pending_tx_segment_size) {
+      nwrite = socket_send_gso(
+        c->endpoint->fd, c->txbuf, remaining, c->pending_tx_segment_size,
+        (const struct sockaddr *)&c->pending_remote_addr,
+        c->pending_remote_addrlen);
+      if (nwrite == SOCKET_CALL_ERROR) {
+        socket_error = socket_last_error();
+        if (socket_error_would_block(socket_error)) {
+          return 1;
+        }
+        if (socket_error_disables_gso(socket_error)) {
+          c->endpoint->gso_supported = false;
+          continue;
+        }
+        set_fatal(c, "GSO send: socket error %d", socket_error);
+        return -1;
+      }
+      if ((size_t)nwrite != remaining) {
+        set_fatal(c, "partial UDP GSO send: %d/%zu", nwrite, remaining);
+        return -1;
+      }
+      c->pending_tx_offset = c->pending_tx_len;
+    } else
+#endif
+    {
+      nwrite = socket_send_datagram(
+        c->endpoint->fd, c->txbuf + c->pending_tx_offset, datalen,
+        (const struct sockaddr *)&c->pending_remote_addr,
+        c->pending_remote_addrlen);
+      if (nwrite == SOCKET_CALL_ERROR) {
+        socket_error = socket_last_error();
+        if (socket_error_would_block(socket_error)) {
+          return 1;
+        }
+        set_fatal(c, "send: socket error %d", socket_error);
+        return -1;
+      }
+      if ((size_t)nwrite != datalen) {
+        set_fatal(c, "partial UDP send: %d/%zu", nwrite, datalen);
+        return -1;
+      }
+      c->pending_tx_offset += datalen;
     }
-    set_fatal(c, "send: socket error %d", socket_error);
-    return -1;
+
   }
-  if ((size_t)nwrite != c->pending_tx_len) {
-    set_fatal(c, "partial UDP send: %d/%zu", nwrite, c->pending_tx_len);
-    return -1;
-  }
+
   c->pending_tx_len = 0;
+  c->pending_tx_offset = 0;
+  c->pending_tx_segment_size = 0;
   return 0;
 }
 
-static void finish_tx_batch(client *c, size_t batch_bytes, uint64_t batch_ts) {
-  if (batch_bytes != 0) {
-    ngtcp2_conn_update_pkt_tx_time(c->qconn, batch_ts);
+static void finish_tx_turn(client *c) {
+  if (c->pending_tx_needs_pacing_update) {
+    ngtcp2_conn_update_pkt_tx_time(c->qconn, timestamp_ns());
+    c->pending_tx_needs_pacing_update = false;
   }
 }
 
 static int drive_tx(client *c) {
-  uint64_t batch_ts;
-  size_t batch_bytes = 0;
-  size_t send_quantum;
+  size_t datagrams_sent = 0;
+  size_t send_quantum_remaining;
   bool had_pending = c->pending_tx_len != 0;
   int rv = send_pending(c);
   if (rv != 0) {
     return rv < 0 ? -1 : 0;
   }
   if (had_pending) {
-    if (c->pending_tx_needs_pacing_update) {
-      ngtcp2_conn_update_pkt_tx_time(c->qconn, timestamp_ns());
-      c->pending_tx_needs_pacing_update = false;
-    }
-    /* A resumed syscall only flushes the already-generated datagram.  Start a
-       fresh ngtcp2 write batch on the next event-loop iteration. */
+    finish_tx_turn(c);
+    /* A resumed syscall finishes the prior send quantum. Start fresh packet
+       generation on the next event-loop turn. */
     return 1;
   }
-
-  send_quantum = ngtcp2_conn_get_send_quantum2(c->qconn);
-  if (send_quantum == 0) {
+  send_quantum_remaining = ngtcp2_conn_get_send_quantum2(c->qconn);
+  if (send_quantum_remaining == 0) {
     return 0;
   }
-  batch_ts = timestamp_ns();
 
   for (;;) {
     ngtcp2_path_storage path_storage;
     ngtcp2_pkt_info pi;
     ngtcp2_ssize nwrite;
-    int sent;
+    uint64_t batch_ts;
+    size_t batch_capacity;
+    size_t batch_datagrams;
+    size_t max_aggregate_packets = 1;
+    size_t path_max_udp_payload_size;
+    size_t segment_size = 0;
+#if defined(__linux__) && defined(UDP_SEGMENT)
+    if (c->endpoint->gso_supported) {
+      max_aggregate_packets = TX_AGGREGATE_MAX_SEGMENTS;
+    }
+#endif
+    if (max_aggregate_packets > TX_DATAGRAMS_PER_TURN - datagrams_sent) {
+      max_aggregate_packets = TX_DATAGRAMS_PER_TURN - datagrams_sent;
+    }
+    path_max_udp_payload_size =
+      ngtcp2_conn_get_path_max_tx_udp_payload_size2(c->qconn);
+    batch_capacity = sizeof(c->txbuf);
+    if (batch_capacity > send_quantum_remaining) {
+      batch_capacity = send_quantum_remaining;
+    }
+    if (batch_capacity < path_max_udp_payload_size) {
+      batch_capacity = path_max_udp_payload_size;
+    }
+    if (batch_capacity > sizeof(c->txbuf)) {
+      set_fatal(c, "QUIC path payload size exceeds the UDP batch buffer");
+      return -1;
+    }
 
+    batch_ts = timestamp_ns();
     memset(&pi, 0, sizeof(pi));
     ngtcp2_path_storage_zero(&path_storage);
-    nwrite = write_nghttp3_packet(c, &path_storage.path, &pi, batch_ts);
+    nwrite = ngtcp2_conn_write_aggregate_pkt2(
+      c->qconn, &path_storage.path, &pi, c->txbuf, batch_capacity,
+      &segment_size, write_nghttp3_packet, max_aggregate_packets, batch_ts);
     if (nwrite < 0) {
-      finish_tx_batch(c, batch_bytes, batch_ts);
+      if (!c->fatal) {
+        set_fatal(c, "ngtcp2_conn_write_aggregate_pkt2: %s (%d)",
+                  ngtcp2_strerror((int)nwrite), (int)nwrite);
+      }
       return -1;
     }
     if (nwrite == 0) {
-      finish_tx_batch(c, batch_bytes, batch_ts);
+      finish_tx_turn(c);
       return 0;
     }
-    batch_bytes += (size_t)nwrite;
+    if (segment_size == 0 || segment_size > (size_t)nwrite) {
+      set_fatal(c, "ngtcp2 returned an invalid UDP segment size");
+      return -1;
+    }
+    batch_datagrams = 1 + ((size_t)nwrite - 1) / segment_size;
+    if (batch_datagrams > max_aggregate_packets) {
+      set_fatal(c, "ngtcp2 exceeded the UDP aggregate segment limit");
+      return -1;
+    }
     if (path_storage.path.remote.addr == NULL ||
         path_storage.path.remote.addrlen <= 0 ||
         (size_t)path_storage.path.remote.addrlen >
           sizeof(c->pending_remote_addr)) {
       set_fatal(c, "ngtcp2 returned an invalid UDP destination address");
-      finish_tx_batch(c, batch_bytes, batch_ts);
       return -1;
     }
     memcpy(&c->pending_remote_addr, path_storage.path.remote.addr,
            (size_t)path_storage.path.remote.addrlen);
     c->pending_remote_addrlen = (socklen_t)path_storage.path.remote.addrlen;
     c->pending_tx_len = (size_t)nwrite;
-    sent = send_pending(c);
-    if (sent < 0) {
+    c->pending_tx_offset = 0;
+    c->pending_tx_segment_size = segment_size;
+    c->pending_tx_needs_pacing_update = true;
+    rv = send_pending(c);
+    if (rv < 0) {
       return -1;
     }
-    if (sent > 0) {
-      /* The complete datagram remains stable in txbuf while RX and expiry keep
-         advancing.  Update pacing at the eventual socket flush time. */
-      c->pending_tx_needs_pacing_update = true;
+    if (rv > 0) {
       return 0;
     }
-    if (batch_bytes >= send_quantum) {
-      finish_tx_batch(c, batch_bytes, batch_ts);
+    datagrams_sent += batch_datagrams;
+    if ((size_t)nwrite >= send_quantum_remaining) {
+      send_quantum_remaining = 0;
+    } else {
+      send_quantum_remaining -= (size_t)nwrite;
+    }
+    if (datagrams_sent == TX_DATAGRAMS_PER_TURN ||
+        send_quantum_remaining == 0) {
+      finish_tx_turn(c);
       return 1;
     }
   }
 }
 
-static rx_drain_result drain_rx(udp_endpoint *endpoint, client *c,
-                                bool stop_at_benchmark_completion) {
+static rx_drain_result process_received_packet(
+  udp_endpoint *endpoint, client *c, const uint8_t *data, size_t datalen,
+  struct sockaddr *remote_addr, socklen_t remote_addrlen, uint64_t ts,
+  bool stop_at_benchmark_completion) {
+  ngtcp2_path path;
+  ngtcp2_pkt_info pi;
+  int rv;
+
+  if (remote_addrlen == 0 ||
+      (size_t)remote_addrlen > sizeof(struct sockaddr_storage)) {
+    set_fatal(c, "received UDP datagram with an invalid source address");
+    return RX_DRAIN_FAILED;
+  }
+
+  memset(&path, 0, sizeof(path));
+  path.local.addr = (struct sockaddr *)&endpoint->local_addr;
+  path.local.addrlen = (socklen_t)endpoint->local_addrlen;
+  path.remote.addr = remote_addr;
+  path.remote.addrlen = remote_addrlen;
+  path.user_data = c;
+  memset(&pi, 0, sizeof(pi));
+  rv = ngtcp2_conn_read_pkt(c->qconn, &path, &pi, data, datalen, ts);
+  if (rv != 0) {
+    if (!c->last_error.error_code) {
+      if (rv == NGTCP2_ERR_CRYPTO) {
+        ngtcp2_ccerr_set_tls_alert(
+          &c->last_error, ngtcp2_conn_get_tls_alert2(c->qconn), NULL, 0);
+      } else {
+        ngtcp2_ccerr_set_liberr(&c->last_error, rv, NULL, 0);
+      }
+    }
+    set_fatal(c,
+              "ngtcp2_conn_read_pkt: %s (%d), started=%" PRIu64
+              " completed=%" PRIu64 " active=%zu",
+              ngtcp2_strerror(rv), rv, c->started, c->completed, c->active);
+    return RX_DRAIN_FAILED;
+  }
+  c->last_progress_ns = ts;
+  if (stop_at_benchmark_completion && c->completed == c->target_requests) {
+    return RX_DRAIN_BENCHMARK_COMPLETE;
+  }
+  return RX_DRAIN_BURST;
+}
+
+static rx_drain_result drain_rx_scalar(udp_endpoint *endpoint, client *c,
+                                       bool stop_at_benchmark_completion) {
   size_t packet_count;
-  for (packet_count = 0; packet_count < MAX_RX_BURST; ++packet_count) {
+  for (packet_count = 0; packet_count < RX_SCALAR_BURST_SIZE;
+       ++packet_count) {
     struct sockaddr_storage remote_addr;
     socklen_t remote_addrlen = (socklen_t)sizeof(remote_addr);
     int nread = socket_receive_datagram(
       endpoint->fd, endpoint->rxbuf, sizeof(endpoint->rxbuf),
       (struct sockaddr *)&remote_addr, &remote_addrlen);
     int socket_error;
-    ngtcp2_path path;
-    ngtcp2_pkt_info pi;
-    uint64_t ts;
-    int rv;
+    rx_drain_result result;
 
     if (nread == SOCKET_CALL_ERROR) {
       socket_error = socket_last_error();
@@ -1209,39 +1463,150 @@ static rx_drain_result drain_rx(udp_endpoint *endpoint, client *c,
     if (nread == 0) {
       continue;
     }
-
-    memset(&path, 0, sizeof(path));
-    path.local.addr = (struct sockaddr *)&endpoint->local_addr;
-    path.local.addrlen = (socklen_t)endpoint->local_addrlen;
-    path.remote.addr = (struct sockaddr *)&remote_addr;
-    path.remote.addrlen = (socklen_t)remote_addrlen;
-    path.user_data = c;
-    memset(&pi, 0, sizeof(pi));
-    ts = timestamp_ns();
-    rv = ngtcp2_conn_read_pkt(c->qconn, &path, &pi, endpoint->rxbuf,
-                              (size_t)nread, ts);
-    if (rv != 0) {
-      if (!c->last_error.error_code) {
-        if (rv == NGTCP2_ERR_CRYPTO) {
-          ngtcp2_ccerr_set_tls_alert(
-            &c->last_error, ngtcp2_conn_get_tls_alert2(c->qconn), NULL, 0);
-        } else {
-          ngtcp2_ccerr_set_liberr(&c->last_error, rv, NULL, 0);
-        }
-      }
-      set_fatal(c,
-                "ngtcp2_conn_read_pkt: %s (%d), started=%" PRIu64
-                " completed=%" PRIu64 " active=%zu",
-                ngtcp2_strerror(rv), rv, c->started, c->completed, c->active);
-      return RX_DRAIN_FAILED;
-    }
-    c->last_progress_ns = ts;
-    if (stop_at_benchmark_completion &&
-        c->completed == c->target_requests) {
-      return RX_DRAIN_BENCHMARK_COMPLETE;
+    result = process_received_packet(
+      endpoint, c, endpoint->rxbuf, (size_t)nread,
+      (struct sockaddr *)&remote_addr, remote_addrlen, timestamp_ns(),
+      stop_at_benchmark_completion);
+    if (result != RX_DRAIN_BURST) {
+      return result;
     }
   }
   return RX_DRAIN_BURST;
+}
+
+#if defined(__linux__)
+typedef union udp_control_buffer {
+  struct cmsghdr align;
+  uint8_t bytes[CMSG_SPACE(sizeof(int))];
+} udp_control_buffer;
+
+static int udp_gro_segment_size(client *c, struct msghdr *msg,
+                                size_t message_len, size_t *segment_size) {
+  struct cmsghdr *cmsg;
+  *segment_size = message_len;
+#if defined(UDP_GRO)
+  for (cmsg = CMSG_FIRSTHDR(msg); cmsg != NULL;
+       cmsg = CMSG_NXTHDR(msg, cmsg)) {
+    if (cmsg->cmsg_level == SOL_UDP && cmsg->cmsg_type == UDP_GRO) {
+      int value;
+      if (cmsg->cmsg_len < CMSG_LEN(sizeof(value))) {
+        set_fatal(c, "UDP_GRO control message was truncated");
+        return -1;
+      }
+      memcpy(&value, CMSG_DATA(cmsg), sizeof(value));
+      if (value <= 0) {
+        set_fatal(c, "UDP_GRO returned an invalid segment size");
+        return -1;
+      }
+      *segment_size = (size_t)value;
+      break;
+    }
+  }
+#else
+  (void)cmsg;
+  (void)c;
+#endif
+  return 0;
+}
+
+static rx_drain_result drain_rx_batch(udp_endpoint *endpoint, client *c,
+                                      bool stop_at_benchmark_completion) {
+  struct mmsghdr messages[RX_BATCH_SIZE];
+  struct iovec vectors[RX_BATCH_SIZE];
+  struct sockaddr_storage remote_addrs[RX_BATCH_SIZE];
+  udp_control_buffer controls[RX_BATCH_SIZE];
+  uint64_t ts;
+  int message_count;
+  size_t i;
+
+  memset(messages, 0, sizeof(messages));
+  memset(vectors, 0, sizeof(vectors));
+  memset(remote_addrs, 0, sizeof(remote_addrs));
+  memset(controls, 0, sizeof(controls));
+  for (i = 0; i < RX_BATCH_SIZE; ++i) {
+    vectors[i].iov_base = endpoint->rx_batch_storage[i];
+    vectors[i].iov_len = RX_MESSAGE_CAPACITY;
+    messages[i].msg_hdr.msg_name = &remote_addrs[i];
+    messages[i].msg_hdr.msg_namelen = sizeof(remote_addrs[i]);
+    messages[i].msg_hdr.msg_iov = &vectors[i];
+    messages[i].msg_hdr.msg_iovlen = 1;
+    messages[i].msg_hdr.msg_control = controls[i].bytes;
+    messages[i].msg_hdr.msg_controllen = sizeof(controls[i].bytes);
+  }
+
+  do {
+    message_count = recvmmsg(endpoint->fd, messages, RX_BATCH_SIZE,
+                             MSG_DONTWAIT, NULL);
+  } while (message_count == SOCKET_CALL_ERROR && errno == EINTR);
+  if (message_count == SOCKET_CALL_ERROR) {
+    int socket_error = socket_last_error();
+    if (socket_error_would_block(socket_error)) {
+      return RX_DRAIN_IDLE;
+    }
+    if (socket_error == ENOSYS) {
+      endpoint->recvmmsg_supported = false;
+      return drain_rx_scalar(endpoint, c, stop_at_benchmark_completion);
+    }
+    set_fatal(c, "recvmmsg: socket error %d", socket_error);
+    return RX_DRAIN_FAILED;
+  }
+
+  ts = timestamp_ns();
+  for (i = 0; i < (size_t)message_count; ++i) {
+    size_t message_len = messages[i].msg_len;
+    size_t segment_size;
+    size_t offset;
+
+    if ((messages[i].msg_hdr.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0) {
+      set_fatal(c, "recvmmsg truncated a UDP datagram or its control data");
+      return RX_DRAIN_FAILED;
+    }
+    if (message_len == 0) {
+      continue;
+    }
+    if (message_len > RX_MESSAGE_CAPACITY ||
+        udp_gro_segment_size(c, &messages[i].msg_hdr, message_len,
+                             &segment_size) != 0) {
+      return RX_DRAIN_FAILED;
+    }
+
+    for (offset = 0; offset < message_len; offset += segment_size) {
+      size_t packet_len = message_len - offset;
+      rx_drain_result result;
+      if (packet_len > segment_size) {
+        packet_len = segment_size;
+      }
+      result = process_received_packet(
+        endpoint, c, endpoint->rx_batch_storage[i] + offset, packet_len,
+        (struct sockaddr *)&remote_addrs[i],
+        messages[i].msg_hdr.msg_namelen, ts, stop_at_benchmark_completion);
+      if (result != RX_DRAIN_BURST) {
+        return result;
+      }
+    }
+  }
+  return message_count == RX_BATCH_SIZE ? RX_DRAIN_BURST : RX_DRAIN_IDLE;
+}
+#endif
+
+static rx_drain_result drain_rx(udp_endpoint *endpoint, client *c,
+                                bool stop_at_benchmark_completion) {
+#if defined(__linux__)
+  if (endpoint->recvmmsg_supported) {
+    uint64_t started = timestamp_ns();
+    for (;;) {
+      rx_drain_result result =
+        drain_rx_batch(endpoint, c, stop_at_benchmark_completion);
+      if (result != RX_DRAIN_BURST || !endpoint->recvmmsg_supported) {
+        return result;
+      }
+      if (timestamp_ns() - started >= RX_TIME_BOUND_NS) {
+        return RX_DRAIN_BURST;
+      }
+    }
+  }
+#endif
+  return drain_rx_scalar(endpoint, c, stop_at_benchmark_completion);
 }
 
 static int handle_expiry(client *c, uint64_t now) {
@@ -1524,10 +1889,34 @@ static int create_udp_endpoint(udp_endpoint *endpoint, client *error_client) {
               socket_last_error());
     return -1;
   }
+#if defined(__linux__)
+  endpoint->rx_batch_storage =
+    malloc(RX_BATCH_SIZE * sizeof(*endpoint->rx_batch_storage));
+  if (endpoint->rx_batch_storage == NULL) {
+    set_fatal(error_client, "could not allocate the UDP receive batch");
+    return -1;
+  }
+  endpoint->recvmmsg_supported = true;
+#if defined(UDP_SEGMENT)
+  endpoint->gso_supported = socket_supports_gso();
+#endif
+#if defined(UDP_GRO)
+  {
+    int one = 1;
+    /* Quinn also treats GRO as opportunistic. If the actual socket rejects
+       the option, recvmmsg safely continues with one datagram per message. */
+    (void)setsockopt(endpoint->fd, SOL_UDP, UDP_GRO, &one, sizeof(one));
+  }
+#endif
+#endif
   return 0;
 }
 
 static void free_udp_endpoint(udp_endpoint *endpoint) {
+#if defined(__linux__)
+  free(endpoint->rx_batch_storage);
+  endpoint->rx_batch_storage = NULL;
+#endif
   if (endpoint->fd != INVALID_SOCKET_HANDLE) {
     socket_close(endpoint->fd);
     endpoint->fd = INVALID_SOCKET_HANDLE;
@@ -1602,7 +1991,7 @@ static int init_quic(client *c) {
 
   ngtcp2_settings_default(&settings);
   settings.initial_ts = timestamp_ns();
-  settings.max_tx_udp_payload_size = TX_CAPACITY;
+  settings.max_tx_udp_payload_size = MAX_TX_UDP_PAYLOAD_SIZE;
 
   ngtcp2_transport_params_default(&params);
   params.initial_max_stream_data_bidi_local = STREAM_RECEIVE_WINDOW;
