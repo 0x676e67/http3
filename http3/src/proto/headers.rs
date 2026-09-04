@@ -175,7 +175,7 @@ impl Header {
         fields: HeaderMap,
         ext: Extensions,
     ) -> Result<Self, HeaderError> {
-        match (uri.authority(), fields.get("host")) {
+        match (uri.authority(), fields.get(header::HOST)) {
             (None, None) => Err(HeaderError::MissingAuthority),
             (Some(a), Some(h)) if a.as_str() != h => Err(HeaderError::ContradictedAuthority),
             _ => Ok(Self {
@@ -235,7 +235,7 @@ impl Header {
         //# If the scheme does not have a mandatory authority component and none
         //# is provided in the request target, the request MUST NOT contain the
         //# :authority pseudo-header or Host header fields.
-        match (self.pseudo.authority, self.fields.get("host")) {
+        match (self.pseudo.authority, self.fields.get(header::HOST)) {
             (None, None) => return Err(HeaderError::MissingAuthority),
             (Some(a), None) => uri = uri.authority(a.as_str().as_bytes()),
             (None, Some(h)) => uri = uri.authority(h.as_bytes()),
