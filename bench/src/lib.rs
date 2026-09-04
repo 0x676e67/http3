@@ -1,6 +1,9 @@
 //! Internal API shared by the benchmark controller and its isolated process roles.
 
-use std::ffi::{CString, OsString, c_char, c_int};
+use std::{
+    ffi::{CString, OsString, c_char, c_int},
+    sync::Mutex,
+};
 
 pub mod case;
 #[doc(hidden)]
@@ -23,9 +26,16 @@ unsafe extern "C" {
     fn http3_bench_nghttp3_main(argc: c_int, argv: *mut *mut c_char) -> c_int;
 }
 
+static NATIVE_CLIENT_LOCK: Mutex<()> = Mutex::new(());
+
 /// Runs the native nghttp3/ngtcp2 Client compiled by this package's build script.
 #[doc(hidden)]
 pub fn run_nghttp3_client(args: impl Iterator<Item = OsString>) -> anyhow::Result<c_int> {
+    // The C adapter owns process-wide socket and timer state. Serialize the
+    // complete call so this safe wrapper cannot expose that state concurrently.
+    let _guard = NATIVE_CLIENT_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("native benchmark Client lock was poisoned"))?;
     let mut encoded = vec![CString::new("nghttp3")?];
     for argument in args {
         encoded.push(CString::new(argument.to_string_lossy().as_bytes())?);

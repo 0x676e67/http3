@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::case::{Case, Http3Library};
 
-pub(crate) const RESULT_SCHEMA: &str = "http3-client-bench-v9";
+pub(crate) const RESULT_SCHEMA: &str = "http3-client-bench-v10";
 
 /// Timed region shared by every Client implementation.
 pub const MEASUREMENT_PROFILE: &str = "post-local-setup-to-last-complete-response";

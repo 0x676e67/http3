@@ -47,7 +47,7 @@ include = [
 doctest = false
 
 [dependencies]
-aws-lc-sys = { version = "=0.44.0", features = ["ssl"] }
+aws-lc-sys = { version = "0.43.0", features = ["ssl"] }
 libc = "0.2"
 
 [build-dependencies]

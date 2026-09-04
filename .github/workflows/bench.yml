@@ -53,9 +53,9 @@ jobs:
             -- --list)
           printf '%s\n' "$output"
           expected=$(printf '%s\n' \
-            'http3-client/post-local-setup-to-last-complete-response/0 B/requests-5000/concurrency-100/http3: benchmark' \
-            'http3-client/post-local-setup-to-last-complete-response/0 B/requests-5000/concurrency-100/h3: benchmark' \
-            'http3-client/post-local-setup-to-last-complete-response/0 B/requests-5000/concurrency-100/nghttp3: benchmark')
+            'http3/0 B/requests-5000/concurrency-100: benchmark' \
+            'h3/0 B/requests-5000/concurrency-100: benchmark' \
+            'nghttp3/0 B/requests-5000/concurrency-100: benchmark')
           actual=$(printf '%s\n' "$output" | grep ': benchmark$')
           test "$actual" = "$expected"
         env:

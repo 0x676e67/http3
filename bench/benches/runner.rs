@@ -3,10 +3,7 @@
 use std::{env, path::Path};
 
 use anyhow::{Context, Result, bail};
-use bench::{
-    case::{Case, DEFAULT_BODY_BYTES, Http3Library, MAX_BODY_BYTES, MAX_REQUESTS},
-    result::MEASUREMENT_PROFILE,
-};
+use bench::case::{Case, DEFAULT_BODY_BYTES, Http3Library, MAX_BODY_BYTES, MAX_REQUESTS};
 use bytesize::ByteSize;
 use criterion::{BenchmarkId, Criterion, SamplingMode, Throughput};
 
@@ -77,6 +74,45 @@ pub(crate) fn run(criterion: &mut Criterion) -> Result<()> {
 }
 
 fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> Result<()> {
+    // RFC 9114 Section 3.3 recommends against opening multiple HTTP/3
+    // connections with the same configuration to one IP address and UDP
+    // port. This same-authority harness therefore expresses concurrency as
+    // request streams on one connection. Each compared direct Client owns
+    // that connection's one UDP socket; shared multi-target endpoints are a
+    // separate QUIC transport scenario. The child Server advertises a fixed
+    // stream-credit window above the supported Client concurrency, avoiding
+    // an unrelated transport-default or MAX_STREAMS bottleneck.
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-3.3
+    let cases = config
+        .cases
+        .iter()
+        .copied()
+        .map(|default_case| {
+            let mut case = if config.test_mode {
+                Case {
+                    body_bytes: default_case.body_bytes,
+                    requests: TEST_REQUESTS,
+                    in_flight: TEST_IN_FLIGHT,
+                }
+            } else {
+                default_case
+            };
+            if let Some(requests) = config.requests {
+                case.requests = requests;
+                case.in_flight = case.in_flight.min(requests);
+            }
+            if let Some(concurrency) = config.concurrency {
+                if concurrency > case.requests {
+                    bail!(
+                        "concurrency {concurrency} exceeds the {} requests in the {case} batch",
+                        case.requests
+                    );
+                }
+                case.in_flight = concurrency;
+            }
+            Ok(case)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let runners = [
         ClientRunner {
             executable,
@@ -92,56 +128,25 @@ fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> 
         },
     ];
 
-    for &default_case in &config.cases {
-        // RFC 9114 Section 3.3 recommends against opening multiple HTTP/3
-        // connections with the same configuration to one IP address and UDP
-        // port. This same-authority harness therefore expresses concurrency as
-        // request streams on one connection. Each compared direct Client owns
-        // that connection's one UDP socket; shared multi-target endpoints are a
-        // separate QUIC transport scenario. The child Server advertises a fixed
-        // stream-credit window above the supported Client concurrency, avoiding
-        // an unrelated transport-default or MAX_STREAMS bottleneck.
-        // https://www.rfc-editor.org/rfc/rfc9114.html#section-3.3
-        let mut case = if config.test_mode {
-            Case {
-                body_bytes: default_case.body_bytes,
-                requests: TEST_REQUESTS,
-                in_flight: TEST_IN_FLIGHT,
-            }
-        } else {
-            default_case
-        };
-        if let Some(requests) = config.requests {
-            case.requests = requests;
-            case.in_flight = case.in_flight.min(requests);
-        }
-        if let Some(concurrency) = config.concurrency {
-            if concurrency > case.requests {
-                bail!(
-                    "concurrency {concurrency} exceeds the {} requests in the {case} batch",
-                    case.requests
-                );
-            }
-            case.in_flight = concurrency;
-        }
-        let group_name = format!(
-            "http3-client/{MEASUREMENT_PROFILE}/{case}/requests-{}/concurrency-{}",
-            case.requests, case.in_flight
-        );
-        let mut group = criterion.benchmark_group(&group_name);
+    for runner in &runners {
+        let library = runner.library;
+        let mut group = criterion.benchmark_group(library.name());
         group.sampling_mode(SamplingMode::Flat);
         if !config.test_mode && !config.sample_size_from_cli {
             group.sample_size(10);
         }
-        if !config.test_mode && !config.measurement_time_from_cli {
-            group.measurement_time(case.measurement_time());
-        }
-        group.throughput(throughput(case)?);
 
-        for runner in &runners {
-            let library = runner.library;
+        for &case in &cases {
+            if !config.test_mode && !config.measurement_time_from_cli {
+                group.measurement_time(case.measurement_time());
+            }
+            group.throughput(throughput(case)?);
+
             let mut server = None;
-            let benchmark_id = BenchmarkId::from_parameter(library.name());
+            let benchmark_id = BenchmarkId::from_parameter(format!(
+                "{case}/requests-{}/concurrency-{}",
+                case.requests, case.in_flight
+            ));
             group.bench_with_input(benchmark_id, &case, |bencher, &case| {
                 server.get_or_insert_with(|| {
                     ServerGuard::start(executable, case.body_bytes).unwrap_or_else(|error| {

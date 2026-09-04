@@ -38,12 +38,12 @@ Options:
                        The Server advertises a fixed 1000-stream credit window.
   -h, --help           Show this help.
 
-The Clients always run once in this fixed order: http3, h3, nghttp3. Cargo
-builds the native nghttp3/ngtcp2 Client automatically. The native build requires
-CMake, a C compiler, LLVM/libclang, NASM, and pkg-config. Criterion arguments
-such as --sample-size and --measurement-time override the harness defaults.
-The published sys crates include the required C sources, so repository
-submodules are not needed for this benchmark.
+Every selected case runs for http3, then h3, then nghttp3, in that fixed Client
+order. Cargo builds the native nghttp3/ngtcp2 Client automatically. The native
+build requires CMake, a C compiler, LLVM/libclang, NASM, and pkg-config.
+Criterion arguments such as --sample-size and --measurement-time override the
+harness defaults. The published sys crates include the required C sources, so
+repository submodules are not needed for this benchmark.
 
 Default body sizes:
   0B,1KiB,10KiB,64KiB,128KiB,1MiB,2MiB,4MiB,100MiB
@@ -139,5 +139,5 @@ else
   unset HTTP3_BENCH_CONCURRENCY || true
 fi
 
-echo 'Running HTTP/3 Clients in fixed order: http3, h3, nghttp3'
-cargo bench -p bench --bench clients -- "${criterion_args[@]}"
+echo 'Running all selected cases in fixed Client order: http3, h3, nghttp3'
+cargo bench -p bench --bench clients --locked -- "${criterion_args[@]}"

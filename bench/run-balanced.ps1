@@ -3,9 +3,9 @@
 Runs the HTTP/3 Client comparison with explicit body-size cases.
 
 .DESCRIPTION
-Runs http3, h3, and nghttp3 once in that fixed order. Body sizes use IEC units;
-the default cases are 0 B, 1 KiB, 10 KiB, 64 KiB, 128 KiB, 1 MiB, 2 MiB,
-4 MiB, and 100 MiB.
+Runs every selected case for http3, then h3, then nghttp3, in that fixed order.
+Body sizes use IEC units; the default cases are 0 B, 1 KiB, 10 KiB, 64 KiB,
+128 KiB, 1 MiB, 2 MiB, 4 MiB, and 100 MiB.
 
 Every Client uses one HTTP/3 connection and one UDP socket. Concurrent requests
 use streams on that connection, matching RFC 9114 Section 3.3 guidance against
@@ -127,8 +127,8 @@ try {
         Write-Host 'Those "creating library" lines are harmless when Cargo continues; Rust 1.99 fixes the diagnostic.'
     }
 
-    Write-Host 'Running HTTP/3 Clients in fixed order: http3, h3, nghttp3'
-    & cargo bench -p bench --bench clients -- @CriterionArgs
+    Write-Host 'Running all selected cases in fixed Client order: http3, h3, nghttp3'
+    & cargo bench -p bench --bench clients --locked -- @CriterionArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Criterion failed with exit code $LASTEXITCODE"
     }
