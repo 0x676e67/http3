@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, atomic::AtomicUsize},
 };
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 
 use super::connection::{Connection, SendRequest};
 use crate::{
@@ -205,6 +205,7 @@ impl Builder {
             max_qpack_decode_buffer_size: self.config.qpack_decode_buffer_size,
             sender_count: Arc::new(AtomicUsize::new(1)),
             send_grease_frame: self.config.send_grease,
+            qpack_encode_buffer: BytesMut::new(),
             _buf: PhantomData,
         };
 

@@ -2,11 +2,12 @@
 
 use std::{
     marker::PhantomData,
+    mem,
     sync::{Arc, atomic::AtomicUsize},
     task::{Context, Poll},
 };
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures_util::future;
 use http::request;
 #[cfg(feature = "tracing")]
@@ -26,6 +27,26 @@ use crate::{
     shared_state::{ConnectionState, SharedState},
     stream::{self, BufRecvStream},
 };
+
+// Retain enough storage to amortize ordinary request headers without letting a
+// single large field section pin memory for the lifetime of a sender.
+const MAX_RETAINED_QPACK_ENCODE_CAPACITY: usize = 4 * 1024;
+
+fn clear_qpack_encode_buffer(buffer: &mut BytesMut) {
+    if buffer.capacity() > MAX_RETAINED_QPACK_ENCODE_CAPACITY {
+        *buffer = BytesMut::new();
+    } else {
+        buffer.clear();
+    }
+}
+
+fn take_qpack_encode_buffer(buffer: &mut BytesMut) -> Bytes {
+    if buffer.capacity() > MAX_RETAINED_QPACK_ENCODE_CAPACITY {
+        mem::take(buffer).freeze()
+    } else {
+        buffer.split().freeze()
+    }
+}
 
 /// HTTP/3 request sender
 ///
@@ -118,6 +139,7 @@ where
     pub(super) sender_count: Arc<AtomicUsize>,
     pub(super) _buf: PhantomData<fn(B)>,
     pub(super) send_grease_frame: bool,
+    pub(super) qpack_encode_buffer: BytesMut,
 }
 
 impl<T, B> ConnectionState for SendRequest<T, B>
@@ -178,16 +200,22 @@ where
         //# ([COOKIES]) MAY be split into separate field lines, each with one or
         //# more cookie-pairs, before compression.
 
-        let mut block = BytesMut::new();
-        let mem_size = qpack::encode_stateless(&mut block, &headers).map_err(|_e| {
-            self.handle_connection_error_on_stream(InternalConnectionError {
-                code: Code::H3_INTERNAL_ERROR,
-                message: "Failed to encode headers".to_string(),
-            })
-        })?;
+        let mem_size = match qpack::encode_stateless(&mut self.qpack_encode_buffer, &headers) {
+            Ok(mem_size) => mem_size,
+            Err(_e) => {
+                clear_qpack_encode_buffer(&mut self.qpack_encode_buffer);
+                return Err(
+                    self.handle_connection_error_on_stream(InternalConnectionError {
+                        code: Code::H3_INTERNAL_ERROR,
+                        message: "Failed to encode headers".to_string(),
+                    }),
+                );
+            }
+        };
         // Do not retain the normalized fields while waiting for QUIC stream
         // credit or write backpressure.
         drop(headers);
+        let block = take_qpack_encode_buffer(&mut self.qpack_encode_buffer);
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
         //= type=implication
@@ -213,7 +241,7 @@ where
             });
         }
 
-        stream::write(&mut stream, Frame::Headers(block.freeze()))
+        stream::write(&mut stream, Frame::Headers(block))
             .await
             .map_err(|e| self.handle_quic_stream_error(e))?;
 
@@ -251,6 +279,9 @@ where
             sender_count: self.sender_count.clone(),
             _buf: PhantomData,
             send_grease_frame: self.send_grease_frame,
+            // Encoding buffers are worker-local mutable state. Sharing their
+            // allocation would add synchronization to the request hot path.
+            qpack_encode_buffer: BytesMut::new(),
         }
     }
 }
@@ -504,5 +535,43 @@ where
         }
 
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod qpack_encode_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn taken_blocks_remain_independent_and_large_storage_is_not_retained() {
+        let mut buffer = BytesMut::with_capacity(64);
+        buffer.extend_from_slice(b"first");
+        let first = take_qpack_encode_buffer(&mut buffer);
+
+        buffer.extend_from_slice(b"second");
+        let second = take_qpack_encode_buffer(&mut buffer);
+
+        assert_eq!(first, b"first"[..]);
+        assert_eq!(second, b"second"[..]);
+
+        let mut large = BytesMut::with_capacity(MAX_RETAINED_QPACK_ENCODE_CAPACITY + 1);
+        large.extend_from_slice(b"large");
+        assert_eq!(take_qpack_encode_buffer(&mut large), b"large"[..]);
+        assert_eq!(large.capacity(), 0);
+    }
+
+    #[test]
+    fn clearing_drops_only_oversized_storage() {
+        let mut small = BytesMut::with_capacity(64);
+        small.extend_from_slice(b"partial");
+        clear_qpack_encode_buffer(&mut small);
+        assert!(small.is_empty());
+        assert!(small.capacity() >= 64);
+
+        let mut large = BytesMut::with_capacity(MAX_RETAINED_QPACK_ENCODE_CAPACITY + 1);
+        large.extend_from_slice(b"partial");
+        clear_qpack_encode_buffer(&mut large);
+        assert!(large.is_empty());
+        assert_eq!(large.capacity(), 0);
     }
 }
