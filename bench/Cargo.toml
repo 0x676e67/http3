@@ -1,0 +1,46 @@
+[package]
+name = "http3-bench"
+version = "0.0.0"
+publish = false
+autobenches = false
+edition = { workspace = true }
+rust-version = "1.96"
+repository = { workspace = true }
+license = { workspace = true }
+build = "build.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+aws-lc-rs = "=1.18.0"
+aws-lc-sys = { version = "=0.44.0", features = ["ssl"] }
+bytesize = "=2.3.1"
+bytes = { workspace = true }
+http = { workspace = true }
+http3 = { workspace = true }
+http3-quic = { path = "../http3-quic", default-features = false, features = ["quinn"] }
+h3 = { git = "https://github.com/hyperium/h3", rev = "704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1" }
+h3-quinn = { git = "https://github.com/hyperium/h3", rev = "704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1" }
+nghttp3-sys = { workspace = true }
+ngtcp2-sys = { workspace = true }
+quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+quinn-proto = { version = "=0.11.17", default-features = false }
+rustls = { version = "=0.23.43", default-features = false, features = ["aws-lc-rs", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "=1.53.1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+criterion = "=0.7.0"
+wait-timeout = "=0.2.1"
+
+[build-dependencies]
+cc = "=1.4.4"
+
+[lib]
+test = false
+bench = false
+doc = false
+
+[[bench]]
+name = "clients"
+harness = false

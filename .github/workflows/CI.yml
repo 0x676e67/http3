@@ -10,6 +10,7 @@ env:
   core_package_args: >-
     --workspace
     --exclude interop
+    --exclude http3-bench
   toolchain_style: nightly
   toolchain_msrv: "1.85"
   toolchain_http3_quinn_msrv: "1.85"

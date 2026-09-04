@@ -1,0 +1,86 @@
+name: Benchmark
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  toolchain_benchmark_msrv: "1.96"
+
+jobs:
+  benchmark:
+    name: Benchmark on Linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install Rust ${{ env.toolchain_benchmark_msrv }}
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.toolchain_benchmark_msrv }}
+          components: clippy
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev nasm pkg-config
+
+      - name: Check Linux launcher
+        run: |
+          bash -n bench/run-balanced.sh
+          bash bench/run-balanced.sh --help
+
+      - name: Lint benchmark
+        run: cargo clippy -p http3-bench --all-targets --locked -- -D warnings
+
+      - name: Build benchmark
+        run: cargo bench -p http3-bench --bench clients --no-run --locked
+        env:
+          RUSTFLAGS: "-D warnings"
+
+      - name: List benchmark cases through Linux launcher
+        working-directory: ${{ runner.temp }}
+        run: |
+          output=$(bash "$GITHUB_WORKSPACE/bench/run-balanced.sh" \
+            --body-sizes 0B \
+            --requests 5000 \
+            -- --list)
+          printf '%s\n' "$output"
+          expected=$(printf '%s\n' \
+            'http3-client/post-local-setup-to-last-complete-response/0 B/requests-5000/concurrency-100/http3: benchmark' \
+            'http3-client/post-local-setup-to-last-complete-response/0 B/requests-5000/concurrency-100/h3: benchmark' \
+            'http3-client/post-local-setup-to-last-complete-response/0 B/requests-5000/concurrency-100/nghttp3: benchmark')
+          actual=$(printf '%s\n' "$output" | grep ': benchmark$')
+          test "$actual" = "$expected"
+        env:
+          RUSTFLAGS: "-D warnings"
+
+      - name: Smoke HTTP/3 benchmark clients
+        timeout-minutes: 5
+        run: cargo bench -p http3-bench --bench clients --locked -- --test
+        env:
+          RUSTFLAGS: "-D warnings"
+          HTTP3_BENCH_BODY_SIZES: "1KiB"
+
+      - name: Compare HTTP/3 clients
+        timeout-minutes: 15
+        run: |
+          bash bench/run-balanced.sh \
+            --body-sizes 0B,1KiB,10KiB,100KiB \
+            --requests 5000 \
+            --concurrency 100 \
+            -- \
+            --sample-size 10 \
+            --measurement-time 5 \
+            --warm-up-time 1 \
+            --noplot
+        env:
+          RUSTFLAGS: "-D warnings"
