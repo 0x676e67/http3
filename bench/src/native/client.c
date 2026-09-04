@@ -226,6 +226,9 @@ struct client {
   ngtcp2_crypto_conn_ref conn_ref;
   ngtcp2_conn *qconn;
   nghttp3_conn *nghttp3_conn;
+  int64_t control_stream_id;
+  int64_t qpack_encoder_stream_id;
+  int64_t qpack_decoder_stream_id;
   ngtcp2_ccerr last_error;
 
   response_state *responses;
@@ -811,6 +814,9 @@ static int setup_nghttp3(client *c) {
   if (rv != 0) {
     return set_nghttp3_failure(c, "nghttp3_conn_bind_qpack_streams", rv);
   }
+  c->control_stream_id = control_stream_id;
+  c->qpack_encoder_stream_id = qpack_encoder_stream_id;
+  c->qpack_decoder_stream_id = qpack_decoder_stream_id;
   c->nghttp3_ready = true;
   c->last_progress_ns = timestamp_ns();
   return 0;
@@ -1638,10 +1644,26 @@ static int poll_timeout_ms(client *c, uint64_t now) {
   return (int)millis;
 }
 
+static bool local_http3_setup_flushed(const client *c) {
+  if (!c->nghttp3_ready || c->control_stream_id < 0 ||
+      c->qpack_encoder_stream_id < 0 || c->qpack_decoder_stream_id < 0) {
+    return false;
+  }
+
+  /* Match the Rust builder boundary: the current control and QPACK bytes have
+     been accepted by QUIC, without waiting for UDP transmission or ACKs. */
+  return nghttp3_conn_is_stream_flushed(c->nghttp3_conn,
+                                        c->control_stream_id) != 0 &&
+         nghttp3_conn_is_stream_flushed(c->nghttp3_conn,
+                                        c->qpack_encoder_stream_id) != 0 &&
+         nghttp3_conn_is_stream_flushed(c->nghttp3_conn,
+                                        c->qpack_decoder_stream_id) != 0;
+}
+
 static bool client_phase_done(const client *c, run_phase phase) {
   switch (phase) {
   case RUN_PHASE_READY:
-    return c->handshake_completed && c->nghttp3_ready;
+    return c->handshake_completed && local_http3_setup_flushed(c);
   case RUN_PHASE_BENCHMARK:
     return c->completed == c->target_requests;
   }
@@ -1691,6 +1713,9 @@ static int run_until_phase(client *c, run_phase phase) {
           timeout = client_timeout;
         }
       }
+    }
+    if (client_phase_done(c, phase)) {
+      return 0;
     }
 
     memset(&pfd, 0, sizeof(pfd));
@@ -2024,6 +2049,9 @@ static int init_quic(client *c) {
 static int client_init(client *c, udp_endpoint *endpoint,
                        const bench_config *config, SSL_CTX *ssl_ctx) {
   memset(c, 0, sizeof(*c));
+  c->control_stream_id = -1;
+  c->qpack_encoder_stream_id = -1;
+  c->qpack_decoder_stream_id = -1;
   c->endpoint = endpoint;
   c->target_requests = config->requests;
   c->expected_body_bytes = config->expected_body_bytes;
@@ -2267,7 +2295,7 @@ int http3_bench_nghttp3_main(int argc, char **argv) {
   }
 
   elapsed_ns = c.measurement_finished_ns - benchmark_started;
-  printf("{\"schema\":\"http3-client-bench-v9\","
+  printf("{\"schema\":\"http3-client-bench-v10\","
          "\"http3_library\":\"nghttp3\","
          "\"quic_backend\":\"ngtcp2\","
          "\"transport_profile\":"

@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -66,7 +67,7 @@ fn prepare_submodule_source(name: &str, manifest_dir: &Path, out_dir: &Path) -> 
     );
     println!("cargo:rerun-if-changed={}", submodule_dir.display());
 
-    ensure_submodule_initialized(&submodule_dir);
+    ensure_submodule_initialized(&submodule_dir, manifest_dir);
 
     let build_dir = out_dir.join(name);
     if build_dir.exists() {
@@ -76,16 +77,32 @@ fn prepare_submodule_source(name: &str, manifest_dir: &Path, out_dir: &Path) -> 
     build_dir
 }
 
-fn ensure_submodule_initialized(submodule_dir: &Path) {
+fn ensure_submodule_initialized(submodule_dir: &Path, manifest_dir: &Path) {
     if submodule_source_ready(submodule_dir) {
         return;
     }
 
-    panic!(
-        "{} submodule is not initialized; from the repository root run \
-         `git submodule update --init --recursive` before building",
-        submodule_dir.display()
-    );
+    let relative = submodule_dir
+        .strip_prefix(manifest_dir)
+        .expect("submodule path should be under manifest dir")
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let status = Command::new("git")
+        .current_dir(manifest_dir)
+        .args([
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+            "--",
+            &relative,
+        ])
+        .status()
+        .expect("Failed to execute git submodule update");
+    if !status.success() {
+        panic!("Failed to initialize {relative} submodule");
+    }
 }
 
 fn submodule_source_ready(submodule_dir: &Path) -> bool {

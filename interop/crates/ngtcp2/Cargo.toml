@@ -14,8 +14,8 @@ name = "ngtcp2"
 path = "src/lib.rs"
 
 [dependencies]
-aws-lc-rs = "=1.18.0"
-aws-lc-sys = { version = "=0.44.0", features = ["ssl"] }
+aws-lc-rs = "1.17.3"
+aws-lc-sys = { version = "0.43.0", features = ["ssl"] }
 libc = "0.2"
 nghttp3-sys = { workspace = true }
 ngtcp2-sys = { workspace = true }

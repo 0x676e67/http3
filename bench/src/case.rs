@@ -3,8 +3,6 @@
 use std::{fmt, path::PathBuf, time::Duration};
 
 use anyhow::Result;
-use bytesize::ByteSize;
-
 pub const SERVER_ADDR: &str = "127.0.0.1:4433";
 pub const SERVER_WORKERS: usize = 8;
 /// Leaves stream-credit headroom above the supported Client concurrency without
@@ -71,10 +69,21 @@ impl Case {
 
 impl fmt::Display for Case {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        ByteSize::b(self.body_bytes as u64)
-            .display()
-            .iec()
-            .fmt(formatter)
+        const KIB: usize = 1024;
+        const MIB: usize = 1024 * KIB;
+
+        // Criterion requires globally unique benchmark IDs. Use the largest
+        // exact IEC unit so nearby byte counts cannot collide through rounded
+        // human-readable output.
+        if self.body_bytes == 0 {
+            formatter.write_str("0 B")
+        } else if self.body_bytes.is_multiple_of(MIB) {
+            write!(formatter, "{} MiB", self.body_bytes / MIB)
+        } else if self.body_bytes.is_multiple_of(KIB) {
+            write!(formatter, "{} KiB", self.body_bytes / KIB)
+        } else {
+            write!(formatter, "{} B", self.body_bytes)
+        }
     }
 }
 
