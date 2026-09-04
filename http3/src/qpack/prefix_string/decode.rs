@@ -1,104 +1,107 @@
+// Independently implemented from RFC 7541 Appendix B and this crate's encoder codebook.
+// Performance background and license references:
+// https://github.com/hyperium/h2/pull/927
+// https://github.com/hyperium/h2/commit/62f878b218406964952f958462a9cc34f74061e6
+// https://github.com/hyperium/h2/blob/62f878b218406964952f958462a9cc34f74061e6/LICENSE
+
+#[cfg(test)]
 use super::BitWindow;
+use super::encode::{ENCODE_CODE_LENGTHS, ENCODE_CODES};
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
+    #[cfg(test)]
     MissingBits(BitWindow),
+    #[cfg(test)]
     Unhandled(BitWindow, usize),
+    Eos,
+    InvalidPadding(usize),
 }
 
-#[derive(Clone, Debug)]
-enum DecodeValue {
-    Partial(&'static HuffmanDecoder),
-    Sym(u8),
-}
+#[cfg(test)]
+mod oracle {
+    use super::{BitWindow, Error};
 
-#[derive(Clone, Debug)]
-struct HuffmanDecoder {
-    lookup: u32,
-    table: &'static [DecodeValue],
-}
+    #[derive(Clone, Debug)]
+    enum DecodeValue {
+        Partial(&'static HuffmanDecoder),
+        Sym(u8),
+    }
 
-impl HuffmanDecoder {
-    fn check_eof(&self, bit_pos: &mut BitWindow, input: &[u8]) -> Result<Option<u32>, Error> {
-        use std::cmp::Ordering;
-        match ((bit_pos.byte + 1) as usize).cmp(&input.len()) {
-            // Position is out-of-range
-            Ordering::Greater => {
-                return Ok(None);
+    #[derive(Clone, Debug)]
+    struct HuffmanDecoder {
+        lookup: usize,
+        table: &'static [DecodeValue],
+        eos: bool,
+    }
+
+    impl HuffmanDecoder {
+        fn fetch_value(&self, bit_pos: &mut BitWindow, input: &[u8]) -> Option<u32> {
+            match read_bits(input, bit_pos.byte, bit_pos.bit, bit_pos.count) {
+                Ok(value) => Some(value as u32),
+                Err(()) => None,
             }
-            // Position is on the last byte
-            Ordering::Equal => {
-                let side = bit_pos.opposite_bit_window();
+        }
 
-                let rest = match read_bits(input, side.byte, side.bit, side.count) {
-                    Ok(x) => x,
-                    Err(()) => {
-                        return Err(Error::MissingBits(side));
-                    }
-                };
-
-                let eof_filler = ((2u16 << (side.count - 1)) - 1) as u8;
-                if rest & eof_filler == eof_filler {
-                    return Ok(None);
-                }
+        fn decode_next(&self, bit_pos: &mut BitWindow, input: &[u8]) -> Result<Option<u8>, Error> {
+            if self.eos {
+                return Err(Error::Eos);
             }
-            Ordering::Less => {}
-        }
-        Err(Error::MissingBits(bit_pos.clone()))
-    }
 
-    fn fetch_value(&self, bit_pos: &mut BitWindow, input: &[u8]) -> Result<Option<u32>, Error> {
-        match read_bits(input, bit_pos.byte, bit_pos.bit, bit_pos.count) {
-            Ok(value) => Ok(Some(value as u32)),
-            Err(()) => self.check_eof(bit_pos, input),
-        }
-    }
+            bit_pos.forwards(self.lookup);
 
-    fn decode_next(&self, bit_pos: &mut BitWindow, input: &[u8]) -> Result<Option<u8>, Error> {
-        bit_pos.forwards(self.lookup);
+            let value = match self.fetch_value(bit_pos, input) {
+                Some(value) => value as usize,
+                None => return Ok(None),
+            };
 
-        let value = match self.fetch_value(bit_pos, input) {
-            Ok(Some(value)) => value as usize,
-            Ok(None) => return Ok(None),
-            Err(err) => return Err(err),
-        };
+            let at_value = match (self.table).get(value) {
+                Some(x) => x,
+                None => return Err(Error::Unhandled(bit_pos.clone(), value)),
+            };
 
-        let at_value = match (self.table).get(value) {
-            Some(x) => x,
-            None => return Err(Error::Unhandled(bit_pos.clone(), value)),
-        };
-
-        match at_value {
-            DecodeValue::Sym(x) => Ok(Some(*x)),
-            DecodeValue::Partial(d) => d.decode_next(bit_pos, input),
+            match at_value {
+                DecodeValue::Sym(x) => Ok(Some(*x)),
+                DecodeValue::Partial(d) => d.decode_next(bit_pos, input),
+            }
         }
     }
-}
 
-/// Read `len` bits from the `src` slice at the specified position
-///
-/// Never read more than 8 bits at a time. `bit_offset` may be larger than 8.
-fn read_bits(src: &[u8], mut byte_offset: u32, mut bit_offset: u32, len: u32) -> Result<u8, ()> {
-    if len == 0 || len > 8 || src.len() as u32 * 8 < (byte_offset * 8) + bit_offset + len {
-        return Err(());
+    /// Read `len` bits from the `src` slice at the specified position
+    ///
+    /// Never read more than 8 bits at a time. `bit_offset` may be larger than 8.
+    pub(super) fn read_bits(
+        src: &[u8],
+        mut byte_offset: usize,
+        mut bit_offset: usize,
+        len: usize,
+    ) -> Result<u8, ()> {
+        let total_bits = src.len().checked_mul(8).ok_or(())?;
+        let end = byte_offset
+            .checked_mul(8)
+            .and_then(|offset| offset.checked_add(bit_offset))
+            .and_then(|offset| offset.checked_add(len))
+            .ok_or(())?;
+        if len == 0 || len > 8 || total_bits < end {
+            return Err(());
+        }
+
+        // Deal with `bit_offset` > 8
+        byte_offset += bit_offset / 8;
+        bit_offset -= (bit_offset / 8) * 8;
+
+        Ok(if bit_offset + len <= 8 {
+            // Read all the bits from a single byte
+            (src[byte_offset] << bit_offset) >> (8 - len)
+        } else {
+            // The range of bits spans over 2 bytes
+            let mut result = (src[byte_offset] as u16) << 8;
+            result |= src[byte_offset + 1] as u16;
+            ((result << bit_offset) >> (16 - len)) as u8
+        })
     }
 
-    // Deal with `bit_offset` > 8
-    byte_offset += bit_offset / 8;
-    bit_offset -= (bit_offset / 8) * 8;
-
-    Ok(if bit_offset + len <= 8 {
-        // Read all the bits from a single byte
-        (src[byte_offset as usize] << bit_offset) >> (8 - len)
-    } else {
-        // The range of bits spans over 2 bytes
-        let mut result = (src[byte_offset as usize] as u16) << 8;
-        result |= src[byte_offset as usize + 1] as u16;
-        ((result << bit_offset) >> (16 - len)) as u8
-    })
-}
-
-macro_rules! bits_decode {
+    macro_rules! bits_decode {
     // general way
     (
         lookup: $count:expr, [
@@ -110,7 +113,8 @@ macro_rules! bits_decode {
             table: &[
                 $( DecodeValue::Sym($sym), )*
                 $( DecodeValue::Partial(&$sub), )*
-            ]
+            ],
+            eos: false,
         }
     };
     // 2-final
@@ -120,7 +124,8 @@ macro_rules! bits_decode {
             table: &[
                 DecodeValue::Sym($first),
                 DecodeValue::Sym($second),
-            ]
+            ],
+            eos: false,
         }
     };
     // 4-final
@@ -132,7 +137,8 @@ macro_rules! bits_decode {
                 DecodeValue::Sym($second),
                 DecodeValue::Sym($third),
                 DecodeValue::Sym($fourth),
-            ]
+            ],
+            eos: false,
         }
     };
     // 2-final-partial
@@ -142,7 +148,8 @@ macro_rules! bits_decode {
             table: &[
                 DecodeValue::Sym($first),
                 DecodeValue::Partial(&$second),
-            ]
+            ],
+            eos: false,
         }
     };
     // 2-partial
@@ -152,7 +159,8 @@ macro_rules! bits_decode {
             table: &[
                 DecodeValue::Partial(&$first),
                 DecodeValue::Partial(&$second),
-            ]
+            ],
+            eos: false,
         }
     };
     // 4-partial
@@ -165,15 +173,22 @@ macro_rules! bits_decode {
                 DecodeValue::Partial(&$second),
                 DecodeValue::Partial(&$third),
                 DecodeValue::Partial(&$fourth),
-            ]
+            ],
+            eos: false,
         }
     };
     [ $( $name:ident => ( $($value:tt)* ), )* ] => {
-        $( const $name: HuffmanDecoder = bits_decode!( $( $value )* ); )*
+        $( static $name: HuffmanDecoder = bits_decode!( $( $value )* ); )*
     };
 }
 
-#[rustfmt::skip]
+    static EOF: HuffmanDecoder = HuffmanDecoder {
+        lookup: 0,
+        table: &[],
+        eos: true,
+    };
+
+    #[rustfmt::skip]
 bits_decode![
     HPACK_STRING => (
         lookup: 5, [ b'0', b'1', b'2', b'a', b'c', b'e', b'i', b'o', b's', b't',
@@ -291,22 +306,383 @@ bits_decode![
     END27B_1110 => (127, 220),
     END27B_1111 => (lookup: 1, [249, => END31_1,]),
     END31_1 => (lookup: 2, [10, 13, 22, => EOF,]),
-    EOF => (lookup: 8, []),
     ];
 
-pub struct DecodeIter<'a> {
-    bit_pos: BitWindow,
-    content: &'a Vec<u8>,
+    pub struct DecodeIter<'a> {
+        bit_pos: BitWindow,
+        content: &'a [u8],
+        symbol_end: usize,
+        finished: bool,
+    }
+
+    impl<'a> Iterator for DecodeIter<'a> {
+        type Item = Result<u8, Error>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.finished {
+                return None;
+            }
+
+            match HPACK_STRING.decode_next(&mut self.bit_pos, self.content) {
+                Ok(Some(x)) => match self.bit_pos.end() {
+                    Some(end) => {
+                        self.symbol_end = end;
+                        Some(Ok(x))
+                    }
+                    None => {
+                        self.finished = true;
+                        Some(Err(Error::MissingBits(self.bit_pos.clone())))
+                    }
+                },
+                Err(err) => {
+                    self.finished = true;
+                    Some(Err(err))
+                }
+                Ok(None) => {
+                    self.finished = true;
+                    let total_bits = match self.content.len().checked_mul(8) {
+                        Some(total_bits) => total_bits,
+                        None => return Some(Err(Error::MissingBits(self.bit_pos.clone()))),
+                    };
+                    let padding = match total_bits.checked_sub(self.symbol_end) {
+                        Some(padding) => padding,
+                        None => return Some(Err(Error::MissingBits(self.bit_pos.clone()))),
+                    };
+                    if padding == 0 {
+                        return None;
+                    }
+                    // QPACK uses the HPACK Huffman code unchanged. The EOS symbol is
+                    // forbidden in strings, and padding is at most seven one bits.
+                    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.1.2
+                    // https://www.rfc-editor.org/rfc/rfc7541.html#section-5.2
+                    if padding > 7 {
+                        return Some(Err(Error::InvalidPadding(padding)));
+                    }
+
+                    let padding_bits = match read_bits(
+                        self.content,
+                        self.symbol_end / 8,
+                        self.symbol_end % 8,
+                        padding,
+                    ) {
+                        Ok(bits) => bits,
+                        Err(()) => return Some(Err(Error::MissingBits(self.bit_pos.clone()))),
+                    };
+                    let expected = ((1u16 << padding) - 1) as u8;
+                    if padding_bits == expected {
+                        None
+                    } else {
+                        Some(Err(Error::InvalidPadding(padding)))
+                    }
+                }
+            }
+        }
+    }
+
+    pub trait HpackStringDecode {
+        fn hpack_decode(&self) -> DecodeIter<'_>;
+    }
+
+    impl HpackStringDecode for Vec<u8> {
+        fn hpack_decode(&self) -> DecodeIter<'_> {
+            self.as_slice().hpack_decode()
+        }
+    }
+
+    impl HpackStringDecode for [u8] {
+        fn hpack_decode(&self) -> DecodeIter<'_> {
+            DecodeIter {
+                bit_pos: BitWindow::new(),
+                content: self,
+                symbol_end: 0,
+                finished: false,
+            }
+        }
+    }
+
+    pub(super) fn decode(content: &[u8]) -> Result<Vec<u8>, Error> {
+        content.hpack_decode().collect()
+    }
 }
 
-impl<'a> Iterator for DecodeIter<'a> {
+const FAST_BITS: u8 = 10;
+const FAST_TABLE_LEN: usize = 1 << FAST_BITS;
+const TRIE_NODE_COUNT: usize = 256;
+const TRIE_LEAF: u16 = 1 << 15;
+const TRIE_EMPTY: u16 = u16::MAX;
+const EOS_SYMBOL: u16 = 256;
+const EOS_BITS: u32 = (1 << 30) - 1;
+const EOS_BIT_COUNT: usize = 30;
+
+struct DecoderTables {
+    fast: [u16; FAST_TABLE_LEN],
+    trie: [[u16; 2]; TRIE_NODE_COUNT],
+}
+
+static DECODER_TABLES: DecoderTables = build_tables();
+
+const fn code_for(symbol: usize) -> (u32, usize) {
+    if symbol < ENCODE_CODES.len() {
+        (ENCODE_CODES[symbol], ENCODE_CODE_LENGTHS[symbol] as usize)
+    } else {
+        (EOS_BITS, EOS_BIT_COUNT)
+    }
+}
+
+const fn build_trie() -> [[u16; 2]; TRIE_NODE_COUNT] {
+    let mut trie = [[TRIE_EMPTY; 2]; TRIE_NODE_COUNT];
+    let mut next_node = 1usize;
+    let mut symbol = 0usize;
+
+    while symbol <= ENCODE_CODES.len() {
+        let (bits, bit_count) = code_for(symbol);
+        let mut remaining = bit_count;
+        let mut node = 0usize;
+
+        while remaining != 0 {
+            remaining -= 1;
+            let branch = ((bits >> remaining) & 1) as usize;
+            if remaining == 0 {
+                assert!(trie[node][branch] == TRIE_EMPTY);
+                trie[node][branch] = TRIE_LEAF | symbol as u16;
+            } else {
+                let edge = trie[node][branch];
+                if edge == TRIE_EMPTY {
+                    assert!(next_node < TRIE_NODE_COUNT);
+                    trie[node][branch] = next_node as u16;
+                    node = next_node;
+                    next_node += 1;
+                } else {
+                    assert!(edge & TRIE_LEAF == 0);
+                    assert!((edge as usize) < TRIE_NODE_COUNT);
+                    node = edge as usize;
+                }
+            }
+        }
+        symbol += 1;
+    }
+
+    assert!(next_node == TRIE_NODE_COUNT);
+    trie
+}
+
+const fn build_tables() -> DecoderTables {
+    let trie = build_trie();
+    let mut fast = [TRIE_EMPTY; FAST_TABLE_LEN];
+    let mut prefix = 0usize;
+
+    while prefix < FAST_TABLE_LEN {
+        let mut node = 0usize;
+        let mut used = 0u8;
+        let mut terminal = false;
+
+        while used < FAST_BITS {
+            let shift = FAST_BITS - used - 1;
+            let branch = (prefix >> shift) & 1;
+            let edge = trie[node][branch];
+            used += 1;
+
+            if edge == TRIE_EMPTY {
+                terminal = true;
+                break;
+            }
+            if edge & TRIE_LEAF != 0 {
+                let symbol = edge & (TRIE_LEAF - 1);
+                if symbol < EOS_SYMBOL {
+                    fast[prefix] = (used as u16) << 8 | symbol;
+                }
+                terminal = true;
+                break;
+            }
+            node = edge as usize;
+        }
+
+        if !terminal {
+            fast[prefix] = TRIE_LEAF | node as u16;
+        }
+        assert!(fast[prefix] != TRIE_EMPTY);
+        prefix += 1;
+    }
+
+    DecoderTables { fast, trie }
+}
+
+enum Decoded {
+    Symbol { symbol: u16, bit_count: u8 },
+    Incomplete,
+}
+
+fn decode_symbol(bits: u64, bit_count: u8) -> Decoded {
+    let (mut node, mut used) = if bit_count >= FAST_BITS {
+        let prefix = (bits >> (64 - FAST_BITS)) as usize;
+        let entry = DECODER_TABLES.fast[prefix];
+        if entry == TRIE_EMPTY {
+            return Decoded::Incomplete;
+        }
+        if entry & TRIE_LEAF == 0 {
+            let encoded_count = entry >> 8;
+            let Ok(encoded_count) = u8::try_from(encoded_count) else {
+                return Decoded::Incomplete;
+            };
+            return Decoded::Symbol {
+                symbol: entry & u16::from(u8::MAX),
+                bit_count: encoded_count,
+            };
+        }
+        (usize::from(entry & (TRIE_LEAF - 1)), FAST_BITS)
+    } else {
+        (0usize, 0u8)
+    };
+
+    while used < bit_count {
+        let shift = 63 - u32::from(used);
+        let branch = ((bits >> shift) & 1) as usize;
+        let edge = DECODER_TABLES.trie[node][branch];
+        used += 1;
+
+        if edge == TRIE_EMPTY {
+            return Decoded::Incomplete;
+        }
+        if edge & TRIE_LEAF != 0 {
+            return Decoded::Symbol {
+                symbol: edge & (TRIE_LEAF - 1),
+                bit_count: used,
+            };
+        }
+        node = usize::from(edge);
+    }
+
+    Decoded::Incomplete
+}
+
+pub struct DecodeIter<'a> {
+    content: &'a [u8],
+    byte_pos: usize,
+    bits: u64,
+    bit_count: u8,
+    #[cfg(test)]
+    symbol_end: usize,
+    finished: bool,
+}
+
+impl DecodeIter<'_> {
+    fn refill(&mut self) {
+        if self.bit_count == 0 {
+            let Some(remaining) = self.content.get(self.byte_pos..) else {
+                return;
+            };
+            if let [a, b, c, d, e, f, g, h, ..] = remaining {
+                self.bits = u64::from_be_bytes([*a, *b, *c, *d, *e, *f, *g, *h]);
+                self.bit_count = 64;
+                self.byte_pos += 8;
+                return;
+            }
+        }
+
+        if self.bit_count <= 32 {
+            let Some(remaining) = self.content.get(self.byte_pos..) else {
+                return;
+            };
+            if let [a, b, c, d, ..] = remaining {
+                let value = u64::from(u32::from_be_bytes([*a, *b, *c, *d]));
+                self.bits |= value << u32::from(32 - self.bit_count);
+                self.bit_count += 32;
+                self.byte_pos += 4;
+            }
+        }
+
+        while self.bit_count < EOS_BIT_COUNT as u8 {
+            let Some(byte) = self.content.get(self.byte_pos).copied() else {
+                break;
+            };
+            self.bits |= u64::from(byte) << u32::from(56 - self.bit_count);
+            self.bit_count += 8;
+            self.byte_pos += 1;
+        }
+    }
+
+    fn consume(&mut self, count: u8) -> bool {
+        if count == 0 || count >= 64 {
+            return false;
+        }
+        let Some(remaining) = self.bit_count.checked_sub(count) else {
+            return false;
+        };
+        self.bits <<= u32::from(count);
+        self.bit_count = remaining;
+        #[cfg(test)]
+        {
+            self.symbol_end = self.symbol_end.saturating_add(usize::from(count));
+        }
+        true
+    }
+
+    fn remaining_bits(&self) -> usize {
+        let Some(unread_bytes) = self.content.len().checked_sub(self.byte_pos) else {
+            return usize::MAX;
+        };
+        let Some(unread_bits) = unread_bytes.checked_mul(8) else {
+            return usize::MAX;
+        };
+        match unread_bits.checked_add(usize::from(self.bit_count)) {
+            Some(remaining) => remaining,
+            None => usize::MAX,
+        }
+    }
+
+    fn finish_tail(&mut self) -> Option<Result<u8, Error>> {
+        self.finished = true;
+        let padding = self.remaining_bits();
+        if padding == 0 {
+            return None;
+        }
+        if padding > 7 {
+            return Some(Err(Error::InvalidPadding(padding)));
+        }
+
+        let shift = 64 - padding;
+        let expected = u64::MAX << shift;
+        if self.bits & expected == expected {
+            None
+        } else {
+            Some(Err(Error::InvalidPadding(padding)))
+        }
+    }
+}
+
+impl Iterator for DecodeIter<'_> {
     type Item = Result<u8, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match HPACK_STRING.decode_next(&mut self.bit_pos, self.content) {
-            Ok(Some(x)) => Some(Ok(x)),
-            Err(err) => Some(Err(err)),
-            Ok(None) => None,
+        if self.finished {
+            return None;
+        }
+
+        self.refill();
+        if self.bit_count == 0 {
+            self.finished = true;
+            return None;
+        }
+
+        match decode_symbol(self.bits, self.bit_count) {
+            Decoded::Symbol {
+                symbol: EOS_SYMBOL, ..
+            } => {
+                self.finished = true;
+                Some(Err(Error::Eos))
+            }
+            Decoded::Symbol { symbol, bit_count } => {
+                let Ok(symbol) = u8::try_from(symbol) else {
+                    self.finished = true;
+                    return Some(Err(Error::Eos));
+                };
+                if self.consume(bit_count) {
+                    Some(Ok(symbol))
+                } else {
+                    self.finish_tail()
+                }
+            }
+            Decoded::Incomplete => self.finish_tail(),
         }
     }
 }
@@ -317,9 +693,20 @@ pub trait HpackStringDecode {
 
 impl HpackStringDecode for Vec<u8> {
     fn hpack_decode(&self) -> DecodeIter<'_> {
+        self.as_slice().hpack_decode()
+    }
+}
+
+impl HpackStringDecode for [u8] {
+    fn hpack_decode(&self) -> DecodeIter<'_> {
         DecodeIter {
-            bit_pos: BitWindow::new(),
             content: self,
+            byte_pos: 0,
+            bits: 0,
+            bit_count: 0,
+            #[cfg(test)]
+            symbol_end: 0,
+            finished: false,
         }
     }
 }
@@ -329,42 +716,46 @@ mod tests {
     #![allow(clippy::identity_op)]
 
     use super::*;
+    use crate::qpack::prefix_string::HpackStringEncode;
 
     #[test]
     fn test_read_bits() {
         // Basic case (within one byte, aligned with start)
-        assert_eq!(read_bits(&[0b1010_1010], 0, 0, 5), Ok(0b1_0101));
+        assert_eq!(oracle::read_bits(&[0b1010_1010], 0, 0, 5), Ok(0b1_0101));
         // Within one byte, aligned with end of byte
-        assert_eq!(read_bits(&[0b1010_1010], 0, 3, 5), Ok(0b1010));
+        assert_eq!(oracle::read_bits(&[0b1010_1010], 0, 3, 5), Ok(0b1010));
         // Within one byte, unaligned with either side
-        assert_eq!(read_bits(&[0b1010_1010], 0, 3, 3), Ok(0b10));
+        assert_eq!(oracle::read_bits(&[0b1010_1010], 0, 3, 3), Ok(0b10));
         // `len` == 0
-        assert_eq!(read_bits(&[0b1010_1010], 0, 0, 0), Err(()));
+        assert_eq!(oracle::read_bits(&[0b1010_1010], 0, 0, 0), Err(()));
         // `len` > 8
-        assert_eq!(read_bits(&[0b1010_1010], 0, 0, 9), Err(()));
+        assert_eq!(oracle::read_bits(&[0b1010_1010], 0, 0, 9), Err(()));
 
         // `bit_offset` > 7
         assert_eq!(
-            read_bits(&[0b1010_1010, 0b1010_1010], 0, 8, 8),
+            oracle::read_bits(&[0b1010_1010, 0b1010_1010], 0, 8, 8),
             Ok(0b1010_1010)
         );
         // Read spanning two bytes
         assert_eq!(
-            read_bits(&[0b1010_1010, 0b1010_1010], 0, 4, 8),
+            oracle::read_bits(&[0b1010_1010, 0b1010_1010], 0, 4, 8),
             Ok(0b1010_1010)
         );
         // Read with non-zero `byte_offset`
         assert_eq!(
-            read_bits(&[0b1010_1010, 0b1010_1010], 1, 0, 5),
+            oracle::read_bits(&[0b1010_1010, 0b1010_1010], 1, 0, 5),
             Ok(0b1_0101)
         );
         // Read with `bit_offset` > 7, unaligned with either side
         assert_eq!(
-            read_bits(&[0b1010_1010, 0b1010_1010], 0, 10, 5),
+            oracle::read_bits(&[0b1010_1010, 0b1010_1010], 0, 10, 5),
             Ok(0b1_0101)
         );
         // Read with `bit_offset` > 7 past end of input slice
-        assert_eq!(read_bits(&[0b1010_1010, 0b1010_1010], 0, 16, 5), Err(()));
+        assert_eq!(
+            oracle::read_bits(&[0b1010_1010, 0b1010_1010], 0, 16, 5),
+            Err(())
+        );
     }
 
     macro_rules! decoding {
@@ -451,12 +842,12 @@ mod tests {
         120 => (0b111_1001 << 1) | /* padding */ 0b1; // 'x'
         121 => (0b111_1010 << 1) | /* padding */ 0b1; // 'y'
         122 => (0b111_1011 << 1) | /* padding */ 0b1; // 'z'
-        38 => 0b1111_1000, /* padding */ 0b1111_1111; // '&'
-        42 => 0b1111_1001, /* padding */ 0b1111_1111; // '*'
-        44 => 0b1111_1010, /* padding */ 0b1111_1111; // ','
-        59 => 0b1111_1011, /* padding */ 0b1111_1111;
-        88 => 0b1111_1100, /* padding */ 0b1111_1111; // 'X'
-        90 => 0b1111_1101, /* padding */ 0b1111_1111; // 'Z'
+        38 => 0b1111_1000; // '&'
+        42 => 0b1111_1001; // '*'
+        44 => 0b1111_1010; // ','
+        59 => 0b1111_1011;
+        88 => 0b1111_1100; // 'X'
+        90 => 0b1111_1101; // 'Z'
         33 => 0b1111_1110, (0b00 << 6) | /* padding */ 0b11_1111; // '!'
         34 => 0b1111_1110, (0b01 << 6) | /* padding */ 0b11_1111; // '"'
         40 => 0b1111_1110, (0b10 << 6) | /* padding */ 0b11_1111; // '('
@@ -557,18 +948,18 @@ mod tests {
         197 => 0b1111_1111, 0b1111_1111, (0b111_0010 << 1) | /* padding */ 0b1;
         231 => 0b1111_1111, 0b1111_1111, (0b111_0011 << 1) | /* padding */ 0b1;
         239 => 0b1111_1111, 0b1111_1111, (0b111_0100 << 1) | /* padding */ 0b1;
-        9 => 0b1111_1111, 0b1111_1111, 0b1110_1010, /* padding */ 0b1111_1111;
-        142 => 0b1111_1111, 0b1111_1111, 0b1110_1011, /* padding */ 0b1111_1111;
-        144 => 0b1111_1111, 0b1111_1111, 0b1110_1100, /* padding */ 0b1111_1111;
-        145 => 0b1111_1111, 0b1111_1111, 0b1110_1101, /* padding */ 0b1111_1111;
-        148 => 0b1111_1111, 0b1111_1111, 0b1110_1110, /* padding */ 0b1111_1111;
-        159 => 0b1111_1111, 0b1111_1111, 0b1110_1111, /* padding */ 0b1111_1111;
-        171 => 0b1111_1111, 0b1111_1111, 0b1111_0000, /* padding */ 0b1111_1111;
-        206 => 0b1111_1111, 0b1111_1111, 0b1111_0001, /* padding */ 0b1111_1111;
-        215 => 0b1111_1111, 0b1111_1111, 0b1111_0010, /* padding */ 0b1111_1111;
-        225 => 0b1111_1111, 0b1111_1111, 0b1111_0011, /* padding */ 0b1111_1111;
-        236 => 0b1111_1111, 0b1111_1111, 0b1111_0100, /* padding */ 0b1111_1111;
-        237 => 0b1111_1111, 0b1111_1111, 0b1111_0101, /* padding */ 0b1111_1111;
+        9 => 0b1111_1111, 0b1111_1111, 0b1110_1010;
+        142 => 0b1111_1111, 0b1111_1111, 0b1110_1011;
+        144 => 0b1111_1111, 0b1111_1111, 0b1110_1100;
+        145 => 0b1111_1111, 0b1111_1111, 0b1110_1101;
+        148 => 0b1111_1111, 0b1111_1111, 0b1110_1110;
+        159 => 0b1111_1111, 0b1111_1111, 0b1110_1111;
+        171 => 0b1111_1111, 0b1111_1111, 0b1111_0000;
+        206 => 0b1111_1111, 0b1111_1111, 0b1111_0001;
+        215 => 0b1111_1111, 0b1111_1111, 0b1111_0010;
+        225 => 0b1111_1111, 0b1111_1111, 0b1111_0011;
+        236 => 0b1111_1111, 0b1111_1111, 0b1111_0100;
+        237 => 0b1111_1111, 0b1111_1111, 0b1111_0101;
         199 => 0b1111_1111, 0b1111_1111, 0b1111_0110, (0b0 << 7) | /* padding */ 0b111_1111;
         207 => 0b1111_1111, 0b1111_1111, 0b1111_0110, (0b1 << 7) | /* padding */ 0b111_1111;
         234 => 0b1111_1111, 0b1111_1111, 0b1111_0111, (0b0 << 7) | /* padding */ 0b111_1111;
@@ -641,6 +1032,78 @@ mod tests {
         22 => 0b1111_1111, 0b1111_1111, 0b1111_1111, (0b11_1110 << 2) | /* padding */ 0b11;
         // 256 => 0b1111_1111, 0b1111_1111, 0b1111_1111, (0b11_1111 << 2) | /* padding */ 0b11;
         ];
+    }
+
+    #[test]
+    fn exact_byte_code_has_no_padding() {
+        let encoded = vec![0b1111_1000];
+        let mut decoded = encoded.hpack_decode();
+
+        assert_eq!(decoded.next(), Some(Ok(b'&')));
+        assert_eq!(decoded.symbol_end, 8);
+        assert_eq!(decoded.next(), None);
+    }
+
+    #[test]
+    fn rejects_invalid_huffman_terminators() {
+        let invalid_padding: Result<Vec<_>, Error> = vec![0b0001_1010].hpack_decode().collect();
+        assert_eq!(invalid_padding, Err(Error::InvalidPadding(3)));
+
+        let overlong_padding: Result<Vec<_>, Error> =
+            vec![0b1111_1000, 0b1111_1111].hpack_decode().collect();
+        assert_eq!(overlong_padding, Err(Error::InvalidPadding(8)));
+
+        let eos: Result<Vec<_>, Error> = vec![0xff, 0xff, 0xff, 0xff].hpack_decode().collect();
+        assert_eq!(eos, Err(Error::Eos));
+
+        let eos_followed_by_data: Result<Vec<_>, Error> =
+            vec![0xff, 0xff, 0xff, 0xfc].hpack_decode().collect();
+        assert_eq!(eos_followed_by_data, Err(Error::Eos));
+
+        let encoded = vec![0xff, 0xff, 0xff, 0xfc];
+        let mut decoded = encoded.hpack_decode();
+        assert_eq!(decoded.next(), Some(Err(Error::Eos)));
+        assert_eq!(decoded.next(), None);
+    }
+
+    #[test]
+    fn accepts_zero_through_seven_padding_bits() {
+        // These symbols have code lengths of 8, 7, 6, 5, 12, 11, 10,
+        // and 25 bits, respectively.
+        for symbol in [b'&', b'B', b' ', b'a', b'#', b'\'', b'!', 199] {
+            let encoded = vec![symbol].hpack_encode().unwrap();
+            let decoded: Result<Vec<_>, Error> = encoded.hpack_decode().collect();
+            assert_eq!(decoded, Ok(vec![symbol]));
+        }
+    }
+
+    #[test]
+    fn every_accepted_short_input_is_canonical() {
+        for value in 0u16..=u16::MAX {
+            let bytes = value.to_be_bytes();
+            for encoded in [&bytes[..1], &bytes[..]] {
+                let decoded: Result<Vec<_>, Error> = encoded.to_vec().hpack_decode().collect();
+                if let Ok(decoded) = decoded {
+                    assert_eq!(decoded.hpack_encode().unwrap(), encoded);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_decoder_matches_recursive_oracle_for_short_inputs() {
+        assert_eq!(
+            <[u8]>::hpack_decode(&[]).collect::<Result<Vec<_>, _>>(),
+            oracle::decode(&[])
+        );
+
+        for value in 0u16..=u16::MAX {
+            let bytes = value.to_be_bytes();
+            for encoded in [&bytes[..1], &bytes[..]] {
+                let decoded: Result<Vec<_>, Error> = encoded.hpack_decode().collect();
+                assert_eq!(decoded, oracle::decode(encoded), "input {encoded:02x?}");
+            }
+        }
     }
 
     /**
@@ -1712,14 +2175,12 @@ mod tests {
             0b1111_1111,
             0b1111_1011,
             (0b10 << 6)
-                // 256 eof |11111111|11111111|11111111|111111
+                // pad symbol 255 to the next byte boundary
                 + 0b11_1111,
-            0b1111_1111,
-            0b1111_1111,
-            0b1111_1111,
         ];
         let expected = (0u8..=255).collect();
         let res: Result<Vec<_>, Error> = bytes.hpack_decode().collect();
+        assert_eq!(res, oracle::decode(&bytes));
         assert_eq!(res, Ok(expected));
     }
 }

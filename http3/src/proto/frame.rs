@@ -4,7 +4,6 @@ use std::{
 };
 
 use bytes::{Buf, BufMut, Bytes};
-use smallvec::SmallVec;
 #[cfg(feature = "tracing")]
 use tracing::trace;
 
@@ -22,6 +21,7 @@ pub enum FrameError {
     UnsupportedFrame(u64), // Known frames that should generate an error
     UnknownFrame(u64),     // Unknown frames that should be ignored
     InvalidFrameValue,
+    ExcessiveLoad { len: u64, limit: usize },
     Incomplete(usize),
     Settings(SettingsError),
     InvalidStreamId(InvalidStreamId),
@@ -39,6 +39,9 @@ impl fmt::Display for FrameError {
             }
             FrameError::UnknownFrame(c) => write!(f, "frame 0x{:x} ignored", c),
             FrameError::InvalidFrameValue => write!(f, "frame value is invalid"),
+            FrameError::ExcessiveLoad { len, limit } => {
+                write!(f, "frame payload length {len} exceeds local limit {limit}")
+            }
             FrameError::Incomplete(x) => write!(f, "internal error: frame incomplete {}", x),
             FrameError::Settings(x) => write!(f, "invalid settings: {}", x),
             FrameError::InvalidStreamId(x) => write!(f, "{}", x),
@@ -85,11 +88,36 @@ impl Frame<PayloadLen> {
 
     /// Decodes a Frame from the stream according to <https://www.rfc-editor.org/rfc/rfc9114#section-7.1>
     pub fn decode<T: Buf>(buf: &mut T) -> Result<Self, FrameError> {
+        let max_addressable = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
+        Self::decode_with_limits(buf, max_addressable, usize::MAX)
+    }
+
+    #[cfg(test)]
+    fn decode_with_max_addressable<T: Buf>(
+        buf: &mut T,
+        max_addressable: u64,
+    ) -> Result<Self, FrameError> {
+        Self::decode_with_limits(buf, max_addressable, usize::MAX)
+    }
+
+    pub(crate) fn decode_with_max_field_section_size<T: Buf>(
+        buf: &mut T,
+        max_field_section_size: usize,
+    ) -> Result<Self, FrameError> {
+        let max_addressable = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
+        Self::decode_with_limits(buf, max_addressable, max_field_section_size)
+    }
+
+    fn decode_with_limits<T: Buf>(
+        buf: &mut T,
+        max_addressable: u64,
+        max_field_section_size: usize,
+    ) -> Result<Self, FrameError> {
         let remaining = buf.remaining();
-        let incomplete = remaining
+        let next_byte = remaining
             .checked_add(1)
             .ok_or(FrameError::InvalidFrameValue)?;
-        let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(incomplete))?;
+        let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(next_byte))?;
 
         // Webtransport streams need special handling as they have no length.
         //
@@ -101,18 +129,15 @@ impl Frame<PayloadLen> {
             return Ok(Frame::WebTransportStream(SessionId::decode(buf)?));
         }
 
-        let len = buf
+        let encoded_len = buf
             .get_var()
-            .map_err(|_| FrameError::Incomplete(incomplete))?;
+            .map_err(|_| FrameError::Incomplete(next_byte))?;
 
-        if ty == FrameType::DATA {
-            let len = len.try_into().map_err(|_| FrameError::InvalidFrameValue)?;
-            return Ok(Frame::Data(PayloadLen(len)));
-        }
-
-        // These HTTP/2 frame types are forbidden in HTTP/3. Their payload does
-        // not need to be buffered before reporting H3_FRAME_UNEXPECTED.
-        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
+        // These HTTP/2 frame types are forbidden even if their payload has not
+        // arrived yet. Avoid buffering it before reporting H3_FRAME_UNEXPECTED.
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
+        //# These frame types MUST NOT be sent, and their receipt MUST be treated
+        //# as a connection error of type H3_FRAME_UNEXPECTED.
         if matches!(
             ty,
             FrameType::H2_PRIORITY
@@ -123,15 +148,32 @@ impl Frame<PayloadLen> {
             return Err(FrameError::UnsupportedFrame(ty.0));
         }
 
-        let len: usize = len.try_into().map_err(|_| FrameError::InvalidFrameValue)?;
+        if matches!(ty, FrameType::HEADERS | FrameType::PUSH_PROMISE)
+            && encoded_len > u64::try_from(max_field_section_size).unwrap_or(u64::MAX)
+        {
+            // QPACK field sections are otherwise buffered before decoding. Stop
+            // at the frame header instead of granting credit for an unbounded
+            // payload.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4
+            return Err(FrameError::ExcessiveLoad {
+                len: encoded_len,
+                limit: max_field_section_size,
+            });
+        }
+
+        let len = payload_len(encoded_len, max_addressable)?;
+
+        if ty == FrameType::DATA {
+            return Ok(Frame::Data(len.into()));
+        }
+
+        let prefix_len = remaining
+            .checked_sub(buf.remaining())
+            .ok_or(FrameError::Malformed)?;
+        let frame_len = buffered_frame_len(prefix_len, encoded_len, max_addressable)?;
         if buf.remaining() < len {
-            let header_len = remaining
-                .checked_sub(buf.remaining())
-                .ok_or(FrameError::InvalidFrameValue)?;
-            let expected = header_len
-                .checked_add(len)
-                .ok_or(FrameError::InvalidFrameValue)?;
-            return Err(FrameError::Incomplete(expected));
+            return Err(FrameError::Incomplete(frame_len));
         }
 
         let mut payload = buf.take(len);
@@ -146,10 +188,6 @@ impl Frame<PayloadLen> {
             FrameType::PUSH_PROMISE => Ok(Frame::PushPromise(PushPromise::decode(&mut payload)?)),
             FrameType::GOAWAY => Ok(Frame::Goaway(VarInt::decode(&mut payload)?)),
             FrameType::MAX_PUSH_ID => Ok(Frame::MaxPushId(payload.get_var()?.try_into()?)),
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
-            //# These frame
-            //# types MUST NOT be sent, and their receipt MUST be treated as a
-            //# connection error of type H3_FRAME_UNEXPECTED.
             FrameType::WEBTRANSPORT_BI_STREAM | FrameType::DATA => Err(FrameError::Malformed),
             _ => {
                 buf.advance(len);
@@ -165,7 +203,7 @@ impl Frame<PayloadLen> {
             trace!(
                 "got frame {:?}, len: {}, remaining: {}",
                 _frame,
-                len,
+                encoded_len,
                 buf.remaining()
             );
         }
@@ -191,11 +229,13 @@ impl Frame<PayloadLen> {
             return Ok(None);
         }
 
-        let len = buf
+        let encoded_len = buf
             .get_var()
-            .map_err(|_| FrameError::Incomplete(incomplete))?
-            .try_into()
-            .map_err(|_| FrameError::InvalidFrameValue)?;
+            .map_err(|_| FrameError::Incomplete(incomplete))?;
+        // Only the remaining payload length needs to fit usize. FrameStream
+        // separately enforces the configured limit on the whole field section.
+        let max_addressable = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
+        let len = payload_len(encoded_len, max_addressable)?;
         Ok(Some(PayloadLen(len)))
     }
 
@@ -221,6 +261,33 @@ impl Frame<PayloadLen> {
         buf.get_var()
             .map(|len| Some((ty.0, len)))
             .map_err(|_| FrameError::Incomplete(incomplete))
+    }
+}
+
+fn payload_len(encoded_len: u64, max_addressable: u64) -> Result<usize, FrameError> {
+    if encoded_len > max_addressable {
+        return Err(excessive_frame_length(encoded_len, max_addressable));
+    }
+    usize::try_from(encoded_len).map_err(|_| excessive_frame_length(encoded_len, max_addressable))
+}
+
+fn buffered_frame_len(
+    prefix_len: usize,
+    encoded_len: u64,
+    max_addressable: u64,
+) -> Result<usize, FrameError> {
+    let prefix_len = u64::try_from(prefix_len).map_err(|_| FrameError::InvalidFrameValue)?;
+    let frame_len = prefix_len
+        .checked_add(encoded_len)
+        .filter(|frame_len| *frame_len <= max_addressable)
+        .ok_or_else(|| excessive_frame_length(encoded_len, max_addressable))?;
+    usize::try_from(frame_len).map_err(|_| excessive_frame_length(encoded_len, max_addressable))
+}
+
+fn excessive_frame_length(encoded_len: u64, max_addressable: u64) -> FrameError {
+    FrameError::ExcessiveLoad {
+        len: encoded_len,
+        limit: usize::try_from(max_addressable).unwrap_or(usize::MAX),
     }
 }
 
@@ -543,11 +610,18 @@ macro_rules! setting_identifiers {
 }
 
 setting_identifiers! {
-    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-5>
+    /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` from
+    /// [RFC 9204 Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
     QPACK_MAX_TABLE_CAPACITY = 0x1,
-    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-5>
+    /// `SETTINGS_QPACK_BLOCKED_STREAMS` from
+    /// [RFC 9204 Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
     QPACK_MAX_BLOCKED_STREAMS = 0x7,
-    /// <https://datatracker.ietf.org/doc/html/rfc9114#section-7.2.4.1>
+    /// `SETTINGS_MAX_FIELD_SECTION_SIZE` from
+    /// [RFC 9114 Section 7.2.4.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1).
+    ///
+    /// The associated constant keeps its historical HTTP/2 name for API
+    /// compatibility; HTTP/3 renamed the setting without changing code point
+    /// `0x06`.
     MAX_HEADER_LIST_SIZE = 0x6,
     /// <https://datatracker.ietf.org/doc/html/rfc9220#section-5>
     ENABLE_CONNECT_PROTOCOL = 0x8,
@@ -561,19 +635,12 @@ setting_identifiers! {
     WEBTRANSPORT_MAX_SESSIONS = 0x2b603743,
 }
 
-const SETTINGS_INLINE: usize = 16;
-
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Settings {
-    entries: SmallVec<[(SettingId, u64); SETTINGS_INLINE]>,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            entries: SmallVec::new(),
-        }
-    }
+    // SETTINGS is exchanged once per connection. Keeping its variable-length
+    // storage out of the generic `Frame` layout avoids making every request
+    // stream carry the largest possible inline SETTINGS representation.
+    entries: Vec<(SettingId, u64)>,
 }
 
 impl FrameHeader for Settings {
@@ -718,6 +785,14 @@ mod tests {
     use assert_matches::assert_matches;
 
     use super::*;
+    use crate::stream::WriteBuf;
+
+    fn frame_header(ty: FrameType, len: u64) -> Cursor<Vec<u8>> {
+        let mut wire = Vec::new();
+        ty.encode(&mut wire);
+        VarInt::try_from(len).unwrap().encode(&mut wire);
+        Cursor::new(wire)
+    }
 
     #[test]
     fn unknown_frame_type() {
@@ -748,6 +823,63 @@ mod tests {
     }
 
     #[test]
+    fn frame_lengths_respect_the_address_space_boundary() {
+        let max_32_bit = u64::from(u32::MAX);
+        let max_addressable = usize::try_from(max_32_bit).unwrap();
+
+        for encoded_len in [max_32_bit - 1, max_32_bit] {
+            assert_matches!(
+                Frame::decode_with_max_addressable(
+                    &mut frame_header(FrameType::DATA, encoded_len),
+                    max_32_bit,
+                ),
+                Ok(Frame::Data(PayloadLen(len)))
+                    if len == usize::try_from(encoded_len).unwrap()
+            );
+        }
+
+        assert_matches!(
+                Frame::decode_with_max_addressable(
+                    &mut frame_header(FrameType::DATA, max_32_bit + 1),
+                    max_32_bit,
+                ),
+            Err(FrameError::ExcessiveLoad {
+                len,
+                limit,
+            }) if len == max_32_bit + 1 && limit == max_addressable
+        );
+        for encoded_len in [max_32_bit - 1, max_32_bit] {
+            assert_matches!(
+                Frame::decode_with_max_addressable(
+                    &mut frame_header(FrameType::HEADERS, encoded_len),
+                    max_32_bit,
+                ),
+                Err(FrameError::ExcessiveLoad {
+                    len,
+                    limit,
+                }) if len == encoded_len && limit == max_addressable
+            );
+        }
+        for encoded_len in [max_32_bit - 1, max_32_bit, max_32_bit + 1] {
+            assert_matches!(
+                Frame::decode_with_max_addressable(
+                    &mut frame_header(FrameType(0x21), encoded_len),
+                    max_32_bit,
+                ),
+                Err(FrameError::ExcessiveLoad {
+                    len,
+                    limit,
+                }) if len == encoded_len && limit == max_addressable
+            );
+        }
+
+        // DATA payloads are streamed and only their payload length must fit.
+        // Buffered frames also need room for the type and length prefix. A
+        // declared length must never be narrowed or allowed to change framing.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+    }
+
+    #[test]
     fn unknown_prefix_keeps_wire_length_as_u64() {
         let mut encoded = Vec::new();
         FrameType::RESERVED.encode(&mut encoded);
@@ -762,6 +894,39 @@ mod tests {
 
     #[cfg(target_pointer_width = "32")]
     #[test]
+    fn native_32_bit_frame_lengths_do_not_truncate() {
+        let max = u64::from(u32::MAX);
+        assert_matches!(
+            Frame::decode(&mut frame_header(FrameType::DATA, max)),
+            Ok(Frame::Data(PayloadLen(len))) if len == usize::MAX
+        );
+        assert_matches!(
+            Frame::decode(&mut frame_header(FrameType::DATA, max + 1)),
+            Err(FrameError::ExcessiveLoad {
+                len,
+                limit: usize::MAX,
+            }) if len == max + 1
+        );
+        assert_matches!(
+            Frame::decode(&mut frame_header(FrameType::HEADERS, max)),
+            Err(FrameError::ExcessiveLoad {
+                len,
+                limit: usize::MAX,
+            }) if len == max
+        );
+        for encoded_len in [max - 1, max, max + 1] {
+            assert_matches!(
+                Frame::decode(&mut frame_header(FrameType(0x21), encoded_len)),
+                Err(FrameError::ExcessiveLoad {
+                    len,
+                    limit: usize::MAX,
+                }) if len == encoded_len
+            );
+        }
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
     fn frame_length_larger_than_usize_is_rejected() {
         let mut encoded = Vec::new();
         FrameType::HEADERS.encode(&mut encoded);
@@ -769,11 +934,17 @@ mod tests {
 
         assert_matches!(
             Frame::decode_headers_prefix(&mut Cursor::new(&encoded)),
-            Err(FrameError::InvalidFrameValue)
+            Err(FrameError::ExcessiveLoad {
+                limit: usize::MAX,
+                ..
+            })
         );
         assert_matches!(
             Frame::decode(&mut Cursor::new(encoded)),
-            Err(FrameError::InvalidFrameValue)
+            Err(FrameError::ExcessiveLoad {
+                limit: usize::MAX,
+                ..
+            })
         );
     }
 
@@ -820,6 +991,30 @@ mod tests {
             ],
             Frame::Settings(recv_settings),
         );
+    }
+
+    #[test]
+    fn write_buf_streams_push_promise_payload_once() {
+        let payload = Bytes::from(vec![0x2a; 128]);
+        let expected = Frame::<Bytes>::PushPromise(PushPromise {
+            id: 7,
+            encoded: payload.clone(),
+        });
+        let mut write = WriteBuf::<Bytes>::from(Frame::<Bytes>::PushPromise(PushPromise {
+            id: 7,
+            encoded: payload,
+        }));
+        let mut wire = write.copy_to_bytes(write.remaining());
+
+        assert_eq!(Frame::<PayloadLen>::decode(&mut wire).unwrap(), expected);
+        assert!(!wire.has_remaining());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn cold_settings_do_not_expand_hot_frames() {
+        assert!(std::mem::size_of::<Settings>() <= 32);
+        assert!(std::mem::size_of::<Frame<Bytes>>() <= 64);
     }
 
     #[test]

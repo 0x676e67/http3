@@ -5,6 +5,7 @@ members = [
     "http3-datagram",
 
     # Internal
+    "bench",
     "examples",
     "interop",
 ]
@@ -51,13 +52,17 @@ proptest = "1"
 quic = { version = "0.11", default-features = false }
 quinn = { version = "0.11", default-features = false }
 quinn-proto = { version = "0.11", default-features = false }
-rcgen = "=0.14.5"
+rcgen = "=0.14.9"
 rustls = { version = "0.23.42", default-features = false }
 rustls-native-certs = "0.8"
 smallvec = "1.15.0"
 structopt = "0.3"
 tokio = { version = "1.53.1", default-features = false }
-tokio-util = "0.7.19"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3", default-features = false }
 tracing-tree = "0.4"
+
+[profile.bench]
+opt-level = 3
+codegen-units = 1
+incremental = false

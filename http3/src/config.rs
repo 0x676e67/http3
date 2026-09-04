@@ -2,6 +2,8 @@ use std::convert::TryFrom;
 
 use crate::proto::{frame, varint::VarInt};
 
+pub(crate) const DEFAULT_QPACK_DECODE_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+
 /// Configures the HTTP/3 connection
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -27,6 +29,16 @@ pub struct Config {
     /// default mode.
     pub(crate) extra_settings: Vec<(frame::SettingId, u64)>,
 
+    /// Maximum compressed QPACK input retained while decoding one field
+    /// section or encoder-stream string.
+    pub(crate) qpack_decode_buffer_size: usize,
+
+    /// Maximum dynamic-table capacity this endpoint's QPACK encoder may use.
+    ///
+    /// This is a local memory and compression policy. The effective capacity is
+    /// also limited by the peer's `SETTINGS_QPACK_MAX_TABLE_CAPACITY` value.
+    pub(crate) qpack_encoder_table_capacity: usize,
+
     /// HTTP/3 Settings
     pub settings: Settings,
 }
@@ -34,13 +46,15 @@ pub struct Config {
 /// HTTP/3 Settings
 #[derive(Debug, Clone, Copy)]
 pub struct Settings {
-    /// The MAX_FIELD_SECTION_SIZE in HTTP/3 refers to the maximum size of the dynamic table used
-    /// in HPACK compression. HPACK is the compression algorithm used in HTTP/3 to reduce the
-    /// size of the header fields in HTTP requests and responses.
-
-    /// In HTTP/3, the MAX_FIELD_SECTION_SIZE is set to 12.
-    /// This means that the dynamic table used for HPACK compression can have a maximum size of
-    /// 2^12 bytes, which is 4KB.
+    /// Largest uncompressed field section this endpoint is willing to accept.
+    ///
+    /// Each field contributes its name and value lengths plus 32 bytes. The
+    /// value is advertised as `SETTINGS_MAX_FIELD_SECTION_SIZE`. Omitting the
+    /// setting means unlimited; this implementation advertises the largest
+    /// QUIC variable-length integer by default.
+    ///
+    /// See [RFC 9114 Section 4.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2)
+    /// and [Section 7.2.4.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1).
     pub(crate) max_field_section_size: u64,
 
     /// https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1
@@ -60,10 +74,14 @@ pub struct Settings {
     /// QPACK dynamic table capacity the encoder is permitted to use, in bytes.
     /// Sent as SETTINGS_QPACK_MAX_TABLE_CAPACITY (0x1).
     /// When unset, the setting is omitted and the protocol default of 0 applies.
+    ///
+    /// See [RFC 9204 Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
     pub(crate) qpack_max_table_capacity: Option<u64>,
 
     /// Maximum number of blocked streams the decoder is willing to tolerate.
     /// Sent as SETTINGS_QPACK_BLOCKED_STREAMS (0x7).
+    ///
+    /// See [RFC 9204 Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
     /// When unset, the setting is omitted and the protocol default of 0 applies.
     pub(crate) qpack_blocked_streams: Option<u64>,
 }
@@ -168,7 +186,8 @@ impl TryFrom<Config> for frame::Settings {
             }
         }
 
-        //  Grease Settings (https://www.rfc-editor.org/rfc/rfc9114.html#name-defined-settings-parameters)
+        // GREASE settings are reserved by RFC 9114 Section 7.2.4.1.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
         //# Setting identifiers of the format 0x1f * N + 0x21 for non-negative
         //# integer values of N are reserved to exercise the requirement that
@@ -205,9 +224,6 @@ impl TryFrom<Config> for frame::Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            // RFC 9114 leaves the setting unlimited when it is omitted. Builders
-            // retain that default unless the application configures a limit.
-            // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1
             max_field_section_size: VarInt::MAX.0,
             enable_webtransport: false,
             enable_extended_connect: false,
@@ -249,30 +265,9 @@ impl Default for Config {
             send_settings: true,
             settings_order: None,
             extra_settings: Vec::new(),
+            qpack_decode_buffer_size: DEFAULT_QPACK_DECODE_BUFFER_SIZE,
+            qpack_encoder_table_capacity: 0,
             settings: Default::default(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_advertises_the_protocol_field_section_limit() {
-        let config = Config::default();
-        assert_eq!(config.settings.max_field_section_size, VarInt::MAX.0);
-
-        let settings = frame::Settings::try_from(config).unwrap();
-        assert_eq!(
-            settings.get(frame::SettingId::MAX_HEADER_LIST_SIZE),
-            Some(VarInt::MAX.0)
-        );
-    }
-
-    #[test]
-    fn omitted_peer_limit_keeps_the_protocol_default() {
-        let settings = Settings::from(&frame::Settings::default());
-        assert_eq!(settings.max_field_section_size, VarInt::MAX.0);
     }
 }

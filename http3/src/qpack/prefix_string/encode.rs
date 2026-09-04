@@ -1,129 +1,126 @@
-use super::BitWindow;
+/*
+ * The bit accumulator in `encode_into` is adapted from hyperium/h2:
+ * https://github.com/hyperium/h2/blob/69a678abc731ebc9780b41b073d47cc9f154d7b9/src/hpack/huffman/encode.rs
+ * https://github.com/hyperium/h2/blob/69a678abc731ebc9780b41b073d47cc9f154d7b9/LICENSE
+ *
+ * Copyright (c) 2017 h2 authors
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+use bytes::BufMut;
 
 #[derive(Debug, PartialEq)]
-pub struct Error {
-    buffer_pos: BitWindow,
-    len: usize,
-    capacity: usize,
-    text: String,
+pub enum Error {
+    EncodedLengthOverflow,
 }
 
-#[derive(Clone, Debug)]
-struct EncodeValue {
-    buffer: &'static [u8],
-    bit_count: u32,
+pub(super) fn encoded_len(value: &[u8]) -> Result<usize, Error> {
+    let mut encoded_len = 0usize;
+    let mut pending_bits = 0usize;
+
+    for code in value {
+        let bit_count = pending_bits + usize::from(ENCODE_CODE_LENGTHS[usize::from(*code)]);
+        encoded_len = encoded_len
+            .checked_add(bit_count / 8)
+            .ok_or(Error::EncodedLengthOverflow)?;
+        pending_bits = bit_count % 8;
+    }
+
+    if pending_bits != 0 {
+        encoded_len = encoded_len
+            .checked_add(1)
+            .ok_or(Error::EncodedLengthOverflow)?;
+    }
+    Ok(encoded_len)
 }
 
-#[derive(Clone, Debug)]
-struct HuffmanEncoder {
-    buffer_pos: BitWindow,
-    buffer: Vec<u8>,
-}
+pub(super) fn encode_into<B: BufMut>(value: &[u8], buf: &mut B) {
+    let mut pending = 0u64;
+    let mut pending_bits = 0usize;
 
-impl HuffmanEncoder {
-    fn new() -> HuffmanEncoder {
-        HuffmanEncoder {
-            buffer_pos: BitWindow::new(),
-            buffer: Vec::new(),
+    for code in value {
+        let index = usize::from(*code);
+        let bit_count = usize::from(ENCODE_CODE_LENGTHS[index]);
+        pending = (pending << bit_count) | u64::from(ENCODE_CODES[index]);
+        pending_bits += bit_count;
+
+        if pending_bits >= 32 {
+            let trailing_bits = pending_bits - 32;
+            buf.put_u32((pending >> trailing_bits) as u32);
+            pending = if trailing_bits == 0 {
+                0
+            } else {
+                pending & ((1u64 << trailing_bits) - 1)
+            };
+            pending_bits = trailing_bits;
         }
     }
 
-    fn ensure_free_space(&mut self, bit_count: u32) {
-        let mut end_range = self.buffer_pos.clone();
-        end_range.forwards(bit_count);
-        end_range.forwards(0);
+    if pending_bits != 0 {
+        let padding = (8 - (pending_bits % 8)) % 8;
+        pending = (pending << padding) | ((1u64 << padding) - 1);
+        pending_bits += padding;
 
-        // buffer still has enough space to work on
-        if self.buffer.len() > end_range.byte as usize {
-            return;
+        while pending_bits != 0 {
+            pending_bits -= 8;
+            buf.put_u8((pending >> pending_bits) as u8);
         }
-
-        // optimisation to grow capacity before pushing data
-        if self.buffer.capacity() <= end_range.byte as usize {
-            self.buffer.reserve(((7 * end_range.byte) / 4) as usize);
-        }
-
-        let forward =
-            end_range.byte as usize - self.buffer.len() + if end_range.bit > 0 { 1 } else { 0 };
-        for _ in 0..forward {
-            // push filler value that will end huffman decoding if not
-            // modified
-            self.buffer.push(255);
-        }
-    }
-
-    fn put(&mut self, code: u8) -> Result<(), Error> {
-        let encode_value = &HPACK_STRING[code as usize];
-
-        self.ensure_free_space(encode_value.bit_count);
-
-        let mut rest = encode_value.bit_count;
-        for i in 0..encode_value.buffer.len() {
-            let part = encode_value.buffer[i];
-
-            self.buffer_pos.forwards(if rest < 8 { rest } else { 8 });
-            rest -= self.buffer_pos.count;
-
-            write_bits(&mut self.buffer, &self.buffer_pos, part)
-        }
-
-        Ok(())
-    }
-
-    fn ends(self) -> Result<Vec<u8>, Error> {
-        Ok(self.buffer)
     }
 }
 
-/// Write bits from `value` to the `out` slice
-///
-/// Write the least significant `pos.count` bits from `value` to the position specified by
-/// `(pos.byte, pos.bit)`. Writes may span multiple bytes. `out` is expected to be long enough
-/// to write these bits; this is ensured by `HuffmanEncoder::ensure_free_space()`, which is
-/// always called prior to calling this function.
-///
-/// The bits to be written to are expected to be set to 1 when calling this function. Similarly,
-/// this function maintains the invariant that unused bits in the output bytes are set to 1.
-fn write_bits(out: &mut [u8], pos: &BitWindow, value: u8) {
-    debug_assert!(pos.bit < 8);
-    debug_assert!(pos.count <= 8);
-    debug_assert!(pos.count > 0);
-
-    if (pos.bit + pos.count) <= 8 {
-        // Bits to be written to fit in a single byte
-        debug_assert_eq!(out[pos.byte as usize] | PAD_LEFT[pos.bit as usize], 255);
-        let pad_left = out[pos.byte as usize] | PAD_RIGHT[(8 - pos.bit) as usize];
-        let shifted = value << (8 - pos.bit - pos.count) | PAD_LEFT[pos.bit as usize];
-        let pad_right = PAD_RIGHT[(8 - pos.count - pos.bit) as usize];
-        out[pos.byte as usize] = (pad_left & shifted) | pad_right;
-    } else {
-        // Bits to be written to span two bytes
-        debug_assert_eq!(out[pos.byte as usize] | PAD_LEFT[pos.bit as usize], 255);
-        let split = 8 - pos.bit;
-        let pad_left = out[pos.byte as usize] | PAD_RIGHT[split as usize];
-        let shifted = (value >> (pos.count - split)) | PAD_LEFT[pos.bit as usize];
-        out[pos.byte as usize] = pad_left & shifted;
-
-        let rem = 8 - (pos.count - split);
-        out[(pos.byte + 1) as usize] = (value << rem) | PAD_RIGHT[rem as usize];
-    }
-}
-
-const PAD_RIGHT: [u8; 9] = [0, 1, 3, 7, 15, 31, 63, 127, 255];
-const PAD_LEFT: [u8; 9] = [0, 128, 192, 224, 240, 248, 252, 254, 255];
-
-macro_rules! bits_encode {
+// Independently split from this crate's existing codebook so the length-only pass
+// touches a 256-byte table and the encoder's complete codebook occupies 1,280 bytes.
+// Performance background and license references:
+// https://github.com/hyperium/h2/pull/949
+// https://github.com/hyperium/h2/commit/cb9574bb2c18d1904eca74e98b31c8986b0d8b32
+// https://github.com/hyperium/h2/blob/cb9574bb2c18d1904eca74e98b31c8986b0d8b32/src/hpack/huffman/table.rs
+// https://github.com/hyperium/h2/blob/cb9574bb2c18d1904eca74e98b31c8986b0d8b32/LICENSE
+macro_rules! define_encode_tables {
     [ $( ( $len:expr => [ $( $byte:expr ),* ] ), )* ] => {
-        [ $(
-            EncodeValue{
-                buffer: &[ $( $byte as u8 ),* ],
-                bit_count: $len
-            } ,
-        )* ]
+        pub(super) const ENCODE_CODES: [u32; 256] = [ $(
+            pack_code($len, &[ $( $byte as u8 ),* ]),
+        )* ];
+        pub(super) const ENCODE_CODE_LENGTHS: [u8; 256] = [ $( $len, )* ];
     }
 }
 
-const HPACK_STRING: [EncodeValue; 256] = bits_encode![
+const fn pack_code(bit_count: usize, parts: &[u8]) -> u32 {
+    let mut bits = 0u32;
+    let mut remaining = bit_count;
+    let mut index = 0;
+
+    while index < parts.len() {
+        let part_bits = if remaining < 8 { remaining } else { 8 };
+        let mask = if part_bits == 8 {
+            u8::MAX
+        } else {
+            (1u8 << part_bits) - 1
+        };
+        bits = (bits << part_bits) | (parts[index] & mask) as u32;
+        remaining -= part_bits;
+        index += 1;
+    }
+    bits
+}
+
+define_encode_tables![
     ( 13 => [0b1111_1111, 0b0001_1000]),
     ( 23 => [0b1111_1111, 0b1111_1111, 0b0101_1000]),
     ( 28 => [0b1111_1111, 0b1111_1111, 0b1111_1110, 0b0000_0010]),
@@ -382,17 +379,24 @@ const HPACK_STRING: [EncodeValue; 256] = bits_encode![
     ( 26 => [0b1111_1111, 0b1111_1111, 0b1111_1011, 0b0000_0010]),
 ];
 
+#[cfg(test)]
 pub trait HpackStringEncode {
     fn hpack_encode(&self) -> Result<Vec<u8>, Error>;
 }
 
+#[cfg(test)]
 impl HpackStringEncode for Vec<u8> {
     fn hpack_encode(&self) -> Result<Vec<u8>, Error> {
-        let mut encoder = HuffmanEncoder::new();
-        for code in self {
-            encoder.put(*code)?;
-        }
-        encoder.ends()
+        self.as_slice().hpack_encode()
+    }
+}
+
+#[cfg(test)]
+impl HpackStringEncode for [u8] {
+    fn hpack_encode(&self) -> Result<Vec<u8>, Error> {
+        let mut encoded = Vec::with_capacity(encoded_len(self)?);
+        encode_into(self, &mut encoded);
+        Ok(encoded)
     }
 }
 
@@ -401,44 +405,6 @@ mod tests {
     #![allow(clippy::identity_op)]
 
     use super::*;
-
-    #[test]
-    fn test_set_bits() {
-        let mut buf = [0b1111_1111; 16];
-        // Write a full 8 bits into a single byte
-        let mut pos = BitWindow {
-            count: 8,
-            ..Default::default()
-        };
-
-        write_bits(&mut buf, &pos, 0b1_0101);
-        assert_eq!(&buf[..1], &[0b1_0101]);
-        pos.byte += 1;
-
-        // 7-bit byte-spanning writes at each possible bit offset
-        pos.count = 7;
-        for _ in 0..8 {
-            write_bits(&mut buf, &pos, 0b101_0101);
-            pos.forwards(7);
-        }
-        assert_eq!(
-            &buf[1..8],
-            &[
-                0b1010_1011,
-                0b0101_0110,
-                0b1010_1101,
-                0b0101_1010,
-                0b1011_0101,
-                0b0110_1010,
-                0b1101_0101
-            ]
-        );
-
-        // Single-write partial bits, aligned with byte start
-        pos.count = 5;
-        write_bits(&mut buf, &pos, 0b1_0101);
-        assert_eq!(&buf[8..9], &[0b1010_1111]);
-    }
 
     macro_rules! encoding {
         [ $( $code:expr => $( $byte:expr ),* ; )* ] => { $( {

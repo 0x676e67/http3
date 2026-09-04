@@ -89,7 +89,7 @@ where
     /// Tell the peer to stop sending into the underlying QUIC stream
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_sending(&mut self, error_code: Code) {
-        self.inner.stream.stop_sending(error_code)
+        self.inner.stop_sending(error_code)
     }
 
     /// Returns the underlying stream id
@@ -132,17 +132,23 @@ where
     pub async fn send_response(&mut self, resp: Response<()>) -> Result<(), StreamError> {
         let (parts, _) = resp.into_parts();
         let response::Parts {
-            status, headers, ..
+            status,
+            headers,
+            extensions,
+            ..
         } = parts;
-        let headers = Header::response(status, headers);
+        let headers = Header::response(status, headers, extensions);
 
         let mut block = BytesMut::new();
-        let mem_size = qpack::encode_stateless(&mut block, headers).map_err(|_e| {
+        let mem_size = qpack::encode_stateless(&mut block, &headers).map_err(|_e| {
             self.handle_connection_error_on_stream(InternalConnectionError {
                 code: Code::H3_INTERNAL_ERROR,
                 message: "Failed to encode headers".to_string(),
             })
         })?;
+        // Do not retain the normalized fields while the encoded block waits on
+        // QUIC backpressure.
+        drop(headers);
 
         let max_mem_size = self.inner.settings().max_field_section_size;
 

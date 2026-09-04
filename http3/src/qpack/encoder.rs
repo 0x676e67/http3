@@ -15,18 +15,21 @@ use super::{
     parse_error::ParseError,
     prefix_int::Error as IntError,
     prefix_string::Error as StringError,
-    static_::StaticTable,
+    static_::{StaticLookup, StaticTable},
     stream::{
         DecoderInstruction, Duplicate, DynamicTableSizeUpdate, HeaderAck, InsertCountIncrement,
         InsertWithNameRef, InsertWithoutNameRef, StreamCancel,
     },
 };
+use crate::quic::StreamId;
 
 #[derive(Debug, PartialEq)]
 pub enum EncoderError {
     Insertion(DynamicTableError),
     InvalidString(StringError),
     InvalidInteger(IntError),
+    InvalidStreamId(u64),
+    MalformedDecoderInstruction,
     UnknownDecoderInstruction(u8),
 }
 
@@ -38,8 +41,14 @@ impl std::fmt::Display for EncoderError {
             EncoderError::Insertion(e) => write!(f, "dynamic table insertion: {:?}", e),
             EncoderError::InvalidString(e) => write!(f, "could not parse string: {}", e),
             EncoderError::InvalidInteger(e) => write!(f, "could not parse integer: {}", e),
+            EncoderError::InvalidStreamId(stream_id) => {
+                write!(f, "invalid stream ID in decoder instruction: {stream_id}")
+            }
+            EncoderError::MalformedDecoderInstruction => {
+                write!(f, "malformed decoder instruction")
+            }
             EncoderError::UnknownDecoderInstruction(e) => {
-                write!(f, "got unkown decoder instruction: {}", e)
+                write!(f, "got unknown decoder instruction: {}", e)
             }
         }
     }
@@ -47,28 +56,42 @@ impl std::fmt::Display for EncoderError {
 
 pub struct Encoder {
     table: DynamicTable,
+    max_table_capacity: usize,
 }
 
 impl Encoder {
-    pub fn encode<W, T, H>(
+    #[cfg(test)]
+    pub(super) fn has_acknowledged_all_insertions(&self) -> bool {
+        let total = self.table.total_inserted();
+        total > 0 && self.table.is_known_received(total)
+    }
+
+    pub(super) fn field_section_is_blocked(&self, required_insert_count: usize) -> bool {
+        !self.table.is_known_received(required_insert_count)
+    }
+
+    pub fn encode<'a, W, E, T, H>(
         &mut self,
         stream_id: u64,
         block: &mut W,
-        encoder_buf: &mut W,
+        encoder_buf: &mut E,
         fields: T,
     ) -> Result<usize, EncoderError>
     where
         W: BufMut,
+        E: BufMut,
         T: IntoIterator<Item = H>,
-        H: AsRef<HeaderField>,
+        H: AsRef<HeaderField<'a>>,
     {
+        let max_table_capacity = self.max_table_capacity;
         let mut required_ref = 0;
         let mut block_buf = Vec::new();
         let mut encoder = self.table.encoder(stream_id);
 
         for field in fields {
+            let field = field.as_ref();
             if let Some(reference) =
-                Self::encode_field(&mut encoder, &mut block_buf, encoder_buf, field.as_ref())?
+                Self::encode_field(&mut encoder, &mut block_buf, encoder_buf, field)?
             {
                 required_ref = cmp::max(required_ref, reference);
             }
@@ -78,7 +101,7 @@ impl Encoder {
             required_ref,
             encoder.base(),
             encoder.total_inserted(),
-            encoder.max_size(),
+            max_table_capacity,
         )
         .encode(block);
         block.put(block_buf.as_slice());
@@ -88,26 +111,64 @@ impl Encoder {
         Ok(required_ref)
     }
 
+    pub(super) fn configure<W: BufMut>(
+        &mut self,
+        encoder_buf: &mut W,
+        max_table_capacity: usize,
+        capacity: usize,
+        max_blocked_streams: u64,
+    ) -> Result<(), EncoderError> {
+        if capacity > max_table_capacity {
+            return Err(DynamicTableError::MaximumTableSizeTooLarge.into());
+        }
+        self.max_table_capacity = max_table_capacity;
+        self.table.set_max_blocked(max_blocked_streams)?;
+        set_dynamic_table_size(&mut self.table, encoder_buf, capacity)
+    }
+
+    pub(super) fn cancel_stream(&mut self, stream_id: u64) -> Result<(), EncoderError> {
+        self.table.cancel_stream(stream_id)?;
+        Ok(())
+    }
+
+    /// Applies instructions received on the peer's QPACK decoder stream.
+    ///
+    /// A trailing incomplete instruction remains unread for the next call.
+    ///
+    /// See [RFC 9204, Section 4.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4).
     pub fn on_decoder_recv<R: Buf>(&mut self, read: &mut R) -> Result<(), EncoderError> {
-        while let Some(instruction) = Action::parse(read)? {
+        self.on_decoder_recv_with(read, Action::parse)
+    }
+
+    /// Applies decoder instructions through a checkpointable receive cursor.
+    ///
+    /// This path allows one instruction to span transport buffers without
+    /// coalescing them. Input advances only after a complete instruction has
+    /// been parsed.
+    ///
+    /// See [RFC 9204, Section 4.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4).
+    pub(crate) fn on_decoder_recv_buffered<R: Buf + Clone>(
+        &mut self,
+        read: &mut R,
+    ) -> Result<(), EncoderError> {
+        self.on_decoder_recv_with(read, Action::parse_buffered)
+    }
+
+    fn on_decoder_recv_with<R: Buf>(
+        &mut self,
+        read: &mut R,
+        parse: impl Fn(&mut R) -> Result<Option<Action>, EncoderError>,
+    ) -> Result<(), EncoderError> {
+        while let Some(instruction) = parse(read)? {
             match instruction {
                 Action::Untrack(stream_id) => {
-                    // A Section Acknowledgment is only valid while this encoder
-                    // still has an unacknowledged dynamic field section for the
-                    // stream.
-                    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
-                    self.table.untrack_block(stream_id)?
+                    self.table.acknowledge_section(stream_id.into_inner())?
                 }
                 Action::StreamCancel(stream_id) => {
-                    // Untrack block twice, as this stream might have a trailer in addition to
-                    // the header. Failures are ignored as blocks might have been acked before
-                    // cancellation.
-                    if self.table.untrack_block(stream_id).is_ok() {
-                        let _ = self.table.untrack_block(stream_id);
-                    }
+                    self.table.cancel_stream(stream_id.into_inner())?;
                 }
                 Action::ReceivedRefIncrement(increment) => {
-                    self.table.update_largest_received(increment)
+                    self.table.update_largest_received(increment)?
                 }
             }
         }
@@ -118,8 +179,12 @@ impl Encoder {
         table: &mut DynamicTableEncoder,
         block: &mut Vec<u8>,
         encoder: &mut W,
-        field: &HeaderField,
+        field: &HeaderField<'_>,
     ) -> Result<Option<usize>, EncoderError> {
+        if field.is_sensitive() {
+            return Self::encode_sensitive_field(table, block, field);
+        }
+
         if let Some(index) = StaticTable::find(field) {
             Indexed::Static(index).encode(block);
             return Ok(None);
@@ -185,45 +250,113 @@ impl Encoder {
         };
         Ok(reference)
     }
+
+    fn encode_sensitive_field(
+        table: &mut DynamicTableEncoder,
+        block: &mut Vec<u8>,
+        field: &HeaderField<'_>,
+    ) -> Result<Option<usize>, EncoderError> {
+        // The N bit forbids an indexed field line and dynamic-table insertion.
+        // A name reference is still a literal representation and can be used.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.4
+        let reference = match table.find_name(&field.name) {
+            DynamicLookupResult::Static(index) => {
+                LiteralWithNameRef::new_static(index, field.value.clone())
+                    .with_never_indexed()
+                    .encode(block)?;
+                None
+            }
+            DynamicLookupResult::Relative { index, absolute } => {
+                LiteralWithNameRef::new_dynamic(index, field.value.clone())
+                    .with_never_indexed()
+                    .encode(block)?;
+                Some(absolute)
+            }
+            DynamicLookupResult::PostBase { index, absolute } => {
+                LiteralWithPostBaseNameRef::new(index, field.value.clone())
+                    .with_never_indexed()
+                    .encode(block)?;
+                Some(absolute)
+            }
+            DynamicLookupResult::NotFound => {
+                Literal::new(field.name.clone(), field.value.clone())
+                    .with_never_indexed()
+                    .encode(block)?;
+                None
+            }
+        };
+        Ok(reference)
+    }
 }
 
 impl Default for Encoder {
     fn default() -> Self {
         Self {
             table: DynamicTable::new(),
+            max_table_capacity: 0,
         }
     }
 }
 
-pub fn encode_stateless<W, T, H>(block: &mut W, fields: T) -> Result<u64, EncoderError>
+/// Encodes a field section without dynamic-table references.
+///
+/// The returned value is the uncompressed field section size, including the
+/// 32-byte overhead defined for each field by
+/// [HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
+///
+/// # Errors
+///
+/// Returns an error if a field cannot be represented by the QPACK encoder.
+pub fn encode_stateless<'a, W, T, H>(block: &mut W, fields: T) -> Result<u64, EncoderError>
 where
     W: BufMut,
     T: IntoIterator<Item = H>,
-    H: AsRef<HeaderField>,
+    H: AsRef<HeaderField<'a>>,
 {
     let mut size = 0;
 
     HeaderPrefix::new(0, 0, 0, 0).encode(block);
     for field in fields {
         let field = field.as_ref();
-
-        if let Some(index) = StaticTable::find(field) {
-            Indexed::Static(index).encode(block);
-        } else if let Some(index) = StaticTable::find_name(&field.name) {
-            LiteralWithNameRef::new_static(index, field.value.clone()).encode(block)?;
-        } else {
-            Literal::new(field.name.clone(), field.value.clone()).encode(block)?;
-        }
-
+        encode_stateless_parts(block, &field.name, &field.value, field.is_sensitive())?;
         size += field.mem_size() as u64;
     }
     Ok(size)
 }
 
+#[inline]
+fn encode_stateless_parts<W: BufMut>(
+    block: &mut W,
+    name: &[u8],
+    value: &[u8],
+    sensitive: bool,
+) -> Result<(), EncoderError> {
+    if sensitive {
+        if let Some(index) = StaticTable::find_name(name) {
+            LiteralWithNameRef::encode_parts(index, value, true, true, block)?;
+        } else {
+            Literal::encode_parts(name, value, true, block)?;
+        }
+    } else {
+        match StaticTable::lookup(name, value) {
+            StaticLookup::Indexed(index) => Indexed::Static(index).encode(block),
+            StaticLookup::Name(index) => {
+                LiteralWithNameRef::encode_parts(index, value, false, true, block)?;
+            }
+            StaticLookup::NotFound => Literal::encode_parts(name, value, false, block)?,
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 impl From<DynamicTable> for Encoder {
     fn from(table: DynamicTable) -> Encoder {
-        Encoder { table }
+        let max_table_capacity = table.max_mem_size();
+        Encoder {
+            table,
+            max_table_capacity,
+        }
     }
 }
 
@@ -231,38 +364,69 @@ impl From<DynamicTable> for Encoder {
 #[derive(Debug, PartialEq)]
 enum Action {
     ReceivedRefIncrement(usize),
-    Untrack(u64),
-    StreamCancel(u64),
+    Untrack(StreamId),
+    StreamCancel(StreamId),
 }
 
 impl Action {
+    fn stream_id(value: u64) -> Result<StreamId, EncoderError> {
+        // Section Acknowledgment and Stream Cancellation carry a QUIC Stream
+        // ID, whose wire range is limited to 62 bits.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-2.1
+        StreamId::try_from(value).map_err(|_| EncoderError::InvalidStreamId(value))
+    }
+
     fn parse<R: Buf>(read: &mut R) -> Result<Option<Action>, EncoderError> {
         if read.remaining() < 1 {
             return Ok(None);
         }
 
         let mut buf = Cursor::new(read.chunk());
+        let instruction = Self::decode(&mut buf)?;
+
+        if instruction.is_some() {
+            read.advance(buf.position() as usize);
+        }
+
+        Ok(instruction)
+    }
+
+    fn parse_buffered<R: Buf + Clone>(read: &mut R) -> Result<Option<Action>, EncoderError> {
+        if read.remaining() < 1 {
+            return Ok(None);
+        }
+
+        let before = read.remaining();
+        let mut buf = read.clone();
+        let instruction = Self::decode(&mut buf)?;
+
+        if instruction.is_some() {
+            read.advance(before - buf.remaining());
+        }
+
+        Ok(instruction)
+    }
+
+    fn decode<R: Buf>(buf: &mut R) -> Result<Option<Action>, EncoderError> {
         let first = buf.chunk()[0];
         let instruction = match DecoderInstruction::decode(first) {
             DecoderInstruction::Unknown => {
                 return Err(EncoderError::UnknownDecoderInstruction(first));
             }
             DecoderInstruction::InsertCountIncrement => {
-                InsertCountIncrement::decode(&mut buf)?.map(|x| Action::ReceivedRefIncrement(x.0))
+                InsertCountIncrement::decode(&mut *buf)?.map(|x| Action::ReceivedRefIncrement(x.0))
             }
-            DecoderInstruction::HeaderAck => {
-                HeaderAck::decode(&mut buf)?.map(|x| Action::Untrack(x.0))
-            }
-            DecoderInstruction::StreamCancel => {
-                StreamCancel::decode(&mut buf)?.map(|x| Action::StreamCancel(x.0))
-            }
+            DecoderInstruction::HeaderAck => match HeaderAck::decode(&mut *buf)? {
+                Some(instruction) => Some(Action::Untrack(Self::stream_id(instruction.0)?)),
+                None => None,
+            },
+            DecoderInstruction::StreamCancel => match StreamCancel::decode(&mut *buf)? {
+                Some(instruction) => Some(Action::StreamCancel(Self::stream_id(instruction.0)?)),
+                None => None,
+            },
         };
-
-        if instruction.is_some() {
-            let pos = buf.position();
-            read.advance(pos as usize);
-        }
-
         Ok(instruction)
     }
 }
@@ -295,20 +459,27 @@ impl From<ParseError> for EncoderError {
             ParseError::Integer(x) => EncoderError::InvalidInteger(x),
             ParseError::String(x) => EncoderError::InvalidString(x),
             ParseError::InvalidPrefix(x) => EncoderError::UnknownDecoderInstruction(x),
-            _ => unreachable!(),
+            ParseError::InvalidBase { .. } | ParseError::InvalidRequiredInsertCount(_) => {
+                EncoderError::MalformedDecoderInstruction
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
-    use crate::qpack::tests::helpers::{TABLE_SIZE, build_table};
+    use crate::{
+        buf::BufList,
+        qpack::tests::helpers::{TABLE_SIZE, build_table, build_table_with_size},
+    };
 
     #[allow(clippy::type_complexity)]
     fn check_encode_field(
-        init_fields: &[HeaderField],
-        field: &[HeaderField],
+        init_fields: &[HeaderField<'static>],
+        field: &[HeaderField<'static>],
         check: &dyn Fn(&mut Cursor<&mut Vec<u8>>, &mut Cursor<&mut Vec<u8>>),
     ) {
         let mut table = build_table();
@@ -319,8 +490,8 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn check_encode_field_table(
         table: &mut DynamicTable,
-        init_fields: &[HeaderField],
-        field: &[HeaderField],
+        init_fields: &[HeaderField<'static>],
+        field: &[HeaderField<'static>],
         stream_id: u64,
         check: &dyn Fn(&mut Cursor<&mut Vec<u8>>, &mut Cursor<&mut Vec<u8>>),
     ) {
@@ -331,12 +502,17 @@ mod tests {
         let mut encoder = Vec::new();
         let mut block = Vec::new();
         let mut enc_table = table.encoder(stream_id);
+        let mut required_insert_count = 0;
 
         for field in field {
-            Encoder::encode_field(&mut enc_table, &mut block, &mut encoder, field).unwrap();
+            if let Some(reference) =
+                Encoder::encode_field(&mut enc_table, &mut block, &mut encoder, field).unwrap()
+            {
+                required_insert_count = required_insert_count.max(reference);
+            }
         }
 
-        enc_table.commit(field.len());
+        enc_table.commit(required_insert_count);
 
         let mut read_block = Cursor::new(&mut block);
         let mut read_encoder = Cursor::new(&mut encoder);
@@ -350,6 +526,81 @@ mod tests {
             assert_eq!(Indexed::decode(&mut b), Ok(Indexed::Static(17)));
             assert_eq!(e.get_ref().len(), 0);
         });
+    }
+
+    #[test]
+    fn dynamic_encoder_keeps_sensitive_static_field_literal() {
+        let mut encoder = Encoder::default();
+        let field = HeaderField::new(":method", "GET").with_sensitive(true);
+        let mut block = Vec::new();
+        let mut encoder_stream = Vec::new();
+
+        assert_eq!(
+            encoder.encode(0, &mut block, &mut encoder_stream, [field]),
+            Ok(0)
+        );
+        assert!(encoder_stream.is_empty());
+
+        let mut block = Cursor::new(block);
+        HeaderPrefix::decode(&mut block).unwrap();
+        assert_eq!(
+            LiteralWithNameRef::decode(&mut block),
+            Ok(LiteralWithNameRef::new_static(15, "GET").with_never_indexed())
+        );
+    }
+
+    #[test]
+    fn dynamic_encoder_uses_sensitive_dynamic_name_without_inserting() {
+        let mut table = build_table();
+        table.put(HeaderField::new("x-private", "old")).unwrap();
+        let mut encoder = Encoder::from(table);
+        let field = HeaderField::new("x-private", "secret").with_sensitive(true);
+        let mut block = Vec::new();
+        let mut encoder_stream = Vec::new();
+
+        assert_eq!(
+            encoder.encode(0, &mut block, &mut encoder_stream, [field]),
+            Ok(1)
+        );
+        assert!(encoder_stream.is_empty());
+
+        let mut block = Cursor::new(block);
+        HeaderPrefix::decode(&mut block).unwrap();
+        assert_eq!(
+            LiteralWithNameRef::decode(&mut block),
+            Ok(LiteralWithNameRef::new_dynamic(0, "secret").with_never_indexed())
+        );
+    }
+
+    #[test]
+    fn dynamic_encoder_uses_sensitive_post_base_name_without_inserting() {
+        let mut table = DynamicTable::new();
+        table.set_max_size(TABLE_SIZE).unwrap();
+        table.set_max_blocked(1).unwrap();
+        let mut encoder = Encoder::from(table);
+        let mut block = Vec::new();
+        let mut encoder_stream = Vec::new();
+
+        assert_eq!(
+            encoder.encode(
+                0,
+                &mut block,
+                &mut encoder_stream,
+                [
+                    HeaderField::new("x-private", "old"),
+                    HeaderField::new("x-private", "secret").with_sensitive(true),
+                ],
+            ),
+            Ok(1)
+        );
+
+        let mut block = Cursor::new(block);
+        HeaderPrefix::decode(&mut block).unwrap();
+        IndexedWithPostBase::decode(&mut block).unwrap();
+        assert_eq!(
+            LiteralWithPostBaseNameRef::decode(&mut block),
+            Ok(LiteralWithPostBaseNameRef::new(0, "secret").with_never_indexed())
+        );
     }
 
     #[test]
@@ -576,7 +827,10 @@ mod tests {
 
         HeaderAck(2).encode(&mut buf);
         let mut cur = Cursor::new(&buf);
-        assert_eq!(Action::parse(&mut cur), Ok(Some(Action::Untrack(2))));
+        assert_eq!(
+            Action::parse(&mut cur),
+            Ok(Some(Action::Untrack(StreamId(2))))
+        );
 
         let mut cur = Cursor::new(&buf);
         assert_eq!(encoder.on_decoder_recv(&mut cur), Ok(()),);
@@ -591,23 +845,165 @@ mod tests {
     }
 
     #[test]
-    fn decoder_stream_cacnceled() {
+    fn section_acknowledgment_advances_known_received_count() {
         let mut table = build_table();
+        table.set_max_blocked(1).unwrap();
+        let mut encoder = Encoder::from(table);
 
-        let field = HeaderField::new("foo", "bar");
-        check_encode_field_table(
-            &mut table,
-            &[],
-            &[field.clone(), field.with_value("quxx")],
-            2,
-            &|_, _| {},
+        assert_eq!(
+            encoder.encode(
+                2,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &[HeaderField::new("first", "value")],
+            ),
+            Ok(1)
+        );
+        assert_eq!(
+            encoder.encode(
+                4,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &[HeaderField::new("blocked", "value")],
+            ),
+            Ok(0)
         );
 
-        let mut buf = vec![];
+        let mut acknowledgment = Vec::new();
+        HeaderAck(2).encode(&mut acknowledgment);
+        encoder
+            .on_decoder_recv(&mut Cursor::new(acknowledgment))
+            .unwrap();
 
-        StreamCancel(2).encode(&mut buf);
-        let mut cur = Cursor::new(&buf);
-        assert_eq!(Action::parse(&mut cur), Ok(Some(Action::StreamCancel(2))));
+        // The acknowledgment proves that insertion 1 arrived and releases the
+        // only blocked-stream slot for a new dynamic field section.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.4
+        assert_eq!(
+            encoder.encode(
+                6,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &[HeaderField::new("second", "value")],
+            ),
+            Ok(2)
+        );
+    }
+
+    #[test]
+    fn section_acknowledgment_skips_static_field_sections() {
+        let mut encoder = Encoder::from(build_table());
+
+        assert_eq!(
+            encoder.encode(
+                2,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &[HeaderField::new(":method", "GET")],
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            encoder.encode(
+                2,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &[HeaderField::new("dynamic", "value")],
+            ),
+            Ok(1)
+        );
+
+        let mut acknowledgment = Vec::new();
+        HeaderAck(2).encode(&mut acknowledgment);
+        assert_eq!(
+            encoder.on_decoder_recv(&mut Cursor::new(&acknowledgment)),
+            Ok(())
+        );
+        assert_eq!(
+            encoder.on_decoder_recv(&mut Cursor::new(acknowledgment)),
+            Err(EncoderError::Insertion(DynamicTableError::UnknownStreamId(
+                2
+            )))
+        );
+    }
+
+    #[test]
+    fn decoder_stream_cancellation_releases_all_field_sections() {
+        let mut table = build_table();
+        table.set_max_blocked(1).unwrap();
+        let mut encoder = Encoder::from(table);
+
+        for index in 1..=3 {
+            assert_eq!(
+                encoder.encode(
+                    2,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &[HeaderField::new(format!("field{index}"), "value")],
+                ),
+                Ok(index)
+            );
+        }
+
+        let mut instruction = Vec::new();
+        StreamCancel(2).encode(&mut instruction);
+        let mut cur = Cursor::new(&instruction);
+        assert_eq!(
+            Action::parse(&mut cur),
+            Ok(Some(Action::StreamCancel(StreamId(2))))
+        );
+
+        encoder
+            .on_decoder_recv(&mut Cursor::new(instruction))
+            .unwrap();
+        assert_eq!(
+            encoder.encode(
+                4,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &[HeaderField::new("replacement", "value")],
+            ),
+            Ok(4)
+        );
+    }
+
+    #[test]
+    fn field_section_prefix_uses_peer_maximum_not_current_capacity() {
+        const PEER_MAXIMUM: usize = 4096;
+        const CURRENT_CAPACITY: usize = 64;
+
+        let mut encoder = Encoder::default();
+        let mut encoder_stream = Vec::new();
+        encoder
+            .configure(&mut encoder_stream, PEER_MAXIMUM, CURRENT_CAPACITY, 1)
+            .unwrap();
+        encoder_stream.clear();
+
+        let mut final_block = Vec::new();
+        for insertion in 1..=9 {
+            let mut block = Vec::new();
+            encoder
+                .encode(
+                    0,
+                    &mut block,
+                    &mut encoder_stream,
+                    [HeaderField::new("x", insertion.to_string())],
+                )
+                .unwrap();
+            encoder_stream.clear();
+
+            if insertion == 9 {
+                final_block = block;
+            } else {
+                let mut acknowledgment = Vec::new();
+                HeaderAck(0).encode(&mut acknowledgment);
+                encoder
+                    .on_decoder_recv(&mut Cursor::new(acknowledgment))
+                    .unwrap();
+            }
+        }
+
+        let prefix = HeaderPrefix::decode(&mut Cursor::new(final_block)).unwrap();
+        assert_eq!(prefix.get(8, PEER_MAXIMUM).unwrap().0, 9);
     }
 
     #[test]
@@ -621,8 +1017,79 @@ mod tests {
         let mut cur = Cursor::new(&buf);
         assert_eq!(
             Action::parse(&mut cur),
-            Ok(Some(Action::StreamCancel(2321)))
+            Ok(Some(Action::StreamCancel(StreamId(2321))))
         );
+    }
+
+    #[test]
+    fn decoder_instruction_can_span_receive_chunks() {
+        let mut encoded = vec![];
+        StreamCancel(2321).encode(&mut encoded);
+
+        let mut received = BufList::new();
+        received.push(Bytes::copy_from_slice(&encoded[..1]));
+        let mut encoder = Encoder::default();
+
+        {
+            let mut cursor = received.cursor();
+            assert_eq!(encoder.on_decoder_recv_buffered(&mut cursor), Ok(()));
+            assert_eq!(cursor.position(), 0);
+        }
+
+        received.push(Bytes::copy_from_slice(&encoded[1..]));
+        let mut cursor = received.cursor();
+        assert_eq!(encoder.on_decoder_recv_buffered(&mut cursor), Ok(()));
+        assert_eq!(cursor.position(), encoded.len());
+    }
+
+    #[test]
+    fn decoder_instruction_stream_id_uses_quic_varint_range() {
+        let max_stream_id = crate::proto::varint::VarInt::MAX.into_inner();
+
+        let mut acknowledgment = Vec::new();
+        HeaderAck(max_stream_id).encode(&mut acknowledgment);
+        assert_eq!(
+            Action::parse(&mut Cursor::new(acknowledgment)),
+            Ok(Some(Action::Untrack(StreamId(max_stream_id))))
+        );
+
+        let mut cancellation = Vec::new();
+        StreamCancel(max_stream_id).encode(&mut cancellation);
+        assert_eq!(
+            Action::parse(&mut Cursor::new(cancellation)),
+            Ok(Some(Action::StreamCancel(StreamId(max_stream_id))))
+        );
+
+        for encoded in [
+            {
+                let mut encoded = Vec::new();
+                HeaderAck(max_stream_id + 1).encode(&mut encoded);
+                encoded
+            },
+            {
+                let mut encoded = Vec::new();
+                StreamCancel(max_stream_id + 1).encode(&mut encoded);
+                encoded
+            },
+        ] {
+            let mut cursor = Cursor::new(encoded);
+            assert_eq!(
+                Action::parse(&mut cursor),
+                Err(EncoderError::InvalidStreamId(max_stream_id + 1))
+            );
+            assert_eq!(cursor.position(), 0);
+        }
+
+        let mut encoded = Vec::new();
+        StreamCancel(max_stream_id + 1).encode(&mut encoded);
+        let mut received = BufList::new();
+        received.push(Bytes::from(encoded));
+        let mut cursor = received.cursor();
+        assert_eq!(
+            Encoder::default().on_decoder_recv_buffered(&mut cursor),
+            Err(EncoderError::InvalidStreamId(max_stream_id + 1))
+        );
+        assert_eq!(cursor.position(), 0);
     }
 
     #[test]
@@ -651,26 +1118,6 @@ mod tests {
     }
 
     #[test]
-    fn section_ack_without_unacknowledged_field_section_is_rejected() {
-        let mut encoder = Encoder::default();
-
-        let mut buf = vec![];
-        // The encoder has not sent any dynamic field section on this stream,
-        // so a Section Acknowledgment cannot correspond to the earliest
-        // unacknowledged field section described by RFC 9204.
-        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
-        HeaderAck(0).encode(&mut buf);
-
-        let mut cur = Cursor::new(&buf);
-        assert_eq!(
-            encoder.on_decoder_recv(&mut cur),
-            Err(EncoderError::Insertion(DynamicTableError::UnknownStreamId(
-                0
-            )))
-        );
-    }
-
-    #[test]
     fn insert_count() {
         let mut buf = vec![];
         InsertCountIncrement(4).encode(&mut buf);
@@ -681,11 +1128,28 @@ mod tests {
             Ok(Some(Action::ReceivedRefIncrement(4)))
         );
 
-        let mut encoder = Encoder {
-            table: build_table(),
-        };
+        let mut encoder = Encoder::from(build_table_with_size(4));
 
         let mut cur = Cursor::new(&buf);
         assert_eq!(encoder.on_decoder_recv(&mut cur), Ok(()));
+    }
+
+    #[test]
+    fn invalid_insert_count_increments_are_rejected() {
+        // Zero and counts beyond the insertions sent by the encoder are
+        // QPACK_DECODER_STREAM_ERROR conditions.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.3
+        for increment in [0, 2] {
+            let mut buf = vec![];
+            InsertCountIncrement(increment).encode(&mut buf);
+            let mut encoder = Encoder::from(build_table_with_size(1));
+
+            assert_eq!(
+                encoder.on_decoder_recv(&mut Cursor::new(buf)),
+                Err(EncoderError::Insertion(
+                    DynamicTableError::InvalidInsertCountIncrement
+                ))
+            );
+        }
     }
 }

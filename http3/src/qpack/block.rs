@@ -3,12 +3,14 @@ use bytes::{Buf, BufMut};
 use super::{parse_error::ParseError, prefix_int, prefix_string};
 
 // 4.5. Field Line Representations
-// Single header field line. These representations reference the static table or
-// the dynamic table in a particular state, but do not modify that state.
+// Each variant represents one field line. These representations reference the
+// static table or the dynamic table in a particular state, but do not modify it.
+// https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5
 pub enum HeaderBlockField {
     // 4.5.2. Indexed Field Line
     // Entry in the static table, or in the dynamic table with an absolute index
     // less than the value of the Base.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.2
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 1 | T |      Index (6+)       |
@@ -17,14 +19,16 @@ pub enum HeaderBlockField {
     // 4.5.3. Indexed Field Line With Post-Base Index
     // Entry in the dynamic table with an absolute index greater than or equal
     // to the value of the Base.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.3
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 0 | 0 | 0 | 1 |  Index (4+)   |
     // +---+---+---+---+---------------+
     IndexedWithPostBase,
     // 4.5.4. Literal Field Line With Name Reference
-    // Entry in the dynamic table with an absolute index greater than or equal
-    // to the value of the Base.
+    // The name comes from the static table or from a dynamic entry before Base;
+    // a dynamic Name Index is relative to Base.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.4
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 0 | 1 | N | T |Name Index (4+)|
@@ -35,8 +39,9 @@ pub enum HeaderBlockField {
     // +-------------------------------+
     LiteralWithNameRef,
     // 4.5.5. Literal Field Line With Post-Base Name Reference
-    // The field name matches a name of an entry in the static table, or in the
-    // dynamic table with an absolute index less than the value of the Base.
+    // The name comes from a dynamic entry at or after Base, and Name Index uses
+    // the post-base index space.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.5
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 0 | 0 | 0 | 0 | N |NameIdx(3+)|
@@ -48,6 +53,7 @@ pub enum HeaderBlockField {
     LiteralWithPostBaseNameRef,
     // 4.5.6. Literal Field Line With Literal Name
     // Field name and field value are encoded as string literals.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.6
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 0 | 0 | 1 | N | H |NameLen(3+)|
@@ -128,73 +134,87 @@ impl HeaderPrefix {
         total_inserted: usize,
         max_table_size: usize,
     ) -> Result<(usize, usize), ParseError> {
+        let required = Self::reconstruct_required_insert_count(
+            self.encoded_insert_count,
+            total_inserted,
+            max_table_size,
+        )?;
+        let base = Self::calculate_base(required, self.sign_negative, self.delta_base)?;
+        Ok((required, base))
+    }
+
+    pub(super) fn reconstruct_required_insert_count(
+        encoded_insert_count: usize,
+        total_inserted: usize,
+        max_table_size: usize,
+    ) -> Result<usize, ParseError> {
         // Required Insert Count reconstruction uses the advertised maximum
         // capacity, not the table's current capacity.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
-        let required = if self.encoded_insert_count == 0 {
+        let required = if encoded_insert_count == 0 {
             0
         } else {
             let max_entries = max_table_size / 32;
             let full_range = 2 * max_entries;
-            if max_entries == 0 || self.encoded_insert_count > full_range {
-                return Err(ParseError::InvalidRequiredInsertCount(
-                    self.encoded_insert_count,
-                ));
+            if max_entries == 0 || encoded_insert_count > full_range {
+                return Err(ParseError::InvalidRequiredInsertCount(encoded_insert_count));
             }
 
             // Choose the largest candidate no more than MaxEntries ahead of the
             // decoder's current Insert Count.
-            let max_value = total_inserted.checked_add(max_entries).ok_or(
-                ParseError::InvalidRequiredInsertCount(self.encoded_insert_count),
-            )?;
+            let max_value = total_inserted
+                .checked_add(max_entries)
+                .ok_or(ParseError::InvalidRequiredInsertCount(encoded_insert_count))?;
             let max_wrapped = (max_value / full_range) * full_range;
             let mut required = max_wrapped
-                .checked_add(self.encoded_insert_count)
+                .checked_add(encoded_insert_count)
                 .and_then(|value| value.checked_sub(1))
-                .ok_or(ParseError::InvalidRequiredInsertCount(
-                    self.encoded_insert_count,
-                ))?;
+                .ok_or(ParseError::InvalidRequiredInsertCount(encoded_insert_count))?;
 
             if required > max_value {
                 if required <= full_range {
-                    return Err(ParseError::InvalidRequiredInsertCount(
-                        self.encoded_insert_count,
-                    ));
+                    return Err(ParseError::InvalidRequiredInsertCount(encoded_insert_count));
                 }
                 required -= full_range;
             }
 
             if required == 0 {
-                return Err(ParseError::InvalidRequiredInsertCount(
-                    self.encoded_insert_count,
-                ));
+                return Err(ParseError::InvalidRequiredInsertCount(encoded_insert_count));
             }
             required
         };
+        Ok(required)
+    }
 
+    pub(super) fn calculate_base(
+        required: usize,
+        sign_negative: bool,
+        delta_base: usize,
+    ) -> Result<usize, ParseError> {
         let invalid_base = || ParseError::InvalidBase {
             required_insert_count: required,
-            sign_negative: self.sign_negative,
-            delta_base: self.delta_base,
+            sign_negative,
+            delta_base,
         };
 
         // Delta Base is peer-controlled. Checked arithmetic rejects a Base that
         // cannot be represented as `usize`.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1
-        let base = if required == 0 {
-            0
-        } else if !self.sign_negative {
-            required
-                .checked_add(self.delta_base)
-                .ok_or_else(invalid_base)?
+        let base = if !sign_negative {
+            // With no dynamic references, RIC 0 can still use any Base.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.2
+            required.checked_add(delta_base).ok_or_else(invalid_base)?
         } else {
+            // A negative sign is invalid when Required Insert Count is no
+            // greater than Delta Base, including when both values are zero.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.2
             required
-                .checked_sub(self.delta_base)
+                .checked_sub(delta_base)
                 .and_then(|base| base.checked_sub(1))
                 .ok_or_else(invalid_base)?
         };
 
-        Ok((required, base))
+        Ok(base)
     }
 
     // 4.5.1. Encoded Field Section Prefix
@@ -301,8 +321,16 @@ impl IndexedWithPostBase {
 
 #[derive(Debug, PartialEq)]
 pub enum LiteralWithNameRef {
-    Static { index: usize, value: Vec<u8> },
-    Dynamic { index: usize, value: Vec<u8> },
+    Static {
+        index: usize,
+        value: Vec<u8>,
+        never_indexed: bool,
+    },
+    Dynamic {
+        index: usize,
+        value: Vec<u8>,
+        never_indexed: bool,
+    },
 }
 
 impl LiteralWithNameRef {
@@ -310,6 +338,7 @@ impl LiteralWithNameRef {
         LiteralWithNameRef::Static {
             index,
             value: value.into(),
+            never_indexed: false,
         }
     }
 
@@ -317,12 +346,29 @@ impl LiteralWithNameRef {
         LiteralWithNameRef::Dynamic {
             index,
             value: value.into(),
+            never_indexed: false,
         }
     }
 
+    pub fn with_never_indexed(mut self) -> Self {
+        match &mut self {
+            Self::Static { never_indexed, .. } | Self::Dynamic { never_indexed, .. } => {
+                *never_indexed = true;
+            }
+        }
+        self
+    }
+
     pub fn decode<R: Buf>(buf: &mut R) -> Result<Self, ParseError> {
+        Self::decode_limited(buf, usize::MAX)
+    }
+
+    pub(crate) fn decode_limited<R: Buf>(
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<Self, ParseError> {
         match prefix_int::decode(4, buf)? {
-            (f, i) if f & 0b0101 == 0b0101 => {
+            (f, i) if f & 0b1101 == 0b0101 => {
                 if i > (usize::MAX as u64) {
                     return Err(ParseError::Integer(
                         crate::qpack::prefix_int::Error::Overflow,
@@ -331,10 +377,11 @@ impl LiteralWithNameRef {
 
                 Ok(LiteralWithNameRef::new_static(
                     i as usize,
-                    prefix_string::decode(8, buf)?,
-                ))
+                    prefix_string::decode_limited(8, buf, max_encoded_string_size)?,
+                )
+                .with_never_indexed_if(f & 0b0010 != 0))
             }
-            (f, i) if f & 0b0101 == 0b0100 => {
+            (f, i) if f & 0b1101 == 0b0100 => {
                 if i > (usize::MAX as u64) {
                     return Err(ParseError::Integer(
                         crate::qpack::prefix_int::Error::Overflow,
@@ -343,8 +390,9 @@ impl LiteralWithNameRef {
 
                 Ok(LiteralWithNameRef::new_dynamic(
                     i as usize,
-                    prefix_string::decode(8, buf)?,
-                ))
+                    prefix_string::decode_limited(8, buf, max_encoded_string_size)?,
+                )
+                .with_never_indexed_if(f & 0b0010 != 0))
             }
             (f, _) => Err(ParseError::InvalidPrefix(f)),
         }
@@ -352,16 +400,42 @@ impl LiteralWithNameRef {
 
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
         match self {
-            LiteralWithNameRef::Static { index, value } => {
-                prefix_int::encode(4, 0b0101, *index as u64, buf);
-                prefix_string::encode(8, 0, value, buf)?;
-            }
-            LiteralWithNameRef::Dynamic { index, value } => {
-                prefix_int::encode(4, 0b0100, *index as u64, buf);
-                prefix_string::encode(8, 0, value, buf)?;
-            }
+            LiteralWithNameRef::Static {
+                index,
+                value,
+                never_indexed,
+            } => Self::encode_parts(*index, value, *never_indexed, true, buf)?,
+            LiteralWithNameRef::Dynamic {
+                index,
+                value,
+                never_indexed,
+            } => Self::encode_parts(*index, value, *never_indexed, false, buf)?,
         }
         Ok(())
+    }
+
+    pub(crate) fn encode_parts<W: BufMut>(
+        index: usize,
+        value: &[u8],
+        never_indexed: bool,
+        is_static: bool,
+        buf: &mut W,
+    ) -> Result<(), prefix_string::Error> {
+        prefix_int::encode(
+            4,
+            if is_static { 0b0101 } else { 0b0100 } | (u8::from(never_indexed) << 1),
+            index as u64,
+            buf,
+        );
+        prefix_string::encode(8, 0, value, buf)
+    }
+
+    fn with_never_indexed_if(self, never_indexed: bool) -> Self {
+        if never_indexed {
+            self.with_never_indexed()
+        } else {
+            self
+        }
     }
 }
 
@@ -369,6 +443,7 @@ impl LiteralWithNameRef {
 pub struct LiteralWithPostBaseNameRef {
     pub index: usize,
     pub value: Vec<u8>,
+    pub never_indexed: bool,
 }
 
 impl LiteralWithPostBaseNameRef {
@@ -376,29 +451,44 @@ impl LiteralWithPostBaseNameRef {
         LiteralWithPostBaseNameRef {
             index,
             value: value.into(),
+            never_indexed: false,
         }
     }
 
+    pub fn with_never_indexed(mut self) -> Self {
+        self.never_indexed = true;
+        self
+    }
+
     pub fn decode<R: Buf>(buf: &mut R) -> Result<Self, ParseError> {
+        Self::decode_limited(buf, usize::MAX)
+    }
+
+    pub(crate) fn decode_limited<R: Buf>(
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<Self, ParseError> {
         match prefix_int::decode(3, buf)? {
-            (f, i) if f & 0b1111_0000 == 0 => {
+            (f, i) if f & 0b11110 == 0 => {
                 if i > (usize::MAX as u64) {
                     return Err(ParseError::Integer(
                         crate::qpack::prefix_int::Error::Overflow,
                     ));
                 }
 
-                Ok(LiteralWithPostBaseNameRef::new(
+                let mut literal = LiteralWithPostBaseNameRef::new(
                     i as usize,
-                    prefix_string::decode(8, buf)?,
-                ))
+                    prefix_string::decode_limited(8, buf, max_encoded_string_size)?,
+                );
+                literal.never_indexed = f & 1 != 0;
+                Ok(literal)
             }
             (f, _) => Err(ParseError::InvalidPrefix(f)),
         }
     }
 
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
-        prefix_int::encode(3, 0b0000, self.index as u64, buf);
+        prefix_int::encode(3, u8::from(self.never_indexed), self.index as u64, buf);
         prefix_string::encode(8, 0, &self.value, buf)?;
         Ok(())
     }
@@ -408,6 +498,7 @@ impl LiteralWithPostBaseNameRef {
 pub struct Literal {
     pub name: Vec<u8>,
     pub value: Vec<u8>,
+    pub never_indexed: bool,
 }
 
 impl Literal {
@@ -415,25 +506,50 @@ impl Literal {
         Literal {
             name: name.into(),
             value: value.into(),
+            never_indexed: false,
         }
     }
 
+    pub fn with_never_indexed(mut self) -> Self {
+        self.never_indexed = true;
+        self
+    }
+
     pub fn decode<R: Buf>(buf: &mut R) -> Result<Self, ParseError> {
+        Self::decode_limited(buf, usize::MAX)
+    }
+
+    pub(crate) fn decode_limited<R: Buf>(
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<Self, ParseError> {
         if buf.remaining() < 1 {
             return Err(ParseError::Integer(prefix_int::Error::UnexpectedEnd));
         } else if buf.chunk()[0] & 0b1110_0000 != 0b0010_0000 {
             return Err(ParseError::InvalidPrefix(buf.chunk()[0]));
         }
-        Ok(Literal::new(
-            prefix_string::decode(4, buf)?,
-            prefix_string::decode(8, buf)?,
-        ))
+        let never_indexed = buf.chunk()[0] & 0b0001_0000 != 0;
+        let mut literal = Literal::new(
+            prefix_string::decode_limited(4, buf, max_encoded_string_size)?,
+            prefix_string::decode_limited(8, buf, max_encoded_string_size)?,
+        );
+        literal.never_indexed = never_indexed;
+        Ok(literal)
     }
 
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
-        prefix_string::encode(4, 0b0010, &self.name, buf)?;
-        prefix_string::encode(8, 0, &self.value, buf)?;
+        Self::encode_parts(&self.name, &self.value, self.never_indexed, buf)?;
         Ok(())
+    }
+
+    pub(crate) fn encode_parts<W: BufMut>(
+        name: &[u8],
+        value: &[u8],
+        never_indexed: bool,
+        buf: &mut W,
+    ) -> Result<(), prefix_string::Error> {
+        prefix_string::encode(4, 0b0010 | u8::from(never_indexed), name, buf)?;
+        prefix_string::encode(8, 0, value, buf)
     }
 }
 
@@ -482,6 +598,16 @@ mod test {
     }
 
     #[test]
+    fn literal_with_name_ref_preserves_never_indexed() {
+        let field = LiteralWithNameRef::new_dynamic(42, "foo").with_never_indexed();
+        let mut buf = vec![];
+        field.encode(&mut buf).unwrap();
+
+        assert_ne!(buf[0] & 0b0010_0000, 0);
+        assert_eq!(LiteralWithNameRef::decode(&mut Cursor::new(buf)), Ok(field));
+    }
+
+    #[test]
     fn literal_with_post_base_name_ref() {
         let field = LiteralWithPostBaseNameRef::new(42, "foo");
         let mut buf = vec![];
@@ -491,12 +617,35 @@ mod test {
     }
 
     #[test]
+    fn literal_with_post_base_name_ref_preserves_never_indexed() {
+        let field = LiteralWithPostBaseNameRef::new(42, "foo").with_never_indexed();
+        let mut buf = vec![];
+        field.encode(&mut buf).unwrap();
+
+        assert_ne!(buf[0] & 0b0000_1000, 0);
+        assert_eq!(
+            LiteralWithPostBaseNameRef::decode(&mut Cursor::new(buf)),
+            Ok(field)
+        );
+    }
+
+    #[test]
     fn literal() {
         let field = Literal::new("foo", "bar");
         let mut buf = vec![];
         field.encode(&mut buf).unwrap();
         let mut read = Cursor::new(&buf);
         assert_eq!(Literal::decode(&mut read), Ok(field));
+    }
+
+    #[test]
+    fn literal_preserves_never_indexed() {
+        let field = Literal::new("foo", "bar").with_never_indexed();
+        let mut buf = vec![];
+        field.encode(&mut buf).unwrap();
+
+        assert_ne!(buf[0] & 0b0001_0000, 0);
+        assert_eq!(Literal::decode(&mut Cursor::new(buf)), Ok(field));
     }
 
     #[test]
@@ -573,6 +722,38 @@ mod test {
                 delta_base: 2,
             })
         );
+    }
+
+    #[test]
+    fn negative_delta_base_with_zero_required_insert_count_is_rejected() {
+        let prefix = HeaderPrefix {
+            encoded_insert_count: 0,
+            sign_negative: true,
+            delta_base: 0,
+        };
+
+        assert_eq!(
+            prefix.get(0, TABLE_SIZE),
+            Err(ParseError::InvalidBase {
+                required_insert_count: 0,
+                sign_negative: true,
+                delta_base: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn positive_delta_base_with_zero_required_insert_count_is_allowed() {
+        let prefix = HeaderPrefix {
+            encoded_insert_count: 0,
+            sign_negative: false,
+            delta_base: 1,
+        };
+
+        // A field section without dynamic references can use any Base. RIC 0
+        // therefore does not require Delta Base to be zero when the sign is positive.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.2
+        assert_eq!(prefix.get(0, TABLE_SIZE), Ok((0, 1)));
     }
 
     #[test]

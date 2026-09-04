@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, atomic::AtomicUsize},
 };
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 
 use super::connection::{Connection, SendRequest};
 use crate::{
@@ -77,13 +77,45 @@ impl Builder {
         self
     }
 
-    /// Set the maximum header size this client is willing to accept
+    /// Sets the largest uncompressed field section this client will accept.
     ///
-    /// See [header size constraints] section of the specification for details.
+    /// The value is advertised to the server as
+    /// `SETTINGS_MAX_FIELD_SECTION_SIZE`. Each field contributes its name and
+    /// value lengths plus 32 bytes. By default, the client advertises the
+    /// largest value the setting can encode.
     ///
-    /// [header size constraints]: https://www.rfc-editor.org/rfc/rfc9114.html#name-header-size-constraints
+    /// See [RFC 9114 Section 4.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2).
     pub fn max_field_section_size(&mut self, value: u64) -> &mut Self {
         self.config.settings.max_field_section_size = value;
+        self
+    }
+
+    /// Limits compressed QPACK input accepted per field section or encoder string.
+    ///
+    /// This is a local memory limit, not an HTTP/3 setting. It applies to the
+    /// entire encoded HEADERS payload, even when decoded incrementally, and to
+    /// one encoded string on the peer's QPACK encoder stream. The default is
+    /// 16 MiB.
+    ///
+    /// See [RFC 9204, Section 7.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3)
+    /// and [Section 7.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4).
+    pub fn max_qpack_decode_buffer_size(&mut self, value: usize) -> &mut Self {
+        self.config.qpack_decode_buffer_size = value;
+        self
+    }
+
+    /// Set the maximum dynamic-table capacity used to encode requests.
+    ///
+    /// The default is `0`, which keeps request encoding stateless. A non-zero
+    /// value enables dynamic request compression after the peer advertises a
+    /// non-zero `SETTINGS_QPACK_MAX_TABLE_CAPACITY`; the smaller value is used.
+    /// This does not change the decoder capacity advertised by
+    /// [`qpack_max_table_capacity`](Self::qpack_max_table_capacity).
+    ///
+    /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3)
+    /// and [Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
+    pub fn qpack_encoder_table_capacity(&mut self, value: usize) -> &mut Self {
+        self.config.qpack_encoder_table_capacity = value;
         self
     }
 
@@ -117,10 +149,12 @@ impl Builder {
     /// explicitly sends the setting with value `0`.
     ///
     /// HTTP/3 encodes this setting as a QUIC variable-length integer, so values
-    /// can range up to `2^62 - 1`. Set no more table memory than the decoder can
-    /// hold for this connection.
+    /// can range up to `2^62 - 1`. The value must also fit the target's address
+    /// space; connection setup rejects a capacity the decoder cannot represent.
+    /// Set no more table memory than the decoder can hold for this connection.
     ///
-    /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3)
+    /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3),
+    /// [Section 7.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4),
     /// and [RFC 9114, Section 7.2.4](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4).
     pub fn qpack_max_table_capacity<T: Into<Option<u64>>>(&mut self, value: T) -> &mut Self {
         self.config.settings.qpack_max_table_capacity = value.into();
@@ -182,10 +216,13 @@ impl Builder {
         let send_request = SendRequest {
             open,
             conn_state: inner.shared.clone(),
-            decoder: inner.qpack_decoder(),
+            decoder: inner.dynamic_qpack_decoder(),
+            encoder: inner.dynamic_qpack_encoder(),
             max_field_section_size: self.config.settings.max_field_section_size,
+            max_qpack_decode_buffer_size: self.config.qpack_decode_buffer_size,
             sender_count: Arc::new(AtomicUsize::new(1)),
             send_grease_frame: self.config.send_grease,
+            qpack_encode_buffer: BytesMut::new(),
             _buf: PhantomData,
         };
 
