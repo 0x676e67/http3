@@ -3,7 +3,9 @@
 use std::{env, path::Path};
 
 use anyhow::{Context, Result, bail};
-use bench::case::{Case, DEFAULT_BODY_BYTES, Http3Library, MAX_BODY_BYTES, MAX_REQUESTS};
+use bench::case::{
+    Case, DEFAULT_BODY_BYTES, Http3Library, MAX_BODY_BYTES, MAX_EXTRA_HEADERS, MAX_REQUESTS,
+};
 use bytesize::ByteSize;
 use criterion::{BenchmarkId, Criterion, SamplingMode, Throughput};
 
@@ -12,6 +14,7 @@ use super::child::{ClientRunner, ServerGuard};
 const BODY_SIZES_ENV: &str = "HTTP3_BENCH_BODY_SIZES";
 const REQUESTS_ENV: &str = "HTTP3_BENCH_REQUESTS";
 const CONCURRENCY_ENV: &str = "HTTP3_BENCH_CONCURRENCY";
+const EXTRA_HEADERS_ENV: &str = "HTTP3_BENCH_EXTRA_HEADERS";
 const MAX_CONCURRENCY: usize = 100;
 const BANDWIDTH_BODY_THRESHOLD: usize = 64 * 1024;
 const TEST_REQUESTS: usize = 4;
@@ -21,6 +24,7 @@ struct Config {
     cases: Vec<Case>,
     requests: Option<usize>,
     concurrency: Option<usize>,
+    extra_headers: usize,
     test_mode: bool,
     sample_size_from_cli: bool,
     measurement_time_from_cli: bool,
@@ -55,11 +59,23 @@ impl Config {
             Err(env::VarError::NotPresent) => None,
             Err(error) => return Err(error).context("could not read benchmark concurrency"),
         };
+        let extra_headers = match env::var(EXTRA_HEADERS_ENV) {
+            Ok(value) => {
+                let extra_headers = parse_nonnegative(&value, EXTRA_HEADERS_ENV)?;
+                if extra_headers > MAX_EXTRA_HEADERS {
+                    bail!("{EXTRA_HEADERS_ENV} cannot exceed {MAX_EXTRA_HEADERS}");
+                }
+                extra_headers
+            }
+            Err(env::VarError::NotPresent) => 0,
+            Err(error) => return Err(error).context("could not read extra request header count"),
+        };
 
         Ok(Self {
             cases,
             requests,
             concurrency,
+            extra_headers,
             test_mode: criterion_arg_present("--test"),
             sample_size_from_cli: criterion_arg_present("--sample-size"),
             measurement_time_from_cli: criterion_arg_present("--measurement-time"),
@@ -93,9 +109,13 @@ fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> 
                     body_bytes: default_case.body_bytes,
                     requests: TEST_REQUESTS,
                     in_flight: TEST_IN_FLIGHT,
+                    extra_headers: config.extra_headers,
                 }
             } else {
-                default_case
+                Case {
+                    extra_headers: config.extra_headers,
+                    ..default_case
+                }
             };
             if let Some(requests) = config.requests {
                 case.requests = requests;
@@ -143,12 +163,12 @@ fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> 
 
             let mut server = None;
             let benchmark_id = BenchmarkId::from_parameter(format!(
-                "requests-{}/concurrency-{}",
-                case.requests, case.in_flight,
+                "requests-{}/concurrency-{}/extra-headers-{}",
+                case.requests, case.in_flight, case.extra_headers,
             ));
             group.bench_with_input(benchmark_id, &case, |bencher, &case| {
                 server.get_or_insert_with(|| {
-                    ServerGuard::start(executable, case.body_bytes).unwrap_or_else(|error| {
+                    ServerGuard::start(executable, case).unwrap_or_else(|error| {
                         panic!("could not start {library} benchmark server: {error:#}")
                     })
                 });
@@ -211,11 +231,15 @@ fn parse_cases(value: &str) -> Result<Vec<Case>> {
 }
 
 fn parse_positive(value: &str, name: &str) -> Result<usize> {
-    let value = value
-        .parse::<usize>()
-        .with_context(|| format!("invalid positive integer {value:?} in {name}"))?;
+    let value = parse_nonnegative(value, name)?;
     if value == 0 {
         bail!("{name} must be greater than zero");
     }
     Ok(value)
+}
+
+fn parse_nonnegative(value: &str, name: &str) -> Result<usize> {
+    value
+        .parse::<usize>()
+        .with_context(|| format!("invalid non-negative integer {value:?} in {name}"))
 }

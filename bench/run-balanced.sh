@@ -20,7 +20,7 @@
 #   bash bench/run-balanced.sh -- --noplot
 # Custom body-size cases:
 #   bash bench/run-balanced.sh --body-sizes 0B,64KiB,1MiB \
-#     --requests 20000 --concurrency 32 -- --noplot
+#     --requests 20000 --concurrency 32 --extra-headers 16 -- --noplot
 
 set -euo pipefail
 
@@ -36,6 +36,9 @@ Options:
                        Range: 1-100. By default the benchmark chooses it from
                        the body size; it cannot exceed a case's request count.
                        The Server advertises a fixed 1000-stream credit window.
+  --extra-headers N    Separate x-http3-bench: benchmark-value field lines,
+                       from 0 to 64. This benchmark field is list-valued; the
+                       Server validates every line after decoding.
   -h, --help           Show this help.
 
 For each selected body size, the Clients run in this fixed order: http3, h3,
@@ -51,7 +54,7 @@ Default body sizes:
 Examples:
   bash bench/run-balanced.sh -- --noplot
   bash bench/run-balanced.sh --body-sizes 0B,64KiB,1MiB \
-    --requests 20000 --concurrency 32 -- \
+    --requests 20000 --concurrency 32 --extra-headers 16 -- \
     --sample-size 20 --measurement-time 60 --noplot
 EOF
 }
@@ -59,6 +62,7 @@ EOF
 body_sizes=
 requests=
 concurrency=
+extra_headers=
 criterion_args=()
 
 while (($# > 0)); do
@@ -92,6 +96,19 @@ while (($# > 0)); do
         exit 2
       }
       concurrency=$2
+      shift 2
+      ;;
+    --extra-headers)
+      (($# >= 2)) || { echo '--extra-headers requires a value' >&2; exit 2; }
+      [[ $2 =~ ^[0-9]+$ ]] || {
+        echo '--extra-headers must be a non-negative integer' >&2
+        exit 2
+      }
+      ((10#$2 <= 64)) || {
+        echo '--extra-headers cannot exceed 64' >&2
+        exit 2
+      }
+      extra_headers=$2
       shift 2
       ;;
     --)
@@ -137,6 +154,11 @@ if [[ -n $concurrency ]]; then
   export HTTP3_BENCH_CONCURRENCY=$concurrency
 else
   unset HTTP3_BENCH_CONCURRENCY || true
+fi
+if [[ -n $extra_headers ]]; then
+  export HTTP3_BENCH_EXTRA_HEADERS=$extra_headers
+else
+  unset HTTP3_BENCH_EXTRA_HEADERS || true
 fi
 
 echo 'Running each selected case in fixed Client order: http3, h3, nghttp3'
