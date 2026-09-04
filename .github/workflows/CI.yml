@@ -10,12 +10,14 @@ env:
   core_package_args: >-
     --workspace
     --exclude interop
+    --exclude http3-bench
   toolchain_style: nightly
   toolchain_msrv: "1.85"
   toolchain_http3_quinn_msrv: "1.85"
   toolchain_doc: nightly
   toolchain_lint: stable
   toolchain_fuzz: nightly
+  toolchain_benchmark_msrv: "1.96"
 
 jobs:
   ci-pass:
@@ -24,6 +26,7 @@ jobs:
     needs:
       - style
       - lint
+      - benchmark
       - msrv
       - msrv_http3_quic
       - test
@@ -58,6 +61,91 @@ jobs:
           toolchain: ${{ env.toolchain_lint }}
           components: clippy
       - run: cargo clippy ${{ env.core_package_args }}
+
+  benchmark:
+    name: Build benchmark on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install Rust ${{ env.toolchain_benchmark_msrv }}
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.toolchain_benchmark_msrv }}
+          components: clippy
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev nasm pkg-config
+      - name: Check Linux launcher
+        if: runner.os == 'Linux'
+        run: |
+          bash -n bench/run-balanced.sh
+          bash bench/run-balanced.sh --help
+      - name: Check Windows launcher
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path bench/run-balanced.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+          Get-Help ./bench/run-balanced.ps1 -Full | Out-String | Write-Host
+      - name: Lint benchmark
+        if: runner.os == 'Linux'
+        run: cargo clippy -p http3-bench --all-targets --locked -- -D warnings
+      - name: Build benchmark
+        run: cargo bench -p http3-bench --bench clients --no-run --locked
+        env:
+          RUSTFLAGS: "-D warnings"
+      - name: List benchmark cases through Linux launcher
+        if: runner.os == 'Linux'
+        working-directory: ${{ runner.temp }}
+        run: |
+          output=$(bash "$GITHUB_WORKSPACE/bench/run-balanced.sh" \
+            --topologies 1/1 \
+            --body-sizes 0B \
+            -- --list)
+          printf '%s\n' "$output"
+          expected=$(printf '%s\n' \
+            'http3-client/post-local-setup-to-last-complete-response/1-connection-1-socket/0 B/http3: benchmark' \
+            'http3-client/post-local-setup-to-last-complete-response/1-connection-1-socket/0 B/h3: benchmark' \
+            'http3-client/post-local-setup-to-last-complete-response/1-connection-1-socket/0 B/nghttp3: benchmark')
+          actual=$(printf '%s\n' "$output" | grep ': benchmark$')
+          test "$actual" = "$expected"
+        env:
+          RUSTFLAGS: "-D warnings"
+      - name: List benchmark cases through Windows launcher
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          $output = @(& (Join-Path $env:GITHUB_WORKSPACE 'bench/run-balanced.ps1') `
+            -Topologies '1/1' `
+            -BodySizes '0B' `
+            -CriterionArgs @('--list'))
+          $output | Write-Host
+          $actual = @($output | Where-Object { $_ -match ': benchmark$' })
+          $expected = @(
+            'http3-client/post-local-setup-to-last-complete-response/1-connection-1-socket/0 B/http3: benchmark'
+            'http3-client/post-local-setup-to-last-complete-response/1-connection-1-socket/0 B/h3: benchmark'
+            'http3-client/post-local-setup-to-last-complete-response/1-connection-1-socket/0 B/nghttp3: benchmark'
+          )
+          if (($actual -join "`n") -ne ($expected -join "`n")) {
+            throw "Unexpected benchmark list:`n$($actual -join "`n")"
+          }
+        env:
+          RUSTFLAGS: "-D warnings"
 
   msrv:
     name: Check MSRV

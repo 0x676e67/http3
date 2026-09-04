@@ -1,0 +1,205 @@
+//! Isolated multi-worker HTTP/3 benchmark Server implementation.
+
+use std::{
+    io::{Read, Write},
+    sync::Arc,
+    thread,
+};
+
+use anyhow::{Context, Result, bail};
+use bytes::Bytes;
+use http::StatusCode;
+use http3::server::RequestResolver;
+use quinn::crypto::rustls::QuicServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::task::JoinSet;
+
+use super::case::{ALPN_H3, SERVER_ADDR, SERVER_WORKERS, workspace_root};
+
+pub(crate) fn run_from_args(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let body_bytes = args
+        .next()
+        .context("missing server response body size")?
+        .parse::<usize>()
+        .context("invalid server response body size")?;
+    if let Some(extra) = args.next() {
+        bail!("unexpected internal server argument {extra:?}");
+    }
+
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.worker_threads(SERVER_WORKERS).enable_all();
+    let runtime = runtime
+        .build()
+        .context("could not create benchmark server runtime")?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    thread::spawn(move || {
+        let mut byte = [0u8; 1];
+        let _ = std::io::stdin().read(&mut byte);
+        let _ = shutdown_tx.send(());
+    });
+    runtime.block_on(run_server(body_bytes, shutdown_rx))
+}
+
+async fn run_server(
+    body_bytes: usize,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
+    let body = Bytes::from(vec![b'A'; body_bytes]);
+    let cert = CertificateDer::from(std::fs::read(
+        workspace_root().join("examples/server.cert"),
+    )?);
+    let key = PrivateKeyDer::try_from(std::fs::read(workspace_root().join("examples/server.key"))?)
+        .map_err(anyhow::Error::msg)?;
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.cipher_suites =
+        vec![rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256];
+    let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)?;
+    tls_config.alpn_protocols = vec![ALPN_H3.to_vec()];
+
+    let server_config =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config)?));
+
+    let endpoint = quinn::Endpoint::server(server_config, SERVER_ADDR.parse()?)?;
+    println!(
+        "http3-bench-server-v1 address={SERVER_ADDR} body_bytes={body_bytes} \
+         transport=quinn-default workers={SERVER_WORKERS}"
+    );
+    std::io::stdout().flush()?;
+
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                shutdown_connections(&endpoint, &mut connections).await?;
+                return Ok(());
+            }
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    drain_tasks(&mut connections, "benchmark server connection").await?;
+                    return Ok(());
+                };
+                let body = body.clone();
+                connections.spawn(serve_connection(incoming, body));
+            }
+            completed = connections.join_next(), if !connections.is_empty() => {
+                completed
+                    .context("benchmark server connection task disappeared")?
+                    .context("benchmark server connection task failed")??;
+            }
+        }
+    }
+}
+
+async fn shutdown_connections(
+    endpoint: &quinn::Endpoint,
+    connections: &mut JoinSet<Result<()>>,
+) -> Result<()> {
+    while let Some(completed) = connections.try_join_next() {
+        completed
+            .context("benchmark server connection task failed")?
+            .context("benchmark server connection failed")?;
+    }
+
+    // The controller closes stdin only after a successful Client process. Request validation and
+    // response delivery have therefore completed; cancel remaining connection drivers before
+    // closing the Endpoint so its local shutdown is not misreported as a Client protocol error.
+    connections.abort_all();
+    while let Some(completed) = connections.join_next().await {
+        match completed {
+            Ok(result) => result.context("benchmark server connection failed")?,
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => return Err(error).context("benchmark server connection task failed"),
+        }
+    }
+
+    endpoint.close(0u32.into(), b"benchmark complete");
+    endpoint.wait_idle().await;
+    Ok(())
+}
+
+async fn serve_connection(incoming: quinn::Incoming, body: Bytes) -> Result<()> {
+    let connection = incoming.await?;
+    let mut builder = http3::server::builder();
+    builder.send_grease(false);
+    let mut connection = builder
+        .build(http3_quic::Connection::new(connection))
+        .await?;
+
+    let mut requests = JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = connection.accept() => match accepted {
+                Ok(Some(resolver)) => {
+                    requests.spawn(respond(resolver, body.clone()));
+                }
+                Ok(None) => {
+                    drain_tasks(&mut requests, "benchmark server request").await?;
+                    return Ok(());
+                }
+                Err(error) if error.is_h3_no_error() => {
+                    drain_tasks(&mut requests, "benchmark server request").await?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            },
+            completed = requests.join_next(), if !requests.is_empty() => {
+                completed
+                    .context("benchmark server request task disappeared")?
+                    .context("benchmark server request task failed")??;
+            }
+        }
+    }
+}
+
+async fn drain_tasks(tasks: &mut JoinSet<Result<()>>, name: &str) -> Result<()> {
+    while let Some(completed) = tasks.join_next().await {
+        completed.with_context(|| format!("{name} task failed"))??;
+    }
+    Ok(())
+}
+
+async fn respond(
+    resolver: RequestResolver<http3_quic::Connection, Bytes>,
+    body: Bytes,
+) -> Result<()> {
+    let (request, mut stream) = resolver.resolve_request().await?;
+    if request.version() != http::Version::HTTP_3 {
+        bail!("benchmark request used {:?}", request.version());
+    }
+    if request.method() != http::Method::GET {
+        bail!("benchmark request used {}", request.method());
+    }
+    if request.uri().scheme_str() != Some("https")
+        || request.uri().authority().map(http::uri::Authority::as_str) != Some("localhost:4433")
+        || request
+            .uri()
+            .path_and_query()
+            .map(http::uri::PathAndQuery::as_str)
+            != Some("/")
+    {
+        bail!("benchmark request used unexpected URI {}", request.uri());
+    }
+    // Validate the request half before reporting a successful response so a missing FIN cannot be
+    // hidden by a Client that exits as soon as it receives the response body.
+    if stream.recv_data().await?.is_some() {
+        bail!("benchmark request unexpectedly contained a body");
+    }
+    if stream.recv_trailers().await?.is_some() {
+        bail!("benchmark request unexpectedly contained trailers");
+    }
+
+    let response = http::Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_LENGTH, body.len())
+        .body(())?;
+    stream.send_response(response).await?;
+    if !body.is_empty() {
+        stream.send_data(body).await?;
+    }
+    stream.finish().await?;
+    Ok(())
+}
