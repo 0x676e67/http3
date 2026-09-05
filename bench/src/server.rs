@@ -81,9 +81,6 @@ async fn run_server(
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
     workers: Vec<tokio::runtime::Handle>,
 ) -> Result<()> {
-    if workers.is_empty() {
-        bail!("benchmark server needs an Endpoint worker and at least one connection worker");
-    }
     let body = Bytes::from(vec![b'A'; body_bytes]);
     let cert = CertificateDer::from(std::fs::read(
         workspace_root().join("examples/server.cert"),
