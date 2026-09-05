@@ -1,3 +1,4 @@
+#[cfg(test)]
 mod bitwin;
 mod decode;
 mod encode;
@@ -6,15 +7,15 @@ use std::{convert::TryInto, fmt, num::TryFromIntError};
 
 use bytes::{Buf, BufMut};
 
+#[cfg(test)]
+pub use self::bitwin::BitWindow;
+#[cfg(test)]
+pub use self::encode::HpackStringEncode;
 pub use self::{
-    bitwin::BitWindow,
     decode::{Error as HuffmanDecodingError, HpackStringDecode},
-    encode::{Error as HuffmanEncodingError, HpackStringEncode},
+    encode::Error as HuffmanEncodingError,
 };
-use crate::{
-    proto::coding::BufMutExt,
-    qpack::prefix_int::{self, Error as IntegerError},
-};
+use crate::qpack::prefix_int::{self, Error as IntegerError};
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -77,11 +78,9 @@ pub(crate) fn decode_limited<B: Buf>(
 }
 
 pub fn encode<B: BufMut>(size: u8, flags: u8, value: &[u8], buf: &mut B) -> Result<(), Error> {
-    let encoded = value.hpack_encode()?;
-    prefix_int::encode(size - 1, flags << 1 | 1, encoded.len().try_into()?, buf);
-    for byte in encoded {
-        buf.write(byte);
-    }
+    let encoded_len = self::encode::encoded_len(value)?;
+    prefix_int::encode(size - 1, flags << 1 | 1, encoded_len.try_into()?, buf);
+    self::encode::encode_into(value, buf);
     Ok(())
 }
 

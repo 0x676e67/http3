@@ -15,7 +15,7 @@ use super::{
     parse_error::ParseError,
     prefix_int::Error as IntError,
     prefix_string::Error as StringError,
-    static_::StaticTable,
+    static_::{StaticLookup, StaticTable},
     stream::{
         DecoderInstruction, Duplicate, DynamicTableSizeUpdate, HeaderAck, InsertCountIncrement,
         InsertWithNameRef, InsertWithoutNameRef, StreamCancel,
@@ -302,12 +302,14 @@ fn encode_stateless_parts<W: BufMut>(
         } else {
             Literal::encode_parts(name, value, true, block)?;
         }
-    } else if let Some(index) = StaticTable::find_parts(name, value) {
-        Indexed::Static(index).encode(block);
-    } else if let Some(index) = StaticTable::find_name(name) {
-        LiteralWithNameRef::encode_parts(index, value, false, true, block)?;
     } else {
-        Literal::encode_parts(name, value, false, block)?;
+        match StaticTable::lookup(name, value) {
+            StaticLookup::Indexed(index) => Indexed::Static(index).encode(block),
+            StaticLookup::Name(index) => {
+                LiteralWithNameRef::encode_parts(index, value, false, true, block)?;
+            }
+            StaticLookup::NotFound => Literal::encode_parts(name, value, false, block)?,
+        }
     }
     Ok(())
 }
