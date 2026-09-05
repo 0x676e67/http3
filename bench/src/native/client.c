@@ -99,6 +99,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "headers.h"
+
 #include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
@@ -151,14 +153,13 @@
 #define CLOSE_FLUSH_NS (100ULL * NGTCP2_MILLISECONDS)
 #define POLL_CAP_MS 10
 #define CLIENT_CONNECTION_ID_LENGTH 16
-#define MAX_EXTRA_HEADERS 64
-#define EXTRA_HEADER_NAME "x-http3-bench"
-#define EXTRA_HEADER_VALUE "benchmark-value"
 
 _Static_assert(RX_CAPACITY >= NGTCP2_MAX_UDP_PAYLOAD_SIZE,
                "CONNECTION_CLOSE needs the ngtcp2 client minimum buffer");
 _Static_assert(RX_MESSAGE_CAPACITY >= RX_CAPACITY,
                "GRO receive slots must hold a full UDP datagram");
+_Static_assert(RESPONSE_HEADERS_LEN < 64,
+               "response fields must fit the validation mask");
 
 #if defined(_WIN32)
 typedef SOCKET socket_handle;
@@ -196,7 +197,8 @@ typedef struct bench_config {
   uint64_t requests;
   uint64_t expected_body_bytes;
   size_t inflight;
-  size_t extra_headers;
+  size_t request_headers;
+  size_t response_headers;
 } bench_config;
 
 struct udp_endpoint {
@@ -216,6 +218,7 @@ struct udp_endpoint {
 struct response_state {
   int64_t stream_id;
   uint64_t body_bytes;
+  uint64_t response_headers_seen;
   bool complete;
   bool headers_begin;
   bool headers_end;
@@ -243,7 +246,8 @@ struct client {
   uint64_t received_bytes;
   uint64_t measurement_finished_ns;
   size_t inflight_limit;
-  size_t extra_headers;
+  size_t request_headers;
+  size_t response_headers;
   size_t active;
 
   bool handshake_completed;
@@ -632,8 +636,8 @@ static int on_nghttp3_recv_header(
   response_state *r = checked_response(c, stream_id, stream_user_data);
   nghttp3_vec val;
   uint64_t content_length;
+  size_t i;
   (void)conn;
-  (void)name;
   (void)flags;
 
   if (r == NULL) {
@@ -658,6 +662,21 @@ static int on_nghttp3_recv_header(
       return NGHTTP3_ERR_CALLBACK_FAILURE;
     }
     r->content_length_seen = true;
+  } else {
+    nghttp3_vec field = nghttp3_rcbuf_get_buf(name);
+    for (i = 0; i < RESPONSE_HEADERS_LEN; ++i) {
+      if (bytes_equal(field, RESPONSE_HEADERS[i].name)) {
+        uint64_t bit = UINT64_C(1) << i;
+        if (c->response_headers == 0 || (r->response_headers_seen & bit) != 0 ||
+            !bytes_equal(val, RESPONSE_HEADERS[i].value)) {
+          set_fatal(c, "invalid response template field on stream %" PRId64,
+                    stream_id);
+          return NGHTTP3_ERR_CALLBACK_FAILURE;
+        }
+        r->response_headers_seen |= bit;
+        break;
+      }
+    }
   }
   return 0;
 }
@@ -672,7 +691,9 @@ static int on_nghttp3_end_headers(
     return NGHTTP3_ERR_CALLBACK_FAILURE;
   }
   if (!r->headers_begin || r->headers_end || !r->status_seen ||
-      !r->content_length_seen || (fin && c->expected_body_bytes != 0)) {
+      !r->content_length_seen ||
+      r->response_headers_seen != (UINT64_C(1) << c->response_headers) - 1 ||
+      (fin && c->expected_body_bytes != 0)) {
     set_fatal(c, "invalid response header end on stream %" PRId64, stream_id);
     return NGHTTP3_ERR_CALLBACK_FAILURE;
   }
@@ -1107,7 +1128,7 @@ static nghttp3_nv make_nv(const char *name, const char *value) {
 static int fill_request_window(client *c) {
   while (c->started < c->target_requests && c->active < c->inflight_limit) {
     response_state *r;
-    nghttp3_nv headers[4 + MAX_EXTRA_HEADERS];
+    nghttp3_nv headers[4 + REQUEST_HEADERS_LEN];
     int64_t stream_id;
     int rv;
     size_t i;
@@ -1129,11 +1150,11 @@ static int fill_request_window(client *c) {
     headers[1] = make_nv(":scheme", "https");
     headers[2] = make_nv(":authority", "localhost:4433");
     headers[3] = make_nv(":path", REQUEST_PATH);
-    for (i = 0; i < c->extra_headers; ++i) {
-      headers[4 + i] = make_nv(EXTRA_HEADER_NAME, EXTRA_HEADER_VALUE);
+    for (i = 0; i < c->request_headers; ++i) {
+      headers[4 + i] = make_nv(REQUEST_HEADERS[i].name, REQUEST_HEADERS[i].value);
     }
     rv = nghttp3_conn_submit_request(c->nghttp3_conn, stream_id, headers,
-                                     4 + c->extra_headers, NULL, r);
+                                     4 + c->request_headers, NULL, r);
     if (rv != 0) {
       set_nghttp3_failure(c, "nghttp3_conn_submit_request", rv);
       return -1;
@@ -2065,7 +2086,8 @@ static int client_init(client *c, udp_endpoint *endpoint,
   c->target_requests = config->requests;
   c->expected_body_bytes = config->expected_body_bytes;
   c->inflight_limit = config->inflight;
-  c->extra_headers = config->extra_headers;
+  c->request_headers = config->request_headers;
+  c->response_headers = config->response_headers;
   c->last_progress_ns = timestamp_ns();
   ngtcp2_ccerr_default(&c->last_error);
 
@@ -2128,16 +2150,13 @@ static bool parse_nonnegative_u64_arg(const char *text, uint64_t *value) {
 
 static int parse_args(int argc, char **argv, bench_config *config) {
   uint64_t inflight;
-  uint64_t extra_headers;
   if (argc != 5 || !parse_positive_u64_arg(argv[1], &config->requests) ||
       config->requests > SIZE_MAX ||
       !parse_nonnegative_u64_arg(argv[2], &config->expected_body_bytes) ||
-      !parse_positive_u64_arg(argv[3], &inflight) || inflight > SIZE_MAX ||
-      !parse_nonnegative_u64_arg(argv[4], &extra_headers) ||
-      extra_headers > MAX_EXTRA_HEADERS) {
+      !parse_positive_u64_arg(argv[3], &inflight) || inflight > SIZE_MAX) {
     fprintf(stderr,
             "usage: %s <requests> <expected-body-bytes> <inflight> "
-            "<extra-request-headers>\n",
+            "<none|request|response|both>\n",
             argv[0]);
     return -1;
   }
@@ -2146,7 +2165,22 @@ static int parse_args(int argc, char **argv, bench_config *config) {
     return -1;
   }
   config->inflight = (size_t)inflight;
-  config->extra_headers = (size_t)extra_headers;
+  if (strcmp(argv[4], "none") == 0) {
+    config->request_headers = 0;
+    config->response_headers = 0;
+  } else if (strcmp(argv[4], "request") == 0) {
+    config->request_headers = REQUEST_HEADERS_LEN;
+    config->response_headers = 0;
+  } else if (strcmp(argv[4], "response") == 0) {
+    config->request_headers = 0;
+    config->response_headers = RESPONSE_HEADERS_LEN;
+  } else if (strcmp(argv[4], "both") == 0) {
+    config->request_headers = REQUEST_HEADERS_LEN;
+    config->response_headers = RESPONSE_HEADERS_LEN;
+  } else {
+    fprintf(stderr, "unsupported header mode: %s\n", argv[4]);
+    return -1;
+  }
   return 0;
 }
 
@@ -2310,7 +2344,7 @@ int http3_bench_nghttp3_main(int argc, char **argv) {
   }
 
   elapsed_ns = c.measurement_finished_ns - benchmark_started;
-  printf("{\"schema\":\"http3-client-bench-v11\","
+  printf("{\"schema\":\"http3-client-bench-v12\","
          "\"http3_library\":\"nghttp3\","
          "\"quic_backend\":\"ngtcp2\","
          "\"transport_profile\":"
@@ -2319,14 +2353,15 @@ int http3_bench_nghttp3_main(int argc, char **argv) {
          "\"post-local-setup-to-last-complete-response\","
          "\"requests\":%" PRIu64 ","
          "\"in_flight\":%zu,"
-         "\"extra_request_headers\":%zu,"
+         "\"request_headers\":%zu,"
+         "\"response_headers\":%zu,"
          "\"response_body_bytes\":%" PRIu64 ","
          "\"completed\":%" PRIu64 ",\"received_bytes\":%" PRIu64 ","
          "\"elapsed_ns\":%" PRIu64 ","
          "\"path_max_udp_payload_size\":%zu}\n",
-         config.requests, config.inflight, config.extra_headers,
-         config.expected_body_bytes, c.completed, c.received_bytes, elapsed_ns,
-         path_max_udp_payload_size);
+         config.requests, config.inflight, config.request_headers,
+         config.response_headers, config.expected_body_bytes, c.completed,
+         c.received_bytes, elapsed_ns, path_max_udp_payload_size);
   exit_code = EXIT_SUCCESS;
 
 cleanup_client:

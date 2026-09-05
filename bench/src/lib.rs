@@ -8,6 +8,7 @@ use std::{
 pub mod case;
 #[doc(hidden)]
 pub mod client;
+pub mod headers;
 pub mod result;
 mod server;
 

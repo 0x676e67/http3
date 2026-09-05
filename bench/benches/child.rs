@@ -119,7 +119,7 @@ impl ClientRunner<'_> {
             .arg(case.requests.to_string())
             .arg(case.body_bytes.to_string())
             .arg(case.in_flight.to_string())
-            .arg(case.extra_headers.to_string())
+            .arg(case.headers.to_string())
             .current_dir(workspace_root())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -180,14 +180,14 @@ pub(crate) struct ServerGuard {
 impl ServerGuard {
     pub(crate) fn start(executable: &Path, case: Case, library: Http3Library) -> Result<Self> {
         let body_bytes = case.body_bytes;
-        let extra_headers = case.extra_headers;
+        let headers = case.headers;
         let mut child = ChildCleanupGuard {
             child: Some(
                 ChildRole::Server
                     .command(executable)
                     .arg(library.name())
                     .arg(body_bytes.to_string())
-                    .arg(extra_headers.to_string())
+                    .arg(headers.to_string())
                     .current_dir(workspace_root())
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
@@ -222,8 +222,8 @@ impl ServerGuard {
             }
         };
         let expected = format!(
-            "http3-bench-server-v4 library={library} address={SERVER_ADDR} body_bytes={body_bytes} \
-             extra_request_headers={extra_headers} \
+            "http3-bench-server-v5 library={library} address={SERVER_ADDR} body_bytes={body_bytes} \
+             headers={headers} \
              max_concurrent_bidi_streams={SERVER_MAX_BIDI_STREAMS} transport=quinn \
              workers={SERVER_WORKERS}"
         );
