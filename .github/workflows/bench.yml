@@ -54,18 +54,24 @@ jobs:
             -- --list)
           printf '%s\n' "$output"
           expected=$(printf '%s\n' \
-            'http3/0 B/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'h3/0 B/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'nghttp3/0 B/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'http3/1 KiB/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'h3/1 KiB/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'nghttp3/1 KiB/requests-5000/concurrency-100/extra-headers-0: benchmark')
+            'http3/0 B/server-http3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
+            'h3/0 B/server-http3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
+            'nghttp3/0 B/server-http3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
+            'http3/0 B/server-h3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
+            'h3/0 B/server-h3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
+            'nghttp3/0 B/server-h3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
+            'http3/1 KiB/server-http3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
+            'h3/1 KiB/server-http3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
+            'nghttp3/1 KiB/server-http3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
+            'http3/1 KiB/server-h3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
+            'h3/1 KiB/server-h3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
+            'nghttp3/1 KiB/server-h3/requests-5000/concurrency-100/extra-headers-0: benchmark')
           actual=$(printf '%s\n' "$output" | grep ': benchmark$')
           test "$actual" = "$expected"
         env:
           RUSTFLAGS: "-D warnings"
 
-      - name: Smoke HTTP/3 benchmark clients
+      - name: Smoke clients against both Servers
         timeout-minutes: 5
         run: cargo bench -p bench --bench clients --locked -- --test
         env:
@@ -73,7 +79,7 @@ jobs:
           HTTP3_BENCH_BODY_SIZES: "1KiB"
           HTTP3_BENCH_EXTRA_HEADERS: "4"
 
-      - name: Compare HTTP/3 clients
+      - name: Compare clients against both Servers
         timeout-minutes: 15
         run: |
           bash bench/run-balanced.sh \
@@ -88,7 +94,7 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
 
-      - name: Compare multi-header request path
+      - name: Compare 32 request headers against both Servers
         timeout-minutes: 15
         run: |
           echo 'Low concurrency: 32 extra request headers'

@@ -1,4 +1,4 @@
-//! Isolated multi-worker HTTP/3 benchmark Server implementation.
+//! Isolated http3 and h3 Servers sharing transport, validation, and response handling.
 
 use std::{
     io::{Read, Write},
@@ -9,17 +9,25 @@ use std::{
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use http::StatusCode;
-use http3::server::RequestResolver;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::task::JoinSet;
 
 use super::case::{
-    ALPN_H3, EXTRA_HEADER_NAME, EXTRA_HEADER_VALUE, MAX_EXTRA_HEADERS, SERVER_ADDR,
+    ALPN_H3, EXTRA_HEADER_NAME, EXTRA_HEADER_VALUE, Http3Library, MAX_EXTRA_HEADERS, SERVER_ADDR,
     SERVER_MAX_BIDI_STREAMS, SERVER_WORKERS, workspace_root,
 };
 
 pub(crate) fn run_from_args(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let library = match args
+        .next()
+        .context("missing server HTTP/3 library")?
+        .as_str()
+    {
+        "http3" => Http3Library::Http3,
+        "h3" => Http3Library::H3,
+        library => bail!("unsupported server HTTP/3 library {library:?}"),
+    };
     let body_bytes = args
         .next()
         .context("missing server response body size")?
@@ -49,10 +57,11 @@ pub(crate) fn run_from_args(mut args: impl Iterator<Item = String>) -> Result<()
         let _ = std::io::stdin().read(&mut byte);
         let _ = shutdown_tx.send(());
     });
-    runtime.block_on(run_server(body_bytes, extra_headers, shutdown_rx))
+    runtime.block_on(run_server(library, body_bytes, extra_headers, shutdown_rx))
 }
 
 async fn run_server(
+    library: Http3Library,
     body_bytes: usize,
     extra_headers: usize,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
@@ -80,7 +89,7 @@ async fn run_server(
 
     let endpoint = quinn::Endpoint::server(server_config, SERVER_ADDR.parse()?)?;
     println!(
-        "http3-bench-server-v3 address={SERVER_ADDR} body_bytes={body_bytes} \
+        "http3-bench-server-v4 library={library} address={SERVER_ADDR} body_bytes={body_bytes} \
          extra_request_headers={extra_headers} \
          max_concurrent_bidi_streams={SERVER_MAX_BIDI_STREAMS} transport=quinn \
          workers={SERVER_WORKERS}"
@@ -100,7 +109,7 @@ async fn run_server(
                     return Ok(());
                 };
                 let body = body.clone();
-                connections.spawn(serve_connection(incoming, body, extra_headers));
+                connections.spawn(serve_connection(library, incoming, body, extra_headers));
             }
             completed = connections.join_next(), if !connections.is_empty() => {
                 completed
@@ -139,40 +148,16 @@ async fn shutdown_connections(
 }
 
 async fn serve_connection(
+    library: Http3Library,
     incoming: quinn::Incoming,
     body: Bytes,
     extra_headers: usize,
 ) -> Result<()> {
     let connection = incoming.await?;
-    let mut builder = http3::server::builder();
-    builder.send_grease(false);
-    let mut connection = builder
-        .build(http3_quic::Connection::new(connection))
-        .await?;
-
-    let mut requests = JoinSet::new();
-    loop {
-        tokio::select! {
-            accepted = connection.accept() => match accepted {
-                Ok(Some(resolver)) => {
-                    requests.spawn(respond(resolver, body.clone(), extra_headers));
-                }
-                Ok(None) => {
-                    drain_tasks(&mut requests, "benchmark server request").await?;
-                    return Ok(());
-                }
-                Err(error) if error.is_h3_no_error() => {
-                    drain_tasks(&mut requests, "benchmark server request").await?;
-                    return Ok(());
-                }
-                Err(error) => return Err(error.into()),
-            },
-            completed = requests.join_next(), if !requests.is_empty() => {
-                completed
-                    .context("benchmark server request task disappeared")?
-                    .context("benchmark server request task failed")??;
-            }
-        }
+    match library {
+        Http3Library::Http3 => serve_http3_connection(connection, body, extra_headers).await,
+        Http3Library::H3 => serve_h3_connection(connection, body, extra_headers).await,
+        Http3Library::Nghttp3 => bail!("unsupported server HTTP/3 library {library}"),
     }
 }
 
@@ -183,12 +168,7 @@ async fn drain_tasks(tasks: &mut JoinSet<Result<()>>, name: &str) -> Result<()> 
     Ok(())
 }
 
-async fn respond(
-    resolver: RequestResolver<http3_quic::Connection, Bytes>,
-    body: Bytes,
-    extra_headers: usize,
-) -> Result<()> {
-    let (request, mut stream) = resolver.resolve_request().await?;
+fn validate_request(request: &http::Request<()>, extra_headers: usize) -> Result<()> {
     if request.version() != http::Version::HTTP_3 {
         bail!("benchmark request used {:?}", request.version());
     }
@@ -219,23 +199,79 @@ async fn respond(
     {
         bail!("benchmark request contained an unexpected extra header value");
     }
-    // Validate the request half before reporting a successful response so a missing FIN cannot be
-    // hidden by a Client that exits as soon as it receives the response body.
-    if stream.recv_data().await?.is_some() {
-        bail!("benchmark request unexpectedly contained a body");
-    }
-    if stream.recv_trailers().await?.is_some() {
-        bail!("benchmark request unexpectedly contained trailers");
-    }
-
-    let response = http::Response::builder()
-        .status(StatusCode::OK)
-        .header(http::header::CONTENT_LENGTH, body.len())
-        .body(())?;
-    stream.send_response(response).await?;
-    if !body.is_empty() {
-        stream.send_data(body).await?;
-    }
-    stream.finish().await?;
     Ok(())
 }
+
+// Instantiate the same request lifecycle for both libraries so Server choice
+// cannot silently change validation, task scheduling, or response completion.
+macro_rules! server_adapter {
+    ($serve:ident, $respond:ident, $http3_crate:ident, $transport:ident) => {
+        async fn $serve(
+            connection: quinn::Connection,
+            body: Bytes,
+            extra_headers: usize,
+        ) -> Result<()> {
+            let mut builder = $http3_crate::server::builder();
+            builder.send_grease(false);
+            let mut connection = builder
+                .build($transport::Connection::new(connection))
+                .await?;
+
+            let mut requests = JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = connection.accept() => match accepted {
+                        Ok(Some(resolver)) => {
+                            requests.spawn($respond(resolver, body.clone(), extra_headers));
+                        }
+                        Ok(None) => {
+                            drain_tasks(&mut requests, "benchmark server request").await?;
+                            return Ok(());
+                        }
+                        Err(error) if error.is_h3_no_error() => {
+                            drain_tasks(&mut requests, "benchmark server request").await?;
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error.into()),
+                    },
+                    completed = requests.join_next(), if !requests.is_empty() => {
+                        completed
+                            .context("benchmark server request task disappeared")?
+                            .context("benchmark server request task failed")??;
+                    }
+                }
+            }
+        }
+
+        async fn $respond(
+            resolver: $http3_crate::server::RequestResolver<$transport::Connection, Bytes>,
+            body: Bytes,
+            extra_headers: usize,
+        ) -> Result<()> {
+            let (request, mut stream) = resolver.resolve_request().await?;
+            validate_request(&request, extra_headers)?;
+            // Validate the request half before reporting a successful response so a missing FIN
+            // cannot be hidden by a Client that exits after receiving the response body.
+            if stream.recv_data().await?.is_some() {
+                bail!("benchmark request unexpectedly contained a body");
+            }
+            if stream.recv_trailers().await?.is_some() {
+                bail!("benchmark request unexpectedly contained trailers");
+            }
+
+            let response = http::Response::builder()
+                .status(StatusCode::OK)
+                .header(http::header::CONTENT_LENGTH, body.len())
+                .body(())?;
+            stream.send_response(response).await?;
+            if !body.is_empty() {
+                stream.send_data(body).await?;
+            }
+            stream.finish().await?;
+            Ok(())
+        }
+    };
+}
+
+server_adapter!(serve_http3_connection, respond_http3, http3, http3_quic);
+server_adapter!(serve_h3_connection, respond_h3, h3, h3_quinn);
