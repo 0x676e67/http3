@@ -122,6 +122,8 @@ async fn run_client<A: Adapter>(
             .await
             .context("request workers exited before reaching the start barrier")?;
     }
+    // Profiling snapshots stay outside the request timer and are opt-in.
+    let stats_before = std::env::var_os("HTTP3_BENCH_QUINN_STATS").map(|_| quic_connection.stats());
     let benchmark_started = Instant::now();
     start_tx
         .send(true)
@@ -140,7 +142,13 @@ async fn run_client<A: Adapter>(
     let elapsed = finished_at
         .checked_duration_since(benchmark_started)
         .context("benchmark finish timestamp preceded its start")?;
-    let path_max_udp_payload_size = usize::from(quic_connection.stats().path.current_mtu);
+    let stats_after = quic_connection.stats();
+    let path_max_udp_payload_size = usize::from(stats_after.path.current_mtu);
+    if let Some(stats_before) = stats_before {
+        // Collection can follow driver work after the last response; these are
+        // diagnostic counts, not an exact trace of the timed interval.
+        eprintln!("quinn_before={stats_before:?}\nquinn_after={stats_after:?}");
+    }
     drop(sender_guard);
     drop(quic_connection);
 
