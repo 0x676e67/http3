@@ -6,6 +6,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      profile:
+        description: Sample Client CPU stacks instead of comparing throughput
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,11 +46,20 @@ jobs:
         run: cargo clippy -p bench --all-targets --locked -- -D warnings
 
       - name: Build benchmark
-        run: cargo bench -p bench --bench clients --no-run --locked
+        id: build
+        run: |
+          cargo bench -p bench --bench clients --no-run --locked --message-format=json > "$RUNNER_TEMP/benchmark-build.json"
+          executable=$(jq -ers '
+            map(select(.reason == "compiler-artifact" and .target.name == "clients" and .executable != null))
+            | if length == 1 then .[0].executable else error("expected one benchmark executable") end
+          ' "$RUNNER_TEMP/benchmark-build.json")
+          printf 'executable=%s\n' "$executable" >> "$GITHUB_OUTPUT"
         env:
           RUSTFLAGS: "-D warnings"
+          CARGO_PROFILE_BENCH_DEBUG: ${{ inputs.profile && '1' || '0' }}
 
       - name: List benchmark cases through Linux launcher
+        if: ${{ !inputs.profile }}
         working-directory: ${{ runner.temp }}
         run: |
           for headers in none request response both; do
@@ -68,6 +82,7 @@ jobs:
           RUSTFLAGS: "-D warnings"
 
       - name: Smoke clients against both Servers
+        if: ${{ !inputs.profile }}
         timeout-minutes: 5
         run: |
           for headers in none request response both; do
@@ -79,6 +94,7 @@ jobs:
           RUSTFLAGS: "-D warnings"
 
       - name: Compare header directions and body sizes
+        if: ${{ !inputs.profile }}
         run: |
           # 4 body sizes x 2 concurrency levels x 4 header modes x 2 Servers x
           # 3 Clients = 192 cases. Criterion may exceed its 3-second target
@@ -94,3 +110,104 @@ jobs:
           done
         env:
           RUSTFLAGS: "-D warnings"
+
+      - name: Install Linux perf
+        if: ${{ inputs.profile }}
+        run: |
+          sudo apt-get install -y linux-tools-common linux-tools-generic
+          # Use the packaged binary directly: the runner kernel need not match
+          # the kernel version selected by Ubuntu's tools metapackage.
+          perf=$(find -L /usr/lib/linux-tools -type f -name perf -executable | sort -V | tail -n 1)
+          test -n "$perf"
+          "$perf" --version
+          printf 'PERF=%s\n' "$perf" >> "$GITHUB_ENV"
+          sudo sysctl kernel.perf_event_paranoid=2
+
+      - name: Sample Client CPU stacks against fixed h3 Server
+        if: ${{ inputs.profile }}
+        timeout-minutes: 15
+        env:
+          BENCH_EXE: ${{ steps.build.outputs.executable }}
+        run: |
+          profile_dir="$RUNNER_TEMP/http3-client-profile"
+          mkdir -p "$profile_dir"
+          cp "$BENCH_EXE" "$profile_dir/clients"
+          printf '%s\n' \
+            'Client-only user CPU sampling; includes process setup and teardown.' \
+            'Fixed h3 Server; 0 B; headers=none; concurrency=100; 10 batches x 20000 requests per Client.' \
+            'Sampled wall times are not throughput benchmark results.' > "$profile_dir/README.txt"
+          control_dir=$(mktemp -d)
+          mkfifo "$control_dir/stdin"
+          server_pid=
+          stop_server() {
+            if [[ -z "$server_pid" ]]; then return; fi
+            exec 9>&-
+            if ! timeout 10s tail --pid="$server_pid" -f /dev/null; then
+              kill -KILL "$server_pid" 2>/dev/null || true
+              wait "$server_pid" || true
+              server_pid=
+              return 1
+            fi
+            local status=0
+            wait "$server_pid" || status=$?
+            server_pid=
+            return "$status"
+          }
+          trap 'status=$?; stop_server || status=1; exit "$status"' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          for client in http3 h3 nghttp3; do
+            output="$profile_dir/$client"
+            mkdir -p "$output"
+            exec 9<> "$control_dir/stdin"
+            "$BENCH_EXE" --http3-bench-child server h3 0 none \
+              < "$control_dir/stdin" 9>&- > "$output/server.stdout" 2> "$output/server.stderr" &
+            server_pid=$!
+            ready=false
+            for attempt in {1..150}; do
+              if grep -Fxq 'http3-bench-server-v5 library=h3 address=127.0.0.1:4433 body_bytes=0 headers=none max_concurrent_bidi_streams=1000 transport=quinn workers=8' "$output/server.stdout"; then
+                ready=true
+                break
+              fi
+              kill -0 "$server_pid" 2>/dev/null || break
+              sleep 0.1
+            done
+            if [[ "$ready" != true ]]; then
+              cat "$output/server.stdout" "$output/server.stderr" >&2
+              exit 1
+            fi
+            for batch in {1..10}; do
+              if ! timeout --signal=INT --kill-after=10s 120s \
+                "$PERF" record -e cpu-clock:u -F 199 --call-graph dwarf,16384 \
+                -o "$output/$batch.data" -- \
+                "$BENCH_EXE" --http3-bench-child "$client" 20000 0 100 none \
+                9>&- < /dev/null > "$output/$batch.json" 2> "$output/$batch.stderr"; then
+                cat "$output/$batch.stderr" >&2
+                exit 1
+              fi
+              jq -e --arg client "$client" '
+                .schema == "http3-client-bench-v12" and .http3_library == $client
+                and .requests == 20000 and .completed == 20000 and .in_flight == 100
+                and .request_headers == 0 and .response_headers == 0
+                and .response_body_bytes == 0 and .received_bytes == 0
+              ' "$output/$batch.json" > /dev/null
+              "$PERF" report --stdio -i "$output/$batch.data" \
+                > "$output/$batch.report.txt" 2> "$output/$batch.report.stderr"
+              "$PERF" script -i "$output/$batch.data" \
+                > "$output/$batch.stacks.txt" 2> "$output/$batch.stacks.stderr"
+            done
+            if ! stop_server; then
+              cat "$output/server.stderr" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload Client CPU profiles
+        if: ${{ always() && inputs.profile }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: http3-client-cpu-profiles
+          path: ${{ runner.temp }}/http3-client-profile
+          if-no-files-found: warn
+          retention-days: 7
