@@ -35,8 +35,15 @@ pub(super) fn encoded_len(value: &[u8]) -> Result<usize, Error> {
     let mut encoded_len = 0usize;
     let mut pending_bits = 0usize;
 
-    for code in value {
-        let bit_count = pending_bits + usize::from(ENCODE_CODE_LENGTHS[usize::from(*code)]);
+    for chunk in value.chunks(64) {
+        // A code uses at most 30 bits (RFC 7541 Appendix B). Summing a
+        // bounded chunk cannot overflow, even on 32-bit targets, and avoids
+        // carrying byte counts and padding through every input byte.
+        let bit_count = pending_bits
+            + chunk
+                .iter()
+                .map(|code| usize::from(ENCODE_CODE_LENGTHS[usize::from(*code)]))
+                .sum::<usize>();
         encoded_len = encoded_len
             .checked_add(bit_count / 8)
             .ok_or(Error::EncodedLengthOverflow)?;
@@ -1774,6 +1781,21 @@ mod tests {
         let reencoded = res.hpack_encode();
 
         assert_eq!(reencoded.unwrap().last(), Some(&0xdb));
+    }
+
+    #[test]
+    fn encoded_length_matches_output_at_chunk_boundaries() {
+        for len in [0, 1, 63, 64, 65, 127, 128, 129, 256, 1025] {
+            let value: Vec<u8> = (0..=255).cycle().take(len).collect();
+            let mut encoded = Vec::new();
+            super::encode_into(&value, &mut encoded);
+            let bits: usize = value
+                .iter()
+                .map(|byte| usize::from(super::ENCODE_CODE_LENGTHS[usize::from(*byte)]))
+                .sum();
+            assert_eq!(super::encoded_len(&value), Ok(bits.div_ceil(8)));
+            assert_eq!(encoded.len(), bits.div_ceil(8));
+        }
     }
 
     #[test]
