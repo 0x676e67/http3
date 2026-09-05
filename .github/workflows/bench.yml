@@ -70,7 +70,7 @@ jobs:
             expected=$(for body in '0 B' '1 KiB'; do
               for server in http3 h3; do
                 for client in http3 h3 nghttp3; do
-                  printf '%s/%s/server-%s/requests-1000/concurrency-100/headers-%s: benchmark\n' \
+                  printf '%s/%s/server-%s-no-steal-8/requests-1000/concurrency-100/headers-%s: benchmark\n' \
                     "$client" "$body" "$server" "$headers"
                 done
               done
@@ -166,7 +166,7 @@ jobs:
             server_pid=$!
             ready=false
             for attempt in {1..150}; do
-              if grep -Fxq 'http3-bench-server-v5 library=h3 address=127.0.0.1:4433 body_bytes=0 headers=none max_concurrent_bidi_streams=1000 transport=quinn workers=8' "$output/server.stdout"; then
+              if grep -Fxq 'http3-bench-server-v6 library=h3 address=127.0.0.1:4433 body_bytes=0 headers=none max_concurrent_bidi_streams=1000 transport=quinn runtime=pingora-no-steal workers=8' "$output/server.stdout"; then
                 ready=true
                 break
               fi
