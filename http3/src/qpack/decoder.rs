@@ -10,7 +10,7 @@ use super::{
         LiteralWithPostBaseNameRef,
     },
     dynamic::{DynamicTable, DynamicTableDecoder, Error as DynamicTableError},
-    field::HeaderField,
+    field::{ESTIMATED_OVERHEAD_BYTES, HeaderField},
     parse_error::ParseError,
     prefix_int, prefix_string,
     static_::{Error as StaticError, StaticTable},
@@ -155,6 +155,7 @@ pub(crate) struct DecoderState {
     pub(crate) pending: BytesMut,
     prefix: PrefixState,
     fields: Vec<HeaderField<'static>>,
+    literal_name: Option<(Vec<u8>, bool)>,
     mem_size: u64,
 }
 
@@ -166,6 +167,7 @@ impl DecoderState {
             pending: BytesMut::new(),
             prefix: PrefixState::RequiredInsertCount,
             fields: Vec::new(),
+            literal_name: None,
             mem_size: 0,
         }
     }
@@ -249,21 +251,30 @@ impl DecoderState {
         end: bool,
         max_size: u64,
         required_ref: usize,
+        max_encoded_string_size: usize,
         mut parse: impl FnMut(&mut Cursor<&[u8]>) -> Result<HeaderField<'static>, DecoderError>,
     ) -> Result<Option<Decoded>, DecoderError> {
-        while self.pending.has_remaining() {
-            // A failed partial parse must not consume bytes. Once a whole field
-            // succeeds, it is moved into the result and never parsed again.
-            let mut cursor = Cursor::new(&self.pending[..]);
-            let field = match parse(&mut cursor) {
+        // An empty scratch buffer is not a field boundary while a literal name
+        // is waiting for its value, including at the end of the HEADERS frame.
+        while self.pending.has_remaining() || self.literal_name.is_some() {
+            let field = match self.decode_field(max_size, max_encoded_string_size, &mut parse) {
                 Ok(field) => field,
                 Err(DecoderError::UnexpectedEnd) if !end => {
+                    // The name no longer occupies compressed scratch, but its
+                    // decoded allocation still counts toward the section limit.
+                    let retained_size = self.literal_name.as_ref().map_or(0, |(name, _)| {
+                        (name.len() as u64).saturating_add(ESTIMATED_OVERHEAD_BYTES as u64)
+                    });
+                    let known_size = self.mem_size.saturating_add(retained_size);
+                    if known_size > max_size {
+                        return Err(DecoderError::HeaderTooLong(known_size));
+                    }
                     // A valid Huffman literal uses at most four encoded bytes
                     // per decoded octet, plus its prefixed integers. This bound
                     // supplements the independent compressed-scratch limit.
                     // https://www.rfc-editor.org/rfc/rfc7541.html#appendix-B
                     let encoded_limit = max_size
-                        .saturating_sub(self.mem_size)
+                        .saturating_sub(known_size)
                         .saturating_mul(4)
                         .saturating_add(32);
                     if self.pending.len() as u64 > encoded_limit {
@@ -273,17 +284,6 @@ impl DecoderState {
                 }
                 Err(error) => return Err(error),
             };
-            let consumed = cursor.position() as usize;
-            let field_size = u64::try_from(field.mem_size())?;
-            let mem_size = self
-                .mem_size
-                .checked_add(field_size)
-                .ok_or(DecoderError::HeaderTooLong(u64::MAX))?;
-            if mem_size > max_size {
-                return Err(DecoderError::HeaderTooLong(mem_size));
-            }
-            self.pending.advance(consumed);
-            self.mem_size = mem_size;
             self.fields.push(field);
         }
         if !end {
@@ -295,6 +295,63 @@ impl DecoderState {
             dyn_ref: required_ref > 0,
             mem_size: std::mem::take(&mut self.mem_size),
         }))
+    }
+
+    fn decode_field(
+        &mut self,
+        max_size: u64,
+        max_encoded_string_size: usize,
+        parse: &mut impl FnMut(&mut Cursor<&[u8]>) -> Result<HeaderField<'static>, DecoderError>,
+    ) -> Result<HeaderField<'static>, DecoderError> {
+        if self.literal_name.is_none()
+            && self.pending.first().is_some_and(|first| {
+                matches!(HeaderBlockField::decode(*first), HeaderBlockField::Literal)
+            })
+        {
+            let mut cursor = Cursor::new(&self.pending[..]);
+            let name = Literal::decode_name(&mut cursor, max_encoded_string_size)?;
+            self.pending.advance(cursor.position() as usize);
+            // Keep a completed name while the value is fragmented, so retries
+            // cannot repeat its allocation or Huffman decode. Each string is
+            // still decoded only after its entire encoded payload is available.
+            // RFC 9204, Section 4.5.6: https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.6
+            // State-boundary reference only; independently implemented:
+            // https://github.com/google/quiche/blob/f44fa9f33b5d40dc86fdb38ad22086a1da693cb0/quiche/quic/core/qpack/qpack_instruction_decoder.cc#L223-L310
+            // https://github.com/google/quiche/blob/f44fa9f33b5d40dc86fdb38ad22086a1da693cb0/LICENSE
+            self.literal_name = Some(name);
+        }
+
+        let section_size = |name_len: usize, value_len: usize| {
+            let size = self
+                .mem_size
+                .checked_add(name_len as u64)
+                .and_then(|size| size.checked_add(value_len as u64))
+                .and_then(|size| size.checked_add(ESTIMATED_OVERHEAD_BYTES as u64))
+                .ok_or(DecoderError::HeaderTooLong(u64::MAX))?;
+            if size > max_size {
+                return Err(DecoderError::HeaderTooLong(size));
+            }
+            Ok(size)
+        };
+        let mut cursor = Cursor::new(&self.pending[..]);
+        let (field, mem_size) = if let Some((name, sensitive)) = &mut self.literal_name {
+            let value = prefix_string::decode_limited(8, &mut cursor, max_encoded_string_size)?;
+            // Check before taking the name or consuming the value: retrying an
+            // oversized section must not silently omit its rejected field.
+            let size = section_size(name.len(), value.len())?;
+            (
+                HeaderField::new(std::mem::take(name), value).with_sensitive(*sensitive),
+                size,
+            )
+        } else {
+            let field = parse(&mut cursor)?;
+            let size = section_size(field.name.len(), field.value.len())?;
+            (field, size)
+        };
+        self.pending.advance(cursor.position() as usize);
+        self.literal_name = None;
+        self.mem_size = mem_size;
+        Ok(field)
     }
 }
 
@@ -440,9 +497,13 @@ impl Decoder {
             return Err(DecoderError::MissingRefs(required_ref));
         }
         let table = self.table.decoder(base, required_ref);
-        state.decode_fields(end, max_size, required_ref, |cursor| {
-            Self::parse_header_field(&table, cursor, self.max_encoded_string_size)
-        })
+        state.decode_fields(
+            end,
+            max_size,
+            required_ref,
+            self.max_encoded_string_size,
+            |cursor| Self::parse_header_field(&table, cursor, self.max_encoded_string_size),
+        )
     }
 
     // The receiving side of encoder stream
@@ -725,9 +786,13 @@ pub(crate) fn decode_stateless_incremental_limited(
     let Some(prefix) = state.decode_prefix(end, 0, 0)? else {
         return Ok(None);
     };
-    state.decode_fields(end, max_size, prefix.required_ref, |cursor| {
-        parse_stateless_header_field(cursor, max_encoded_string_size)
-    })
+    state.decode_fields(
+        end,
+        max_size,
+        prefix.required_ref,
+        max_encoded_string_size,
+        |cursor| parse_stateless_header_field(cursor, max_encoded_string_size),
+    )
 }
 
 fn parse_stateless_header_field<T: Buf>(
@@ -940,6 +1005,10 @@ mod tests {
             .with_never_indexed()
             .encode(&mut dynamic)
             .unwrap();
+        Literal::new("private-name", "private-value")
+            .with_never_indexed()
+            .encode(&mut dynamic)
+            .unwrap();
 
         for (encoded, decoder, is_stateless) in [
             (stateless, Decoder::new(0, 0).unwrap(), true),
@@ -978,6 +1047,11 @@ mod tests {
                                      * limit */
             &[0, 0, 0x50, 0x84, 0xff, 0xff, 0xff, 0xff], // Huffman EOS
             &[0, 0, 0x50, 0x81, 0],                      // invalid Huffman padding
+            &[0, 0, 0x21, b'n'],                         // name complete, no value prefix
+            &[0, 0, 0x21, b'n', 3, b'a'],                // incomplete value
+            &[0, 0, 0x21, b'n', 5],                      // value length over limit
+            &[0, 0, 0x21, b'n', 0x84, 0xff, 0xff, 0xff, 0xff], // value Huffman EOS
+            &[0, 0, 0x21, b'n', 0x81, 0],                // value Huffman padding
         ];
         for encoded in cases {
             let mut decoder = Decoder::new(0, 0).unwrap();
@@ -1008,6 +1082,73 @@ mod tests {
                 }
                 assert_eq!(result.unwrap_err(), expected);
             }
+        }
+    }
+
+    #[test]
+    fn incremental_literal_retains_name_until_value_completes() {
+        let mut name = vec![0, 0];
+        prefix_string::encode(4, 0b0011, b"private-name", &mut name).unwrap();
+        let mut value = Vec::new();
+        prefix_string::encode(8, 0, b"private-value", &mut value).unwrap();
+        let field = HeaderField::new("private-name", "private-value").with_sensitive(true);
+        let max_size = field.mem_size() as u64;
+        let mut state = DecoderState::new();
+        state.extend(&mut Cursor::new(&name), 4096).unwrap();
+        assert_eq!(
+            decode_stateless_incremental_limited(&mut state, false, max_size, 4096),
+            Ok(None)
+        );
+        assert!(state.pending.is_empty());
+        let (retained, sensitive) = state.literal_name.as_ref().unwrap();
+        assert_eq!(retained, b"private-name");
+        assert!(*sensitive);
+        let allocation = retained.as_ptr();
+        for byte in &value[..value.len() - 1] {
+            state.extend(&mut Cursor::new([*byte]), 4096).unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    decode_stateless_incremental_limited(&mut state, false, max_size, 4096),
+                    Ok(None)
+                );
+                assert_eq!(state.literal_name.as_ref().unwrap().0.as_ptr(), allocation);
+            }
+        }
+        state
+            .extend(&mut Cursor::new(&value[value.len() - 1..]), 4096)
+            .unwrap();
+        let decoded = decode_stateless_incremental_limited(&mut state, true, max_size, 4096)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.fields, vec![field]);
+        assert_eq!(decoded.mem_size, max_size);
+        assert!(state.literal_name.is_none());
+        assert!(state.pending.is_empty());
+
+        // A new field section must not inherit the previous name or N bit.
+        state
+            .extend(&mut Cursor::new([0, 0, 0x21, b'n', 0]), 4096)
+            .unwrap();
+        let decoded = decode_stateless_incremental_limited(&mut state, true, 33, 4096)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.fields, vec![HeaderField::new("n", "")]);
+        assert_eq!(decoded.mem_size, 33);
+
+        // Retaining a decoded name cannot remove it from the decoded budget.
+        state.extend(&mut Cursor::new(&name), 4096).unwrap();
+        assert_eq!(
+            decode_stateless_incremental_limited(&mut state, false, 43, 4096),
+            Err(DecoderError::HeaderTooLong(44))
+        );
+
+        // A complete but oversized literal must also remain rejected on retry.
+        state.extend(&mut Cursor::new(&value), 4096).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                decode_stateless_incremental_limited(&mut state, true, max_size - 1, 4096),
+                Err(DecoderError::HeaderTooLong(max_size))
+            );
         }
     }
 
@@ -1051,10 +1192,12 @@ mod tests {
             Ok(None)
         );
         state.extend(&mut Cursor::new([0xc0 | 18]), 3).unwrap();
-        assert_eq!(
-            decode_stateless_incremental_limited(&mut state, true, max_size - 1, 3),
-            Err(DecoderError::HeaderTooLong(max_size))
-        );
+        for _ in 0..2 {
+            assert_eq!(
+                decode_stateless_incremental_limited(&mut state, true, max_size - 1, 3),
+                Err(DecoderError::HeaderTooLong(max_size))
+            );
+        }
     }
 
     #[test]

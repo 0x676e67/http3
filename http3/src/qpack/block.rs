@@ -523,18 +523,28 @@ impl Literal {
         buf: &mut R,
         max_encoded_string_size: usize,
     ) -> Result<Self, ParseError> {
+        let (name, never_indexed) = Self::decode_name(buf, max_encoded_string_size)?;
+        let value = prefix_string::decode_limited(8, buf, max_encoded_string_size)?;
+        Ok(Self {
+            name,
+            value,
+            never_indexed,
+        })
+    }
+
+    /// Decodes a complete name without requiring the following value to be available.
+    pub(crate) fn decode_name<R: Buf>(
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<(Vec<u8>, bool), ParseError> {
         if buf.remaining() < 1 {
             return Err(ParseError::Integer(prefix_int::Error::UnexpectedEnd));
         } else if buf.chunk()[0] & 0b1110_0000 != 0b0010_0000 {
             return Err(ParseError::InvalidPrefix(buf.chunk()[0]));
         }
         let never_indexed = buf.chunk()[0] & 0b0001_0000 != 0;
-        let mut literal = Literal::new(
-            prefix_string::decode_limited(4, buf, max_encoded_string_size)?,
-            prefix_string::decode_limited(8, buf, max_encoded_string_size)?,
-        );
-        literal.never_indexed = never_indexed;
-        Ok(literal)
+        let name = prefix_string::decode_limited(4, buf, max_encoded_string_size)?;
+        Ok((name, never_indexed))
     }
 
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
