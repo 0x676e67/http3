@@ -169,7 +169,9 @@ where
 
         buf[*len..end].copy_from_slice(&payload.chunk()[..payload_len]);
         *len = end;
-        payload.advance(payload_len);
+        // The inline copy now owns all wire bytes; an empty Bytes would still
+        // retain its allocation and be visited by subsequent partial writes.
+        self.frame = None;
     }
 
     fn encode_frame_prefix<T: BufMut>(frame: &Frame<B>, buf: &mut T) {
@@ -953,24 +955,18 @@ mod tests {
 
     #[test]
     fn small_headers_are_one_inline_chunk() {
-        let payload = Bytes::from_static(b"small qpack block");
+        let payload = Bytes::from(b"small qpack block".to_vec());
         let payload_len = payload.len();
         let mut expected = BytesMut::new();
         Frame::<Bytes>::Headers(payload.clone()).encode_with_payload(&mut expected);
 
-        let mut write_buf = WriteBuf::from(Frame::<Bytes>::Headers(payload));
+        let mut write_buf = WriteBuf::from(Frame::<Bytes>::Headers(payload.clone()));
 
         assert!(matches!(&write_buf.buf, EncodedHeader::Inline(_)));
         assert_eq!(write_buf.chunk(), expected.as_ref());
         assert_eq!(write_buf.remaining(), expected.len());
-        assert_eq!(
-            write_buf
-                .frame
-                .as_ref()
-                .and_then(Frame::payload)
-                .map(Buf::remaining),
-            Some(0)
-        );
+        assert!(write_buf.frame.is_none());
+        assert!(payload.is_unique());
 
         let prefix_len = expected.len() - payload_len;
         write_buf.advance(1);
@@ -1014,14 +1010,7 @@ mod tests {
         let write_buf = WriteBuf::from(Frame::<Bytes>::Headers(payload));
         assert_eq!(write_buf.len, WRITE_BUF_ENCODE_SIZE);
         assert_eq!(write_buf.chunk().len(), WRITE_BUF_ENCODE_SIZE);
-        assert_eq!(
-            write_buf
-                .frame
-                .as_ref()
-                .and_then(Frame::payload)
-                .map(Buf::remaining),
-            Some(0)
-        );
+        assert!(write_buf.frame.is_none());
 
         let payload = Bytes::from(vec![0x5a; WRITE_BUF_ENCODE_SIZE - 1]);
         let write_buf = WriteBuf::from(Frame::<Bytes>::Headers(payload.clone()));
@@ -1040,14 +1029,7 @@ mod tests {
         let write_buf = WriteBuf::from((StreamType::ENCODER, Frame::<Bytes>::Headers(payload)));
         assert_eq!(write_buf.len, WRITE_BUF_ENCODE_SIZE);
         assert_eq!(write_buf.chunk().len(), WRITE_BUF_ENCODE_SIZE);
-        assert_eq!(
-            write_buf
-                .frame
-                .as_ref()
-                .and_then(Frame::payload)
-                .map(Buf::remaining),
-            Some(0)
-        );
+        assert!(write_buf.frame.is_none());
 
         let payload = Bytes::from(vec![0x5a; WRITE_BUF_ENCODE_SIZE - 2]);
         let write_buf = WriteBuf::from((
