@@ -16,6 +16,7 @@ jobs:
   benchmark:
     name: Benchmark on Linux
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v7
@@ -47,77 +48,49 @@ jobs:
       - name: List benchmark cases through Linux launcher
         working-directory: ${{ runner.temp }}
         run: |
-          output=$(bash "$GITHUB_WORKSPACE/bench/run-balanced.sh" \
-            --body-sizes 0B,1KiB \
-            --requests 5000 \
-            --extra-headers 0 \
-            -- --list)
-          printf '%s\n' "$output"
-          expected=$(printf '%s\n' \
-            'http3/0 B/server-http3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'h3/0 B/server-http3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'nghttp3/0 B/server-http3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'http3/0 B/server-h3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'h3/0 B/server-h3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'nghttp3/0 B/server-h3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'http3/1 KiB/server-http3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'h3/1 KiB/server-http3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'nghttp3/1 KiB/server-http3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'http3/1 KiB/server-h3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'h3/1 KiB/server-h3/requests-5000/concurrency-100/extra-headers-0: benchmark' \
-            'nghttp3/1 KiB/server-h3/requests-5000/concurrency-100/extra-headers-0: benchmark')
-          actual=$(printf '%s\n' "$output" | grep ': benchmark$')
-          test "$actual" = "$expected"
+          for headers in none request response both; do
+            output=$(bash "$GITHUB_WORKSPACE/bench/run-balanced.sh" \
+              --body-sizes 0B,1KiB --requests 1000 --concurrency 100 \
+              --headers "$headers" -- --list)
+            printf '%s\n' "$output"
+            expected=$(for body in '0 B' '1 KiB'; do
+              for server in http3 h3; do
+                for client in http3 h3 nghttp3; do
+                  printf '%s/%s/server-%s/requests-1000/concurrency-100/headers-%s: benchmark\n' \
+                    "$client" "$body" "$server" "$headers"
+                done
+              done
+            done)
+            actual=$(printf '%s\n' "$output" | grep ': benchmark$')
+            test "$actual" = "$expected"
+          done
         env:
           RUSTFLAGS: "-D warnings"
 
       - name: Smoke clients against both Servers
         timeout-minutes: 5
-        run: cargo bench -p bench --bench clients --locked -- --test
-        env:
-          RUSTFLAGS: "-D warnings"
-          HTTP3_BENCH_BODY_SIZES: "1KiB"
-          HTTP3_BENCH_EXTRA_HEADERS: "4"
-
-      - name: Compare clients against both Servers
-        timeout-minutes: 15
         run: |
-          bash bench/run-balanced.sh \
-            --body-sizes 0B,1KiB,10KiB,100KiB \
-            --requests 5000 \
-            --concurrency 100 \
-            -- \
-            --sample-size 10 \
-            --measurement-time 5 \
-            --warm-up-time 1 \
-            --noplot
+          for headers in none request response both; do
+            bash bench/run-balanced.sh \
+              --body-sizes 0B,1KiB --requests 4 --concurrency 2 \
+              --headers "$headers" -- --test
+          done
         env:
           RUSTFLAGS: "-D warnings"
 
-      - name: Compare 32 request headers against both Servers
-        timeout-minutes: 15
+      - name: Compare header directions and body sizes
         run: |
-          echo 'Low concurrency: 32 extra request headers'
-          bash bench/run-balanced.sh \
-            --body-sizes 0B,1KiB \
-            --requests 5000 \
-            --concurrency 1 \
-            --extra-headers 32 \
-            -- \
-            --sample-size 10 \
-            --measurement-time 5 \
-            --warm-up-time 1 \
-            --noplot
-          echo 'High concurrency: 32 extra request headers'
-          bash bench/run-balanced.sh \
-            --body-sizes 0B,1KiB \
-            --requests 5000 \
-            --concurrency 100 \
-            --extra-headers 32 \
-            -- \
-            --sample-size 10 \
-            --measurement-time 5 \
-            --warm-up-time 1 \
-            --noplot
+          # 4 body sizes x 2 concurrency levels x 4 header modes x 2 Servers x
+          # 3 Clients = 192 cases. Criterion may exceed its 3-second target
+          # to collect 10 samples; 1000 requests per iteration bounds each batch.
+          for concurrency in 1 100; do
+            for headers in none request response both; do
+              echo "Headers: $headers; concurrency: $concurrency"
+              bash bench/run-balanced.sh \
+                --body-sizes 0B,1KiB,10KiB,100KiB \
+                --requests 1000 --concurrency "$concurrency" --headers "$headers" \
+                -- --sample-size 10 --measurement-time 3 --warm-up-time 1 --noplot
+            done
+          done
         env:
           RUSTFLAGS: "-D warnings"

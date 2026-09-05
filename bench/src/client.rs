@@ -17,7 +17,8 @@ use tokio::{
 };
 
 use super::{
-    case::{ALPN_H3, MAX_EXTRA_HEADERS, SERVER_ADDR, SERVER_NAME, workspace_root},
+    case::{ALPN_H3, SERVER_ADDR, SERVER_NAME, workspace_root},
+    headers::{HeaderMode, REQUEST_HEADERS, RESPONSE_HEADERS},
     result::{ClientResult, MEASUREMENT_PROFILE, RESULT_SCHEMA},
 };
 
@@ -44,7 +45,7 @@ pub trait Adapter: Send + 'static {
         sender: &mut Self::Sender,
         request_uri: Uri,
         expected_body_size: usize,
-        extra_headers: usize,
+        headers: HeaderMode,
     ) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -53,12 +54,12 @@ pub fn run_from_args<A: Adapter>(mut args: impl Iterator<Item = String>) -> Resu
     let requests = parse_positive(&mut args, "requests")?;
     let expected_body_size = parse_nonnegative(&mut args, "expected-body-bytes")?;
     let in_flight = parse_positive(&mut args, "in-flight")?;
-    let extra_headers = parse_nonnegative(&mut args, "extra-request-headers")?;
+    let headers = args
+        .next()
+        .context("missing header mode")?
+        .parse::<HeaderMode>()?;
     if in_flight > requests {
         bail!("in-flight requests cannot exceed total requests");
-    }
-    if extra_headers > MAX_EXTRA_HEADERS {
-        bail!("extra request headers cannot exceed {MAX_EXTRA_HEADERS}");
     }
     if let Some(extra) = args.next() {
         bail!("unexpected internal client argument {extra:?}");
@@ -71,7 +72,7 @@ pub fn run_from_args<A: Adapter>(mut args: impl Iterator<Item = String>) -> Resu
         requests,
         expected_body_size,
         in_flight,
-        extra_headers,
+        headers,
     ))?;
 
     println!("{}", serde_json::to_string(&result)?);
@@ -82,7 +83,7 @@ async fn run_client<A: Adapter>(
     requests: usize,
     expected_body_size: usize,
     in_flight: usize,
-    extra_headers: usize,
+    headers: HeaderMode,
 ) -> Result<ClientResult> {
     let expected_bytes = requests
         .checked_mul(expected_body_size)
@@ -108,7 +109,7 @@ async fn run_client<A: Adapter>(
             sender_guard.clone(),
             assigned_requests,
             expected_body_size,
-            extra_headers,
+            headers,
             prepared_tx.clone(),
             start_rx.clone(),
         ));
@@ -155,7 +156,16 @@ async fn run_client<A: Adapter>(
         path_max_udp_payload_size,
         requests,
         in_flight,
-        extra_request_headers: extra_headers,
+        request_headers: if headers.request {
+            REQUEST_HEADERS.len()
+        } else {
+            0
+        },
+        response_headers: if headers.response {
+            RESPONSE_HEADERS.len()
+        } else {
+            0
+        },
         response_body_bytes: expected_body_size,
         completed: requests,
         received_bytes: expected_bytes,
@@ -201,7 +211,7 @@ async fn run_request_worker<A: Adapter>(
     mut sender: A::Sender,
     assigned_requests: usize,
     expected_body_size: usize,
-    extra_headers: usize,
+    headers: HeaderMode,
     prepared: mpsc::Sender<()>,
     mut start: watch::Receiver<bool>,
 ) -> Result<Instant> {
@@ -222,7 +232,7 @@ async fn run_request_worker<A: Adapter>(
             &mut sender,
             request_uri.clone(),
             expected_body_size,
-            extra_headers,
+            headers,
         )
         .await?;
     }
@@ -293,7 +303,7 @@ macro_rules! client_adapter {
                 sender: &mut Self::Sender,
                 request_uri: http::Uri,
                 expected_body_size: usize,
-                extra_headers: usize,
+                headers: $crate::headers::HeaderMode,
             ) -> anyhow::Result<()> {
                 use anyhow::Context as _;
                 use bytes::Buf as _;
@@ -301,11 +311,10 @@ macro_rules! client_adapter {
                 let mut request = http::Request::builder()
                     .method(http::Method::GET)
                     .uri(request_uri);
-                for _ in 0..extra_headers {
-                    request = request.header(
-                        $crate::case::EXTRA_HEADER_NAME.clone(),
-                        $crate::case::EXTRA_HEADER_VALUE.clone(),
-                    );
+                if headers.request {
+                    for (name, value) in &$crate::headers::REQUEST_HEADERS {
+                        request = request.header(name.clone(), value.clone());
+                    }
                 }
                 let request = request.body(())?;
                 let mut stream = sender.send_request(request).await?;
@@ -318,6 +327,12 @@ macro_rules! client_adapter {
                 if response.status() != http::StatusCode::OK {
                     anyhow::bail!("expected 200 response, got {}", response.status());
                 }
+                $crate::headers::validate_headers(
+                    response.headers(),
+                    &$crate::headers::RESPONSE_HEADERS,
+                    headers.response,
+                )
+                .context("invalid benchmark response headers")?;
                 let declared_body_size = response
                     .headers()
                     .get(http::header::CONTENT_LENGTH)
