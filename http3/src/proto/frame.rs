@@ -184,19 +184,40 @@ impl Frame<PayloadLen> {
         let frame = match ty {
             FrameType::HEADERS => Ok(Frame::Headers(payload.copy_to_bytes(len))),
             FrameType::SETTINGS => Ok(Frame::Settings(Settings::decode(&mut payload)?)),
-            FrameType::CANCEL_PUSH => Ok(Frame::CancelPush(payload.get_var()?.try_into()?)),
-            FrameType::PUSH_PROMISE => Ok(Frame::PushPromise(PushPromise::decode(&mut payload)?)),
-            FrameType::GOAWAY => Ok(Frame::Goaway(VarInt::decode(&mut payload)?)),
-            FrameType::MAX_PUSH_ID => Ok(Frame::MaxPushId(payload.get_var()?.try_into()?)),
+            FrameType::CANCEL_PUSH => Ok(Frame::CancelPush(
+                payload
+                    .get_var()
+                    .map_err(|_| FrameError::Malformed)?
+                    .try_into()?,
+            )),
+            FrameType::PUSH_PROMISE => Ok(Frame::PushPromise(
+                PushPromise::decode(&mut payload).map_err(|_| FrameError::Malformed)?,
+            )),
+            FrameType::GOAWAY => Ok(Frame::Goaway(
+                VarInt::decode(&mut payload).map_err(|_| FrameError::Malformed)?,
+            )),
+            FrameType::MAX_PUSH_ID => Ok(Frame::MaxPushId(
+                payload
+                    .get_var()
+                    .map_err(|_| FrameError::Malformed)?
+                    .try_into()?,
+            )),
             FrameType::WEBTRANSPORT_BI_STREAM | FrameType::DATA => Err(FrameError::Malformed),
             _ => {
-                buf.advance(len);
+                payload.advance(len);
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
                 //# Endpoints MUST
                 //# NOT consider these frames to have any meaning upon receipt.
                 Err(FrameError::UnknownFrame(ty.0))
             }
         };
+
+        // All declared bytes are present. Internal truncation or trailing bytes
+        // violate the frame layout; they cannot be completed by the next frame.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+        if frame.is_ok() && payload.has_remaining() {
+            return Err(FrameError::Malformed);
+        }
 
         if let Ok(_frame) = &frame {
             #[cfg(feature = "tracing")]
@@ -466,7 +487,7 @@ impl FrameType {
 pub struct FrameType(u64);
 
 impl FrameType {
-    fn decode<B: Buf>(buf: &mut B) -> Result<Self, UnexpectedEnd> {
+    pub(crate) fn decode<B: Buf>(buf: &mut B) -> Result<Self, UnexpectedEnd> {
         Ok(FrameType(buf.get_var()?))
     }
 
@@ -756,7 +777,10 @@ impl fmt::Display for SettingsError {
 
 impl From<SettingsError> for FrameError {
     fn from(e: SettingsError) -> Self {
-        Self::Settings(e)
+        match e {
+            SettingsError::Malformed => Self::Malformed,
+            error => Self::Settings(error),
+        }
     }
 }
 
@@ -820,6 +844,42 @@ mod tests {
         let mut buf = Cursor::new(&[4, 4, 0, 255, 128]);
         let decoded = Frame::decode(&mut buf);
         assert_matches!(decoded, Err(FrameError::Incomplete(6)));
+    }
+
+    #[test]
+    fn complete_frame_payload_must_match_its_layout() {
+        // A complete declared payload cannot borrow bytes from the next frame.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+        for ty in [3, 7, 13] {
+            for payload in [&[][..], &[0x40][..], &[0, 0][..]] {
+                let mut wire = vec![ty, payload.len() as u8];
+                wire.extend_from_slice(payload);
+                assert_matches!(
+                    Frame::decode(&mut wire.as_slice()),
+                    Err(FrameError::Malformed)
+                );
+            }
+            for payload in [&[0][..], &[0x40, 0][..], &[0xc0, 0, 0, 0, 0, 0, 0, 0][..]] {
+                let mut wire = vec![ty, payload.len() as u8];
+                wire.extend_from_slice(payload);
+                wire.extend_from_slice(&[0, 0]);
+                let mut read = wire.as_slice();
+                assert!(Frame::decode(&mut read).is_ok());
+                assert_eq!(read, &[0, 0]);
+            }
+            assert_matches!(
+                Frame::decode(&mut [ty, 2, 0x40].as_slice()),
+                Err(FrameError::Incomplete(4))
+            );
+        }
+        for wire in [
+            &[4, 1, 0][..],
+            &[4, 2, 0, 0x40][..],
+            &[5, 0][..],
+            &[5, 1, 0x40][..],
+        ] {
+            assert_matches!(Frame::decode(&mut &wire[..]), Err(FrameError::Malformed));
+        }
     }
 
     #[test]

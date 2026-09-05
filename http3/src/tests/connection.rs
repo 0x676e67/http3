@@ -17,7 +17,6 @@ use crate::{
     proto::{
         coding::{Decode as _, Encode as _},
         frame::{Frame, Settings},
-        push::PushId,
         stream::StreamType,
         varint::VarInt,
     },
@@ -885,44 +884,55 @@ async fn control_close_send_error() {
 }
 
 #[tokio::test]
-async fn missing_settings() {
+async fn invalid_control_frame() {
     init_tracing();
-    let mut pair = Pair::default();
-    let mut server = pair.server();
+    // A non-SETTINGS first type must fail even without a length or payload.
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
+    // Complete but internally truncated/overlong payloads are frame errors,
+    // not settings errors or a reason to wait for more stream bytes.
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+    for (frames, expected) in [
+        (&[3][..], Code::H3_MISSING_SETTINGS),
+        (&[0x21][..], Code::H3_MISSING_SETTINGS),
+        (&[0x21, 1, 0xff, 4, 0][..], Code::H3_MISSING_SETTINGS),
+        (&[4, 1, 0][..], Code::H3_FRAME_ERROR),
+        (&[4, 0, 7, 1, 0x40][..], Code::H3_FRAME_ERROR),
+        (&[4, 0, 7, 2, 0, 0][..], Code::H3_FRAME_ERROR),
+    ] {
+        let mut pair = Pair::default();
+        let mut server = pair.server();
+        let client_fut = async {
+            let connection = pair.client_inner().await;
+            let mut control_stream = connection.open_uni().await.unwrap();
+            let mut buf = BytesMut::new();
+            StreamType::CONTROL.encode(&mut buf);
+            buf.extend_from_slice(frames);
+            control_stream.write_all(&buf).await.unwrap();
 
-    let client_fut = async {
-        let connection = pair.client_inner().await;
-        let mut control_stream = connection.open_uni().await.unwrap();
-
-        let mut buf = BytesMut::new();
-        StreamType::CONTROL.encode(&mut buf);
-
-        //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
-        //= type=test
-        //# If the first frame of the control stream is any other frame
-        //# type, this MUST be treated as a connection error of type
-        //# H3_MISSING_SETTINGS.
-        Frame::<Bytes>::CancelPush(PushId(0)).encode(&mut buf);
-        control_stream.write_all(&buf[..]).await.unwrap();
-
-        tokio::time::sleep(Duration::from_secs(10)).await;
-    };
-
-    let server_fut = async {
-        let conn = server.next().await;
-        let mut incoming = server::Connection::new(conn).await.unwrap();
-        assert_matches!(
-            incoming.accept().await.map(|_| ()).unwrap_err(),
-            ConnectionError::Local {
-                error: LocalError::Application {
-                    code: Code::H3_MISSING_SETTINGS,
-                    ..
-                }
-            }
-        );
-    };
-
-    tokio::select! { _ = server_fut => (), _ = client_fut => panic!("client resolved first") };
+            // Keep the stream open: FIN must not be required to detect these errors.
+            assert_matches!(
+                connection.closed().await,
+                quinn::ConnectionError::ApplicationClosed(error)
+                    if error.error_code.into_inner() == expected.value()
+            );
+            drop(control_stream);
+        };
+        let server_fut = async {
+            let conn = server.next().await;
+            let mut incoming = server::Connection::new(conn).await.unwrap();
+            assert_matches!(
+                incoming.accept().await.map(|_| ()).unwrap_err(),
+                ConnectionError::Local {
+                    error: LocalError::Application { code, .. }
+                } if code == expected
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server_fut, client_fut);
+        })
+        .await
+        .expect("control frame was not rejected while the stream stayed open");
+    }
 }
 
 #[tokio::test]

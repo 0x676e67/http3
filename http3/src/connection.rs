@@ -1073,7 +1073,38 @@ where
             }
         };
 
-        let res = match ready!(recv.poll_next(cx)) {
+        let next = loop {
+            // The generic frame decoder discards unknown frames. On a control
+            // stream even an unknown first type must instead fail immediately.
+            // Peek without consuming a possibly fragmented SETTINGS prefix.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
+            if !self.got_peer_settings {
+                match frame::FrameType::decode(&mut recv.stream.buf().cursor()) {
+                    Ok(ty) if ty != frame::FrameType::SETTINGS => {
+                        //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+                        //# If the first frame of the control stream is any other frame
+                        //# type, this MUST be treated as a connection error of type
+                        //# H3_MISSING_SETTINGS.
+                        return Poll::Ready(Err(self.handle_connection_error(
+                            InternalConnectionError::new(
+                                Code::H3_MISSING_SETTINGS,
+                                format!("received frame {ty:?} before settings"),
+                            ),
+                        )));
+                    }
+                    Ok(_) => {}
+                    Err(_) if !recv.stream.is_eos() => match ready!(recv.stream.poll_read(cx)) {
+                        Ok(false) => continue,
+                        Ok(true) => {}
+                        Err(error) => break Err(FrameStreamError::Quic(error)),
+                    },
+                    Err(_) => {}
+                }
+            }
+            break ready!(recv.poll_next(cx));
+        };
+
+        let res = match next {
             Err(FrameStreamError::Quic(StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error,
             })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
@@ -1166,19 +1197,6 @@ where
                         ),
                     )));
                 }
-            }
-            Ok(Some(frame)) if !self.got_peer_settings => {
-                // We received a frame before the settings frame
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
-                //# If the first frame of the control stream is any other frame
-                //# type, this MUST be treated as a connection error of type
-                //# H3_MISSING_SETTINGS.
-                return Poll::Ready(Err(self.handle_connection_error(
-                    InternalConnectionError::new(
-                        Code::H3_MISSING_SETTINGS,
-                        format!("received frame {:?} before settings", frame),
-                    ),
-                )));
             }
             Ok(Some(
                 frame @ Frame::Goaway(_)
@@ -1860,7 +1878,10 @@ where
                 reason: "response headers have not been fully received".to_string(),
             }));
         }
-        if !self.stream.has_data() {
+        // An empty DATA frame carries no content; only FIN or trailers end the
+        // body. Keep parsing until a nonempty DATA payload is available.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
+        while !self.stream.has_data() {
             match ready!(self.stream.poll_next_frame(cx)) {
                 Err(frame_stream_error) => {
                     return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
@@ -2476,5 +2497,61 @@ mod qpack_field_section_tests {
         let effective: crate::config::Settings = (&wire_settings).into();
         assert_eq!(effective.qpack_max_table_capacity, None);
         assert_eq!(effective.qpack_blocked_streams, None);
+    }
+
+    #[tokio::test]
+    async fn fragmented_settings_type_preserves_control_frame_order() {
+        let mut pair = crate::tests::Pair::default();
+        let mut server = pair.server();
+        let (resume_send, resume_recv) = tokio::sync::oneshot::channel();
+        let (done_send, done_recv) = tokio::sync::oneshot::channel();
+        let client = async {
+            let connection = pair.client_inner().await;
+            let mut control = connection.open_uni().await.unwrap();
+            // CONTROL stream type, then half of a legal two-byte SETTINGS type.
+            control.write_all(&[0x00, 0x40]).await.unwrap();
+            resume_recv.await.unwrap();
+            // Complete SETTINGS (QPACK capacity 12), then an unknown frame and GOAWAY.
+            control
+                .write_all(&[0x04, 0x02, 0x01, 0x0c, 0x21, 0x01, 0xff, 0x07, 0x01, 0x00])
+                .await
+                .unwrap();
+            done_recv.await.unwrap();
+            drop(control);
+        };
+        let server = async {
+            let mut incoming = crate::server::Connection::new(server.next().await)
+                .await
+                .unwrap();
+            future::poll_fn(|cx| {
+                assert!(incoming.inner.poll_control(cx).is_pending());
+                // Wait for the actual prefix, not merely an early network Pending.
+                if incoming.inner.control_recv.as_ref().is_some_and(|recv| {
+                    let buf = recv.stream.buf();
+                    buf.remaining() == 1 && buf.chunk() == [0x40]
+                }) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            resume_send.send(()).unwrap();
+            let settings = future::poll_fn(|cx| incoming.inner.poll_control(cx))
+                .await
+                .unwrap();
+            assert!(matches!(settings, Frame::Settings(_)));
+            assert_eq!(incoming.inner.settings().qpack_max_table_capacity, Some(12));
+            let next = future::poll_fn(|cx| incoming.inner.poll_control(cx))
+                .await
+                .unwrap();
+            assert!(matches!(next, Frame::Goaway(id) if id.into_inner() == 0));
+            done_send.send(()).unwrap();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(client, server);
+        })
+        .await
+        .expect("fragmented SETTINGS did not resume");
     }
 }
