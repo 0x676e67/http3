@@ -167,10 +167,6 @@ fn shared_decoder_queues_blocked_header_for_connection_driver() {
     enc_table.set_max_blocked(100).unwrap();
     let mut encoder = Encoder::from(enc_table);
 
-    let mut dec_table = DynamicTable::new();
-    dec_table.set_max_size(TABLE_SIZE).unwrap();
-    dec_table.set_max_blocked(100).unwrap();
-
     let mut block_buf = vec![];
     let mut enc_buf = vec![];
     encoder
@@ -183,7 +179,7 @@ fn shared_decoder_queues_blocked_header_for_connection_driver() {
         .unwrap();
 
     let (decoder_waker, mut decoder_wakers) = tokio::sync::mpsc::unbounded_channel();
-    let decoder = QpackDecoder::new(Decoder::from(dec_table), decoder_waker);
+    let decoder = QpackDecoder::new(Decoder::new(TABLE_SIZE as u64, 100).unwrap(), decoder_waker);
     let mut block_cur = Cursor::new(&mut block_buf);
     let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
 
@@ -204,6 +200,18 @@ fn shared_decoder_queues_blocked_header_for_connection_driver() {
             ..
         })
     ));
+}
+
+#[test]
+fn shared_decoder_rejects_blocking_when_the_advertised_limit_is_zero() {
+    let (events_send, mut events_recv) = tokio::sync::mpsc::unbounded_channel();
+    let decoder = QpackDecoder::new(Decoder::new(TABLE_SIZE as u64, 0).unwrap(), events_send);
+
+    assert!(matches!(
+        decoder.queue_blocked_stream(StreamId(0), 1, futures_util::task::noop_waker_ref()),
+        Err(DecoderError::TooManyBlockedStreams)
+    ));
+    assert!(events_recv.try_recv().is_err());
 }
 
 #[test]

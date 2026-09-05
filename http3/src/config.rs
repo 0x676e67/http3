@@ -33,6 +33,12 @@ pub struct Config {
     /// section or encoder-stream string.
     pub(crate) qpack_decode_buffer_size: usize,
 
+    /// Maximum dynamic-table capacity this endpoint's QPACK encoder may use.
+    ///
+    /// This is a local memory and compression policy. The effective capacity is
+    /// also limited by the peer's `SETTINGS_QPACK_MAX_TABLE_CAPACITY` value.
+    pub(crate) qpack_encoder_table_capacity: usize,
+
     /// HTTP/3 Settings
     pub settings: Settings,
 }
@@ -260,6 +266,7 @@ impl Default for Config {
             settings_order: None,
             extra_settings: Vec::new(),
             qpack_decode_buffer_size: DEFAULT_QPACK_DECODE_BUFFER_SIZE,
+            qpack_encoder_table_capacity: 0,
             settings: Default::default(),
         }
     }

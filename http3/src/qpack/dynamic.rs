@@ -6,6 +6,11 @@ use std::{
 use super::{field::HeaderField, static_::StaticTable};
 use crate::qpack::vas::{self, VirtualAddressSpace};
 
+// Bound encoder bookkeeping even if a peer advances the Known Received Count
+// but never acknowledges or cancels field sections.
+// https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3
+const MAX_TRACKED_STREAMS: usize = 1000;
+
 #[derive(Debug, PartialEq)]
 pub enum Error {
     BadRelativeIndex(usize),
@@ -66,6 +71,7 @@ pub struct DynamicTableEncoder<'a> {
     committed: bool,
     stream_id: u64,
     allow_blocking: bool,
+    allow_tracking: bool,
     block_refs: HashMap<usize, usize>,
 }
 
@@ -79,10 +85,6 @@ impl<'a> Drop for DynamicTableEncoder<'a> {
 }
 
 impl<'a> DynamicTableEncoder<'a> {
-    pub(super) fn max_size(&self) -> usize {
-        self.table.max_size
-    }
-
     pub(super) fn base(&self) -> usize {
         self.base
     }
@@ -103,11 +105,26 @@ impl<'a> DynamicTableEncoder<'a> {
         self.committed = true;
     }
 
-    pub(super) fn find(&mut self, field: &HeaderField<'static>) -> DynamicLookupResult {
-        self.lookup_result(self.table.field_map.get(field).cloned())
+    pub(super) fn find(&mut self, field: &HeaderField<'_>) -> DynamicLookupResult {
+        let absolute = self
+            .table
+            .fields
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, candidate)| {
+                candidate.name.as_ref() == field.name.as_ref()
+                    && candidate.value.as_ref() == field.value.as_ref()
+            })
+            .and_then(|(index, _)| self.table.vas.index(index).ok());
+        self.lookup_result(absolute)
     }
 
     fn lookup_result(&mut self, absolute: Option<usize>) -> DynamicLookupResult {
+        if !self.allow_tracking {
+            return DynamicLookupResult::NotFound;
+        }
+
         match absolute {
             Some(absolute)
                 if (absolute <= self.table.largest_known_received || self.allow_blocking)
@@ -135,7 +152,7 @@ impl<'a> DynamicTableEncoder<'a> {
 
     pub(super) fn insert(
         &mut self,
-        field: &HeaderField<'static>,
+        field: &HeaderField<'_>,
     ) -> Result<DynamicInsertionResult, Error> {
         // A newly inserted entry is not known to the decoder yet. Referencing
         // it is allowed only when this stream can consume a blocked-stream
@@ -147,6 +164,11 @@ impl<'a> DynamicTableEncoder<'a> {
             ));
         }
 
+        let field = HeaderField {
+            name: Cow::Owned(field.name.to_vec()),
+            value: Cow::Owned(field.value.to_vec()),
+            sensitive: field.sensitive,
+        };
         let index = match self.table.insert(field.clone()) {
             Ok(Some(index)) => index,
             Err(Error::MaxTableSizeReached) | Ok(None) => {
@@ -221,7 +243,7 @@ impl<'a> DynamicTableEncoder<'a> {
             return DynamicLookupResult::Static(index);
         }
 
-        self.lookup_result(self.table.name_map.get(name).cloned())
+        self.lookup_result(self.table.name_map.get(name).copied())
     }
 
     fn track_ref(&mut self, reference: usize) {
@@ -312,6 +334,7 @@ pub struct DynamicTable {
     track_map: BTreeMap<usize, usize>,
     track_blocks: HashMap<u64, TrackedStream>,
     largest_known_received: usize,
+    encoder_side: bool,
     blocked_max: u64,
     // Ordered by Required Insert Count so decoder feedback can release all
     // newly unblocked streams without scanning every tracked stream.
@@ -332,14 +355,21 @@ impl DynamicTable {
     }
 
     pub fn encoder(&mut self, stream_id: u64) -> DynamicTableEncoder<'_> {
-        for (idx, field) in self.fields.iter().enumerate() {
-            self.name_map
-                .insert(field.name.clone(), self.vas.index(idx).unwrap());
-            self.field_map
-                .insert(field.clone(), self.vas.index(idx).unwrap());
+        self.encoder_side = true;
+        // Encoder insertions maintain both maps incrementally. Rebuild only for
+        // a pre-populated table instead of cloning it for every field section.
+        if self.field_map.is_empty() && !self.fields.is_empty() {
+            for (idx, field) in self.fields.iter().enumerate() {
+                self.name_map
+                    .insert(field.name.clone(), self.vas.index(idx).unwrap());
+                self.field_map
+                    .insert(field.clone(), self.vas.index(idx).unwrap());
+            }
         }
 
         let allow_blocking = self.stream_is_blocked(stream_id) || !self.blocked_limit_reached();
+        let allow_tracking = self.track_blocks.contains_key(&stream_id)
+            || self.track_blocks.len() < MAX_TRACKED_STREAMS;
 
         DynamicTableEncoder {
             base: self.vas.largest_ref(),
@@ -347,7 +377,8 @@ impl DynamicTable {
             block_refs: HashMap::new(),
             committed: false,
             stream_id,
-            allow_blocking,
+            allow_blocking: allow_tracking && allow_blocking,
+            allow_tracking,
         }
     }
 
@@ -432,6 +463,10 @@ impl DynamicTable {
 
     pub(super) fn total_inserted(&self) -> usize {
         self.vas.total_inserted()
+    }
+
+    pub(super) fn is_known_received(&self, required_insert_count: usize) -> bool {
+        required_insert_count <= self.largest_known_received
     }
 
     #[cfg(test)]
@@ -590,8 +625,13 @@ impl DynamicTable {
                 break;
             }
 
-            if self.is_tracked(self.vas.index(idx).unwrap()) {
-                // TODO handle out of bounds error
+            let absolute = self.vas.index(idx)?;
+            // An insertion is not evictable until the decoder acknowledges it,
+            // even when no field section currently references it.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.1
+            if (self.encoder_side && absolute > self.largest_known_received)
+                || self.is_tracked(absolute)
+            {
                 break;
             }
 
@@ -1200,10 +1240,11 @@ mod tests {
     }
 
     #[test]
-    fn encoder_can_evict_unreferenced() {
+    fn encoder_can_evict_acknowledged_unreferenced_entry() {
         let mut table = build_table();
         table.set_max_size(63).unwrap();
         table.insert(HeaderField::new("foo", "bar")).unwrap();
+        table.update_largest_received(1).unwrap();
 
         assert_eq!(table.fields.len(), 1);
         assert_eq!(
@@ -1583,6 +1624,48 @@ mod tests {
     }
 
     #[test]
+    fn canceled_speculative_stream_keeps_unacknowledged_entry_non_evictable() {
+        let mut table = DynamicTable::new();
+        let first = HeaderField::new("first", "value");
+        let second = HeaderField::new("other", "value");
+        assert_eq!(first.mem_size(), second.mem_size());
+        table.set_max_size(first.mem_size()).unwrap();
+        table.set_max_blocked(1).unwrap();
+
+        {
+            let mut encoder = table.encoder(42);
+            assert!(matches!(
+                encoder.insert(&first),
+                Ok(DynamicInsertionResult::Inserted { absolute: 1, .. })
+            ));
+            encoder.commit(1);
+        }
+        table.cancel_stream(42).unwrap();
+
+        assert_eq!(table.largest_known_received, 0);
+        assert!(matches!(
+            table.encoder(44).insert(&second),
+            Ok(DynamicInsertionResult::NotInserted(_))
+        ));
+        assert_eq!(table.fields.front(), Some(&first));
+    }
+
+    #[test]
+    fn decoder_still_evicts_entries_as_encoder_instructions_arrive() {
+        let mut table = DynamicTable::new();
+        let first = HeaderField::new("first", "value");
+        let second = HeaderField::new("other", "value");
+        assert_eq!(first.mem_size(), second.mem_size());
+        table.set_max_size(first.mem_size()).unwrap();
+
+        table.put_decoder(first).unwrap();
+        table.put_decoder(second.clone()).unwrap();
+
+        assert_eq!(table.fields.len(), 1);
+        assert_eq!(table.fields.front(), Some(&second));
+    }
+
+    #[test]
     fn acknowledged_entries_can_be_referenced_without_a_blocked_slot() {
         let mut table = build_table();
         let field = HeaderField::new("known", "value");
@@ -1597,6 +1680,34 @@ mod tests {
                 absolute: 1,
             }
         );
+    }
+
+    #[test]
+    fn encoder_bounds_streams_waiting_for_section_feedback() {
+        let mut table = build_table();
+        let field = HeaderField::new("known", "value");
+        table.put(field.clone()).unwrap();
+        table.update_largest_received(1).unwrap();
+        table.set_max_blocked(0).unwrap();
+
+        for stream_id in 0..MAX_TRACKED_STREAMS as u64 {
+            let mut encoder = table.encoder(stream_id);
+            assert!(matches!(
+                encoder.find(&field),
+                DynamicLookupResult::Relative { absolute: 1, .. }
+            ));
+            encoder.commit(1);
+        }
+
+        assert_eq!(table.track_blocks.len(), MAX_TRACKED_STREAMS);
+        assert_eq!(
+            table.encoder(MAX_TRACKED_STREAMS as u64).find(&field),
+            DynamicLookupResult::NotFound
+        );
+        assert!(matches!(
+            table.encoder(0).find(&field),
+            DynamicLookupResult::Relative { absolute: 1, .. }
+        ));
     }
 
     #[test]

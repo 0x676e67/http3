@@ -1,6 +1,6 @@
 use std::{convert::TryFrom, sync::Arc};
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use http::{Request, StatusCode};
 use tokio::sync::mpsc::UnboundedSender;
 #[cfg(feature = "tracing")]
@@ -8,7 +8,7 @@ use tracing::instrument;
 
 use super::{connection::RequestEnd, stream::RequestStream};
 use crate::{
-    connection::{self},
+    connection::{self, RequestDecodeState},
     error::{
         Code, StreamError,
         connection_error_creators::{CloseStream, HandleFrameStreamErrorOnRequestStream},
@@ -19,7 +19,7 @@ use crate::{
         frame::{Frame, PayloadLen},
         headers::Header,
     },
-    qpack::{self, QpackDecoder},
+    qpack,
     quic::{self, SendStream, StreamId},
     shared_state::{ConnectionState, SharedState},
 };
@@ -37,9 +37,8 @@ where
     pub(super) request_end_send: UnboundedSender<StreamId>,
     pub(super) send_grease_frame: bool,
     pub(super) max_field_section_size: u64,
-    pub(super) max_qpack_decode_buffer_size: usize,
     pub(super) shared: Arc<SharedState>,
-    pub(super) decoder: QpackDecoder,
+    pub(super) decode_state: RequestDecodeState,
 }
 
 impl<C, B> ConnectionState for RequestResolver<C, B>
@@ -75,7 +74,7 @@ where
         req.resolve().await
     }
 
-    /// Accepts a http request where the first frame has already been read and decoded.
+    /// Accepts an HTTP request whose first frame has already been read.
     ///
     /// This is needed as a bidirectional stream may be read as part of incoming webtransport
     /// bi-streams. If it turns out that the stream is *not* a `WEBTRANSPORT_STREAM` the request
@@ -85,7 +84,7 @@ where
         mut self,
         frame: Result<Option<Frame<PayloadLen>>, FrameStreamError>,
     ) -> Result<ResolvedRequest<C, B>, StreamError> {
-        let mut encoded = match frame {
+        let encoded = match frame {
             Ok(Some(Frame::Headers(h))) => h,
 
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
@@ -126,44 +125,23 @@ where
             }
         };
 
-        let decoded = match qpack::decode_stateless_limited(
-            &mut encoded,
-            self.max_field_section_size,
-            self.max_qpack_decode_buffer_size,
-        ) {
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
-            //# An HTTP/3 implementation MAY impose a limit on the maximum size of
-            //# the message header it will accept on an individual HTTP message.
-            Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => Err(cancel_size),
-            Ok(decoded) => Ok(decoded),
-            Err(_e) => {
-                return Err(
-                    self.handle_connection_error_on_stream(InternalConnectionError {
-                        code: Code::QPACK_DECOMPRESSION_FAILED,
-                        message: "Failed to decode headers".to_string(),
-                    }),
-                );
-            }
-        };
-
         let request_stream = RequestStream {
             request_end: Arc::new(RequestEnd {
                 request_end: self.request_end_send.clone(),
                 stream_id: self.frame_stream.send_id(),
             }),
-            inner: connection::RequestStream::new(
+            inner: connection::RequestStream::with_decode_state(
                 self.frame_stream,
                 self.max_field_section_size,
-                self.max_qpack_decode_buffer_size,
                 self.shared.clone(),
                 self.send_grease_frame,
-                self.decoder,
+                self.decode_state,
             ),
         };
 
         Ok(ResolvedRequest::new(
             request_stream,
-            decoded,
+            encoded,
             self.max_field_section_size,
         ))
     }
@@ -175,8 +153,7 @@ where
     B: Buf,
 {
     request_stream: RequestStream<C::BidiStream, B>,
-    // Ok or `REQUEST_HEADER_FIELDS_TO_LARGE` which needs to be sent
-    decoded: Result<qpack::Decoded, u64>,
+    encoded: Bytes,
     max_field_section_size: u64,
 }
 
@@ -187,12 +164,12 @@ where
 {
     pub fn new(
         request_stream: RequestStream<C::BidiStream, B>,
-        decoded: Result<qpack::Decoded, u64>,
+        encoded: Bytes,
         max_field_section_size: u64,
     ) -> Self {
         Self {
             request_stream,
-            decoded,
+            encoded,
             max_field_section_size,
         }
     }
@@ -203,9 +180,15 @@ where
     pub async fn resolve(
         mut self,
     ) -> Result<(Request<()>, RequestStream<C::BidiStream, B>), StreamError> {
-        let fields = match self.decoded {
-            Ok(v) => v.fields,
-            Err(cancel_size) => {
+        let decoded = match std::future::poll_fn(|cx| {
+            self.request_stream
+                .inner
+                .poll_decode_field_section(cx, &mut self.encoded)
+        })
+        .await
+        {
+            Ok(decoded) => decoded,
+            Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
                 // Send and await the error response
                 self.request_stream
                     .send_response(
@@ -221,7 +204,21 @@ where
                     max_size: self.max_field_section_size,
                 });
             }
+            Err(error) => {
+                let code = if error.is_internal() {
+                    Code::H3_INTERNAL_ERROR
+                } else {
+                    Code::QPACK_DECOMPRESSION_FAILED
+                };
+                return Err(self.request_stream.handle_connection_error_on_stream(
+                    InternalConnectionError::new(
+                        code,
+                        format!("failed to decode request headers: {error}"),
+                    ),
+                ));
+            }
         };
+        let fields = decoded.fields;
 
         // Parse the request headers
         let result = match Header::try_from(fields) {

@@ -89,7 +89,7 @@ where
     /// Tell the peer to stop sending into the underlying QUIC stream
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_sending(&mut self, error_code: Code) {
-        self.inner.stream.stop_sending(error_code)
+        self.inner.stop_sending(error_code)
     }
 
     /// Returns the underlying stream id
