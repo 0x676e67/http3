@@ -53,6 +53,7 @@ pub fn decode<B: Buf>(size: u8, buf: &mut B) -> Result<(u8, u64), Error> {
     Ok((flags, value))
 }
 
+#[inline]
 pub fn encode<B: BufMut>(size: u8, flags: u8, value: u64, buf: &mut B) {
     assert!(size <= 8);
     // NOTE: following casts to u8 intend to trim the most significant bits, they are used as a

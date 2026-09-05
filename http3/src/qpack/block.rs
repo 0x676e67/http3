@@ -134,76 +134,87 @@ impl HeaderPrefix {
         total_inserted: usize,
         max_table_size: usize,
     ) -> Result<(usize, usize), ParseError> {
+        let required = Self::reconstruct_required_insert_count(
+            self.encoded_insert_count,
+            total_inserted,
+            max_table_size,
+        )?;
+        let base = Self::calculate_base(required, self.sign_negative, self.delta_base)?;
+        Ok((required, base))
+    }
+
+    pub(super) fn reconstruct_required_insert_count(
+        encoded_insert_count: usize,
+        total_inserted: usize,
+        max_table_size: usize,
+    ) -> Result<usize, ParseError> {
         // Required Insert Count reconstruction uses the advertised maximum
         // capacity, not the table's current capacity.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
-        let required = if self.encoded_insert_count == 0 {
+        let required = if encoded_insert_count == 0 {
             0
         } else {
             let max_entries = max_table_size / 32;
             let full_range = 2 * max_entries;
-            if max_entries == 0 || self.encoded_insert_count > full_range {
-                return Err(ParseError::InvalidRequiredInsertCount(
-                    self.encoded_insert_count,
-                ));
+            if max_entries == 0 || encoded_insert_count > full_range {
+                return Err(ParseError::InvalidRequiredInsertCount(encoded_insert_count));
             }
 
             // Choose the largest candidate no more than MaxEntries ahead of the
             // decoder's current Insert Count.
-            let max_value = total_inserted.checked_add(max_entries).ok_or(
-                ParseError::InvalidRequiredInsertCount(self.encoded_insert_count),
-            )?;
+            let max_value = total_inserted
+                .checked_add(max_entries)
+                .ok_or(ParseError::InvalidRequiredInsertCount(encoded_insert_count))?;
             let max_wrapped = (max_value / full_range) * full_range;
             let mut required = max_wrapped
-                .checked_add(self.encoded_insert_count)
+                .checked_add(encoded_insert_count)
                 .and_then(|value| value.checked_sub(1))
-                .ok_or(ParseError::InvalidRequiredInsertCount(
-                    self.encoded_insert_count,
-                ))?;
+                .ok_or(ParseError::InvalidRequiredInsertCount(encoded_insert_count))?;
 
             if required > max_value {
                 if required <= full_range {
-                    return Err(ParseError::InvalidRequiredInsertCount(
-                        self.encoded_insert_count,
-                    ));
+                    return Err(ParseError::InvalidRequiredInsertCount(encoded_insert_count));
                 }
                 required -= full_range;
             }
 
             if required == 0 {
-                return Err(ParseError::InvalidRequiredInsertCount(
-                    self.encoded_insert_count,
-                ));
+                return Err(ParseError::InvalidRequiredInsertCount(encoded_insert_count));
             }
             required
         };
+        Ok(required)
+    }
 
+    pub(super) fn calculate_base(
+        required: usize,
+        sign_negative: bool,
+        delta_base: usize,
+    ) -> Result<usize, ParseError> {
         let invalid_base = || ParseError::InvalidBase {
             required_insert_count: required,
-            sign_negative: self.sign_negative,
-            delta_base: self.delta_base,
+            sign_negative,
+            delta_base,
         };
 
         // Delta Base is peer-controlled. Checked arithmetic rejects a Base that
         // cannot be represented as `usize`.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1
-        let base = if !self.sign_negative {
+        let base = if !sign_negative {
             // With no dynamic references, RIC 0 can still use any Base.
             // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.2
-            required
-                .checked_add(self.delta_base)
-                .ok_or_else(invalid_base)?
+            required.checked_add(delta_base).ok_or_else(invalid_base)?
         } else {
             // A negative sign is invalid when Required Insert Count is no
             // greater than Delta Base, including when both values are zero.
             // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.2
             required
-                .checked_sub(self.delta_base)
+                .checked_sub(delta_base)
                 .and_then(|base| base.checked_sub(1))
                 .ok_or_else(invalid_base)?
         };
 
-        Ok((required, base))
+        Ok(base)
     }
 
     // 4.5.1. Encoded Field Section Prefix
@@ -512,18 +523,28 @@ impl Literal {
         buf: &mut R,
         max_encoded_string_size: usize,
     ) -> Result<Self, ParseError> {
+        let (name, never_indexed) = Self::decode_name(buf, max_encoded_string_size)?;
+        let value = prefix_string::decode_limited(8, buf, max_encoded_string_size)?;
+        Ok(Self {
+            name,
+            value,
+            never_indexed,
+        })
+    }
+
+    /// Decodes a complete name without requiring the following value to be available.
+    pub(crate) fn decode_name<R: Buf>(
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<(Vec<u8>, bool), ParseError> {
         if buf.remaining() < 1 {
             return Err(ParseError::Integer(prefix_int::Error::UnexpectedEnd));
         } else if buf.chunk()[0] & 0b1110_0000 != 0b0010_0000 {
             return Err(ParseError::InvalidPrefix(buf.chunk()[0]));
         }
         let never_indexed = buf.chunk()[0] & 0b0001_0000 != 0;
-        let mut literal = Literal::new(
-            prefix_string::decode_limited(4, buf, max_encoded_string_size)?,
-            prefix_string::decode_limited(8, buf, max_encoded_string_size)?,
-        );
-        literal.never_indexed = never_indexed;
-        Ok(literal)
+        let name = prefix_string::decode_limited(4, buf, max_encoded_string_size)?;
+        Ok((name, never_indexed))
     }
 
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {

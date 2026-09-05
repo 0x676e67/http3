@@ -18,7 +18,10 @@ pub use self::{
     field::HeaderField,
 };
 pub(crate) use self::{
-    decoder::{FieldSectionPrefix, decode_stateless_limited},
+    decoder::{
+        DecoderState, FieldSectionPrefix, decode_stateless_incremental_limited,
+        decode_stateless_limited,
+    },
     encoder::Encoder,
 };
 use crate::quic::StreamId;
@@ -381,6 +384,11 @@ impl QpackDecoder {
         self.0.decoder_dynamic_table
     }
 
+    /// Returns the local bound on retained compressed input.
+    pub(crate) fn max_encoded_string_size(&self) -> usize {
+        self.0.max_encoded_string_size
+    }
+
     /// Queues a blocked field section for the connection driver.
     ///
     /// The driver owns blocked-stream accounting and wakes the request when its
@@ -527,11 +535,11 @@ impl QpackDecoder {
     }
 
     /// Releases a decode guard and wakes a driver waiting to update the table.
-    fn finish_decode(
+    fn finish_decode<T>(
         &self,
         decoder: RwLockReadGuard<'_, Decoder>,
-        decoded: Result<Decoded, DecoderError>,
-    ) -> Poll<Result<Decoded, DecoderError>> {
+        decoded: Result<T, DecoderError>,
+    ) -> Poll<Result<T, DecoderError>> {
         // A driver blocked in poll_on_recv_encoder can continue after the guard drops.
         drop(decoder);
         self.0.write_waker.wake();
@@ -563,10 +571,48 @@ impl QpackDecoder {
             ));
         }
 
+        self.poll_with_decoder(cx, |decoder| {
+            decoder.decode_header_limited(field_section, max_field_section_size, prefix)
+        })
+    }
+
+    /// Continues decoding the current HEADERS payload without consuming another frame.
+    ///
+    /// `end` is true only when that payload is exhausted. `Ok(None)` needs more
+    /// payload bytes; `MissingRefs` requires registration with the connection
+    /// driver. `Pending` waits for the driver's dynamic-table write lock.
+    ///
+    /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
+    pub(crate) fn poll_decode_field_section_incremental(
+        &self,
+        cx: &mut Context<'_>,
+        state: &mut DecoderState,
+        end: bool,
+        max_field_section_size: u64,
+    ) -> Poll<Result<Option<Decoded>, DecoderError>> {
+        if !self.0.decoder_dynamic_table {
+            return Poll::Ready(decode_stateless_incremental_limited(
+                state,
+                end,
+                max_field_section_size,
+                self.0.max_encoded_string_size,
+            ));
+        }
+
+        self.poll_with_decoder(cx, |decoder| {
+            decoder.decode_header_incremental(state, end, max_field_section_size)
+        })
+    }
+
+    /// Acquires a shared decoder guard, registering before retrying a busy writer.
+    fn poll_with_decoder<T>(
+        &self,
+        cx: &mut Context<'_>,
+        decode: impl FnOnce(&Decoder) -> Result<T, DecoderError>,
+    ) -> Poll<Result<T, DecoderError>> {
         match self.0.decoder.try_read() {
             Ok(decoder) => {
-                let decoded =
-                    decoder.decode_header_limited(field_section, max_field_section_size, prefix);
+                let decoded = decode(&decoder);
                 return self.finish_decode(decoder, decoded);
             }
             Err(TryLockError::WouldBlock) => {}
@@ -593,8 +639,7 @@ impl QpackDecoder {
 
         match self.0.decoder.try_read() {
             Ok(decoder) => {
-                let decoded =
-                    decoder.decode_header_limited(field_section, max_field_section_size, prefix);
+                let decoded = decode(&decoder);
                 self.finish_decode(decoder, decoded)
             }
             Err(TryLockError::WouldBlock) => Poll::Pending,

@@ -361,115 +361,138 @@ async fn client_keeps_blocked_field_section_prefix_across_table_updates() {
     const TABLE_CAPACITY: u64 = 34;
 
     init_tracing();
-    let mut pair = Pair::default();
-    let server = pair.server_inner();
-    let (blocked_send, blocked_recv) = tokio::sync::oneshot::channel();
+    for evict in [false, true] {
+        let mut pair = Pair::default();
+        let server = pair.server_inner();
+        let (blocked_send, blocked_recv) = tokio::sync::oneshot::channel();
+        let expected_code = if evict {
+            Code::QPACK_DECOMPRESSION_FAILED
+        } else {
+            Code::H3_NO_ERROR
+        };
 
-    let client_fut = async {
-        let mut builder = client::builder();
-        builder
-            .qpack_max_table_capacity(TABLE_CAPACITY)
-            .qpack_blocked_streams(1);
-        let (mut driver, mut send) = builder
-            .build::<_, _, Bytes>(pair.client().await)
-            .await
-            .unwrap();
-        let mut request_stream = send
-            .send_request(Request::get("http://localhost/").body(()).unwrap())
-            .await
-            .unwrap();
-
-        let mut response = Box::pin(request_stream.recv_response());
-        future::poll_fn(|cx| {
-            if let std::task::Poll::Ready(error) = driver.poll_close(cx) {
-                panic!("connection closed before the field section blocked: {error:?}");
-            }
-            if let std::task::Poll::Ready(result) = response.as_mut().poll(cx) {
-                panic!("response completed before the field section blocked: {result:?}");
-            }
-
-            if driver.inner.qpack_blocked_stream_count() == 1 {
-                std::task::Poll::Ready(())
-            } else {
-                std::task::Poll::Pending
-            }
-        })
-        .await;
-        blocked_send.send(()).unwrap();
-
-        let (response, connection) =
-            tokio::join!(response, future::poll_fn(|cx| driver.poll_close(cx)),);
-        drop(send);
-        assert_matches!(
-            response,
-            Err(StreamError::ConnectionError(ConnectionError::Local {
-                error: LocalError::Application {
-                    code: Code::QPACK_DECOMPRESSION_FAILED,
-                    ..
-                }
-            }))
-        );
-        assert_matches!(
-            connection,
-            ConnectionError::Local {
-                error: LocalError::Application {
-                    code: Code::QPACK_DECOMPRESSION_FAILED,
-                    ..
-                }
-            }
-        );
-    };
-
-    let server_fut = async {
-        let connection = server.accept().await.unwrap().await.unwrap();
-        let mut control_stream = connection.open_uni().await.unwrap();
-        let mut control = BytesMut::new();
-        StreamType::CONTROL.encode(&mut control);
-        Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut control);
-        control_stream.write_all(&control).await.unwrap();
-
-        let mut encoder_stream = connection.open_uni().await.unwrap();
-        let mut encoder_header = BytesMut::new();
-        StreamType::ENCODER.encode(&mut encoder_header);
-        encoder_stream.write_all(&encoder_header).await.unwrap();
-
-        let (mut response_send, _request_recv) = connection.accept_bi().await.unwrap();
-        // With MaxEntries 1, encoded RIC 2 reconstructs to RIC 1 while the
-        // decoder table is empty. Relative index 0 therefore names insertion 1.
-        let mut response = BytesMut::new();
-        Frame::headers(vec![0x02, 0x00, 0x80]).encode_with_payload(&mut response);
-        response_send.write_all(&response).await.unwrap();
-
-        // Wait until the connection driver has recorded the original Required
-        // Insert Count. Each subsequent 34-byte entry evicts its predecessor.
-        blocked_recv.await.unwrap();
-        let mut instructions = BytesMut::new();
-        qpack::DynamicTableSizeUpdate(usize::try_from(TABLE_CAPACITY).unwrap())
-            .encode(&mut instructions);
-        for value in ["1", "2", "3"] {
-            qpack::InsertWithoutNameRef::new("a", value)
-                .encode(&mut instructions)
+        let client_fut = async {
+            let mut builder = client::builder();
+            builder
+                .qpack_max_table_capacity(TABLE_CAPACITY)
+                .qpack_blocked_streams(1);
+            let (mut driver, mut send) = builder
+                .build::<_, _, Bytes>(pair.client().await)
+                .await
                 .unwrap();
-        }
-        encoder_stream.write_all(&instructions).await.unwrap();
+            let mut request_stream = send
+                .send_request(Request::get("http://localhost/").body(()).unwrap())
+                .await
+                .unwrap();
 
-        // The original insertion is gone. Reconstructing the prefix a second
-        // time would incorrectly bind the response to insertion 3 instead.
-        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
-        assert_matches!(
-            connection.closed().await,
-            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
-                error_code,
-                ..
-            }) if error_code.into_inner() == Code::QPACK_DECOMPRESSION_FAILED.value()
-        );
-    };
+            let mut response = Box::pin(request_stream.recv_response());
+            future::poll_fn(|cx| {
+                if let std::task::Poll::Ready(error) = driver.poll_close(cx) {
+                    panic!("connection closed before the field section blocked: {error:?}");
+                }
+                if let std::task::Poll::Ready(result) = response.as_mut().poll(cx) {
+                    panic!("response completed before the field section blocked: {result:?}");
+                }
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(server_fut, client_fut);
-    })
-    .await
-    .expect("blocked field section did not preserve its reconstructed prefix");
+                if driver.inner.qpack_blocked_stream_count() == 1 {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            blocked_send.send(()).unwrap();
+
+            // Canceling the wait must leave the decoded prefix on the request stream.
+            drop(response);
+            let response = async {
+                let response = request_stream.recv_response().await;
+                if evict {
+                    assert_matches!(
+                        response,
+                        Err(StreamError::ConnectionError(ConnectionError::Local {
+                            error: LocalError::Application {
+                                code: Code::QPACK_DECOMPRESSION_FAILED,
+                                ..
+                            }
+                        }))
+                    );
+                } else {
+                    let response = response.unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(response.headers().get("a").unwrap(), "1");
+                    assert!(request_stream.recv_data().await.unwrap().is_none());
+                    assert!(request_stream.recv_trailers().await.unwrap().is_none());
+                }
+                drop(request_stream);
+                // Close only after the resumed response completes, so the driver
+                // remains available to wake the blocked decoder in both cases.
+                drop(send);
+            };
+            let (_, connection) =
+                tokio::join!(response, future::poll_fn(|cx| driver.poll_close(cx)),);
+            assert_matches!(
+                connection,
+                ConnectionError::Local {
+                    error: LocalError::Application { code, .. }
+                } if code == expected_code
+            );
+        };
+
+        let server_fut = async {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            let mut control_stream = connection.open_uni().await.unwrap();
+            let mut control = BytesMut::new();
+            StreamType::CONTROL.encode(&mut control);
+            Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut control);
+            control_stream.write_all(&control).await.unwrap();
+
+            let mut encoder_stream = connection.open_uni().await.unwrap();
+            let mut encoder_header = BytesMut::new();
+            StreamType::ENCODER.encode(&mut encoder_header);
+            encoder_stream.write_all(&encoder_header).await.unwrap();
+
+            let (mut response_send, _request_recv) = connection.accept_bi().await.unwrap();
+            // With MaxEntries 1, encoded RIC 2 reconstructs to RIC 1 while the
+            // decoder table is empty. Static :status 200 precedes relative index
+            // 0, which names insertion 1.
+            let mut response = BytesMut::new();
+            Frame::headers(vec![0x02, 0x00, 0xd9, 0x80]).encode_with_payload(&mut response);
+            response_send.write_all(&response).await.unwrap();
+            response_send.finish().unwrap();
+
+            // Wait until the connection driver has recorded the original Required
+            // Insert Count. Each subsequent 34-byte entry evicts its predecessor.
+            blocked_recv.await.unwrap();
+            let mut instructions = BytesMut::new();
+            qpack::DynamicTableSizeUpdate(usize::try_from(TABLE_CAPACITY).unwrap())
+                .encode(&mut instructions);
+            for value in ["1", "2", "3"].into_iter().take(if evict { 3 } else { 1 }) {
+                qpack::InsertWithoutNameRef::new("a", value)
+                    .encode(&mut instructions)
+                    .unwrap();
+            }
+            encoder_stream.write_all(&instructions).await.unwrap();
+
+            // Without eviction, insertion 1 must resume the original response.
+            // With eviction, reconstructing the prefix again would incorrectly
+            // bind it to insertion 3 instead of rejecting the missing entry.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
+            assert_matches!(
+                connection.closed().await,
+                quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                    error_code,
+                    ..
+                }) if error_code.into_inner() == expected_code.value()
+            );
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server_fut, client_fut);
+        })
+        .await
+        .expect("blocked field section did not preserve its reconstructed prefix");
+    }
 }
 
 #[tokio::test]
@@ -612,6 +635,91 @@ async fn server_rejects_oversized_encoded_field_section_from_frame_header() {
 }
 
 #[tokio::test]
+async fn recv_trailers_before_body_keeps_body_readable() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+
+    let client_fut = async {
+        let (mut driver, mut client) = client::new(pair.client().await).await.expect("client init");
+        let drive_fut = async { future::poll_fn(|cx| driver.poll_close(cx)).await };
+        let req_fut = async move {
+            let mut request_stream = client
+                .send_request(Request::get("http://localhost/salut").body(()).unwrap())
+                .await
+                .expect("request");
+
+            request_stream.recv_response().await.expect("recv response");
+            assert_matches!(
+                request_stream.recv_trailers().await,
+                Err(StreamError::StreamError {
+                    code: Code::H3_FRAME_UNEXPECTED,
+                    ..
+                })
+            );
+
+            let first = request_stream
+                .recv_data()
+                .await
+                .expect("recv first data")
+                .expect("first data");
+            assert_eq!(first.chunk(), b"first");
+            let second = request_stream
+                .recv_data()
+                .await
+                .expect("recv second data")
+                .expect("second data");
+            assert_eq!(second.chunk(), b"second");
+            assert!(
+                request_stream
+                    .recv_data()
+                    .await
+                    .expect("recv end")
+                    .is_none()
+            );
+            assert!(
+                request_stream
+                    .recv_trailers()
+                    .await
+                    .expect("recv trailers")
+                    .is_none()
+            );
+        };
+        tokio::join!(req_fut, drive_fut)
+    };
+
+    let server_fut = async {
+        let conn = server.next().await;
+        let mut incoming_req = server::Connection::new(conn).await.unwrap();
+        let (_request, mut request_stream) = get_stream_blocking(&mut incoming_req)
+            .await
+            .expect("accept");
+
+        request_stream
+            .send_response(Response::new(()))
+            .await
+            .expect("send response");
+        request_stream
+            .send_data("first".into())
+            .await
+            .expect("send first data");
+        request_stream
+            .send_data("second".into())
+            .await
+            .expect("send second data");
+        request_stream.finish().await.expect("finish");
+
+        assert_matches!(
+            incoming_req.accept().await.err().unwrap(),
+            ConnectionError::Remote(ConnectionErrorIncoming::ApplicationClose{error_code: code, ..})
+            if code == Code::H3_NO_ERROR.value()
+        );
+    };
+
+    tokio::join!(server_fut, client_fut);
+}
+
+#[tokio::test]
 async fn get_with_trailers_unknown_content_type() {
     init_tracing();
     let mut pair = Pair::default();
@@ -632,6 +740,8 @@ async fn get_with_trailers_unknown_content_type() {
                 .expect("recv data")
                 .expect("body");
 
+            assert!(request_stream.recv_data().await.unwrap().is_none());
+            // Repeated body reads must not consume the pending trailer field section.
             assert!(request_stream.recv_data().await.unwrap().is_none());
             let trailers = request_stream
                 .recv_trailers()
@@ -766,13 +876,21 @@ async fn post() {
                 .await
                 .expect("request");
 
-            request_stream
-                .send_data("wonderful json".into())
-                .await
-                .expect("send_data");
+            // Empty DATA is not end-of-body in either direction (RFC 9114 Section 4.1).
+            for data in ["", "wonderful json", ""] {
+                request_stream
+                    .send_data(data.into())
+                    .await
+                    .expect("send_data");
+            }
             request_stream.finish().await.expect("client finish");
 
             request_stream.recv_response().await.expect("recv response");
+            let mut response_body = Vec::new();
+            while let Some(mut data) = request_stream.recv_data().await.expect("response body") {
+                response_body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+            }
+            assert_eq!(response_body, b"wonderful hypertext");
         };
         tokio::join!(req_fut, drive_fut);
     };
@@ -794,13 +912,18 @@ async fn post() {
             .await
             .expect("send_response");
 
-        let request_body = request_stream
-            .recv_data()
-            .await
-            .expect("recv data")
-            .expect("server recv body");
-        assert_eq!(request_body.chunk(), b"wonderful json");
-        request_stream.finish().await.expect("client finish");
+        let mut request_body = Vec::new();
+        while let Some(mut data) = request_stream.recv_data().await.expect("request body") {
+            request_body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+        }
+        assert_eq!(request_body, b"wonderful json");
+        for data in ["", "wonderful hypertext", ""] {
+            request_stream
+                .send_data(data.into())
+                .await
+                .expect("send_data");
+        }
+        request_stream.finish().await.expect("server finish");
 
         // keep connection until client is finished
         assert_matches!(

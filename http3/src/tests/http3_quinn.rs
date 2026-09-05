@@ -597,12 +597,17 @@ mod tests {
         const ERROR_CODE: u64 = 0x10c;
 
         let (mut recv, send, _client, _server) = connected_recv_stream().await;
+        let id = recv.recv_id();
         poll_fn(|cx| match recv.poll_data(cx) {
             Poll::Pending => Poll::Ready(()),
             Poll::Ready(result) => panic!("read unexpectedly completed: {result:?}"),
         })
         .await;
 
+        // A pending read must leave the stream ID available to HTTP/3.
+        // Regression scenario: https://github.com/hyperium/h3/commit/b986a537ddb1ccdd1eca3685b883cf7549ff7698
+        // https://github.com/hyperium/h3/blob/b986a537ddb1ccdd1eca3685b883cf7549ff7698/LICENSE
+        assert_eq!(recv.recv_id(), id);
         recv.stop_sending(ERROR_CODE);
         assert!(poll_fn(|cx| recv.poll_data(cx)).await.unwrap().is_none());
         drop(recv);

@@ -12,7 +12,7 @@ use crate::{
     qpack::{
         BlockedStreamRegistry, Decoded, DecoderError, HeaderField, QpackDecoder, QpackEvent,
         block::{HeaderPrefix, Indexed, Literal, LiteralWithNameRef, LiteralWithPostBaseNameRef},
-        decoder::{Decoder, decode_stateless},
+        decoder::{Decoder, DecoderState, decode_stateless},
         dynamic::{DynamicTable, Error as DynamicTableError},
         encoder::{Encoder, encode_stateless, set_dynamic_table_size},
         stream::{DynamicTableSizeUpdate, InsertWithoutNameRef},
@@ -126,6 +126,14 @@ fn blocked_field_section_keeps_reconstructed_prefix() {
 
     let mut decoder = Decoder::new(ENTRY_SIZE as u64, 1).unwrap();
     let mut prefix = None;
+    let mut incremental = DecoderState::new();
+    incremental
+        .extend(&mut Cursor::new(&field_section), ENTRY_SIZE)
+        .unwrap();
+    assert_eq!(
+        decoder.decode_header_incremental(&mut incremental, true, u64::MAX),
+        Err(DecoderError::MissingRefs(1))
+    );
     let mut read = Cursor::new(field_section);
     assert_eq!(
         decoder.decode_header_limited(&mut read, u64::MAX, &mut prefix),
@@ -149,6 +157,12 @@ fn blocked_field_section_keeps_reconstructed_prefix() {
     // silently bind this field line to a different dynamic-table entry.
     // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
     let result = decoder.decode_header_limited(&mut read, u64::MAX, &mut prefix);
+    assert_eq!(
+        decoder
+            .decode_header_incremental(&mut incremental, true, u64::MAX)
+            .unwrap_err(),
+        DecoderError::DynamicTable(DynamicTableError::BadRelativeIndex(0))
+    );
     assert!(
         matches!(
             result,

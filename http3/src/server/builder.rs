@@ -76,11 +76,12 @@ impl Builder {
         self
     }
 
-    /// Limits compressed QPACK input buffered before a field section is decoded.
+    /// Limits compressed QPACK input accepted per field section or encoder string.
     ///
-    /// This is a local memory limit, not an HTTP/3 setting. It applies to an
-    /// encoded HEADERS payload and to one encoded string on the peer's QPACK
-    /// encoder stream. The default is 16 MiB.
+    /// This is a local memory limit, not an HTTP/3 setting. It applies to the
+    /// entire encoded HEADERS payload, even when decoded incrementally, and to
+    /// one encoded string on the peer's QPACK encoder stream. The default is
+    /// 16 MiB.
     ///
     /// See [RFC 9204, Section 7.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3)
     /// and [Section 7.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4).

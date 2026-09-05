@@ -64,17 +64,29 @@ pub(crate) fn decode_limited<B: Buf>(
         return Err(Error::UnexpectedEnd);
     }
 
-    let payload = buf.copy_to_bytes(len);
-    let value = if flags & 1 == 0 {
-        payload.into_iter().collect()
-    } else {
-        let mut decoded = Vec::new();
-        for byte in payload.as_ref().hpack_decode() {
+    let decode_payload = |payload: &[u8]| -> Result<Vec<u8>, Error> {
+        if flags & 1 == 0 {
+            return Ok(payload.to_vec());
+        }
+        // Five bits is the shortest Huffman code. Cap the initial reservation
+        // at 64 bytes so a long, invalid payload cannot force a large allocation.
+        let mut decoded = Vec::with_capacity(payload.len().min(40) * 8 / 5);
+        for byte in payload.hpack_decode() {
             decoded.push(byte?);
         }
-        decoded
+        Ok(decoded)
     };
-    Ok(value)
+    if let Some(payload) = buf.chunk().get(..len) {
+        // Cursor-backed field sections otherwise allocate and copy the encoded
+        // string before decoding it. The returned value still owns its bytes.
+        let decoded = decode_payload(payload);
+        // Match copy_to_bytes: a complete payload is consumed even if its
+        // Huffman EOS or padding is invalid; a truncated payload is not.
+        buf.advance(len);
+        decoded
+    } else {
+        decode_payload(&buf.copy_to_bytes(len))
+    }
 }
 
 pub fn encode<B: BufMut>(size: u8, flags: u8, value: &[u8], buf: &mut B) -> Result<(), Error> {
@@ -207,5 +219,44 @@ mod tests {
         let decoded = decode(8, &mut encoded).unwrap();
 
         assert_eq!(decoded, b"www.example.com");
+    }
+
+    #[test]
+    fn decode_preserves_payload_boundaries_across_chunks() {
+        let cases = [
+            (&[0x00, 0xaa][..], Ok(&b""[..])),
+            (&[0x03, b'f', b'o', b'o', 0xaa], Ok(b"foo")),
+            (&[0x81, 0x1f, 0xaa], Ok(b"a")),
+            (
+                &[
+                    0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+                    0xaa,
+                ],
+                Ok(b"www.example.com"),
+            ),
+            (
+                &[0x81, 0xff, 0xaa],
+                Err(Error::HuffmanDecoding(
+                    HuffmanDecodingError::InvalidPadding(8),
+                )),
+            ),
+            (
+                &[0x84, 0xff, 0xff, 0xff, 0xff, 0xaa],
+                Err(Error::HuffmanDecoding(HuffmanDecodingError::Eos)),
+            ),
+            (
+                &[0x85, 0x1f, 0xff, 0xff, 0xff, 0xff, 0xaa],
+                Err(Error::HuffmanDecoding(HuffmanDecodingError::Eos)),
+            ),
+        ];
+        for (encoded, expected) in cases {
+            for split in 0..=encoded.len() {
+                let mut input = encoded[..split].chain(&encoded[split..]);
+                let decoded = decode(8, &mut input);
+                assert_eq!(decoded.as_deref(), expected.as_ref().copied());
+                assert_eq!(input.remaining(), 1);
+                assert_eq!(input.get_u8(), 0xaa);
+            }
+        }
     }
 }
