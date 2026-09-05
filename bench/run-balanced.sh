@@ -21,7 +21,7 @@
 #   bash bench/run-balanced.sh -- --noplot
 # Custom body-size cases:
 #   bash bench/run-balanced.sh --body-sizes 0B,64KiB,1MiB \
-#     --requests 20000 --concurrency 32 --extra-headers 16 -- --noplot
+#     --requests 20000 --concurrency 32 --headers both -- --noplot
 
 set -euo pipefail
 
@@ -37,9 +37,12 @@ Options:
                        Range: 1-100. By default the benchmark chooses it from
                        the body size; it cannot exceed a case's request count.
                        The Server advertises a fixed 1000-stream credit window.
-  --extra-headers N    Separate x-http3-bench: benchmark-value field lines,
-                       from 0 to 64. This benchmark field is list-valued; the
-                       Server validates every line after decoding.
+  --headers MODE      Header templates: none, request, response, both (default).
+                       Request: 12 Chrome navigation fields plus 5 custom fields.
+                       Response: 12 designed fields. Each field appears once.
+                       Counts exclude pseudo-headers, status, and content-length.
+                       Both exercises Client QPACK encoding and decoding;
+                       request or response isolates the added work's direction.
   -h, --help           Show this help.
 
 For each selected body size, run the http3 Server and then the h3 Server.
@@ -56,10 +59,10 @@ Default body sizes:
 
 Examples:
   bash bench/run-balanced.sh -- --noplot
-  bash bench/run-balanced.sh --body-sizes 0B,1KiB --extra-headers 32 -- --noplot
+  bash bench/run-balanced.sh --body-sizes 0B,1KiB --headers response -- --noplot
   bash bench/run-balanced.sh --body-sizes 1KiB -- server-h3 --noplot
   bash bench/run-balanced.sh --body-sizes 0B,64KiB,1MiB \
-    --requests 20000 --concurrency 32 --extra-headers 16 -- \
+    --requests 20000 --concurrency 32 --headers both -- \
     --sample-size 20 --measurement-time 60 --noplot
 EOF
 }
@@ -67,7 +70,7 @@ EOF
 body_sizes=
 requests=
 concurrency=
-extra_headers=
+headers=both
 criterion_args=()
 
 while (($# > 0)); do
@@ -103,17 +106,12 @@ while (($# > 0)); do
       concurrency=$2
       shift 2
       ;;
-    --extra-headers)
-      (($# >= 2)) || { echo '--extra-headers requires a value' >&2; exit 2; }
-      [[ $2 =~ ^[0-9]+$ ]] || {
-        echo '--extra-headers must be a non-negative integer' >&2
-        exit 2
-      }
-      ((10#$2 <= 64)) || {
-        echo '--extra-headers cannot exceed 64' >&2
-        exit 2
-      }
-      extra_headers=$2
+    --headers)
+      (($# >= 2)) || { echo '--headers requires a value' >&2; exit 2; }
+      case $2 in
+        none|request|response|both) headers=$2 ;;
+        *) echo '--headers must be none, request, response, or both' >&2; exit 2 ;;
+      esac
       shift 2
       ;;
     --)
@@ -160,11 +158,7 @@ if [[ -n $concurrency ]]; then
 else
   unset HTTP3_BENCH_CONCURRENCY || true
 fi
-if [[ -n $extra_headers ]]; then
-  export HTTP3_BENCH_EXTRA_HEADERS=$extra_headers
-else
-  unset HTTP3_BENCH_EXTRA_HEADERS || true
-fi
+export HTTP3_BENCH_HEADERS=$headers
 
 echo 'Each body size: Server http3, then h3; each Server: Clients http3, h3, nghttp3'
 cargo bench -p bench --bench clients --locked -- "${criterion_args[@]}"
