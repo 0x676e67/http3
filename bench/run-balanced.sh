@@ -6,8 +6,11 @@
 # script intentionally sets no CPU affinity: the operating system may migrate
 # Client threads, so results measure single-threaded Client throughput rather
 # than strict single-core performance. The benchmark Server is a separate,
-# unpinned 8-worker process, with shared validation and transport settings for
-# both Server libraries. The native build requires CMake, a C compiler,
+# unpinned process with 8 Pingora no-steal workers: one for the Endpoint and seven
+# for connections. Connections rotate across those seven current-thread runtimes;
+# each connection's QUIC driver and request tasks stay together.
+# Both Server libraries share this scheduler, validation, and
+# transport settings. The native build requires CMake, a C compiler,
 # LLVM/libclang, NASM, and pkg-config. The published sys crates include the
 # required C sources, so repository submodules are not needed. Each sample ends
 # when the last complete response is validated;

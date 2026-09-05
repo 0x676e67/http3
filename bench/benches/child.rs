@@ -222,10 +222,10 @@ impl ServerGuard {
             }
         };
         let expected = format!(
-            "http3-bench-server-v5 library={library} address={SERVER_ADDR} body_bytes={body_bytes} \
+            "http3-bench-server-v6 library={library} address={SERVER_ADDR} body_bytes={body_bytes} \
              headers={headers} \
              max_concurrent_bidi_streams={SERVER_MAX_BIDI_STREAMS} transport=quinn \
-             workers={SERVER_WORKERS}"
+             runtime=pingora-no-steal workers={SERVER_WORKERS}"
         );
         if ready.trim() != expected {
             let status = child
