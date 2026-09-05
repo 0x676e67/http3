@@ -178,13 +178,14 @@ pub(crate) struct ServerGuard {
 }
 
 impl ServerGuard {
-    pub(crate) fn start(executable: &Path, case: Case) -> Result<Self> {
+    pub(crate) fn start(executable: &Path, case: Case, library: Http3Library) -> Result<Self> {
         let body_bytes = case.body_bytes;
         let extra_headers = case.extra_headers;
         let mut child = ChildCleanupGuard {
             child: Some(
                 ChildRole::Server
                     .command(executable)
+                    .arg(library.name())
                     .arg(body_bytes.to_string())
                     .arg(extra_headers.to_string())
                     .current_dir(workspace_root())
@@ -221,7 +222,7 @@ impl ServerGuard {
             }
         };
         let expected = format!(
-            "http3-bench-server-v3 address={SERVER_ADDR} body_bytes={body_bytes} \
+            "http3-bench-server-v4 library={library} address={SERVER_ADDR} body_bytes={body_bytes} \
              extra_request_headers={extra_headers} \
              max_concurrent_bidi_streams={SERVER_MAX_BIDI_STREAMS} transport=quinn \
              workers={SERVER_WORKERS}"

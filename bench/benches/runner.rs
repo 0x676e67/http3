@@ -149,41 +149,47 @@ fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> 
     ];
 
     for &case in &cases {
-        for runner in &runners {
-            let library = runner.library;
-            let mut group = criterion.benchmark_group(format!("{library}/{case}"));
-            group.sampling_mode(SamplingMode::Flat);
-            if !config.test_mode && !config.sample_size_from_cli {
-                group.sample_size(10);
-            }
-            if !config.test_mode && !config.measurement_time_from_cli {
-                group.measurement_time(case.measurement_time());
-            }
-            group.throughput(throughput(case)?);
+        // Keep both Server stacks in the same run, with identical Client code
+        // and workloads. A shared-code optimization can affect both endpoints;
+        // the fixed upstream Server helps distinguish that from Client changes.
+        for server_library in [Http3Library::Http3, Http3Library::H3] {
+            for runner in &runners {
+                let library = runner.library;
+                let mut group =
+                    criterion.benchmark_group(format!("{library}/{case}/server-{server_library}"));
+                group.sampling_mode(SamplingMode::Flat);
+                if !config.test_mode && !config.sample_size_from_cli {
+                    group.sample_size(10);
+                }
+                if !config.test_mode && !config.measurement_time_from_cli {
+                    group.measurement_time(case.measurement_time());
+                }
+                group.throughput(throughput(case)?);
 
-            let mut server = None;
-            let benchmark_id = BenchmarkId::from_parameter(format!(
-                "requests-{}/concurrency-{}/extra-headers-{}",
-                case.requests, case.in_flight, case.extra_headers,
-            ));
-            group.bench_with_input(benchmark_id, &case, |bencher, &case| {
-                server.get_or_insert_with(|| {
-                    ServerGuard::start(executable, case).unwrap_or_else(|error| {
-                        panic!("could not start {library} benchmark server: {error:#}")
+                let mut server = None;
+                let benchmark_id = BenchmarkId::from_parameter(format!(
+                    "requests-{}/concurrency-{}/extra-headers-{}",
+                    case.requests, case.in_flight, case.extra_headers,
+                ));
+                group.bench_with_input(benchmark_id, &case, |bencher, &case| {
+                    server.get_or_insert_with(|| {
+                    ServerGuard::start(executable, case, server_library).unwrap_or_else(|error| {
+                        panic!("could not start {server_library} server for {library}: {error:#}")
                     })
                 });
-                bencher.iter_custom(|iterations| {
-                    runner
-                        .run_iterations(iterations, case)
-                        .unwrap_or_else(|error| {
-                            panic!("{library} benchmark sample failed: {error:#}")
-                        })
+                    bencher.iter_custom(|iterations| {
+                        runner
+                            .run_iterations(iterations, case)
+                            .unwrap_or_else(|error| {
+                                panic!("{library} benchmark sample failed: {error:#}")
+                            })
+                    });
                 });
-            });
-            if let Some(mut server) = server {
-                server.finish()?;
+                if let Some(mut server) = server {
+                    server.finish()?;
+                }
+                group.finish();
             }
-            group.finish();
         }
     }
     Ok(())

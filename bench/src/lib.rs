@@ -17,7 +17,7 @@ pub fn run_client<A: client::Adapter>(args: impl Iterator<Item = String>) -> any
     client::run_from_args::<A>(args)
 }
 
-/// Runs the isolated HTTP/3 Server shared by all compared Clients.
+/// Runs the isolated http3 or h3 Server selected by the first internal argument.
 pub fn run_server(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     server::run_from_args(args)
 }
