@@ -3,7 +3,7 @@
 A Tokio aware, HTTP/3 implementation for Rust.
 
 [![CI](https://github.com/0x676e67/http3/actions/workflows/CI.yml/badge.svg)](https://github.com/0x676e67/http3/actions/workflows/CI.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![GitHub License](https://img.shields.io/github/license/0x676e67/http3)](https://github.com/0x676e67/http3/blob/main/LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/http3.svg)](https://crates.io/crates/http3)
 
 More information about this crate can be found in the [crate documentation][docs].
