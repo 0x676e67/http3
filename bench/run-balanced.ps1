@@ -24,8 +24,11 @@ The Rust Clients use a Tokio current-thread runtime, while the nghttp3 Client
 uses one synchronous event-loop thread. This script intentionally sets no CPU
 affinity: the operating system may migrate those threads, so results describe
 single-threaded Client throughput rather than strict single-core performance.
-Each benchmark Server is a separate, unpinned 8-worker process. Both Server
-libraries share request validation, response content, and transport settings.
+Each benchmark Server is a separate, unpinned process with 8 Pingora no-steal
+workers: one for the Endpoint and seven for connections. Connections rotate across
+those seven current-thread runtimes; a connection's QUIC driver and request tasks
+stay together. Both Server libraries share this
+scheduler, request validation, response content, and transport settings.
 
 Each sample starts after local HTTP/3 setup and ends when the last complete
 response has been validated. Task aggregation, extra receive draining, final
