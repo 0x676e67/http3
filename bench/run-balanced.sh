@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Runs the http3, h3, and nghttp3 Clients on Linux, including WSL2.
+# Runs the http3, h3, and nghttp3 Clients against both http3 and h3 Servers on Linux.
 #
 # The Rust Clients use a Tokio current-thread runtime. The native nghttp3
 # Client is built automatically by Cargo and uses one event-loop thread. This
 # script intentionally sets no CPU affinity: the operating system may migrate
 # Client threads, so results measure single-threaded Client throughput rather
 # than strict single-core performance. The benchmark Server is a separate,
-# unpinned 8-worker process. The native build requires CMake, a C compiler,
+# unpinned 8-worker process, with shared validation and transport settings for
+# both Server libraries. The native build requires CMake, a C compiler,
 # LLVM/libclang, NASM, and pkg-config. The published sys crates include the
 # required C sources, so repository submodules are not needed. Each sample ends
 # when the last complete response is validated;
@@ -41,8 +42,10 @@ Options:
                        Server validates every line after decoding.
   -h, --help           Show this help.
 
-For each selected body size, the Clients run in this fixed order: http3, h3,
-nghttp3. Cargo builds the native nghttp3/ngtcp2 Client automatically. The
+For each selected body size, run the http3 Server and then the h3 Server.
+Under each Server, Clients run in this fixed order: http3, h3, nghttp3.
+Result names begin with the Client and include server-http3 or server-h3.
+Cargo builds the native nghttp3/ngtcp2 Client automatically. The
 native build requires CMake, a C compiler, LLVM/libclang, NASM, and pkg-config.
 Criterion arguments such as --sample-size and --measurement-time override the
 harness defaults. The published sys crates include the required C sources, so
@@ -53,6 +56,8 @@ Default body sizes:
 
 Examples:
   bash bench/run-balanced.sh -- --noplot
+  bash bench/run-balanced.sh --body-sizes 0B,1KiB --extra-headers 32 -- --noplot
+  bash bench/run-balanced.sh --body-sizes 1KiB -- server-h3 --noplot
   bash bench/run-balanced.sh --body-sizes 0B,64KiB,1MiB \
     --requests 20000 --concurrency 32 --extra-headers 16 -- \
     --sample-size 20 --measurement-time 60 --noplot
@@ -161,5 +166,5 @@ else
   unset HTTP3_BENCH_EXTRA_HEADERS || true
 fi
 
-echo 'Running each selected case in fixed Client order: http3, h3, nghttp3'
+echo 'Each body size: Server http3, then h3; each Server: Clients http3, h3, nghttp3'
 cargo bench -p bench --bench clients --locked -- "${criterion_args[@]}"

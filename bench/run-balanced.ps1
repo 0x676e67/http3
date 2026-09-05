@@ -3,7 +3,9 @@
 Runs the HTTP/3 Client comparison with explicit body-size cases.
 
 .DESCRIPTION
-For each selected body size, runs http3, then h3, then nghttp3. Body sizes use
+For each selected body size, runs the http3 Server and then the h3 Server.
+Under each Server, Clients run in fixed order: http3, h3, nghttp3. Result names
+begin with the Client and include server-http3 or server-h3. Body sizes use
 IEC units; the default cases are 0 B, 1 KiB, 10 KiB, 64 KiB, 128 KiB, 1 MiB,
 2 MiB, 4 MiB, and 100 MiB.
 
@@ -22,7 +24,8 @@ The Rust Clients use a Tokio current-thread runtime, while the nghttp3 Client
 uses one synchronous event-loop thread. This script intentionally sets no CPU
 affinity: the operating system may migrate those threads, so results describe
 single-threaded Client throughput rather than strict single-core performance.
-The benchmark Server is a separate, unpinned 8-worker process.
+Each benchmark Server is a separate, unpinned 8-worker process. Both Server
+libraries share request validation, response content, and transport settings.
 
 Each sample starts after local HTTP/3 setup and ends when the last complete
 response has been validated. Task aggregation, extra receive draining, final
@@ -58,6 +61,12 @@ Shows this complete parameter and example reference without building the benchma
 
 .EXAMPLE
 .\bench\run-balanced.ps1
+
+.EXAMPLE
+.\bench\run-balanced.ps1 -BodySizes '0B,1KiB' -ExtraHeaders 32 -CriterionArgs @('--noplot')
+
+.EXAMPLE
+.\bench\run-balanced.ps1 -BodySizes '1KiB' -CriterionArgs @('server-h3', '--noplot')
 
 .EXAMPLE
 .\bench\run-balanced.ps1 `
@@ -147,7 +156,7 @@ try {
         Write-Host 'Those "creating library" lines are harmless when Cargo continues; Rust 1.99 fixes the diagnostic.'
     }
 
-    Write-Host 'Running each selected case in fixed Client order: http3, h3, nghttp3'
+    Write-Host 'Each body size: Server http3, then h3; each Server: Clients http3, h3, nghttp3'
     & cargo bench -p bench --bench clients --locked -- @CriterionArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Criterion failed with exit code $LASTEXITCODE"
