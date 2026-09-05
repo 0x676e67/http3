@@ -5,9 +5,13 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use super::case::{Case, Http3Library};
+use super::{
+    case::{Case, Http3Library},
+    headers::{REQUEST_HEADERS, RESPONSE_HEADERS},
+};
 
-pub(crate) const RESULT_SCHEMA: &str = "http3-client-bench-v11";
+// v12 uses fixed browser-shaped fields; v11 measured repeated request-only fields.
+pub(crate) const RESULT_SCHEMA: &str = "http3-client-bench-v12";
 
 /// Timed region shared by every Client implementation.
 pub const MEASUREMENT_PROFILE: &str = "post-local-setup-to-last-complete-response";
@@ -22,7 +26,8 @@ pub struct ClientResult {
     pub(crate) measurement_profile: String,
     pub(crate) requests: usize,
     pub(crate) in_flight: usize,
-    pub(crate) extra_request_headers: usize,
+    pub(crate) request_headers: usize,
+    pub(crate) response_headers: usize,
     pub(crate) response_body_bytes: usize,
     pub(crate) completed: usize,
     pub(crate) received_bytes: usize,
@@ -68,9 +73,22 @@ impl ClientResult {
         check_number("requests", self.requests, case.requests)?;
         check_number("in_flight", self.in_flight, case.in_flight)?;
         check_number(
-            "extra_request_headers",
-            self.extra_request_headers,
-            case.extra_headers,
+            "request_headers",
+            self.request_headers,
+            if case.headers.request {
+                REQUEST_HEADERS.len()
+            } else {
+                0
+            },
+        )?;
+        check_number(
+            "response_headers",
+            self.response_headers,
+            if case.headers.response {
+                RESPONSE_HEADERS.len()
+            } else {
+                0
+            },
         )?;
         check_number(
             "response_body_bytes",

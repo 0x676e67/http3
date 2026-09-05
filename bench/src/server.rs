@@ -13,9 +13,11 @@ use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::task::JoinSet;
 
-use super::case::{
-    ALPN_H3, EXTRA_HEADER_NAME, EXTRA_HEADER_VALUE, Http3Library, MAX_EXTRA_HEADERS, SERVER_ADDR,
-    SERVER_MAX_BIDI_STREAMS, SERVER_WORKERS, workspace_root,
+use super::{
+    case::{
+        ALPN_H3, Http3Library, SERVER_ADDR, SERVER_MAX_BIDI_STREAMS, SERVER_WORKERS, workspace_root,
+    },
+    headers::{HeaderMode, REQUEST_HEADERS, RESPONSE_HEADERS, validate_headers},
 };
 
 pub(crate) fn run_from_args(mut args: impl Iterator<Item = String>) -> Result<()> {
@@ -33,14 +35,10 @@ pub(crate) fn run_from_args(mut args: impl Iterator<Item = String>) -> Result<()
         .context("missing server response body size")?
         .parse::<usize>()
         .context("invalid server response body size")?;
-    let extra_headers = args
+    let headers = args
         .next()
-        .context("missing extra request header count")?
-        .parse::<usize>()
-        .context("invalid extra request header count")?;
-    if extra_headers > MAX_EXTRA_HEADERS {
-        bail!("extra request headers cannot exceed {MAX_EXTRA_HEADERS}");
-    }
+        .context("missing header mode")?
+        .parse::<HeaderMode>()?;
     if let Some(extra) = args.next() {
         bail!("unexpected internal server argument {extra:?}");
     }
@@ -57,13 +55,13 @@ pub(crate) fn run_from_args(mut args: impl Iterator<Item = String>) -> Result<()
         let _ = std::io::stdin().read(&mut byte);
         let _ = shutdown_tx.send(());
     });
-    runtime.block_on(run_server(library, body_bytes, extra_headers, shutdown_rx))
+    runtime.block_on(run_server(library, body_bytes, headers, shutdown_rx))
 }
 
 async fn run_server(
     library: Http3Library,
     body_bytes: usize,
-    extra_headers: usize,
+    headers: HeaderMode,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<()> {
     let body = Bytes::from(vec![b'A'; body_bytes]);
@@ -89,8 +87,8 @@ async fn run_server(
 
     let endpoint = quinn::Endpoint::server(server_config, SERVER_ADDR.parse()?)?;
     println!(
-        "http3-bench-server-v4 library={library} address={SERVER_ADDR} body_bytes={body_bytes} \
-         extra_request_headers={extra_headers} \
+        "http3-bench-server-v5 library={library} address={SERVER_ADDR} body_bytes={body_bytes} \
+         headers={headers} \
          max_concurrent_bidi_streams={SERVER_MAX_BIDI_STREAMS} transport=quinn \
          workers={SERVER_WORKERS}"
     );
@@ -109,7 +107,7 @@ async fn run_server(
                     return Ok(());
                 };
                 let body = body.clone();
-                connections.spawn(serve_connection(library, incoming, body, extra_headers));
+                connections.spawn(serve_connection(library, incoming, body, headers));
             }
             completed = connections.join_next(), if !connections.is_empty() => {
                 completed
@@ -151,12 +149,12 @@ async fn serve_connection(
     library: Http3Library,
     incoming: quinn::Incoming,
     body: Bytes,
-    extra_headers: usize,
+    headers: HeaderMode,
 ) -> Result<()> {
     let connection = incoming.await?;
     match library {
-        Http3Library::Http3 => serve_http3_connection(connection, body, extra_headers).await,
-        Http3Library::H3 => serve_h3_connection(connection, body, extra_headers).await,
+        Http3Library::Http3 => serve_http3_connection(connection, body, headers).await,
+        Http3Library::H3 => serve_h3_connection(connection, body, headers).await,
         Http3Library::Nghttp3 => bail!("unsupported server HTTP/3 library {library}"),
     }
 }
@@ -168,7 +166,7 @@ async fn drain_tasks(tasks: &mut JoinSet<Result<()>>, name: &str) -> Result<()> 
     Ok(())
 }
 
-fn validate_request(request: &http::Request<()>, extra_headers: usize) -> Result<()> {
+fn validate_request(request: &http::Request<()>, headers: HeaderMode) -> Result<()> {
     if request.version() != http::Version::HTTP_3 {
         bail!("benchmark request used {:?}", request.version());
     }
@@ -185,21 +183,8 @@ fn validate_request(request: &http::Request<()>, extra_headers: usize) -> Result
     {
         bail!("benchmark request used unexpected URI {}", request.uri());
     }
-    let benchmark_headers = request.headers().get_all(&EXTRA_HEADER_NAME);
-    let actual_extra_headers = benchmark_headers.iter().count();
-    if actual_extra_headers != extra_headers {
-        bail!(
-            "benchmark request contained {actual_extra_headers} extra headers, expected \
-             {extra_headers}"
-        );
-    }
-    if benchmark_headers
-        .iter()
-        .any(|value| value != EXTRA_HEADER_VALUE)
-    {
-        bail!("benchmark request contained an unexpected extra header value");
-    }
-    Ok(())
+    validate_headers(request.headers(), &REQUEST_HEADERS, headers.request)
+        .context("invalid benchmark request headers")
 }
 
 // Instantiate the same request lifecycle for both libraries so Server choice
@@ -209,7 +194,7 @@ macro_rules! server_adapter {
         async fn $serve(
             connection: quinn::Connection,
             body: Bytes,
-            extra_headers: usize,
+            headers: HeaderMode,
         ) -> Result<()> {
             let mut builder = $http3_crate::server::builder();
             builder.send_grease(false);
@@ -222,7 +207,7 @@ macro_rules! server_adapter {
                 tokio::select! {
                     accepted = connection.accept() => match accepted {
                         Ok(Some(resolver)) => {
-                            requests.spawn($respond(resolver, body.clone(), extra_headers));
+                            requests.spawn($respond(resolver, body.clone(), headers));
                         }
                         Ok(None) => {
                             drain_tasks(&mut requests, "benchmark server request").await?;
@@ -246,10 +231,10 @@ macro_rules! server_adapter {
         async fn $respond(
             resolver: $http3_crate::server::RequestResolver<$transport::Connection, Bytes>,
             body: Bytes,
-            extra_headers: usize,
+            headers: HeaderMode,
         ) -> Result<()> {
             let (request, mut stream) = resolver.resolve_request().await?;
-            validate_request(&request, extra_headers)?;
+            validate_request(&request, headers)?;
             // Validate the request half before reporting a successful response so a missing FIN
             // cannot be hidden by a Client that exits after receiving the response body.
             if stream.recv_data().await?.is_some() {
@@ -259,10 +244,17 @@ macro_rules! server_adapter {
                 bail!("benchmark request unexpectedly contained trailers");
             }
 
-            let response = http::Response::builder()
+            let mut response = http::Response::builder()
                 .status(StatusCode::OK)
-                .header(http::header::CONTENT_LENGTH, body.len())
-                .body(())?;
+                .header(http::header::CONTENT_LENGTH, body.len());
+            // Both Server libraries send the same fixed response fixture. The
+            // directional controls separate request encoding from response decoding.
+            if headers.response {
+                for (name, value) in &RESPONSE_HEADERS {
+                    response = response.header(name.clone(), value.clone());
+                }
+            }
+            let response = response.body(())?;
             stream.send_response(response).await?;
             if !body.is_empty() {
                 stream.send_data(body).await?;

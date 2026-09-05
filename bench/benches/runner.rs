@@ -3,8 +3,9 @@
 use std::{env, path::Path};
 
 use anyhow::{Context, Result, bail};
-use bench::case::{
-    Case, DEFAULT_BODY_BYTES, Http3Library, MAX_BODY_BYTES, MAX_EXTRA_HEADERS, MAX_REQUESTS,
+use bench::{
+    case::{Case, DEFAULT_BODY_BYTES, Http3Library, MAX_BODY_BYTES, MAX_REQUESTS},
+    headers::HeaderMode,
 };
 use bytesize::ByteSize;
 use criterion::{BenchmarkId, Criterion, SamplingMode, Throughput};
@@ -14,7 +15,7 @@ use super::child::{ClientRunner, ServerGuard};
 const BODY_SIZES_ENV: &str = "HTTP3_BENCH_BODY_SIZES";
 const REQUESTS_ENV: &str = "HTTP3_BENCH_REQUESTS";
 const CONCURRENCY_ENV: &str = "HTTP3_BENCH_CONCURRENCY";
-const EXTRA_HEADERS_ENV: &str = "HTTP3_BENCH_EXTRA_HEADERS";
+const HEADERS_ENV: &str = "HTTP3_BENCH_HEADERS";
 const MAX_CONCURRENCY: usize = 100;
 const BANDWIDTH_BODY_THRESHOLD: usize = 64 * 1024;
 const TEST_REQUESTS: usize = 4;
@@ -24,7 +25,7 @@ struct Config {
     cases: Vec<Case>,
     requests: Option<usize>,
     concurrency: Option<usize>,
-    extra_headers: usize,
+    headers: HeaderMode,
     test_mode: bool,
     sample_size_from_cli: bool,
     measurement_time_from_cli: bool,
@@ -59,23 +60,20 @@ impl Config {
             Err(env::VarError::NotPresent) => None,
             Err(error) => return Err(error).context("could not read benchmark concurrency"),
         };
-        let extra_headers = match env::var(EXTRA_HEADERS_ENV) {
-            Ok(value) => {
-                let extra_headers = parse_nonnegative(&value, EXTRA_HEADERS_ENV)?;
-                if extra_headers > MAX_EXTRA_HEADERS {
-                    bail!("{EXTRA_HEADERS_ENV} cannot exceed {MAX_EXTRA_HEADERS}");
-                }
-                extra_headers
-            }
-            Err(env::VarError::NotPresent) => 0,
-            Err(error) => return Err(error).context("could not read extra request header count"),
+        let headers = match env::var(HEADERS_ENV) {
+            Ok(value) => value.parse::<HeaderMode>()?,
+            Err(env::VarError::NotPresent) => HeaderMode {
+                request: true,
+                response: true,
+            },
+            Err(error) => return Err(error).context("could not read header mode"),
         };
 
         Ok(Self {
             cases,
             requests,
             concurrency,
-            extra_headers,
+            headers,
             test_mode: criterion_arg_present("--test"),
             sample_size_from_cli: criterion_arg_present("--sample-size"),
             measurement_time_from_cli: criterion_arg_present("--measurement-time"),
@@ -109,11 +107,11 @@ fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> 
                     body_bytes: default_case.body_bytes,
                     requests: TEST_REQUESTS,
                     in_flight: TEST_IN_FLIGHT,
-                    extra_headers: config.extra_headers,
+                    headers: config.headers,
                 }
             } else {
                 Case {
-                    extra_headers: config.extra_headers,
+                    headers: config.headers,
                     ..default_case
                 }
             };
@@ -168,8 +166,9 @@ fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> 
 
                 let mut server = None;
                 let benchmark_id = BenchmarkId::from_parameter(format!(
-                    "requests-{}/concurrency-{}/extra-headers-{}",
-                    case.requests, case.in_flight, case.extra_headers,
+                    // Browser templates are a different workload from historical repeated fields.
+                    "requests-{}/concurrency-{}/headers-{}",
+                    case.requests, case.in_flight, case.headers,
                 ));
                 group.bench_with_input(benchmark_id, &case, |bencher, &case| {
                     server.get_or_insert_with(|| {
