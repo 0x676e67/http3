@@ -68,7 +68,9 @@ pub(crate) fn decode_limited<B: Buf>(
         if flags & 1 == 0 {
             return Ok(payload.to_vec());
         }
-        let mut decoded = Vec::new();
+        // Five bits is the shortest Huffman code. Cap the initial reservation
+        // at 64 bytes so a long, invalid payload cannot force a large allocation.
+        let mut decoded = Vec::with_capacity(payload.len().min(40) * 8 / 5);
         for byte in payload.hpack_decode() {
             decoded.push(byte?);
         }
@@ -240,6 +242,10 @@ mod tests {
             ),
             (
                 &[0x84, 0xff, 0xff, 0xff, 0xff, 0xaa],
+                Err(Error::HuffmanDecoding(HuffmanDecodingError::Eos)),
+            ),
+            (
+                &[0x85, 0x1f, 0xff, 0xff, 0xff, 0xff, 0xaa],
                 Err(Error::HuffmanDecoding(HuffmanDecodingError::Eos)),
             ),
         ];
