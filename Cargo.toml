@@ -5,6 +5,7 @@ members = [
     "http3-datagram",
 
     # Internal
+    "bench",
     "examples",
     "interop",
 ]
@@ -60,3 +61,8 @@ tokio = { version = "1.53.1", default-features = false }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3", default-features = false }
 tracing-tree = "0.4"
+
+[profile.bench]
+opt-level = 3
+codegen-units = 1
+incremental = false
