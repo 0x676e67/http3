@@ -4,7 +4,7 @@ use std::{env, path::Path};
 
 use anyhow::{Context, Result, bail};
 use bench::{
-    case::{Case, DEFAULT_BODY_BYTES, Http3Library, MAX_BODY_BYTES, MAX_REQUESTS},
+    case::{Case, DEFAULT_BODY_BYTES, Http3Library, MAX_BODY_BYTES, MAX_REQUESTS, SERVER_WORKERS},
     headers::HeaderMode,
 };
 use bytesize::ByteSize;
@@ -153,8 +153,10 @@ fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> 
         for server_library in [Http3Library::Http3, Http3Library::H3] {
             for runner in &runners {
                 let library = runner.library;
-                let mut group =
-                    criterion.benchmark_group(format!("{library}/{case}/server-{server_library}"));
+                // Do not compare against historical work-stealing Server baselines implicitly.
+                let mut group = criterion.benchmark_group(format!(
+                    "{library}/{case}/server-{server_library}-no-steal-{SERVER_WORKERS}"
+                ));
                 group.sampling_mode(SamplingMode::Flat);
                 if !config.test_mode && !config.sample_size_from_cli {
                     group.sample_size(10);

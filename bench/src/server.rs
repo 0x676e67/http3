@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
     sync::Arc,
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -43,11 +44,13 @@ pub(crate) fn run_from_args(mut args: impl Iterator<Item = String>) -> Result<()
         bail!("unexpected internal server argument {extra:?}");
     }
 
-    let mut runtime = tokio::runtime::Builder::new_multi_thread();
-    runtime.worker_threads(SERVER_WORKERS).enable_all();
-    let runtime = runtime
-        .build()
-        .context("could not create benchmark server runtime")?;
+    // Keep each connection's driver and request tasks on one worker. With work stealing,
+    // small writes contend on Quinn's connection lock and can trigger premature packet flushes.
+    // https://github.com/quinn-rs/quinn/issues/1433#issuecomment-1292787963
+    let runtime = pingora_runtime::NoStealRuntime::new(SERVER_WORKERS, "bench-server");
+    let workers = (1..SERVER_WORKERS)
+        .map(|index| runtime.get_runtime_at(index).clone())
+        .collect::<Vec<_>>();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     thread::spawn(move || {
@@ -55,7 +58,20 @@ pub(crate) fn run_from_args(mut args: impl Iterator<Item = String>) -> Result<()
         let _ = std::io::stdin().read(&mut byte);
         let _ = shutdown_tx.send(());
     });
-    runtime.block_on(run_server(library, body_bytes, headers, shutdown_rx))
+    // Spawn the Server onto the pool; block_on only joins it from the process's main thread.
+    // Polling run_server directly here would run its endpoint/accept loop outside the pool.
+    // Reserve worker 0 for the Endpoint. Random placement would mix same-runtime and
+    // cross-runtime UDP delivery between samples, obscuring Client comparisons.
+    let handle = runtime.get_runtime_at(0);
+    let result = handle.block_on(handle.spawn(run_server(
+        library,
+        body_bytes,
+        headers,
+        shutdown_rx,
+        workers,
+    )));
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    result.context("benchmark server task failed")?
 }
 
 async fn run_server(
@@ -63,6 +79,7 @@ async fn run_server(
     body_bytes: usize,
     headers: HeaderMode,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
+    workers: Vec<tokio::runtime::Handle>,
 ) -> Result<()> {
     let body = Bytes::from(vec![b'A'; body_bytes]);
     let cert = CertificateDer::from(std::fs::read(
@@ -87,14 +104,15 @@ async fn run_server(
 
     let endpoint = quinn::Endpoint::server(server_config, SERVER_ADDR.parse()?)?;
     println!(
-        "http3-bench-server-v5 library={library} address={SERVER_ADDR} body_bytes={body_bytes} \
+        "http3-bench-server-v6 library={library} address={SERVER_ADDR} body_bytes={body_bytes} \
          headers={headers} \
          max_concurrent_bidi_streams={SERVER_MAX_BIDI_STREAMS} transport=quinn \
-         workers={SERVER_WORKERS}"
+         runtime=pingora-no-steal workers={SERVER_WORKERS}"
     );
     std::io::stdout().flush()?;
 
     let mut connections = JoinSet::new();
+    let mut next_worker = 0;
     loop {
         tokio::select! {
             _ = &mut shutdown => {
@@ -107,7 +125,14 @@ async fn run_server(
                     return Ok(());
                 };
                 let body = body.clone();
-                connections.spawn(serve_connection(library, incoming, body, headers));
+                // Select a worker before incoming.await creates Quinn's ConnectionDriver.
+                // Only distribute connections: ordinary Tokio spawns inside serve_connection
+                // keep all of its streams on that same current-thread runtime.
+                connections.spawn_on(
+                    serve_connection(library, incoming, body, headers),
+                    &workers[next_worker],
+                );
+                next_worker = (next_worker + 1) % workers.len();
             }
             completed = connections.join_next(), if !connections.is_empty() => {
                 completed
