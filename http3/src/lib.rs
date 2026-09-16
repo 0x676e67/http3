@@ -1,5 +1,5 @@
 //! HTTP/3 client and server
-#![deny(missing_docs, clippy::self_named_module_files)]
+#![deny(missing_docs)]
 #![allow(clippy::derive_partial_eq_without_eq)]
 
 pub mod client;
@@ -15,7 +15,6 @@ pub mod server;
 
 mod buf;
 
-mod request_stream_guard;
 mod shared_state;
 
 #[cfg(feature = "unstable")]
