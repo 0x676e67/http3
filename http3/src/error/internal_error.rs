@@ -1,16 +1,15 @@
-//! This module contains the internal error type, which is used to represent errors, which have not yet affected the connection state
+//! This module contains the internal error type, which is used to represent errors, which have not
+//! yet affected the connection state
 
-use std::error::Error;
-
-use crate::{frame::FrameProtocolError, quic::ConnectionErrorIncoming};
+use std::{error::Error, fmt::Display};
 
 use super::codes::Code;
-use std::fmt::Display;
+use crate::{frame::FrameProtocolError, quic::ConnectionErrorIncoming};
 
 /// This error type represents an internal error type, which is used
 /// to represent errors, which have not yet affected the connection state
 ///
-/// Internal error produced by an `http3-rs` module.
+/// Internal error produced by an `http3` module.
 ///
 /// This error type is used in functions which handle a http3 connection state
 #[derive(Debug, Clone, Hash)]
@@ -60,6 +59,14 @@ impl InternalConnectionError {
             FrameProtocolError::InvalidFrameValue | FrameProtocolError::Malformed => InternalConnectionError {
                 code: Code::H3_FRAME_ERROR,
                 message: "frame payload that contains additional bytes after the identified fields or a frame payload that terminates before the end of the identified fields".to_string(),
+            },
+            FrameProtocolError::ExcessiveLoad { len, limit } => InternalConnectionError {
+                // A peer can declare a field section larger than the local
+                // decode budget. HTTP/3 permits rejecting such load at the
+                // connection boundary.
+                // https://www.rfc-editor.org/rfc/rfc9114.html#section-10.5
+                code: Code::H3_EXCESSIVE_LOAD,
+                message: format!("encoded field section length {len} exceeds local limit {limit}"),
             },
             }
     }

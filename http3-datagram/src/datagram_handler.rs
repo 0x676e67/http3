@@ -1,17 +1,18 @@
 //! Traits which define the user API for datagrams.
-//! These traits are implemented for the client and server types in the `http3-rs` crate.
+//! These traits are implemented for the client and server types in the `http3` crate.
 
 use std::{error::Error, fmt::Display, future::poll_fn, marker::PhantomData, sync::Arc};
+
+use bytes::Buf;
+use http3::{
+    ConnectionState, SharedState,
+    error::{ConnectionError, StreamError, connection_error_creators::CloseStream},
+    quic::{self, StreamId},
+};
 
 use crate::{
     datagram::Datagram,
     quic_traits::{DatagramConnectionExt, RecvDatagram, SendDatagram, SendDatagramErrorIncoming},
-};
-use bytes::Buf;
-use http3_rs::{
-    ConnectionState, SharedState,
-    error::{ConnectionError, StreamError, connection_error_creators::CloseStream},
-    quic::{self, StreamId},
 };
 
 /// Gives the ability to send datagrams.

@@ -5,7 +5,12 @@ pub enum ParseError {
     Integer(prefix_int::Error),
     String(prefix_string::Error),
     InvalidPrefix(u8),
-    InvalidBase(isize),
+    InvalidBase {
+        required_insert_count: usize,
+        sign_negative: bool,
+        delta_base: usize,
+    },
+    InvalidRequiredInsertCount(usize),
 }
 
 impl From<prefix_int::Error> for ParseError {

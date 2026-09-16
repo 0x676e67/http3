@@ -7,7 +7,11 @@ on:
 
 env:
   RUST_BACKTRACE: 1
-  toolchain_style: stable
+  core_package_args: >-
+    --workspace
+    --exclude interop
+    --exclude bench
+  toolchain_style: nightly
   toolchain_msrv: "1.85"
   toolchain_http3_quinn_msrv: "1.85"
   toolchain_doc: nightly
@@ -22,7 +26,7 @@ jobs:
       - style
       - lint
       - msrv
-      - msrv_http3_quinn
+      - msrv_http3_quic
       - test
       - doc
       - fuzz
@@ -36,49 +40,49 @@ jobs:
     name: Check Style
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_style }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.toolchain_style }}
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - run: cargo +${{ env.toolchain_style }} fmt --all --check
 
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_lint }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.toolchain_lint }}
           components: clippy
-      - run: cargo clippy
+      - run: cargo clippy ${{ env.core_package_args }}
 
   msrv:
     name: Check MSRV
     needs: [style]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_msrv }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.toolchain_msrv }}
-      - run: cargo check -p http3-rs
+      - run: cargo check -p http3
 
-  msrv_http3_quinn:
-    name: Check MSRV of `http3-quinn-rs`
+  msrv_http3_quic:
+    name: Check MSRV of `http3-quic`
     needs: [style]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_http3_quinn_msrv }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.toolchain_http3_quinn_msrv }}
-      - run: cargo check -p http3-quinn-rs
+      - run: cargo check -p http3-quic
 
   test:
     name: Test ${{ matrix.toolchain }} ${{ matrix.os }} ${{ matrix.target }}
@@ -87,31 +91,31 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         toolchain: [stable, beta]
-        features: [i-implement-a-third-party-backend-and-opt-into-breaking-changes, tracing, 'tracing,i-implement-a-third-party-backend-and-opt-into-breaking-changes']
+        features: [unstable, tracing, "tracing,unstable"]
         target: [x86_64-unknown-linux-gnu]
         include:
           # Add a 32-bit target test configuration
           - os: ubuntu-latest
             toolchain: stable
-            features: i-implement-a-third-party-backend-and-opt-into-breaking-changes
+            features: unstable
             target: i686-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # Add this step for 32-bit build support
       - name: Install 32-bit development libraries
         if: matrix.target == 'i686-unknown-linux-gnu'
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y gcc-multilib libc6-dev-i386
+          sudo apt-get install -y gcc-multilib libc6-dev-i386 libclang-dev
       - name: Install Rust ${{ matrix.toolchain }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ matrix.toolchain }}
           target: ${{ matrix.target }}
-      - run: cargo test --features ${{ matrix.features }} --target ${{ matrix.target }}
-        env:  #[cfg(feature = "datagram")] unexpected `cfg` condition value: `datagram`
+      - run: cargo test ${{ env.core_package_args }} --features ${{ matrix.features }} --target ${{ matrix.target }}
+        env: #[cfg(feature = "datagram")] unexpected `cfg` condition value: `datagram`
           RUSTFLAGS: "-A unexpected_cfgs"
       - name: h3Spec
         run: ./ci/h3spec.sh
@@ -122,19 +126,19 @@ jobs:
     needs: [test]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_doc }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.toolchain_doc }}
-      - run: cargo rustdoc -p http3-rs -- -D rustdoc::broken_intra_doc_links -D warnings
+      - run: cargo rustdoc -p http3 -- -D rustdoc::broken_intra_doc_links -D warnings
 
   fuzz:
     name: Fuzz test
     needs: [test]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_fuzz }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -149,7 +153,7 @@ jobs:
   #   needs: [test]
   #   runs-on: ubuntu-latest
   #   steps:
-  #     - uses: actions/checkout@v5
+  #     - uses: actions/checkout@v7
   #       with:
   #         persist-credentials: false
   #         fetch-depth: 0
@@ -163,7 +167,7 @@ jobs:
     needs: [test]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Rust stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:

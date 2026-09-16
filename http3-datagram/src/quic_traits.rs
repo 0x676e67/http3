@@ -7,7 +7,7 @@ use core::task;
 use std::task::Poll;
 
 use bytes::Buf;
-use http3_rs::quic::ConnectionErrorIncoming;
+use http3::quic::ConnectionErrorIncoming;
 
 use crate::datagram::EncodedDatagram;
 

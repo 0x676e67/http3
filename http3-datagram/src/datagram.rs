@@ -1,5 +1,5 @@
 use bytes::Buf;
-use http3_rs::{
+use http3::{
     error::{Code, internal_error::InternalConnectionError},
     proto::varint::VarInt,
     quic::StreamId,
@@ -38,13 +38,14 @@ where
         })?;
 
         //= https://www.rfc-editor.org/rfc/rfc9297#section-2.1
-        // Quarter Stream ID: A variable-length integer that contains the value of the client-initiated bidirectional
-        // stream that this datagram is associated with divided by four (the division by four stems
-        // from the fact that HTTP requests are sent on client-initiated bidirectional streams,
-        // which have stream IDs that are divisible by four). The largest legal QUIC stream ID
-        // value is 262-1, so the largest legal value of the Quarter Stream ID field is 260-1.
-        // Receipt of an HTTP/3 Datagram that includes a larger value MUST be treated as an HTTP/3
-        // connection error of type H3_DATAGRAM_ERROR (0x33).
+        // Quarter Stream ID: A variable-length integer that contains the value of the
+        // client-initiated bidirectional stream that this datagram is associated with
+        // divided by four (the division by four stems from the fact that HTTP requests are
+        // sent on client-initiated bidirectional streams, which have stream IDs that are
+        // divisible by four). The largest legal QUIC stream ID value is 262-1, so the
+        // largest legal value of the Quarter Stream ID field is 260-1. Receipt of an HTTP/3
+        // Datagram that includes a larger value MUST be treated as an HTTP/3 connection
+        // error of type H3_DATAGRAM_ERROR (0x33).
         let stream_id = StreamId::try_from(u64::from(q_stream_id) * 4).map_err(|_| {
             InternalConnectionError::new(Code::H3_DATAGRAM_ERROR, "invalid stream id".to_string())
         })?;
@@ -72,7 +73,7 @@ where
         let varint = VarInt::from(self.stream_id) / 4;
         varint.encode(&mut buffer.as_mut_slice());
         EncodedDatagram {
-            stream_id: [0; VarInt::MAX_SIZE],
+            stream_id: buffer,
             len: varint.size(),
             pos: 0,
             payload: self.payload,
@@ -82,6 +83,25 @@ where
     /// Returns the datagram payload
     pub fn into_payload(self) -> B {
         self.payload
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::{Buf, Bytes};
+    use http3::quic::StreamId;
+
+    use super::Datagram;
+
+    #[test]
+    fn encode_preserves_quarter_stream_id() {
+        let stream_id = StreamId::try_from(4).unwrap();
+        let mut encoded = Datagram::new(stream_id, Bytes::from_static(b"payload")).encode();
+
+        let decoded = Datagram::decode(encoded.copy_to_bytes(encoded.remaining())).unwrap();
+
+        assert_eq!(decoded.stream_id(), stream_id);
+        assert_eq!(decoded.into_payload(), Bytes::from_static(b"payload"));
     }
 }
 

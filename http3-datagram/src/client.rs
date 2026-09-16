@@ -3,7 +3,7 @@
 use std::marker::PhantomData;
 
 use bytes::Buf;
-use http3_rs::{
+use http3::{
     client::Connection,
     quic::{self},
 };

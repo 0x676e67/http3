@@ -1,5 +1,4 @@
 # Cargo
-Cargo.lock
 debug/
 target/
 
@@ -22,3 +21,7 @@ localhost.pem
 DATA.md
 AGENTS.md
 .agents/
+
+# Generated FFI bindings live in OUT_DIR.
+interop/crates/nghttp3-sys/src/bindings.rs
+interop/crates/ngtcp2-sys/src/bindings.rs

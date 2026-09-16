@@ -2,13 +2,12 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use bytes::{Bytes, BytesMut};
 use http::StatusCode;
+use http3::server::RequestResolver;
+use http3_quic::quic::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use structopt::StructOpt;
 use tokio::{fs::File, io::AsyncReadExt};
 use tracing::{error, info, trace_span};
-
-use http3_quinn_rs::quinn::{self, crypto::rustls::QuicServerConfig};
-use http3_rs::server::RequestResolver;
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "server")]
@@ -113,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     info!("new connection established");
 
                     let mut http3_conn =
-                        http3_rs::server::Connection::new(http3_quinn_rs::Connection::new(conn))
+                        http3::server::Connection::new(http3_quic::Connection::new(conn))
                             .await
                             .unwrap();
 
@@ -159,7 +158,7 @@ async fn handle_request<C>(
     serve_root: Arc<Option<PathBuf>>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    C: http3_rs::quic::Connection<Bytes>,
+    C: http3::quic::Connection<Bytes>,
 {
     let (req, mut stream) = resolver.resolve_request().await?;
 

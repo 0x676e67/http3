@@ -1,0 +1,531 @@
+use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
+
+use bytes::{Buf, Bytes};
+use futures::future;
+use http3::error::StreamError;
+use rustls::pki_types::CertificateDer;
+use tokio::task::JoinSet;
+
+pub type BoxError = Box<dyn Error + Send + Sync>;
+
+pub const INTEROP_ROUNDS: usize = 3;
+pub const INTEROP_CONCURRENCY: usize = 4;
+pub const INTEROP_TEST_TIMEOUT: Duration = Duration::from_secs(180);
+const DEFAULT_BODY_LEN: usize = 36;
+pub const FIELD_SECTION_LIMIT_TEST_MAX: u64 = 512;
+pub const FIELD_SECTION_LIMIT_TEST_HEADER_VALUE_LEN: usize = 2048;
+pub const INTEROP_PADDING_HEADER_NAME: &[u8] = b"x-interop-padding";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InteropCase {
+    pub status: u16,
+    pub body_len: usize,
+    pub response_header_value_len: Option<usize>,
+}
+
+impl InteropCase {
+    pub const fn new(status: u16, body_len: usize) -> Self {
+        Self {
+            status,
+            body_len,
+            response_header_value_len: None,
+        }
+    }
+
+    pub const fn with_response_header_value_len(
+        status: u16,
+        body_len: usize,
+        response_header_value_len: usize,
+    ) -> Self {
+        Self {
+            status,
+            body_len,
+            response_header_value_len: Some(response_header_value_len),
+        }
+    }
+}
+
+// Keep this table intentionally mixed: small bodies catch header-only and
+// single-packet paths, while the MiB cases force DATA over many QUIC stream
+// writes. That is where backend bugs around flow control, partial writes, and
+// FIN delivery have shown up before.
+// https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.1
+pub const INTEROP_CASES: &[InteropCase] = &[
+    InteropCase::new(200, 0),
+    InteropCase::new(200, 1),
+    InteropCase::new(201, 1024),
+    InteropCase::new(204, 0),
+    InteropCase::new(404, 128),
+    InteropCase::new(503, 16 * 1024),
+    InteropCase::new(200, 32 * 1024),
+    InteropCase::new(200, 64 * 1024),
+    InteropCase::new(200, 128 * 1024),
+    InteropCase::new(200, 256 * 1024),
+    InteropCase::new(200, 512 * 1024),
+    InteropCase::new(200, 1024 * 1024),
+    InteropCase::new(200, 2 * 1024 * 1024),
+    InteropCase::new(200, 4 * 1024 * 1024),
+    InteropCase::new(200, 8 * 1024 * 1024),
+    InteropCase::new(200, 16 * 1024 * 1024),
+];
+
+pub const DEFAULT_INTEROP_CASE: InteropCase = InteropCase::new(200, DEFAULT_BODY_LEN);
+
+pub const FIELD_SECTION_LIMIT_TEST_CASE: InteropCase =
+    InteropCase::with_response_header_value_len(200, 0, FIELD_SECTION_LIMIT_TEST_HEADER_VALUE_LEN);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClientInteropConfig {
+    pub qpack_max_table_capacity: Option<u64>,
+    pub qpack_blocked_streams: Option<u64>,
+    pub send_grease: bool,
+}
+
+impl ClientInteropConfig {
+    /// Explicitly disables client-side QPACK dynamic-table support.
+    ///
+    /// RFC 9204 gives both QPACK SETTINGS a default value of zero. Sending
+    /// zero here keeps the same protocol state while making the interop matrix
+    /// exercise the SETTINGS negotiation path.
+    ///
+    /// See RFC 9204 Section 5:
+    /// <https://www.rfc-editor.org/rfc/rfc9204.html#section-5>
+    pub fn stateless_qpack() -> Self {
+        Self {
+            qpack_max_table_capacity: Some(0),
+            qpack_blocked_streams: Some(0),
+            send_grease: false,
+        }
+    }
+
+    /// Enables the client-side QPACK SETTINGS needed for dynamic-table interop.
+    ///
+    /// See RFC 9204 Section 5:
+    /// <https://www.rfc-editor.org/rfc/rfc9204.html#section-5>
+    pub fn qpack_dynamic_table() -> Self {
+        Self {
+            qpack_max_table_capacity: Some(65535),
+            qpack_blocked_streams: Some(100),
+            send_grease: false,
+        }
+    }
+
+    /// Enables HTTP/3 GREASE codepoints for this client run.
+    ///
+    /// RFC 9114 reserves frame, stream, and SETTINGS codepoints so peers keep
+    /// ignoring unknown values. Local interop runs use this to catch strict
+    /// server parsers before the public-server suite is run.
+    ///
+    /// See RFC 9114:
+    /// <https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8>
+    /// <https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.3>
+    /// <https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1>
+    pub fn with_grease(mut self) -> Self {
+        self.send_grease = true;
+        self
+    }
+}
+
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+pub struct TestCertificate {
+    pub cert_pem: String,
+    pub key_pem: String,
+    pub key_der: Vec<u8>,
+    cert_der: CertificateDer<'static>,
+}
+
+impl TestCertificate {
+    pub fn cert_der(&self) -> CertificateDer<'static> {
+        self.cert_der.clone()
+    }
+}
+
+pub fn generate_test_certificate() -> Result<TestCertificate, BoxError> {
+    let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    let key = rcgen::generate_simple_self_signed(subject_alt_names)?;
+    let cert_der = key.cert.der().clone();
+
+    Ok(TestCertificate {
+        cert_pem: key.cert.pem(),
+        key_pem: key.signing_key.serialize_pem(),
+        key_der: key.signing_key.serialize_der(),
+        cert_der,
+    })
+}
+
+pub fn interop_request_path(case: InteropCase, round: usize, index: usize) -> String {
+    let mut path = format!(
+        "/interop/status/{}/body/{}/round/{round}/case/{index}",
+        case.status, case.body_len
+    );
+
+    if let Some(response_header_value_len) = case.response_header_value_len {
+        path.push_str(&format!(
+            "/response-header-value/{}",
+            response_header_value_len
+        ));
+    }
+
+    path
+}
+
+pub fn interop_case_from_path(path: &str) -> Option<InteropCase> {
+    let mut parts = path.trim_start_matches('/').split('/');
+
+    match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (Some("interop"), Some("status"), Some(status), Some("body"), Some(body_len)) => {
+            Some(InteropCase {
+                status: status.parse().ok()?,
+                body_len: body_len.parse().ok()?,
+                response_header_value_len: response_header_value_len(parts)?,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn response_header_value_len<'a>(
+    mut parts: impl Iterator<Item = &'a str>,
+) -> Option<Option<usize>> {
+    let mut len = None;
+
+    while let Some(part) = parts.next() {
+        if part == "response-header-value" {
+            len = Some(parts.next()?.parse().ok()?);
+        }
+    }
+
+    Some(len)
+}
+
+pub fn interop_body(case: InteropCase) -> Vec<u8> {
+    (0..case.body_len)
+        .map(|index| b'a' + ((index + case.status as usize) % 26) as u8)
+        .collect()
+}
+
+pub fn interop_response_header_value(case: InteropCase) -> Option<Vec<u8>> {
+    case.response_header_value_len.map(|len| vec![b'x'; len])
+}
+
+pub fn interop_requests() -> Vec<(InteropCase, String)> {
+    let mut requests = Vec::with_capacity(INTEROP_ROUNDS * INTEROP_CASES.len());
+
+    for round in 0..INTEROP_ROUNDS {
+        for (index, case) in INTEROP_CASES.iter().copied().enumerate() {
+            requests.push((case, interop_request_path(case, round, index)));
+        }
+    }
+
+    requests
+}
+
+pub fn field_section_limit_request_path() -> String {
+    interop_request_path(FIELD_SECTION_LIMIT_TEST_CASE, 0, 0)
+}
+
+pub async fn run_local_quinn_client_interop_matrix_with_config(
+    server_addr: SocketAddr,
+    cert: &TestCertificate,
+    config: ClientInteropConfig,
+) -> Result<(), BoxError> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.cert_der.clone())?;
+
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"h3".to_vec()];
+
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
+    )));
+
+    let conn = endpoint.connect(server_addr, "localhost")?.await?;
+    let quinn_conn = http3_quic::Connection::new(conn);
+
+    let mut builder = http3::client::builder();
+    builder
+        .max_field_section_size(16 * 1024)
+        .send_grease(config.send_grease);
+
+    // RFC 9204 Section 5 defines the QPACK SETTINGS parameters that permit
+    // dynamic-table use. Leaving them unset, or setting them to zero, keeps the
+    // peer on literal/static-table field sections.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-5
+    if let Some(capacity) = config.qpack_max_table_capacity {
+        builder.qpack_max_table_capacity(capacity);
+    }
+    if let Some(blocked_streams) = config.qpack_blocked_streams {
+        builder.qpack_blocked_streams(blocked_streams);
+    }
+
+    let (mut driver, send_request) = builder.build(quinn_conn).await?;
+
+    // The http3 client makes connection progress from the driver future.
+    // Keep it alive while request tasks are waiting on response HEADERS/DATA.
+    let driver_task =
+        tokio::spawn(async move { future::poll_fn(|cx| driver.poll_close(cx)).await });
+
+    let requests = interop_requests();
+    for batch in requests.chunks(INTEROP_CONCURRENCY) {
+        let mut tasks = JoinSet::new();
+
+        // Requests in one batch run concurrently. The batch size keeps the test
+        // cheap enough for CI while still exercising independent request
+        // streams and QPACK blocked-stream accounting.
+        for (case, path) in batch.iter().cloned() {
+            let mut send_request = send_request.clone();
+            let port = server_addr.port();
+            let task_path = path.clone();
+
+            tasks.spawn(async move {
+                let path = task_path.clone();
+                let result = async {
+                    let expected_status = http::StatusCode::from_u16(case.status)?;
+                    let req = http::Request::builder()
+                        .method(http::Method::GET)
+                        .uri(format!("https://localhost:{port}{task_path}"))
+                        .body(())?;
+
+                    let mut stream: http3::client::RequestStream<http3_quic::BidiStream<Bytes>, _> =
+                        send_request.send_request(req).await?;
+                    stream.finish().await?;
+
+                    let body = read_response(stream, expected_status).await?;
+                    let expected_body = interop_body(case);
+                    assert_body_eq(&task_path, &body, &expected_body);
+                    Ok::<(), BoxError>(())
+                }
+                .await;
+                (path, result)
+            });
+        }
+
+        wait_for_interop_tasks(batch, tasks).await?;
+    }
+
+    drop(send_request);
+
+    driver_task.abort();
+    endpoint.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+
+    Ok(())
+}
+
+pub async fn run_local_quinn_client_max_field_section_size_limit(
+    server_addr: SocketAddr,
+    cert: &TestCertificate,
+    config: ClientInteropConfig,
+) -> Result<(), BoxError> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.cert_der.clone())?;
+
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"h3".to_vec()];
+
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
+    )));
+
+    let conn = endpoint.connect(server_addr, "localhost")?.await?;
+    let quinn_conn = http3_quic::Connection::new(conn);
+
+    let mut builder = http3::client::builder();
+    builder
+        .max_field_section_size(FIELD_SECTION_LIMIT_TEST_MAX)
+        .send_grease(false);
+
+    // RFC 9114 Section 4.2.2 lets an endpoint advertise the largest field
+    // section it is willing to accept. This test intentionally sends a larger
+    // response to make sure the client enforces its receive-side limit.
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2
+    if let Some(capacity) = config.qpack_max_table_capacity {
+        builder.qpack_max_table_capacity(capacity);
+    }
+    if let Some(blocked_streams) = config.qpack_blocked_streams {
+        builder.qpack_blocked_streams(blocked_streams);
+    }
+
+    let (mut driver, mut send_request) = builder.build(quinn_conn).await?;
+    let driver_task =
+        tokio::spawn(async move { future::poll_fn(|cx| driver.poll_close(cx)).await });
+
+    let port = server_addr.port();
+    let path = field_section_limit_request_path();
+    let req = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(format!("https://localhost:{port}{path}"))
+        .body(())?;
+
+    let mut stream: http3::client::RequestStream<http3_quic::BidiStream<Bytes>, _> =
+        send_request.send_request(req).await?;
+    stream.finish().await?;
+
+    let result = tokio::time::timeout(Duration::from_secs(10), stream.recv_response()).await;
+    match result {
+        Ok(Err(StreamError::HeaderTooBig {
+            actual_size,
+            max_size,
+            ..
+        })) => {
+            assert_eq!(max_size, FIELD_SECTION_LIMIT_TEST_MAX);
+            assert!(
+                actual_size > max_size,
+                "expected response field section to exceed {max_size}, got {actual_size}"
+            );
+        }
+        Ok(Ok(response)) => {
+            return Err(std::io::Error::other(format!(
+                "expected HeaderTooBig, got response status {}",
+                response.status()
+            ))
+            .into());
+        }
+        Ok(Err(err)) => {
+            return Err(
+                std::io::Error::other(format!("expected HeaderTooBig, got {err:?}")).into(),
+            );
+        }
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for max_field_section_size failure",
+            )
+            .into());
+        }
+    }
+
+    drop(send_request);
+
+    driver_task.abort();
+    endpoint.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+
+    Ok(())
+}
+
+async fn wait_for_interop_tasks(
+    batch: &[(InteropCase, String)],
+    mut tasks: JoinSet<(String, Result<(), BoxError>)>,
+) -> Result<(), BoxError> {
+    let timeout = interop_batch_timeout(batch);
+
+    let result = tokio::time::timeout(timeout, async {
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok((_, Ok(()))) => {}
+                Ok((path, Err(err))) => {
+                    return Err(std::io::Error::other(format!(
+                        "interop request task failed for {path}: {err}"
+                    ))
+                    .into());
+                }
+                Err(err) => {
+                    return Err(std::io::Error::other(format!(
+                        "interop request task panicked or was cancelled: {err}"
+                    ))
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            tasks.abort_all();
+            Err(err)
+        }
+        Err(_) => {
+            tasks.abort_all();
+            let paths = batch
+                .iter()
+                .map(|(_, path)| path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for interop response batch of {} after {:?}: {paths}",
+                    batch.len(),
+                    timeout,
+                ),
+            )
+            .into())
+        }
+    }
+}
+
+fn assert_body_eq(path: &str, actual: &[u8], expected: &[u8]) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "mismatched response length for {path}"
+    );
+
+    if let Some(index) = actual.iter().zip(expected).position(|(a, b)| a != b) {
+        panic!(
+            "mismatched response byte for {path}: index {index}, actual {}, expected {}",
+            actual[index], expected[index]
+        );
+    }
+}
+
+fn interop_batch_timeout(batch: &[(InteropCase, String)]) -> Duration {
+    let body_bytes = batch
+        .iter()
+        .map(|(case, _)| case.body_len as u64)
+        .sum::<u64>();
+    let body_mib = body_bytes.div_ceil(1024 * 1024);
+
+    // Large-body backends may need several writable notifications to drain all
+    // DATA. Scale the timeout with payload size so a real stall is still
+    // visible, but slower Windows debug builds do not fail just for 16MiB.
+    Duration::from_secs(10 + body_mib * 4)
+}
+
+async fn read_response(
+    mut stream: http3::client::RequestStream<http3_quic::BidiStream<Bytes>, Bytes>,
+    expected_status: http::StatusCode,
+) -> Result<Vec<u8>, BoxError> {
+    let response = stream.recv_response().await?;
+    let status = response.status();
+    assert_eq!(status, expected_status);
+
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.recv_data().await? {
+        extend_body_from_buf(&mut body, chunk);
+    }
+
+    Ok(body)
+}
+
+fn extend_body_from_buf<B: Buf>(body: &mut Vec<u8>, mut buf: B) {
+    // Buf::chunk() only exposes the current contiguous slice. Drain the whole
+    // buffer so vectored receive implementations are checked the same way.
+    while buf.has_remaining() {
+        let chunk = buf.chunk();
+        if chunk.is_empty() {
+            break;
+        }
+        body.extend_from_slice(chunk);
+        buf.advance(chunk.len());
+    }
+}

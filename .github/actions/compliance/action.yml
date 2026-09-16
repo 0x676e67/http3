@@ -6,7 +6,7 @@ inputs:
     description: 'Path to script that generates a compliance report'
     required: true
   http3-dir:
-    description: 'Path to the directory where http3-rs is cloned'
+    description: 'Path to the directory where http3 is cloned'
     required: false
     default: ${{ github.workspace }}
 

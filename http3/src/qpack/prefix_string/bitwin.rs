@@ -1,8 +1,8 @@
 #[derive(Debug, Default, PartialEq, Clone)]
 pub struct BitWindow {
-    pub byte: u32,
-    pub bit: u32,
-    pub count: u32,
+    pub byte: usize,
+    pub bit: usize,
+    pub count: usize,
 }
 
 impl BitWindow {
@@ -10,7 +10,7 @@ impl BitWindow {
         Self::default()
     }
 
-    pub fn forwards(&mut self, step: u32) {
+    pub fn forwards(&mut self, step: usize) {
         self.bit += self.count;
 
         self.byte += self.bit / 8;
@@ -19,11 +19,10 @@ impl BitWindow {
         self.count = step;
     }
 
-    pub fn opposite_bit_window(&self) -> BitWindow {
-        BitWindow {
-            byte: self.byte,
-            bit: self.bit,
-            count: 8 - (self.bit % 8),
-        }
+    pub fn end(&self) -> Option<usize> {
+        self.byte
+            .checked_mul(8)?
+            .checked_add(self.bit)?
+            .checked_add(self.count)
     }
 }

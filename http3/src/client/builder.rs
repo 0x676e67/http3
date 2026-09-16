@@ -5,18 +5,16 @@ use std::{
     sync::{Arc, atomic::AtomicUsize},
 };
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 
+use super::connection::{Connection, SendRequest};
 use crate::{
     config::Config,
     connection::ConnectionInner,
     error::ConnectionError,
     proto::frame::SettingId,
     quic::{self},
-    shared_state::SharedState,
 };
-
-use super::connection::{Connection, SendRequest};
 
 /// Start building a new HTTP/3 client
 pub fn builder() -> Builder {
@@ -46,14 +44,14 @@ where
 ///
 /// # Examples
 /// ```rust
-/// # use http3_rs::quic;
+/// # use http3::quic;
 /// # async fn doc<C, O, B>(quic: C)
 /// # where
 /// #   C: quic::Connection<B, OpenStreams = O>,
 /// #   O: quic::OpenStreams<B>,
 /// #   B: bytes::Buf,
 /// # {
-/// let http3_conn = http3_rs::client::builder()
+/// let http3_conn = http3::client::builder()
 ///     .max_field_section_size(8192)
 ///     .build(quic)
 ///     .await
@@ -79,13 +77,44 @@ impl Builder {
         self
     }
 
-    /// Set the maximum header size this client is willing to accept
+    /// Sets the largest uncompressed field section this client will accept.
     ///
-    /// See [header size constraints] section of the specification for details.
+    /// The value is advertised to the server as
+    /// `SETTINGS_MAX_FIELD_SECTION_SIZE`. Each field contributes its name and
+    /// value lengths plus 32 bytes. By default, the client advertises the
+    /// largest value the setting can encode.
     ///
-    /// [header size constraints]: https://www.rfc-editor.org/rfc/rfc9114.html#name-header-size-constraints
+    /// See [RFC 9114 Section 4.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2).
     pub fn max_field_section_size(&mut self, value: u64) -> &mut Self {
         self.config.settings.max_field_section_size = value;
+        self
+    }
+
+    /// Limits compressed QPACK input buffered before a field section is decoded.
+    ///
+    /// This is a local memory limit, not an HTTP/3 setting. It applies to an
+    /// encoded HEADERS payload and to one encoded string on the peer's QPACK
+    /// encoder stream. The default is 16 MiB.
+    ///
+    /// See [RFC 9204, Section 7.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3)
+    /// and [Section 7.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4).
+    pub fn max_qpack_decode_buffer_size(&mut self, value: usize) -> &mut Self {
+        self.config.qpack_decode_buffer_size = value;
+        self
+    }
+
+    /// Set the maximum dynamic-table capacity used to encode requests.
+    ///
+    /// The default is `0`, which keeps request encoding stateless. A non-zero
+    /// value enables dynamic request compression after the peer advertises a
+    /// non-zero `SETTINGS_QPACK_MAX_TABLE_CAPACITY`; the smaller value is used.
+    /// This does not change the decoder capacity advertised by
+    /// [`qpack_max_table_capacity`](Self::qpack_max_table_capacity).
+    ///
+    /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3)
+    /// and [Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
+    pub fn qpack_encoder_table_capacity(&mut self, value: usize) -> &mut Self {
+        self.config.qpack_encoder_table_capacity = value;
         self
     }
 
@@ -114,19 +143,38 @@ impl Builder {
 
     /// Set the QPACK dynamic table capacity the encoder is permitted to use, in bytes.
     ///
-    /// Sent as `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (0x1). A value of `0` (default)
-    /// means the encoder must not use the dynamic table.
-    pub fn qpack_max_table_capacity(&mut self, value: u64) -> &mut Self {
-        self.config.settings.qpack_max_table_capacity = value;
+    /// Sent as `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (0x1). When this is not called,
+    /// the setting is omitted and the protocol default of `0` applies. Passing `0`
+    /// explicitly sends the setting with value `0`.
+    ///
+    /// HTTP/3 encodes this setting as a QUIC variable-length integer, so values
+    /// can range up to `2^62 - 1`. The value must also fit the target's address
+    /// space; connection setup rejects a capacity the decoder cannot represent.
+    /// Set no more table memory than the decoder can hold for this connection.
+    ///
+    /// See [RFC 9204, Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3),
+    /// [Section 7.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4),
+    /// and [RFC 9114, Section 7.2.4](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4).
+    pub fn qpack_max_table_capacity<T: Into<Option<u64>>>(&mut self, value: T) -> &mut Self {
+        self.config.settings.qpack_max_table_capacity = value.into();
         self
     }
 
     /// Set the maximum number of blocked streams the QPACK decoder is willing to tolerate.
     ///
-    /// Sent as `SETTINGS_QPACK_BLOCKED_STREAMS` (0x7). A value of `0` (default)
-    /// means the decoder does not support blocking.
-    pub fn qpack_blocked_streams(&mut self, value: u64) -> &mut Self {
-        self.config.settings.qpack_blocked_streams = value;
+    /// Sent as `SETTINGS_QPACK_BLOCKED_STREAMS` (0x7). When this is not called,
+    /// the setting is omitted and the protocol default of `0` applies. Passing `0`
+    /// explicitly sends the setting with value `0`.
+    ///
+    /// HTTP/3 encodes this setting as a QUIC variable-length integer, and QPACK
+    /// sets no smaller limit. Each blocked stream needs decoder bookkeeping, so
+    /// choose a value that fits the connection's memory budget.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2),
+    /// [Section 7.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3), and
+    /// [RFC 9114, Section 7.2.4](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4).
+    pub fn qpack_blocked_streams<T: Into<Option<u64>>>(&mut self, value: T) -> &mut Self {
+        self.config.settings.qpack_blocked_streams = value.into();
         self
     }
 
@@ -163,19 +211,17 @@ impl Builder {
         B: Buf,
     {
         let open = quic.opener();
-        let shared = SharedState::default();
-
-        let conn_state = Arc::new(shared);
-        let max_field_section_size = self.config.settings.max_field_section_size;
-        let send_grease_frame = self.config.send_grease;
-
-        let inner = ConnectionInner::new(quic, conn_state.clone(), self.config.clone()).await?;
+        let inner = ConnectionInner::new(quic, self.config.clone()).await?;
         let send_request = SendRequest {
             open,
-            conn_state,
-            max_field_section_size,
+            conn_state: inner.shared.clone(),
+            decoder: inner.dynamic_qpack_decoder(),
+            encoder: inner.dynamic_qpack_encoder(),
+            max_field_section_size: self.config.settings.max_field_section_size,
+            max_qpack_decode_buffer_size: self.config.qpack_decode_buffer_size,
             sender_count: Arc::new(AtomicUsize::new(1)),
-            send_grease_frame,
+            send_grease_frame: self.config.send_grease,
+            qpack_encode_buffer: BytesMut::new(),
             _buf: PhantomData,
         };
 

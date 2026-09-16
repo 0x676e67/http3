@@ -1,5 +1,6 @@
-use bytes::{Buf, BufMut};
 use std::convert::TryInto;
+
+use bytes::{Buf, BufMut};
 
 use super::{
     parse_error::ParseError,
@@ -8,9 +9,11 @@ use super::{
 };
 
 // 4.3. Encoder Instructions
+// https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3
 pub enum EncoderInstruction {
     // 4.3.1. Set Dynamic Table Capacity
     // An encoder informs the decoder of a change to the dynamic table capacity.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.1
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 0 | 0 | 1 |   Capacity (5+)   |
@@ -20,6 +23,7 @@ pub enum EncoderInstruction {
     // An encoder adds an entry to the dynamic table where the field name
     // matches the field name of an entry stored in the static or the dynamic
     // table.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.2
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 1 | T |    Name Index (6+)    |
@@ -32,6 +36,7 @@ pub enum EncoderInstruction {
     // 4.3.3. Insert With Literal Name
     // An encoder adds an entry to the dynamic table where both the field name
     // and the field value are represented as string literals.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.3
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 0 | 1 | H | Name Length (5+)  |
@@ -45,6 +50,7 @@ pub enum EncoderInstruction {
     InsertWithoutNameRef,
     // 4.3.4. Duplicate
     // An encoder duplicates an existing entry in the dynamic table.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.4
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 0 | 0 | 0 |    Index (5+)     |
@@ -91,6 +97,13 @@ impl InsertWithNameRef {
     }
 
     pub fn decode<R: Buf>(buf: &mut R) -> Result<Option<Self>, ParseError> {
+        Self::decode_limited(buf, usize::MAX)
+    }
+
+    pub(crate) fn decode_limited<R: Buf>(
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<Option<Self>, ParseError> {
         let (flags, index) = match prefix_int::decode(6, buf) {
             Ok((f, x)) if f & 0b10 == 0b10 => (f, x),
             Ok((f, _)) => return Err(ParseError::InvalidPrefix(f)),
@@ -101,7 +114,7 @@ impl InsertWithNameRef {
             .try_into()
             .map_err(|_e| ParseError::Integer(crate::qpack::prefix_int::Error::Overflow))?;
 
-        let value = match prefix_string::decode(8, buf) {
+        let value = match prefix_string::decode_limited(8, buf, max_encoded_string_size) {
             Ok(x) => x,
             Err(StringError::UnexpectedEnd) => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -117,15 +130,22 @@ impl InsertWithNameRef {
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
         match self {
             InsertWithNameRef::Static { index, value } => {
-                prefix_int::encode(6, 0b11, *index as u64, buf);
-                prefix_string::encode(8, 0, value, buf)?;
+                Self::encode_parts(*index, value, true, buf)
             }
             InsertWithNameRef::Dynamic { index, value } => {
-                prefix_int::encode(6, 0b10, *index as u64, buf);
-                prefix_string::encode(8, 0, value, buf)?;
+                Self::encode_parts(*index, value, false, buf)
             }
         }
-        Ok(())
+    }
+
+    pub(crate) fn encode_parts<W: BufMut>(
+        index: usize,
+        value: &[u8],
+        is_static: bool,
+        buf: &mut W,
+    ) -> Result<(), prefix_string::Error> {
+        prefix_int::encode(6, if is_static { 0b11 } else { 0b10 }, index as u64, buf);
+        prefix_string::encode(8, 0, value, buf)
     }
 }
 
@@ -144,12 +164,19 @@ impl InsertWithoutNameRef {
     }
 
     pub fn decode<R: Buf>(buf: &mut R) -> Result<Option<Self>, ParseError> {
-        let name = match prefix_string::decode(6, buf) {
+        Self::decode_limited(buf, usize::MAX)
+    }
+
+    pub(crate) fn decode_limited<R: Buf>(
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<Option<Self>, ParseError> {
+        let name = match prefix_string::decode_limited(6, buf, max_encoded_string_size) {
             Ok(x) => x,
             Err(StringError::UnexpectedEnd) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let value = match prefix_string::decode(8, buf) {
+        let value = match prefix_string::decode_limited(8, buf, max_encoded_string_size) {
             Ok(x) => x,
             Err(StringError::UnexpectedEnd) => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -158,9 +185,16 @@ impl InsertWithoutNameRef {
     }
 
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
-        prefix_string::encode(6, 0b01, &self.name, buf)?;
-        prefix_string::encode(8, 0, &self.value, buf)?;
-        Ok(())
+        Self::encode_parts(&self.name, &self.value, buf)
+    }
+
+    pub(crate) fn encode_parts<W: BufMut>(
+        name: &[u8],
+        value: &[u8],
+        buf: &mut W,
+    ) -> Result<(), prefix_string::Error> {
+        prefix_string::encode(6, 0b01, name, buf)?;
+        prefix_string::encode(8, 0, value, buf)
     }
 }
 
@@ -220,11 +254,13 @@ impl DynamicTableSizeUpdate {
 // A decoder sends decoder instructions on the decoder stream to inform the encoder
 // about the processing of field sections and table updates to ensure consistency
 // of the dynamic table.
+// https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4
 #[derive(Debug, PartialEq)]
 pub enum DecoderInstruction {
-    // 4.4.1. Section Acknowledgement
+    // 4.4.1. Section Acknowledgment
     // Acknowledge processing of an encoded field section whose declared Required
     // Insert Count is not zero.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 1 |      Stream ID (7+)       |
@@ -232,14 +268,16 @@ pub enum DecoderInstruction {
     HeaderAck,
     // 4.4.2. Stream Cancellation
     // When a stream is reset or reading is abandoned.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 0 | 1 |     Stream ID (6+)    |
     // +---+---+-----------------------+
     StreamCancel,
-    //  4.4.3. Insert Count Increment
-    //  Increases the Known Received Count to the total number of dynamic table
-    //  insertions and duplications processed so far.
+    // 4.4.3. Insert Count Increment
+    // Increases the Known Received Count by Increment. A decoder should choose
+    // an increment that brings the count to all insertions processed so far.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.3
     //   0   1   2   3   4   5   6   7
     // +---+---+---+---+---+---+---+---+
     // | 0 | 0 |     Increment (6+)    |
@@ -262,20 +300,21 @@ impl DecoderInstruction {
     }
 }
 
+/// Increases the encoder's Known Received Count.
+///
+/// The increment uses a 6-bit-prefixed integer. Values above 63 continue in
+/// subsequent bytes.
+///
+/// See [RFC 9204, Section 4.4.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.3).
 #[derive(Debug, PartialEq)]
-pub struct InsertCountIncrement(pub u8);
+pub struct InsertCountIncrement(pub usize);
 
 impl InsertCountIncrement {
     pub fn decode<R: Buf>(buf: &mut R) -> Result<Option<Self>, ParseError> {
         let insert_count = match prefix_int::decode(6, buf) {
-            Ok((0b00, x)) => {
-                if x > 64 {
-                    return Err(ParseError::Integer(
-                        crate::qpack::prefix_int::Error::Overflow,
-                    ));
-                }
-                x as u8
-            }
+            Ok((0b00, x)) => x
+                .try_into()
+                .map_err(|_| ParseError::Integer(IntError::Overflow))?,
             Ok((f, _)) => return Err(ParseError::InvalidPrefix(f)),
             Err(IntError::UnexpectedEnd) => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -328,8 +367,9 @@ impl StreamCancel {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use std::io::Cursor;
+
+    use super::*;
 
     #[test]
     fn insert_with_name_ref() {
@@ -375,7 +415,7 @@ mod test {
 
     #[test]
     fn insert_count_increment() {
-        let instruction = InsertCountIncrement(42);
+        let instruction = InsertCountIncrement(4096);
         let mut buf = vec![];
         instruction.encode(&mut buf);
         let mut read = Cursor::new(&buf);

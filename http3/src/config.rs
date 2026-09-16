@@ -2,6 +2,8 @@ use std::convert::TryFrom;
 
 use crate::proto::{frame, varint::VarInt};
 
+pub(crate) const DEFAULT_QPACK_DECODE_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+
 /// Configures the HTTP/3 connection
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -27,6 +29,16 @@ pub struct Config {
     /// default mode.
     pub(crate) extra_settings: Vec<(frame::SettingId, u64)>,
 
+    /// Maximum compressed QPACK input retained while decoding one field
+    /// section or encoder-stream string.
+    pub(crate) qpack_decode_buffer_size: usize,
+
+    /// Maximum dynamic-table capacity this endpoint's QPACK encoder may use.
+    ///
+    /// This is a local memory and compression policy. The effective capacity is
+    /// also limited by the peer's `SETTINGS_QPACK_MAX_TABLE_CAPACITY` value.
+    pub(crate) qpack_encoder_table_capacity: usize,
+
     /// HTTP/3 Settings
     pub settings: Settings,
 }
@@ -34,35 +46,44 @@ pub struct Config {
 /// HTTP/3 Settings
 #[derive(Debug, Clone, Copy)]
 pub struct Settings {
-    /// The MAX_FIELD_SECTION_SIZE in HTTP/3 refers to the maximum size of the dynamic table used in HPACK compression.
-    /// HPACK is the compression algorithm used in HTTP/3 to reduce the size of the header fields in HTTP requests and responses.
-
-    /// In HTTP/3, the MAX_FIELD_SECTION_SIZE is set to 12.
-    /// This means that the dynamic table used for HPACK compression can have a maximum size of 2^12 bytes, which is 4KB.
+    /// Largest uncompressed field section this endpoint is willing to accept.
+    ///
+    /// Each field contributes its name and value lengths plus 32 bytes. The
+    /// value is advertised as `SETTINGS_MAX_FIELD_SECTION_SIZE`. Omitting the
+    /// setting means unlimited; this implementation advertises the largest
+    /// QUIC variable-length integer by default.
+    ///
+    /// See [RFC 9114 Section 4.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2)
+    /// and [Section 7.2.4.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1).
     pub(crate) max_field_section_size: u64,
 
-    /// https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1
+    /// <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1>
     /// Sets `SETTINGS_ENABLE_WEBTRANSPORT` if enabled
     pub(crate) enable_webtransport: bool,
-    /// https://www.rfc-editor.org/info/rfc8441 defines an extended CONNECT method in Section 4,
+    /// <https://www.rfc-editor.org/info/rfc8441> defines an extended CONNECT method in Section 4,
     /// enabled by the SETTINGS_ENABLE_CONNECT_PROTOCOL parameter.
     /// That parameter is only defined for HTTP/2.
-    /// for extended CONNECT in HTTP/3; instead, the SETTINGS_ENABLE_WEBTRANSPORT setting implies that an endpoint supports extended CONNECT.
+    /// for extended CONNECT in HTTP/3; instead, the SETTINGS_ENABLE_WEBTRANSPORT setting implies
+    /// that an endpoint supports extended CONNECT.
     pub(crate) enable_extended_connect: bool,
-    /// Enable HTTP Datagrams, see https://datatracker.ietf.org/doc/rfc9297/ for details
+    /// Enable HTTP Datagrams, see <https://datatracker.ietf.org/doc/rfc9297/> for details
     pub(crate) enable_datagram: bool,
     /// The maximum number of concurrent streams that can be opened by the peer.
     pub(crate) max_webtransport_sessions: u64,
 
     /// QPACK dynamic table capacity the encoder is permitted to use, in bytes.
     /// Sent as SETTINGS_QPACK_MAX_TABLE_CAPACITY (0x1).
-    /// A value of 0 (the default) means the encoder must not use the dynamic table.
-    pub(crate) qpack_max_table_capacity: u64,
+    /// When unset, the setting is omitted and the protocol default of 0 applies.
+    ///
+    /// See [RFC 9204 Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
+    pub(crate) qpack_max_table_capacity: Option<u64>,
 
     /// Maximum number of blocked streams the decoder is willing to tolerate.
     /// Sent as SETTINGS_QPACK_BLOCKED_STREAMS (0x7).
-    /// A value of 0 (the default) means the decoder does not support blocking.
-    pub(crate) qpack_blocked_streams: u64,
+    ///
+    /// See [RFC 9204 Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
+    /// When unset, the setting is omitted and the protocol default of 0 applies.
+    pub(crate) qpack_blocked_streams: Option<u64>,
 }
 
 impl From<&frame::Settings> for Settings {
@@ -87,12 +108,8 @@ impl From<&frame::Settings> for Settings {
                 .get(frame::SettingId::ENABLE_CONNECT_PROTOCOL)
                 .map(|value| value != 0)
                 .unwrap_or(defaults.enable_extended_connect),
-            qpack_max_table_capacity: settings
-                .get(frame::SettingId::QPACK_MAX_TABLE_CAPACITY)
-                .unwrap_or(defaults.qpack_max_table_capacity),
-            qpack_blocked_streams: settings
-                .get(frame::SettingId::QPACK_MAX_BLOCKED_STREAMS)
-                .unwrap_or(defaults.qpack_blocked_streams),
+            qpack_max_table_capacity: settings.get(frame::SettingId::QPACK_MAX_TABLE_CAPACITY),
+            qpack_blocked_streams: settings.get(frame::SettingId::QPACK_MAX_BLOCKED_STREAMS),
         }
     }
 }
@@ -111,12 +128,8 @@ impl Config {
             frame::SettingId::WEBTRANSPORT_MAX_SESSIONS => {
                 Some(self.settings.max_webtransport_sessions)
             }
-            frame::SettingId::QPACK_MAX_TABLE_CAPACITY => {
-                Some(self.settings.qpack_max_table_capacity)
-            }
-            frame::SettingId::QPACK_MAX_BLOCKED_STREAMS => {
-                Some(self.settings.qpack_blocked_streams)
-            }
+            frame::SettingId::QPACK_MAX_TABLE_CAPACITY => self.settings.qpack_max_table_capacity,
+            frame::SettingId::QPACK_MAX_BLOCKED_STREAMS => self.settings.qpack_blocked_streams,
             _ => self
                 .extra_settings
                 .iter()
@@ -160,14 +173,12 @@ impl TryFrom<Config> for frame::Settings {
                 frame::SettingId::WEBTRANSPORT_MAX_SESSIONS,
                 value.settings.max_webtransport_sessions,
             )?;
-            settings.insert(
-                frame::SettingId::QPACK_MAX_TABLE_CAPACITY,
-                value.settings.qpack_max_table_capacity,
-            )?;
-            settings.insert(
-                frame::SettingId::QPACK_MAX_BLOCKED_STREAMS,
-                value.settings.qpack_blocked_streams,
-            )?;
+            if let Some(value) = value.settings.qpack_max_table_capacity {
+                settings.insert(frame::SettingId::QPACK_MAX_TABLE_CAPACITY, value)?;
+            }
+            if let Some(value) = value.settings.qpack_blocked_streams {
+                settings.insert(frame::SettingId::QPACK_MAX_BLOCKED_STREAMS, value)?;
+            }
 
             // Append extra settings at the end in default mode
             for (id, val) in &value.extra_settings {
@@ -175,7 +186,8 @@ impl TryFrom<Config> for frame::Settings {
             }
         }
 
-        //  Grease Settings (https://www.rfc-editor.org/rfc/rfc9114.html#name-defined-settings-parameters)
+        // GREASE settings are reserved by RFC 9114 Section 7.2.4.1.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
         //# Setting identifiers of the format 0x1f * N + 0x21 for non-negative
         //# integer values of N are reserved to exercise the requirement that
@@ -217,28 +229,29 @@ impl Default for Settings {
             enable_extended_connect: false,
             enable_datagram: false,
             max_webtransport_sessions: 0,
-            qpack_max_table_capacity: 0,
-            qpack_blocked_streams: 0,
+            qpack_max_table_capacity: None,
+            qpack_blocked_streams: None,
         }
     }
 }
 
 impl Settings {
-    /// https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1
+    /// <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1>
     /// Sets `SETTINGS_ENABLE_WEBTRANSPORT` if enabled
     pub fn enable_webtransport(&self) -> bool {
         self.enable_webtransport
     }
 
-    /// Enable HTTP Datagrams, see https://datatracker.ietf.org/doc/rfc9297/ for details
+    /// Enable HTTP Datagrams, see <https://datatracker.ietf.org/doc/rfc9297/> for details
     pub fn enable_datagram(&self) -> bool {
         self.enable_datagram
     }
 
-    /// https://www.rfc-editor.org/info/rfc8441 defines an extended CONNECT method in Section 4,
+    /// <https://www.rfc-editor.org/info/rfc8441> defines an extended CONNECT method in Section 4,
     /// enabled by the SETTINGS_ENABLE_CONNECT_PROTOCOL parameter.
     /// That parameter is only defined for HTTP/2.
-    /// for extended CONNECT in HTTP/3; instead, the SETTINGS_ENABLE_WEBTRANSPORT setting implies that an endpoint supports extended CONNECT.
+    /// for extended CONNECT in HTTP/3; instead, the SETTINGS_ENABLE_WEBTRANSPORT setting implies
+    /// that an endpoint supports extended CONNECT.
     pub fn enable_extended_connect(&self) -> bool {
         self.enable_extended_connect
     }
@@ -252,6 +265,8 @@ impl Default for Config {
             send_settings: true,
             settings_order: None,
             extra_settings: Vec::new(),
+            qpack_decode_buffer_size: DEFAULT_QPACK_DECODE_BUFFER_SIZE,
+            qpack_encoder_table_capacity: 0,
             settings: Default::default(),
         }
     }

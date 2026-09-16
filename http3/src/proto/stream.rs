@@ -1,16 +1,16 @@
-use bytes::{Buf, BufMut};
 use std::{
     convert::TryFrom,
     fmt::{self, Display},
     ops::Add,
 };
 
-use crate::webtransport::SessionId;
+use bytes::{Buf, BufMut};
 
 use super::{
     coding::{BufExt, BufMutExt, Decode, Encode, UnexpectedEnd},
     varint::VarInt,
 };
+use crate::webtransport::SessionId;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct StreamType(u64);

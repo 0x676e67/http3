@@ -1,5 +1,10 @@
+use std::{
+    convert::TryFrom,
+    future::poll_fn,
+    task::{Context, Poll},
+};
+
 use bytes::Buf;
-use futures_util::future;
 use http::{HeaderMap, Response};
 use quic::StreamId;
 #[cfg(feature = "tracing")]
@@ -8,8 +13,7 @@ use tracing::instrument;
 use crate::{
     connection::{self},
     error::{
-        Code, StreamError,
-        connection_error_creators::{CloseStream, HandleFrameStreamErrorOnRequestStream},
+        Code, StreamError, connection_error_creators::CloseStream,
         internal_error::InternalConnectionError,
     },
     proto::{frame::Frame, headers::Header},
@@ -17,32 +21,32 @@ use crate::{
     quic::{self},
     shared_state::{ConnectionState, SharedState},
 };
-use std::{
-    convert::TryFrom,
-    task::{Context, Poll},
-};
 
 /// Manage request bodies transfer, response and trailers.
 ///
-/// Once a request has been sent via [`crate::client::SendRequest::send_request()`], a response can be awaited by calling
-/// [`RequestStream::recv_response()`]. A body for this request can be sent with [`RequestStream::send_data()`], then the request
-/// shall be completed by either sending trailers with  [`RequestStream::finish()`].
+/// Once a request has been sent via [`crate::client::SendRequest::send_request()`], a response can
+/// be awaited by calling [`RequestStream::recv_response()`]. A body for this request can be sent
+/// with [`RequestStream::send_data()`], then the request shall be completed by either sending
+/// trailers with  [`RequestStream::finish()`].
 ///
-/// After receiving the response's headers, it's body can be read by [`RequestStream::recv_data()`] until it returns
-/// `None`. Then the trailers will eventually be available via [`RequestStream::recv_trailers()`].
+/// After receiving the response's headers, it's body can be read by [`RequestStream::recv_data()`]
+/// until it returns `None`. Then the trailers will eventually be available via
+/// [`RequestStream::recv_trailers()`].
 ///
 /// TODO: If data is polled before the response has been received, an error will be thrown.
 ///
-/// TODO: If trailers are polled but the body hasn't been fully received, an UNEXPECT_FRAME error will be
-/// thrown
+/// TODO: If trailers are polled but the body hasn't been fully received, an UNEXPECT_FRAME error
+/// will be thrown
 ///
-/// Whenever the client wants to cancel this request, it can call [`RequestStream::stop_sending()`], which will
-/// put an end to any transfer concerning it.
+/// Dropping an unfinished stream cancels its open directions with `H3_REQUEST_CANCELLED`.
+/// After [`split()`](Self::split), each half cancels only its own direction. Explicit
+/// [`stop_sending()`](Self::stop_sending) stops receiving; [`stop_stream()`](Self::stop_stream)
+/// stops sending.
 ///
 /// # Examples
 ///
 /// ```rust
-/// # use http3_rs::{quic, client::*};
+/// # use http3::{quic, client::*};
 /// # use http::{Request, Response};
 /// # use bytes::Buf;
 /// # use tokio::io::AsyncWriteExt;
@@ -97,9 +101,9 @@ where
     /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_response(&mut self) -> Result<Response<()>, StreamError> {
-        let mut frame = future::poll_fn(|cx| self.inner.stream.poll_next(cx))
+        let frame = poll_fn(|cx| self.inner.stream.poll_next(cx))
             .await
-            .map_err(|e| self.handle_frame_stream_error_on_request_stream(e))?
+            .map_err(|e| self.inner.handle_receive_stream_error(e))?
             .ok_or_else(|| {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                 //# Receipt of an invalid sequence of frames MUST be treated as a
@@ -123,8 +127,23 @@ where
         //# mismatch, it MUST respond with a connection error of type
         //# H3_GENERAL_PROTOCOL_ERROR.
 
-        let decoded = if let Frame::Headers(ref mut encoded) = frame {
-            match qpack::decode_stateless(encoded, self.inner.max_field_section_size) {
+        let mut encoded = match frame {
+            Frame::Headers(encoded) => encoded,
+            _ => {
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+                //# Receipt of an invalid sequence of frames MUST be treated as a
+                //# connection error of type H3_FRAME_UNEXPECTED.
+                return Err(
+                    self.handle_connection_error_on_stream(InternalConnectionError::new(
+                        Code::H3_FRAME_UNEXPECTED,
+                        "First response frame is not headers".to_string(),
+                    )),
+                );
+            }
+        };
+
+        let decoded =
+            match poll_fn(|cx| self.inner.poll_decode_field_section(cx, &mut encoded)).await {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
                 //# An HTTP/3 implementation MAY impose a limit on the maximum size of
                 //# the message header it will accept on an individual HTTP message.
@@ -136,49 +155,40 @@ where
                     });
                 }
                 Ok(decoded) => decoded,
-                Err(_e) => {
-                    return Err(
-                        self.handle_connection_error_on_stream(InternalConnectionError {
-                            code: Code::QPACK_DECOMPRESSION_FAILED,
-                            message: "Failed to decode headers".to_string(),
-                        }),
-                    );
+                Err(error) => {
+                    let code = if error.is_internal() {
+                        Code::H3_INTERNAL_ERROR
+                    } else {
+                        Code::QPACK_DECOMPRESSION_FAILED
+                    };
+                    return Err(self.handle_connection_error_on_stream(
+                        InternalConnectionError::new(
+                            code,
+                            format!("failed to decode response headers: {error}"),
+                        ),
+                    ));
                 }
-            }
-        } else {
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-            //# Receipt of an invalid sequence of frames MUST be treated as a
-            //# connection error of type H3_FRAME_UNEXPECTED.
-
-            return Err(
-                self.handle_connection_error_on_stream(InternalConnectionError::new(
-                    Code::H3_FRAME_UNEXPECTED,
-                    "First response frame is not headers".to_string(),
-                )),
-            );
-        };
+            };
 
         let qpack::Decoded { fields, .. } = decoded;
 
-        let (status, headers) = Header::try_from(fields)
-            .map_err(|_e| {
-                self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
+        let (status, headers, pseudo_sensitivity) = Header::try_from(fields)
+            .and_then(Header::into_response_parts)
+            .map_err(|error| {
+                let code = error.code();
+                self.inner.stop_sending(code);
                 StreamError::StreamError {
-                    code: Code::H3_MESSAGE_ERROR,
-                    reason: "Received malformed header".to_string(),
-                }
-            })?
-            .into_response_parts()
-            .map_err(|_e| {
-                self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
-                StreamError::StreamError {
-                    code: Code::H3_MESSAGE_ERROR,
-                    reason: "Received malformed header".to_string(),
+                    code,
+                    reason: format!("rejected response headers: {error}"),
                 }
             })?;
+
         let mut resp = Response::new(());
         *resp.status_mut() = status;
         *resp.headers_mut() = headers;
+        if !pseudo_sensitivity.is_empty() {
+            resp.extensions_mut().insert(pseudo_sensitivity);
+        }
         *resp.version_mut() = http::Version::HTTP_3;
 
         Ok(resp)
@@ -188,7 +198,7 @@ where
     // TODO what if called before recv_response ?
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_data(&mut self) -> Result<Option<impl Buf + use<S, B>>, StreamError> {
-        future::poll_fn(|cx| self.poll_recv_data(cx)).await
+        poll_fn(|cx| self.poll_recv_data(cx)).await
     }
 
     /// Receive request body
@@ -202,7 +212,7 @@ where
     /// Receive an optional set of trailers for the response.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, StreamError> {
-        future::poll_fn(|cx| self.poll_recv_trailers(cx)).await
+        poll_fn(|cx| self.poll_recv_trailers(cx)).await
     }
 
     /// Poll receive an optional set of trailers for the response.

@@ -1,0 +1,310 @@
+name: Benchmark
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Comparison (80 cases) or diagnostic (576 cases, all header/QPACK directions)
+        type: choice
+        options:
+          - comparison
+          - diagnostic
+        default: comparison
+      profile:
+        description: Sample Client CPU stacks instead of comparing throughput
+        type: boolean
+        default: false
+      trace:
+        description: Trace native transport state only (takes precedence over profile)
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  toolchain_benchmark_msrv: "1.96"
+
+jobs:
+  benchmark:
+    name: Benchmark on Linux
+    runs-on: ubuntu-latest
+    # The manual diagnostic suite includes all header and QPACK directions.
+    timeout-minutes: 90
+    env:
+      HTTP3_BENCH_SUITE: ${{ inputs.suite || 'comparison' }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust ${{ env.toolchain_benchmark_msrv }}
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.toolchain_benchmark_msrv }}
+          components: clippy
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev nasm pkg-config
+
+      - name: Check Linux launcher
+        run: |
+          bash -n bench/run-balanced.sh
+          bash -n bench/ci.sh
+          bash bench/run-balanced.sh --help
+
+      - name: Lint benchmark
+        run: cargo clippy -p bench --all-targets --locked -- -D warnings
+
+      - name: Build benchmark
+        id: build
+        run: |
+          cargo bench -p bench --bench clients --no-run --locked --message-format=json > "$RUNNER_TEMP/benchmark-build.json"
+          executable=$(jq -ers '
+            map(select(.reason == "compiler-artifact" and .target.name == "clients" and .executable != null))
+            | if length == 1 then .[0].executable else error("expected one benchmark executable") end
+          ' "$RUNNER_TEMP/benchmark-build.json")
+          printf 'executable=%s\n' "$executable" >> "$GITHUB_OUTPUT"
+          printf 'BENCH_EXE=%s\n' "$executable" >> "$GITHUB_ENV"
+          printf 'HTTP3_BENCH_RESULTS=%s/http3-bench\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+        env:
+          RUSTFLAGS: "-D warnings"
+          CARGO_PROFILE_BENCH_DEBUG: ${{ inputs.profile && '1' || '0' }}
+
+      - name: List benchmark cases through Linux launcher
+        if: ${{ !inputs.profile && !inputs.trace }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          for headers in none request response both; do
+            output=$(bash "$GITHUB_WORKSPACE/bench/run-balanced.sh" \
+              --body-sizes 0B,1KiB --requests 1000 --concurrency 100 \
+              --headers "$headers" --qpack all -- --list)
+            printf '%s\n' "$output"
+            expected=$(for body in '0 B' '1 KiB'; do
+              for qpack in none request response both; do
+                clients=(http3 nghttp3)
+                if [[ "$qpack" == none ]]; then clients=(http3 h3 nghttp3); fi
+                for client in "${clients[@]}"; do
+                  printf '%s/%s/server-nghttp3-native-4/requests-1000/concurrency-100/headers-%s/qpack-%s: benchmark\n' \
+                    "$client" "$body" "$headers" "$qpack"
+                done
+              done
+            done)
+            actual=$(printf '%s\n' "$output" | grep ': benchmark$')
+            test "$actual" = "$expected"
+          done
+        env:
+          RUSTFLAGS: "-D warnings"
+
+      - name: Smoke static and dynamic QPACK against native Server
+        if: ${{ !inputs.profile && !inputs.trace }}
+        timeout-minutes: 5
+        run: |
+          # Repeated requests let the dynamic encoder receive table feedback
+          # before the batch finishes; four requests would not prove table reuse.
+          # A non-divisible budget also exercises the shared request window tail.
+          bash bench/run-balanced.sh \
+            --body-sizes 0B,1KiB,100KiB --requests 127 --concurrency 4 \
+            --headers both --qpack all -- --test
+          # Exactly one request per worker leaves no shared budget to consume.
+          bash bench/run-balanced.sh \
+            --body-sizes 0B --requests 4 --concurrency 4 \
+            --headers both --qpack all -- --test
+        env:
+          RUSTFLAGS: "-D warnings"
+
+      # Each step has its own summary file; write the shared notes once before
+      # the concurrency steps append their tables to the job summary.
+      - name: Benchmark summary
+        if: ${{ !inputs.profile && !inputs.trace }}
+        run: |
+          printf '%s\n' \
+            'Median batch throughput; higher is better. Full Client stacks against the native Server.' \
+            'Each batch includes request-state allocation, connection establishment, all response validation and normal task aggregation.' \
+            'Runtime, certificate trust/TLS configuration, sockets/endpoints and addresses are prepared before timing.' \
+            'Shutdown and result serialization are excluded.' \
+            'TLS: AES-128-GCM with X25519 on every Client and the Server.' \
+            'Each 1000-request batch starts with a fresh QPACK table; h3 supports static QPACK only.' \
+            'Percentages = (left Client throughput / right Client throughput - 1) × 100%; positive favors the left Client.' \
+            'Percentages use unrounded values; small differences do not establish statistical significance.' \
+            '' >> "$GITHUB_STEP_SUMMARY"
+
+      # Compare all body sizes in one step per concurrency level.
+      # Default: 4 bodies x 4 concurrency levels x (3 static + 2 dynamic) = 80.
+      # Manual diagnostic: also vary all header and QPACK directions = 576.
+      # Run sequentially against the same build; publish tables in Summary.
+      - name: Concurrency 1
+        if: ${{ !inputs.profile && !inputs.trace }}
+        run: bash bench/ci.sh 1
+
+      - name: Concurrency 10
+        if: ${{ !inputs.profile && !inputs.trace }}
+        run: bash bench/ci.sh 10
+
+      - name: Concurrency 50
+        if: ${{ !inputs.profile && !inputs.trace }}
+        run: bash bench/ci.sh 50
+
+      - name: Concurrency 100
+        if: ${{ !inputs.profile && !inputs.trace }}
+        run: bash bench/ci.sh 100
+
+      - name: Upload benchmark measurements
+        if: ${{ always() && !inputs.profile && !inputs.trace }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-${{ env.HTTP3_BENCH_SUITE }}
+          path: ${{ runner.temp }}/http3-bench
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Trace native transport state
+        if: ${{ inputs.trace }}
+        shell: bash
+        timeout-minutes: 5
+        env:
+          HTTP3_BENCH_NATIVE_TRACE: "1"
+          HTTP3_BENCH_HEADERS: both
+          HTTP3_BENCH_REQUESTS: "1000"
+        run: |
+          # Functional batches only: trace collection affects execution timing.
+          # Each Client uses the same Server; record Server state for Rust too.
+          for workload in '1KiB 10' '10KiB 1'; do
+            read -r HTTP3_BENCH_BODY_SIZES HTTP3_BENCH_CONCURRENCY <<< "$workload"
+            export HTTP3_BENCH_BODY_SIZES HTTP3_BENCH_CONCURRENCY
+            for HTTP3_BENCH_QPACK in none both; do
+              export HTTP3_BENCH_QPACK
+              for repeat in 1 2 3; do
+                printf 'TRACE_CASE body=%s concurrency=%s qpack=%s repeat=%s\n' \
+                  "$HTTP3_BENCH_BODY_SIZES" "$HTTP3_BENCH_CONCURRENCY" "$HTTP3_BENCH_QPACK" "$repeat"
+                "$BENCH_EXE" --test
+              done
+            done
+          done 2>&1 | tee "$RUNNER_TEMP/native-transport-trace.log"
+
+      - name: Upload native transport trace
+        if: ${{ always() && inputs.trace }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-transport-trace
+          path: ${{ runner.temp }}/native-transport-trace.log
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Install Linux perf
+        if: ${{ inputs.profile && !inputs.trace }}
+        run: |
+          sudo apt-get install -y linux-tools-common linux-tools-generic
+          # Use the packaged binary directly: the runner kernel need not match
+          # the kernel version selected by Ubuntu's tools metapackage.
+          perf=$(find -L /usr/lib/linux-tools -type f -name perf -executable | sort -V | tail -n 1)
+          test -n "$perf"
+          "$perf" --version
+          printf 'PERF=%s\n' "$perf" >> "$GITHUB_ENV"
+          sudo sysctl kernel.perf_event_paranoid=2
+
+      - name: Sample Client CPU stacks against fixed Server
+        if: ${{ inputs.profile && !inputs.trace }}
+        timeout-minutes: 15
+        env:
+          BENCH_EXE: ${{ steps.build.outputs.executable }}
+          PROFILE_BODY_BYTES: 1024
+          HTTP3_BENCH_QUINN_STATS: "1"
+        run: |
+          profile_dir="$RUNNER_TEMP/http3-client-profile"
+          mkdir -p "$profile_dir"
+          cp "$BENCH_EXE" "$profile_dir/clients"
+          printf '%s\n' \
+            'Client-only user CPU sampling; includes setup, teardown and diagnostic output.' \
+            "Fixed native nghttp3/ngtcp2 Server; $PROFILE_BODY_BYTES B; headers=none; qpack=none; concurrency=100; 10 batches x 20000 requests per Client." \
+            'Client JSON uses one batch timer covering request-state allocation, connection establishment, all response validation and normal task aggregation.' \
+            'Runtime, certificate trust/TLS configuration, socket/address preparation, shutdown and result serialization are excluded from that timer.' \
+            'Rust Client stderr includes request-only Quinn counters; the before snapshot is inside the batch timer.' \
+            'Sampled wall times are not throughput benchmark results.' > "$profile_dir/README.txt"
+          control_dir=$(mktemp -d)
+          mkfifo "$control_dir/stdin"
+          server_pid=
+          stop_server() {
+            if [[ -z "$server_pid" ]]; then return; fi
+            exec 9>&-
+            if ! timeout 10s tail --pid="$server_pid" -f /dev/null; then
+              kill -KILL "$server_pid" 2>/dev/null || true
+              wait "$server_pid" || true
+              server_pid=
+              return 1
+            fi
+            local status=0
+            wait "$server_pid" || status=$?
+            server_pid=
+            return "$status"
+          }
+          trap 'status=$?; stop_server || status=1; exit "$status"' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          for client in http3 h3 nghttp3; do
+            output="$profile_dir/$client"
+            mkdir -p "$output"
+            exec 9<> "$control_dir/stdin"
+            "$BENCH_EXE" --http3-bench-child server "$PROFILE_BODY_BYTES" none none \
+              < "$control_dir/stdin" 9>&- > "$output/server.stdout" 2> "$output/server.stderr" &
+            server_pid=$!
+            ready=false
+            for attempt in {1..150}; do
+              if grep -Fxq "http3-bench-server-v7 library=nghttp3 address=127.0.0.1:4433 body_bytes=$PROFILE_BODY_BYTES headers=none qpack=none max_concurrent_bidi_streams=1000 transport=ngtcp2 runtime=native workers=1" "$output/server.stdout"; then
+                ready=true
+                break
+              fi
+              kill -0 "$server_pid" 2>/dev/null || break
+              sleep 0.1
+            done
+            if [[ "$ready" != true ]]; then
+              cat "$output/server.stdout" "$output/server.stderr" >&2
+              exit 1
+            fi
+            for batch in {1..10}; do
+              if ! timeout --signal=INT --kill-after=10s 120s \
+                "$PERF" record -e cpu-clock:u -F 199 --call-graph dwarf,16384 \
+                -o "$output/$batch.data" -- \
+                "$BENCH_EXE" --http3-bench-child "$client" 20000 "$PROFILE_BODY_BYTES" 100 none none \
+                9>&- < /dev/null > "$output/$batch.json" 2> "$output/$batch.stderr"; then
+                cat "$output/$batch.stderr" >&2
+                exit 1
+              fi
+              jq -e --arg client "$client" --argjson body "$PROFILE_BODY_BYTES" '
+                .schema == "http3-client-bench-v15" and .http3_library == $client
+                and .measurement_profile == "connect-to-batch-complete"
+                and .qpack == "none"
+                and .requests == 20000 and .completed == 20000 and .in_flight == 100
+                and .request_headers == 0 and .response_headers == 0
+                and .response_body_bytes == $body and .received_bytes == (20000 * $body)
+              ' "$output/$batch.json" > /dev/null
+              "$PERF" report --stdio -i "$output/$batch.data" \
+                > "$output/$batch.report.txt" 2> "$output/$batch.report.stderr"
+              "$PERF" script -i "$output/$batch.data" \
+                > "$output/$batch.stacks.txt" 2> "$output/$batch.stacks.stderr"
+            done
+            if ! stop_server; then
+              cat "$output/server.stderr" >&2
+              exit 1
+            fi
+            tail -n +2 "$output/server.stdout" | jq -es '
+              length == 1 and .[0].schema == "http3-server-bench-v1"
+              and .[0].requests == 200000
+              and .[0].request_dynamic_sections == 0
+              and .[0].response_dynamic_sections == 0
+            ' > /dev/null
+          done
+
+      - name: Upload Client CPU profiles
+        if: ${{ always() && inputs.profile && !inputs.trace }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: http3-client-cpu-profiles
+          path: ${{ runner.temp }}/http3-client-profile
+          if-no-files-found: warn
+          retention-days: 7

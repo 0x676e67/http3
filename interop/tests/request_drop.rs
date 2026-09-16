@@ -1,0 +1,173 @@
+//! Dependency cancellation contracts against an upstream h3 server.
+
+use std::{future::Future, time::Duration};
+
+use bytes::{Buf, Bytes, BytesMut};
+use http::{Request, Response};
+use tokio::{sync::oneshot, time::timeout};
+
+#[path = "request_drop/tls.rs"]
+mod tls;
+
+#[tokio::test]
+async fn dropping_request_or_send_half_resets_upload() {
+    bounded(async {
+        for split in [false, true] {
+            let (_, server_config, client_config) = tls::config();
+            let (client, server, _endpoints) = quic_pair(server_config, client_config).await;
+            let (client, server) = tokio::join!(
+                http3::client::new(http3_quic::Connection::new(client)),
+                h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(server)),
+            );
+            let (mut driver, mut sender) = client.unwrap();
+            let mut server = server.unwrap();
+            let drive = tokio::spawn(async move { driver.wait_idle().await });
+            let (accepted_tx, accepted_rx) = oneshot::channel();
+            let peer = tokio::spawn(async move {
+                let (_, mut stream) = server
+                    .accept()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .resolve_request()
+                    .await
+                    .unwrap();
+                accepted_tx.send(()).unwrap();
+                let error = stream
+                    .recv_data()
+                    .await
+                    .err()
+                    .expect("upload must be reset");
+                assert!(
+                    matches!(error, h3::error::StreamError::RemoteTerminate { code, .. }
+                    if code == h3::error::Code::H3_REQUEST_CANCELLED.value())
+                );
+                if split {
+                    stream.send_response(Response::new(())).await.unwrap();
+                    stream
+                        .send_data(Bytes::from_static(b"still receiving"))
+                        .await
+                        .unwrap();
+                    stream.finish().await.unwrap();
+                }
+                server
+            });
+            let stream = sender
+                .send_request(Request::post("https://localhost/drop").body(()).unwrap())
+                .await
+                .unwrap();
+            accepted_rx.await.unwrap();
+            if split {
+                let (send, mut recv) = stream.split();
+                drop(send);
+                assert_eq!(recv.recv_response().await.unwrap().status(), 200);
+                let mut body = BytesMut::new();
+                while let Some(mut data) = recv.recv_data().await.unwrap() {
+                    body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+                }
+                assert_eq!(&body[..], b"still receiving");
+                assert!(recv.recv_trailers().await.unwrap().is_none());
+            } else {
+                drop(stream);
+            }
+            let _server = peer.await.unwrap();
+            drop(sender);
+            assert!(drive.await.unwrap().is_h3_no_error());
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn dropping_receive_half_stops_download_without_canceling_upload() {
+    bounded(async {
+        let (_, server_config, client_config) = tls::config();
+        let (client, server, _endpoints) = quic_pair(server_config, client_config).await;
+        let (client, server) = tokio::join!(
+            http3::client::new(http3_quic::Connection::new(client)),
+            h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(server)),
+        );
+        let (mut driver, mut sender) = client.unwrap();
+        let mut server = server.unwrap();
+        let drive = tokio::spawn(async move { driver.wait_idle().await });
+        let peer = tokio::spawn(async move {
+            let (_, mut stream) = server
+                .accept()
+                .await
+                .unwrap()
+                .unwrap()
+                .resolve_request()
+                .await
+                .unwrap();
+            stream.send_response(Response::new(())).await.unwrap();
+            let (mut send, mut recv) = stream.split();
+            let ((), ()) = tokio::join!(
+                async {
+                    let error = send
+                        .send_data(Bytes::from(vec![0; 4 * 1024 * 1024]))
+                        .await
+                        .expect_err("download must be stopped");
+                    assert!(
+                        matches!(error, h3::error::StreamError::RemoteTerminate { code, .. }
+                    if code == h3::error::Code::H3_REQUEST_CANCELLED.value())
+                    );
+                },
+                async {
+                    let mut body = BytesMut::new();
+                    while let Some(mut data) = recv.recv_data().await.unwrap() {
+                        body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+                    }
+                    assert_eq!(&body[..], b"still sending");
+                }
+            );
+            server
+        });
+        let mut stream = sender
+            .send_request(
+                Request::post("https://localhost/drop-recv")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        stream.recv_response().await.unwrap();
+        let (mut send, recv) = stream.split();
+        drop(recv);
+        send.send_data(Bytes::from_static(b"still sending"))
+            .await
+            .unwrap();
+        send.finish().await.unwrap();
+        drop(send);
+        let _server = peer.await.unwrap();
+        drop(sender);
+        assert!(drive.await.unwrap().is_h3_no_error());
+    })
+    .await;
+}
+
+async fn quic_pair(
+    server_config: quinn::ServerConfig,
+    client_config: quinn::ClientConfig,
+) -> (
+    quinn::Connection,
+    quinn::Connection,
+    (quinn::Endpoint, quinn::Endpoint),
+) {
+    let server_endpoint =
+        quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client_endpoint.set_default_client_config(client_config);
+    let client = client_endpoint
+        .connect(server_endpoint.local_addr().unwrap(), "localhost")
+        .unwrap();
+    let (client, server) = tokio::join!(client, async {
+        server_endpoint.accept().await.unwrap().await.unwrap()
+    });
+    (client.unwrap(), server, (client_endpoint, server_endpoint))
+}
+
+async fn bounded<F: Future>(future: F) -> F::Output {
+    timeout(Duration::from_secs(10), future)
+        .await
+        .expect("HTTP/3 test timed out")
+}

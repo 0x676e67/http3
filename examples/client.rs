@@ -1,20 +1,26 @@
 use std::{path::PathBuf, sync::Arc};
 
+use bytes::{Buf, Bytes};
 use futures::future;
-use http3_rs::error::{ConnectionError, StreamError};
-use rustls::pki_types::CertificateDer;
+use http3::error::{Code, ConnectionError, StreamError};
+use rustls::{
+    DigitallySignedStruct, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::WebPkiSupportedAlgorithms,
+    pki_types::{CertificateDer, ServerName, UnixTime},
+};
 use rustls_native_certs::CertificateResult;
 use structopt::StructOpt;
-use tokio::io::AsyncWriteExt;
-use tracing::{error, info};
-
-use http3_quinn_rs::quinn;
+use tracing::{Level, error, info};
 
 static ALPN: &[u8] = b"h3";
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "server")]
 struct Opt {
+    #[structopt(long, help = "Logging level", default_value = "info")]
+    pub log: Level,
+
     #[structopt(
         long,
         short,
@@ -26,20 +32,90 @@ struct Opt {
     #[structopt(name = "keylogfile", long)]
     pub key_log_file: bool,
 
-    #[structopt()]
+    #[structopt(
+        long,
+        short = "n",
+        default_value = "1",
+        help = "Number of concurrent requests to send"
+    )]
+    pub requests: usize,
+
+    #[structopt(long, help = "QPACK max table capacity")]
+    pub qpack_max_table_capacity: Option<u64>,
+
+    #[structopt(long, help = "QPACK blocked streams")]
+    pub qpack_blocked_streams: Option<u64>,
+
+    #[structopt(
+        default_value = "https://cloudflare-quic.com",
+        help = "URI of the server to connect to"
+    )]
     pub uri: String,
+
+    #[structopt(long, help = "Skip server certificate verification (insecure)")]
+    pub skip_verify: bool,
+}
+
+#[derive(Debug)]
+struct SkipServerVerification(WebPkiSupportedAlgorithms);
+
+impl SkipServerVerification {
+    fn new() -> Self {
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .expect("rustls default crypto provider not initialized");
+        Self(provider.signature_verification_algorithms)
+    }
+}
+
+impl ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_schemes()
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let opt = Opt::from_args();
+
+    if opt.requests == 0 {
+        Err("requests must be greater than 0")?;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
         .with_writer(std::io::stderr)
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(opt.log)
         .init();
-
-    let opt = Opt::from_args();
 
     // DNS lookup
 
@@ -62,22 +138,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // create quinn client endpoint
 
-    // load CA certificates stored in the system
     let mut roots = rustls::RootCertStore::empty();
-    let CertificateResult { certs, errors, .. } = rustls_native_certs::load_native_certs();
-    for cert in certs {
-        if let Err(e) = roots.add(cert) {
+    if !opt.skip_verify {
+        // load CA certificates stored in the system
+        let CertificateResult { certs, errors, .. } = rustls_native_certs::load_native_certs();
+        for cert in certs {
+            if let Err(e) = roots.add(cert) {
+                error!("failed to parse trust anchor: {}", e);
+            }
+        }
+        for e in errors {
+            error!("couldn't load default trust roots: {}", e);
+        }
+
+        // load certificate of CA who issues the server certificate
+        // NOTE that this should be used for dev only
+        if let Err(e) = roots.add(CertificateDer::from(std::fs::read(opt.ca)?)) {
             error!("failed to parse trust anchor: {}", e);
         }
-    }
-    for e in errors {
-        error!("couldn't load default trust roots: {}", e);
-    }
-
-    // load certificate of CA who issues the server certificate
-    // NOTE that this should be used for dev only
-    if let Err(e) = roots.add(CertificateDer::from(std::fs::read(opt.ca)?)) {
-        error!("failed to parse trust anchor: {}", e);
     }
 
     let mut tls_config = rustls::ClientConfig::builder()
@@ -90,12 +168,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // optional debugging support
     if opt.key_log_file {
         // Write all Keys to a file if SSLKEYLOGFILE is set
-        // WARNING, we enable this for the example, you should think carefully about enabling in your own code
+        // WARNING, we enable this for the example, you should think carefully about enabling in
+        // your own code
         tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
     }
 
-    let mut client_endpoint = http3_quinn_rs::quinn::Endpoint::client("[::]:0".parse().unwrap())?;
+    if opt.skip_verify {
+        info!("TLS certificate verification is disabled for this run");
+        tls_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(SkipServerVerification::new()));
+    }
 
+    let mut client_endpoint = http3_quic::quic::Endpoint::client("[::]:0".parse().unwrap())?;
     let client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
     ));
@@ -107,12 +192,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create the HTTP/3 client.
 
-    // http3-rs works with different QUIC implementations via
+    // http3 works with different QUIC implementations via
     // a generic interface, that is, the [`quic::Connection`] trait.
-    // http3-quinn-rs implements the transport traits with Quinn.
-    let quinn_conn = http3_quinn_rs::Connection::new(conn);
+    // http3-quic implements the transport traits with Quinn.
+    let quinn_conn = http3_quic::Connection::new(conn);
 
-    let (mut driver, mut send_request) = http3_rs::client::new(quinn_conn).await?;
+    let (mut driver, send_request) = http3::client::builder()
+        .max_field_section_size(262144u64)
+        .qpack_max_table_capacity(opt.qpack_max_table_capacity)
+        .qpack_blocked_streams(opt.qpack_blocked_streams)
+        .enable_datagram(true)
+        .send_grease(true)
+        .build(quinn_conn)
+        .await?;
 
     let drive = async move {
         Err::<(), ConnectionError>(future::poll_fn(|cx| driver.poll_close(cx)).await)
@@ -125,31 +217,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //             So we "move" it.
     //                  vvvv
     let request = async move {
-        info!("sending request ...");
+        let mut requests = Vec::with_capacity(opt.requests);
 
-        let req = http::Request::builder().uri(uri).body(()).unwrap();
+        for request_id in 0..opt.requests {
+            let uri = uri.clone();
+            let mut send_request = send_request.clone();
 
-        // sending request results in a bidirectional stream,
-        // which is also used for receiving response
-        let mut stream = send_request.send_request(req).await?;
+            let join = tokio::spawn(async move {
+                info!(request_id, "sending request ...");
 
-        // finish on the sending side
-        stream.finish().await?;
+                let req = http::Request::builder().uri(uri).body(()).unwrap();
 
-        info!("receiving response ...");
+                // sending request results in a bidirectional stream,
+                // which is also used for receiving response
+                let mut stream: http3::client::RequestStream<http3_quic::BidiStream<Bytes>, _> =
+                    send_request.send_request(req).await?;
 
-        let resp = stream.recv_response().await?;
+                // finish on the sending side
+                stream.finish().await?;
 
-        info!("response: {:?} {}", resp.version(), resp.status());
-        info!("headers: {:#?}", resp.headers());
+                info!(request_id, "receiving response ...");
 
-        // `recv_data()` must be called after `recv_response()` for
-        // receiving potential response body
-        while let Some(mut chunk) = stream.recv_data().await? {
-            let mut out = tokio::io::stdout();
-            out.write_all_buf(&mut chunk).await.unwrap();
-            out.flush().await.unwrap();
+                let resp = stream.recv_response().await?;
+
+                info!(
+                    request_id,
+                    "response: {:?} {}",
+                    resp.version(),
+                    resp.status()
+                );
+                info!(request_id, "headers: {:#?}", resp.headers());
+
+                // `recv_data()` must be called after `recv_response()` for
+                // receiving potential response body
+                let mut body = Vec::new();
+                while let Some(chunk) = stream.recv_data().await? {
+                    body.extend_from_slice(chunk.chunk());
+                }
+                info!(
+                    request_id,
+                    "body: {}",
+                    String::from_utf8(body).map_err(|err| {
+                        StreamError::StreamError {
+                            code: Code::H3_NO_ERROR,
+                            reason: err.to_string(),
+                        }
+                    })?
+                );
+
+                Ok::<_, StreamError>(())
+            });
+
+            requests.push(join);
         }
+
+        let _ = future::try_join_all(requests).await;
 
         Ok::<_, StreamError>(())
     };
