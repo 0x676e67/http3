@@ -233,7 +233,7 @@ pub fn field_section_limit_request_path() -> String {
     interop_request_path(FIELD_SECTION_LIMIT_TEST_CASE, 0, 0)
 }
 
-pub async fn run_local_quinn_client_interop_matrix_with_config(
+pub async fn run_local_quic_client_interop_matrix_with_config(
     server_addr: SocketAddr,
     cert: &TestCertificate,
     config: ClientInteropConfig,
@@ -246,13 +246,13 @@ pub async fn run_local_quinn_client_interop_matrix_with_config(
         .with_no_client_auth();
     tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
+    let endpoint = quic::Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(quic::ClientConfig::new(Arc::new(
+        quic::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
     )));
 
     let conn = endpoint.connect(server_addr, "localhost")?.await?;
-    let quinn_conn = http3_quic::Connection::new(conn);
+    let quic_conn = http3_quic::Connection::new(conn);
 
     let mut builder = http3::client::builder();
     builder
@@ -270,7 +270,7 @@ pub async fn run_local_quinn_client_interop_matrix_with_config(
         builder.qpack_blocked_streams(blocked_streams);
     }
 
-    let (mut driver, send_request) = builder.build(quinn_conn).await?;
+    let (mut driver, send_request) = builder.build(quic_conn).await?;
 
     // The http3 client makes connection progress from the driver future.
     // Keep it alive while request tasks are waiting on response HEADERS/DATA.
@@ -324,7 +324,7 @@ pub async fn run_local_quinn_client_interop_matrix_with_config(
     Ok(())
 }
 
-pub async fn run_local_quinn_client_max_field_section_size_limit(
+pub async fn run_local_quic_client_max_field_section_size_limit(
     server_addr: SocketAddr,
     cert: &TestCertificate,
     config: ClientInteropConfig,
@@ -337,13 +337,13 @@ pub async fn run_local_quinn_client_max_field_section_size_limit(
         .with_no_client_auth();
     tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
+    let endpoint = quic::Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(quic::ClientConfig::new(Arc::new(
+        quic::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
     )));
 
     let conn = endpoint.connect(server_addr, "localhost")?.await?;
-    let quinn_conn = http3_quic::Connection::new(conn);
+    let quic_conn = http3_quic::Connection::new(conn);
 
     let mut builder = http3::client::builder();
     builder
@@ -361,7 +361,7 @@ pub async fn run_local_quinn_client_max_field_section_size_limit(
         builder.qpack_blocked_streams(blocked_streams);
     }
 
-    let (mut driver, mut send_request) = builder.build(quinn_conn).await?;
+    let (mut driver, mut send_request) = builder.build(quic_conn).await?;
     let driver_task =
         tokio::spawn(async move { future::poll_fn(|cx| driver.poll_close(cx)).await });
 

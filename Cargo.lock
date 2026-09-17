@@ -249,6 +249,7 @@ dependencies = [
  "nghttp3-sys",
  "ngtcp2-sys",
  "pingora-runtime",
+ "quic",
  "quinn",
  "quinn-proto",
  "rustls",
@@ -989,7 +990,7 @@ dependencies = [
  "http3-datagram",
  "http3-quic",
  "octets",
- "quinn",
+ "quic",
  "rcgen",
  "rustls",
  "rustls-native-certs",
@@ -1560,7 +1561,6 @@ dependencies = [
  "http3",
  "http3-datagram",
  "quic",
- "quinn",
  "tracing",
 ]
 
@@ -1799,6 +1799,7 @@ dependencies = [
  "http3",
  "http3-quic",
  "ngtcp2",
+ "quic",
  "quinn",
  "rcgen",
  "rustls",
@@ -2678,19 +2679,43 @@ dependencies = [
 [[package]]
 name = "quic"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7530b18ecfbd734ee6a349c9ef1d7e10db964ceeb7fd014de281e414e452da8"
+source = "git+https://github.com/0x676e67/quic?rev=c8e14ea948a94ad51ef413c733405b7f91e786a2#c8e14ea948a94ad51ef413c733405b7f91e786a2"
 dependencies = [
  "bytes",
  "cfg_aliases",
  "futures-io",
+ "libc",
  "pin-project-lite",
- "quinn-proto",
- "quinn-udp 0.6.1",
+ "quic-proto",
+ "quinn-udp 0.6.2",
  "rustc-hash 2.1.3",
+ "rustls",
  "socket2",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
+ "web-time",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "quic-proto"
+version = "0.11.16"
+source = "git+https://github.com/0x676e67/quic?rev=c8e14ea948a94ad51ef413c733405b7f91e786a2#c8e14ea948a94ad51ef413c733405b7f91e786a2"
+dependencies = [
+ "aws-lc-rs",
+ "bytes",
+ "getrandom 0.4.3",
+ "lru-slab",
+ "rand 0.10.2",
+ "rand_pcg",
+ "ring",
+ "rustc-hash 2.1.3",
+ "rustls",
+ "rustls-pki-types",
+ "slab",
+ "thiserror 2.0.20",
+ "tinyvec",
  "tracing",
  "web-time",
 ]
@@ -2787,15 +2812,15 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76150b617afc75e6e21ac5f39bc196e80b65415ae48d62dbef8e2519d040ce42"
+checksum = "3ca72c3f2792761ab5fa848490694cbc728c7f659669ed4320c4c79c12150966"
 dependencies = [
  "cfg_aliases",
  "libc",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

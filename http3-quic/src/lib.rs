@@ -20,17 +20,8 @@ use http3::{
     error::Code,
     quic::{ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf},
 };
-
-#[cfg(all(feature = "quinn", feature = "quic"))]
-compile_error!("features `quinn` and `quic` are mutually exclusive");
-
-#[cfg(all(feature = "quic", not(feature = "quinn")))]
-pub use quic;
 use quic::ReadError;
-#[cfg(any(feature = "quinn", feature = "quic"))]
-pub use quic::{AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
-#[cfg(all(feature = "quinn", not(feature = "quic")))]
-pub use quinn as quic;
+pub use quic::{self, AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -40,9 +31,9 @@ pub mod datagram;
 /// BoxStream with Sync trait
 type BoxStreamSync<'a, T> = Pin<Box<dyn Stream<Item = T> + Sync + Send + 'a>>;
 
-/// A QUIC connection backed
+/// An HTTP/3 transport backed by a QUIC connection.
 ///
-/// Implements a [`quic::Connection`] backed by a [`quic::Connection`].
+/// Implements [`http3::quic::Connection`] backed by a [`quic::Connection`].
 pub struct Connection {
     conn: quic::Connection,
     incoming_bi: BoxStreamSync<'static, <AcceptBi<'static> as Future>::Output>,
@@ -187,8 +178,8 @@ where
 
 /// Stream opener backed by a QUIC connection
 ///
-/// Implements [`quic::OpenStreams`] using [`quinn::Connection`],
-/// [`quinn::OpenBi`], [`quinn::OpenUni`].
+/// Implements [`http3::quic::OpenStreams`] using [`quic::Connection`],
+/// [`quic::OpenBi`], [`quic::OpenUni`].
 pub struct OpenStreams {
     conn: quic::Connection,
     opening_bi: Option<BoxStreamSync<'static, <OpenBi<'static> as Future>::Output>>,
@@ -264,7 +255,7 @@ impl Clone for OpenStreams {
 
 /// QUIC-backed bidirectional stream
 ///
-/// Implements [`quic::BidiStream`] which allows the stream to be split
+/// Implements [`http3::quic::BidiStream`] which allows the stream to be split
 /// into two structs each implementing one direction.
 pub struct BidiStream<B>
 where
@@ -353,7 +344,7 @@ where
 
 /// QUIC-backed receive stream
 ///
-/// Implements a [`quic::RecvStream`] backed by a [`quinn::RecvStream`].
+/// Implements [`http3::quic::RecvStream`] backed by a [`quic::RecvStream`].
 pub struct RecvStream {
     stream: quic::RecvStream,
     is_0rtt: bool,
@@ -439,7 +430,7 @@ fn convert_write_error_to_stream_error(error: quic::WriteError) -> StreamErrorIn
 
 /// QUIC-backed send stream
 ///
-/// Implements a [`quic::SendStream`] backed by a [`quic::SendStream`].
+/// Implements [`http3::quic::SendStream`] backed by a [`quic::SendStream`].
 pub struct SendStream<B: Buf> {
     stream: quic::SendStream,
     writing: Option<WriteBuf<B>>,
