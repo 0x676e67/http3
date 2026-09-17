@@ -2,12 +2,22 @@
 
 use std::{
     borrow::Cow,
-    sync::{OnceLock, atomic::AtomicBool},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use futures_util::task::AtomicWaker;
 
-use crate::{config::Settings, error::internal_error::ErrorOrigin};
+use crate::{
+    config::Settings,
+    error::{
+        StreamError, connection_error_creators::convert_to_connection_error,
+        internal_error::ErrorOrigin,
+    },
+    quic::StreamId,
+};
 
 /// State shared by an HTTP/3 connection and its streams.
 #[derive(Debug)]
@@ -20,6 +30,9 @@ pub struct SharedState {
     closing: AtomicBool,
     /// Waker for the connection
     waker: AtomicWaker,
+    // u64::MAX is outside the QUIC stream ID space.
+    peer_goaway: AtomicU64,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl Default for SharedState {
@@ -29,6 +42,8 @@ impl Default for SharedState {
             connection_error: OnceLock::new(),
             closing: AtomicBool::new(false),
             waker: AtomicWaker::new(),
+            peer_goaway: AtomicU64::new(u64::MAX),
+            changed: Arc::default(),
         }
     }
 }
@@ -57,6 +72,7 @@ pub trait ConnectionState {
             .shared_state()
             .connection_error
             .get_or_init(move || error);
+        self.shared_state().changed.notify_waiters();
         err.clone()
     }
 
@@ -82,15 +98,12 @@ pub trait ConnectionState {
     }
     /// Set the connection to closing
     fn set_closing(&self) {
-        self.shared_state()
-            .closing
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.shared_state().closing.store(true, Ordering::Release);
+        self.shared_state().changed.notify_waiters();
     }
     /// Check if the connection is closing
     fn is_closing(&self) -> bool {
-        self.shared_state()
-            .closing
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.shared_state().closing.load(Ordering::Acquire)
     }
     /// Set the settings
     fn set_settings(&self, settings: Settings) {
@@ -102,3 +115,58 @@ pub trait ConnectionState {
         &self.shared_state().waker
     }
 }
+
+impl SharedState {
+    pub(crate) fn notified(&self) -> tokio::sync::futures::OwnedNotified {
+        self.changed.clone().notified_owned()
+    }
+
+    pub(crate) fn request_error(&self, stream_id: StreamId) -> Option<StreamError> {
+        let boundary = self.peer_goaway.load(Ordering::Acquire);
+        if stream_id.into_inner() >= boundary {
+            // Only validated server GOAWAY IDs are stored here.
+            if let Ok(boundary) = StreamId::try_from(boundary) {
+                return Some(StreamError::GoawayRejected {
+                    stream_id,
+                    boundary,
+                });
+            }
+        }
+        self.get_conn_error()
+            .map(convert_to_connection_error)
+            .map(StreamError::ConnectionError)
+    }
+
+    pub(crate) fn set_peer_goaway(&self, boundary: StreamId) {
+        if self
+            .peer_goaway
+            .fetch_min(boundary.into_inner(), Ordering::AcqRel)
+            > boundary.into_inner()
+        {
+            self.changed.notify_waiters();
+        }
+    }
+
+    pub(crate) async fn wait_closing(&self) {
+        loop {
+            // notify_waiters records events even before Notified's first poll.
+            let changed = self.changed.notified();
+            if self.is_closing() || self.get_conn_error().is_some() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) async fn wait_rejected(&self, stream_id: StreamId) -> StreamError {
+        loop {
+            let changed = self.changed.notified();
+            if let Some(error) = self.request_error(stream_id) {
+                return error;
+            }
+            changed.await;
+        }
+    }
+}
+
+impl crate::error::connection_error_creators::CloseStream for SharedState {}

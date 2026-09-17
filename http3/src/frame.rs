@@ -16,6 +16,9 @@ use crate::{
     stream::{BufRecvStream, WriteBuf},
 };
 
+// Bound work on continuously ready streams, including ignored frames.
+pub(crate) const MAX_PARSE_STEPS: usize = 32;
+
 /// Decodes Frames from the underlying QUIC stream
 pub struct FrameStream<S, B> {
     pub stream: BufRecvStream<S, B>,
@@ -63,9 +66,15 @@ where
     /// Polls the stream for the next frame header
     ///
     /// When a frame header is received use `poll_data` to retrieve the frame's data.
+    ///
+    /// `budget` counts remaining parser steps, not bytes or frames. Initialize it
+    /// once per outer task poll and share it across nested frame reads. Exhaustion
+    /// wakes the task and returns `Pending` without discarding buffered input;
+    /// replenish the budget when the task is polled again.
     pub fn poll_next(
         &mut self,
         cx: &mut Context<'_>,
+        budget: &mut usize,
     ) -> Poll<Result<Option<Frame<PayloadLen>>, FrameStreamError>> {
         assert!(
             self.remaining_data == 0,
@@ -74,7 +83,7 @@ where
 
         loop {
             // Decode buffered frames before reading more from the transport.
-            return match self.decoder.decode(self.stream.buf_mut())? {
+            return match self.decoder.decode(self.stream.buf_mut(), budget)? {
                 Some(Frame::Data(PayloadLen(len))) => {
                     self.remaining_data = len;
                     self.data_until_eos = false;
@@ -86,6 +95,10 @@ where
                     Poll::Ready(Ok(frame))
                 }
                 Some(frame) => Poll::Ready(Ok(Some(frame))),
+                None if *budget == 0 => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
                 None => match self.try_recv(cx)? {
                     // Received a chunk but frame is incomplete, poll until we get `Pending`.
                     Poll::Ready(false) => continue,
@@ -243,10 +256,15 @@ impl FrameDecoder {
     fn decode<B: Buf>(
         &mut self,
         src: &mut BufList<B>,
+        budget: &mut usize,
     ) -> Result<Option<Frame<PayloadLen>>, FrameStreamError> {
         // Decode in a loop since we ignore unknown frames, and there may be
         // other frames already in our BufList.
         loop {
+            if *budget == 0 {
+                return Ok(None);
+            }
+            *budget -= 1;
             if !src.has_remaining() {
                 return Ok(None);
             }
@@ -374,7 +392,10 @@ mod tests {
         let mut buf = BufList::from(buf);
 
         let mut decoder = FrameDecoder::default();
-        assert_matches!(decoder.decode(&mut buf), Ok(Some(Frame::Headers(_))));
+        assert_matches!(
+            decoder.decode(&mut buf, &mut { usize::MAX }),
+            Ok(Some(Frame::Headers(_)))
+        );
     }
 
     #[test]
@@ -387,7 +408,7 @@ mod tests {
         let mut buf = BufList::from(buf);
 
         let mut decoder = FrameDecoder::default();
-        assert_matches!(decoder.decode(&mut buf), Ok(None));
+        assert_matches!(decoder.decode(&mut buf, &mut { usize::MAX }), Ok(None));
     }
 
     #[test]
@@ -403,7 +424,7 @@ mod tests {
             ..FrameDecoder::default()
         };
         assert_matches!(
-            decoder.decode(&mut buf),
+            decoder.decode(&mut buf, &mut { usize::MAX }),
             Err(FrameStreamError::Proto(FrameProtocolError::ExcessiveLoad {
                 len: 5,
                 limit: 4,
@@ -423,7 +444,10 @@ mod tests {
 
             let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
             let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
-            assert!(matches!(stream.poll_next(&mut cx), Poll::Pending));
+            assert!(matches!(
+                stream.poll_next(&mut cx, &mut { MAX_PARSE_STEPS }),
+                Poll::Pending
+            ));
         }
     }
 
@@ -439,7 +463,7 @@ mod tests {
             let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
             let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
             assert_matches!(
-                stream.poll_next(&mut cx),
+                stream.poll_next(&mut cx, &mut { MAX_PARSE_STEPS }),
                 Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
             );
         }
@@ -455,7 +479,10 @@ mod tests {
         buf_list.push(&buf[1..]);
 
         let mut decoder = FrameDecoder::default();
-        assert_matches!(decoder.decode(&mut buf_list), Ok(Some(Frame::Headers(_))));
+        assert_matches!(
+            decoder.decode(&mut buf_list, &mut { usize::MAX }),
+            Ok(Some(Frame::Headers(_)))
+        );
     }
 
     #[test]
@@ -469,7 +496,10 @@ mod tests {
         buf_list.push(&buf[2..]);
 
         let mut decoder = FrameDecoder::default();
-        assert_matches!(decoder.decode(&mut buf_list), Ok(Some(Frame::Headers(_))));
+        assert_matches!(
+            decoder.decode(&mut buf_list, &mut { usize::MAX }),
+            Ok(Some(Frame::Headers(_)))
+        );
     }
 
     #[test]
@@ -483,12 +513,15 @@ mod tests {
         let mut buf = BufList::from(buf);
 
         let mut decoder = FrameDecoder::default();
-        assert_matches!(decoder.decode(&mut buf), Ok(Some(Frame::Headers(_))));
         assert_matches!(
-            decoder.decode(&mut buf),
+            decoder.decode(&mut buf, &mut { usize::MAX }),
+            Ok(Some(Frame::Headers(_)))
+        );
+        assert_matches!(
+            decoder.decode(&mut buf, &mut { usize::MAX }),
             Ok(Some(Frame::Data(PayloadLen(4))))
         );
-        assert_matches!(decoder.decode(&mut buf), Ok(None));
+        assert_matches!(decoder.decode(&mut buf, &mut { usize::MAX }), Ok(None));
     }
 
     // FrameStream
@@ -520,16 +553,22 @@ mod tests {
 
         let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
 
-        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
         assert_poll_matches!(
-            |cx| stream.poll_next(cx),
+            |cx| stream.poll_next(cx, &mut { MAX_PARSE_STEPS }),
+            Ok(Some(Frame::Headers(_)))
+        );
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx, &mut { MAX_PARSE_STEPS }),
             Ok(Some(Frame::Data(PayloadLen(4))))
         );
         assert_poll_matches!(
             |cx| to_bytes(stream.poll_data(cx)),
             Ok(Some(b)) if b.remaining() == 4
         );
-        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx, &mut { MAX_PARSE_STEPS }),
+            Ok(Some(Frame::Headers(_)))
+        );
     }
 
     #[tokio::test]
@@ -543,7 +582,7 @@ mod tests {
         let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
 
         assert_poll_matches!(
-            |cx| stream.poll_next(cx),
+            |cx| stream.poll_next(cx, &mut { MAX_PARSE_STEPS }),
             Err(FrameStreamError::UnexpectedEnd)
         );
     }
@@ -562,12 +601,12 @@ mod tests {
         let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
 
         assert_poll_matches!(
-            |cx| stream.poll_next(cx),
+            |cx| stream.poll_next(cx, &mut { MAX_PARSE_STEPS }),
             Ok(Some(Frame::Data(PayloadLen(4))))
         );
 
         // There is still data to consume, poll_next should panic
-        let _ = poll_fn(|cx| stream.poll_next(cx)).await;
+        let _ = poll_fn(|cx| stream.poll_next(cx, &mut { MAX_PARSE_STEPS })).await;
     }
 
     #[tokio::test]
@@ -585,7 +624,7 @@ mod tests {
 
         // We get the total size of data about to be received
         assert_poll_matches!(
-            |cx| stream.poll_next(cx),
+            |cx| stream.poll_next(cx, &mut { MAX_PARSE_STEPS }),
             Ok(Some(Frame::Data(PayloadLen(4))))
         );
 
@@ -613,7 +652,7 @@ mod tests {
         let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
 
         assert_poll_matches!(
-            |cx| stream.poll_next(cx),
+            |cx| stream.poll_next(cx, &mut { MAX_PARSE_STEPS }),
             Ok(Some(Frame::Data(PayloadLen(4))))
         );
         assert_poll_matches!(
@@ -632,7 +671,7 @@ mod tests {
 
         let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
         assert_poll_matches!(
-            |cx| stream.poll_next(cx),
+            |cx| stream.poll_next(cx, &mut { MAX_PARSE_STEPS }),
             Ok(Some(Frame::Data(PayloadLen(4))))
         );
 
@@ -650,7 +689,7 @@ mod tests {
 
         let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
         assert_poll_matches!(
-            |cx| stream.poll_next(cx),
+            |cx| stream.poll_next(cx, &mut { MAX_PARSE_STEPS }),
             Ok(Some(Frame::Data(PayloadLen(4))))
         );
         assert_poll_matches!(
@@ -669,7 +708,7 @@ mod tests {
 
         let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
         assert_poll_matches!(
-            |cx| stream.poll_next(cx),
+            |cx| stream.poll_next(cx, &mut { MAX_PARSE_STEPS }),
             Ok(Some(Frame::WebTransportStream(_)))
         );
         assert_poll_matches!(
@@ -702,7 +741,7 @@ mod tests {
         let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
 
         assert_poll_matches!(
-            |cx| stream.poll_next(cx),
+            |cx| stream.poll_next(cx, &mut { MAX_PARSE_STEPS }),
             Ok(Some(Frame::Data(PayloadLen(4))))
         );
         assert_poll_matches!(
@@ -724,7 +763,7 @@ mod tests {
         let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
 
         assert_poll_matches!(
-            |cx| stream.poll_next(cx),
+            |cx| stream.poll_next(cx, &mut { MAX_PARSE_STEPS }),
             Ok(Some(Frame::Data(PayloadLen(4))))
         );
 
@@ -756,14 +795,249 @@ mod tests {
 
         let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
 
-        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx, &mut { MAX_PARSE_STEPS }),
+            Ok(Some(Frame::Headers(_)))
+        );
         assert_eq!(reads.load(Ordering::Relaxed), 1);
 
-        assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx, &mut { MAX_PARSE_STEPS }),
+            Ok(Some(Frame::Headers(_)))
+        );
         assert_eq!(reads.load(Ordering::Relaxed), 1);
     }
 
     // Helpers
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl futures_util::task::ArcWake for WakeCounter {
+        fn wake_by_ref(counter: &Arc<Self>) {
+            counter.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn ignored_frames_and_fragmented_headers_yield_without_losing_state() {
+        for fragmented in [false, true] {
+            let mut wire = BytesMut::new();
+            for _ in 0..MAX_PARSE_STEPS * 3 {
+                FrameType::grease().encode(&mut wire);
+                VarInt::from(0_u32).encode(&mut wire);
+            }
+            Frame::headers(&b"header"[..]).encode_with_payload(&mut wire);
+            let mut recv = FakeRecv::default();
+            if fragmented {
+                for byte in wire {
+                    recv.chunk(Bytes::from(vec![byte]));
+                }
+            } else {
+                recv.chunk(wire.freeze());
+            }
+            let reads = recv.reads();
+            let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+            let counter = Arc::new(WakeCounter::default());
+            let waker = futures_util::task::waker(counter.clone());
+            let mut cx = Context::from_waker(&waker);
+            assert!(
+                stream
+                    .poll_next(&mut cx, &mut { MAX_PARSE_STEPS })
+                    .is_pending()
+            );
+            assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+            assert!(reads.load(Ordering::Relaxed) <= MAX_PARSE_STEPS);
+            for _ in 0..MAX_PARSE_STEPS * 3 {
+                match stream.poll_next(&mut cx, &mut { MAX_PARSE_STEPS }) {
+                    Poll::Pending => continue,
+                    Poll::Ready(Ok(Some(Frame::Headers(block)))) => {
+                        assert_eq!(block.as_ref(), b"header");
+                        assert!(matches!(
+                            stream.poll_next(&mut cx, &mut { MAX_PARSE_STEPS }),
+                            Poll::Ready(Ok(None))
+                        ));
+                        break;
+                    }
+                    other => panic!("unexpected result: {other:?}"),
+                }
+            }
+            assert!(stream.is_eos());
+        }
+    }
+
+    #[test]
+    fn empty_data_yields_and_preserves_body_trailers_and_fin() {
+        for trailers in [false, true] {
+            let mut wire = BytesMut::new();
+            for _ in 0..MAX_PARSE_STEPS * 3 {
+                Frame::Data(Bytes::new()).encode_with_payload(&mut wire);
+            }
+            for data in [
+                Bytes::from_static(b"a"),
+                Bytes::new(),
+                Bytes::from_static(b"bc"),
+                Bytes::new(),
+            ] {
+                Frame::Data(data).encode_with_payload(&mut wire);
+            }
+            if trailers {
+                let mut fields = http::HeaderMap::new();
+                fields.insert("trailer", "value".parse().unwrap());
+                let mut block = BytesMut::new();
+                crate::qpack::encode_stateless(
+                    &mut block,
+                    &crate::proto::headers::Header::trailer(fields),
+                )
+                .unwrap();
+                Frame::headers(block.freeze()).encode_with_payload(&mut wire);
+            }
+            let mut recv = FakeRecv::default();
+            recv.chunk(wire.freeze());
+            let mut stream = crate::connection::RequestStream::<_, Bytes>::new(
+                FrameStream::new(BufRecvStream::new(recv)),
+                u64::MAX,
+                usize::MAX,
+                Arc::default(),
+                false,
+                None,
+            );
+            let counter = Arc::new(WakeCounter::default());
+            let waker = futures_util::task::waker(counter.clone());
+            let mut cx = Context::from_waker(&waker);
+            assert!(stream.poll_recv_data(&mut cx).is_pending());
+            assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+            let mut body = BytesMut::new();
+            let mut ended = false;
+            for _ in 0..MAX_PARSE_STEPS {
+                match stream.poll_recv_data(&mut cx) {
+                    Poll::Pending => (),
+                    Poll::Ready(Ok(Some(mut data))) => {
+                        body.extend_from_slice(&data.copy_to_bytes(data.remaining()))
+                    }
+                    Poll::Ready(Ok(None)) => {
+                        ended = true;
+                        break;
+                    }
+                    Poll::Ready(Err(error)) => panic!("body failed: {error}"),
+                }
+            }
+            assert!(ended);
+            assert_eq!(&body[..], b"abc");
+            assert!(matches!(
+                stream.poll_recv_data(&mut cx),
+                Poll::Ready(Ok(None))
+            ));
+            match stream.poll_recv_trailers(&mut cx) {
+                Poll::Ready(Ok(Some(fields))) if trailers => assert_eq!(fields["trailer"], "value"),
+                Poll::Ready(Ok(None)) if !trailers => (),
+                other => panic!("unexpected trailers: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_body_eof_keeps_unread_dynamic_trailers_cancellable() {
+        use crate::qpack::{self, QpackDecoder, QpackEvent};
+
+        for consume_trailers in [false, true] {
+            let mut instructions = Vec::new();
+            qpack::DynamicTableSizeUpdate(256).encode(&mut instructions);
+            qpack::InsertWithoutNameRef::new(b"trailer".as_slice(), b"value".as_slice())
+                .encode(&mut instructions)
+                .unwrap();
+            let mut decoder = qpack::Decoder::new(256, 1).unwrap();
+            decoder
+                .on_encoder_recv(&mut instructions.as_slice(), &mut Vec::new())
+                .unwrap();
+            let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut wire = BytesMut::new();
+            // Required Insert Count = 1, Base = 1, dynamic relative index = 0.
+            // RFC 9204 sections 4.5.1 and 4.5.2.
+            Frame::headers(Bytes::from_static(&[2, 0, 0x80])).encode_with_payload(&mut wire);
+            let mut recv = FakeRecv::default();
+            recv.chunk(wire.freeze());
+            let mut stream = crate::connection::RequestStream::<_, Bytes>::new(
+                FrameStream::new(BufRecvStream::new(recv)),
+                u64::MAX,
+                usize::MAX,
+                Arc::default(),
+                false,
+                Some(QpackDecoder::new(decoder, events_tx)),
+            );
+            let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+            for _ in 0..2 {
+                assert!(matches!(
+                    stream.poll_recv_data(&mut cx),
+                    Poll::Ready(Ok(None))
+                ));
+            }
+            assert!(events_rx.try_recv().is_err());
+            if consume_trailers {
+                assert!(matches!(
+                    stream.poll_recv_trailers(&mut cx),
+                    Poll::Ready(Ok(Some(fields))) if fields["trailer"] == "value"
+                ));
+            }
+            drop(stream);
+            match events_rx.try_recv().unwrap() {
+                QpackEvent::HeaderAck(id) if consume_trailers => assert_eq!(id.into_inner(), 0),
+                QpackEvent::StreamCancel(id) if !consume_trailers => assert_eq!(id.into_inner(), 0),
+                other => panic!("unexpected decoder event: {other:?}"),
+            }
+            assert!(events_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn frame_budget_is_shared_and_resumes_after_replenishing() {
+        let mut wire = BytesMut::new();
+        for _ in 0..MAX_PARSE_STEPS * 2 {
+            Frame::Data(Bytes::new()).encode_with_payload(&mut wire);
+        }
+        Frame::headers(Bytes::from_static(b"header")).encode_with_payload(&mut wire);
+        let mut recv = FakeRecv::default();
+        recv.chunk(wire.freeze());
+        let reads = recv.reads();
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+        let counter = Arc::new(WakeCounter::default());
+        let waker = futures_util::task::waker(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut budget = MAX_PARSE_STEPS;
+        let mut data_frames = 0;
+        for _ in 0..MAX_PARSE_STEPS * 2 {
+            match stream.poll_next(&mut cx, &mut budget) {
+                Poll::Ready(Ok(Some(Frame::Data(PayloadLen(0))))) => data_frames += 1,
+                Poll::Pending => break,
+                other => panic!("unexpected frame before yield: {other:?}"),
+            }
+        }
+        assert!(data_frames > 0 && data_frames < MAX_PARSE_STEPS * 2);
+        assert_eq!(budget, 0);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+        let reads_before = reads.load(Ordering::Relaxed);
+        assert!(stream.poll_next(&mut cx, &mut budget).is_pending());
+        assert_eq!(reads.load(Ordering::Relaxed), reads_before);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 2);
+
+        // A new task poll replenishes the budget; buffered frames remain intact.
+        let mut received_headers = false;
+        budget = MAX_PARSE_STEPS;
+        for _ in 0..MAX_PARSE_STEPS * 3 {
+            match stream.poll_next(&mut cx, &mut budget) {
+                Poll::Ready(Ok(Some(Frame::Data(PayloadLen(0))))) => data_frames += 1,
+                Poll::Ready(Ok(Some(Frame::Headers(block)))) => {
+                    assert_eq!(block.as_ref(), b"header");
+                    received_headers = true;
+                    break;
+                }
+                Poll::Pending => budget = MAX_PARSE_STEPS,
+                other => panic!("unexpected frame after yield: {other:?}"),
+            }
+        }
+        assert!(received_headers);
+        assert_eq!(data_frames, MAX_PARSE_STEPS * 2);
+    }
 
     #[derive(Default)]
     struct FakeRecv {
@@ -808,7 +1082,7 @@ mod tests {
         }
 
         fn recv_id(&self) -> StreamId {
-            unimplemented!()
+            StreamId::try_from(0).unwrap()
         }
     }
 

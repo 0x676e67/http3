@@ -68,6 +68,21 @@ pub enum LocalError {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum StreamError {
+    /// A locally constructed request is invalid. No request was sent and the
+    /// connection remains usable.
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
+    InvalidRequest {
+        /// Why the request could not be constructed.
+        reason: String,
+    },
+    /// The server's GOAWAY guarantees this request was not processed.
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
+    GoawayRejected {
+        /// The rejected request stream.
+        stream_id: crate::quic::StreamId,
+        /// The first stream the server will not process.
+        boundary: crate::quic::StreamId,
+    },
     /// The error occurred on the stream
     #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     StreamError {
@@ -151,6 +166,16 @@ impl std::error::Error for ConnectionError {}
 impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            StreamError::InvalidRequest { reason } => write!(f, "Invalid request: {reason}"),
+            StreamError::GoawayRejected {
+                stream_id,
+                boundary,
+            } => {
+                write!(
+                    f,
+                    "Request {stream_id} rejected by GOAWAY boundary {boundary}"
+                )
+            }
             StreamError::StreamError { code, reason } => {
                 write!(f, "Stream error: {:?} - {}", code, reason)
             }

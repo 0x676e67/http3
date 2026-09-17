@@ -107,8 +107,8 @@ where
     }
 }
 
-/// Converts a [`ErrorOrigin`] into a [`ConnectionError`] and sets self.handled_connection_error
-fn convert_to_connection_error(error: ErrorOrigin) -> ConnectionError {
+/// Converts the published error without changing connection state.
+pub(crate) fn convert_to_connection_error(error: ErrorOrigin) -> ConnectionError {
     match error {
         ErrorOrigin::Internal(internal_error) => ConnectionError::Local {
             error: LocalError::Application {
@@ -150,6 +150,11 @@ pub trait CloseStream: ConnectionState {
 
     /// Checks if the peer connection is closing an if it is allowed to send a request / server push
     fn check_peer_connection_closing(&self) -> Option<StreamError> {
+        if let Some(error) = self.get_conn_error() {
+            return Some(StreamError::ConnectionError(convert_to_connection_error(
+                error,
+            )));
+        }
         if self.is_closing() {
             return Some(StreamError::RemoteClosing);
         };

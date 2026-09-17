@@ -1114,7 +1114,8 @@ where
             return Poll::Pending;
         };
 
-        let res = match ready!(recv.poll_next(cx)) {
+        let mut budget = crate::frame::MAX_PARSE_STEPS;
+        let res = match ready!(recv.poll_next(cx, &mut budget)) {
             Err(FrameStreamError::Quic(StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error,
             })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
@@ -1704,8 +1705,14 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
-        if !self.stream.has_data() {
-            match ready!(self.stream.poll_next(cx)) {
+        if self.trailers.is_some() {
+            return Poll::Ready(Ok(None));
+        }
+        let mut budget = crate::frame::MAX_PARSE_STEPS;
+        // A zero-length DATA frame ends only that frame, not the HTTP body.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
+        while !self.stream.has_data() {
+            match ready!(self.stream.poll_next(cx, &mut budget)) {
                 Err(frame_stream_error) => {
                     return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
                 }
@@ -1764,10 +1771,11 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
+        let mut budget = crate::frame::MAX_PARSE_STEPS;
         let mut trailers = if let Some(encoded) = self.trailers.take() {
             encoded
         } else {
-            match ready!(self.stream.poll_next(cx)) {
+            match ready!(self.stream.poll_next(cx, &mut budget)) {
                 Err(frame_stream_error) => {
                     return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
                 }
@@ -1815,7 +1823,7 @@ where
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
             //# Receipt of an invalid sequence of frames MUST be treated as a
             //# connection error of type H3_FRAME_UNEXPECTED.
-            match self.stream.poll_next(cx) {
+            match self.stream.poll_next(cx, &mut budget) {
                 Poll::Ready(Err(frame_stream_error)) => {
                     return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
                 }
