@@ -1720,7 +1720,11 @@ where
             return Poll::Ready(Ok(None));
         }
 
-        if !self.stream.has_data() {
+        // Empty DATA frames do not end the body. Keep reading until payload,
+        // trailers, transport EOF, or Pending; only EOF completes the guard.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.1
+        while !self.stream.has_data() {
             match ready!(self.stream.poll_next(cx)) {
                 Err(frame_stream_error) => {
                     return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
@@ -2581,6 +2585,7 @@ mod request_drop_tests {
         incoming: Option<Bytes>,
         backpressure: bool,
         pending_write: bool,
+        pending_read: bool,
     }
 
     impl quic::RecvStream for Probe {
@@ -2590,6 +2595,9 @@ mod request_drop_tests {
             &mut self,
             _: &mut Context<'_>,
         ) -> Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
+            if self.incoming.is_none() && self.pending_read {
+                return Poll::Pending;
+            }
             Poll::Ready(Ok(self.incoming.take()))
         }
 
@@ -2938,6 +2946,72 @@ mod request_drop_tests {
         assert!(
             probe.events.lock().unwrap().is_empty(),
             "server construction remains disarmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_data_frames_preserve_body_and_trailers() {
+        for client in [false, true] {
+            for trailers in [false, true] {
+                // Empty DATA before and after content, then optional trailers.
+                // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
+                let mut wire = vec![0, 0, 0, 0, 0, 3, b'a', b'b', b'c', 0, 0];
+                if trailers {
+                    wire.extend_from_slice(&[1, 2, 0, 0]);
+                }
+                let (mut stream, probe) = stream_with_probe(Probe {
+                    incoming: Some(Bytes::from(wire)),
+                    ..Probe::default()
+                });
+                if client {
+                    stream = stream.cancel_on_drop();
+                }
+                let mut body = Vec::new();
+                while let Some(mut data) = future::poll_fn(|cx| stream.poll_recv_data(cx))
+                    .await
+                    .unwrap()
+                {
+                    body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+                }
+                assert_eq!(body, b"abc");
+                assert_eq!(
+                    future::poll_fn(|cx| stream.poll_recv_trailers(cx))
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    trailers
+                );
+                drop(stream);
+                let expected = if client {
+                    vec![("reset", Code::H3_REQUEST_CANCELLED.value())]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(*probe.events.lock().unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_data_before_pending_keeps_receive_cancellation_armed() {
+        let (stream, probe) = stream_with_probe(Probe {
+            incoming: Some(Bytes::from_static(&[0, 0])),
+            pending_read: true,
+            ..Probe::default()
+        });
+        let mut stream = stream.cancel_on_drop();
+        assert!(
+            future::poll_fn(|cx| stream.poll_recv_data(cx))
+                .now_or_never()
+                .is_none()
+        );
+        drop(stream);
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [
+                ("reset", Code::H3_REQUEST_CANCELLED.value()),
+                ("stop", Code::H3_REQUEST_CANCELLED.value()),
+            ]
         );
     }
 }
