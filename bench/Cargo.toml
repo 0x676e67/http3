@@ -4,7 +4,7 @@ version = "0.0.0"
 publish = false
 autobenches = false
 edition = { workspace = true }
-rust-version = "1.96"
+rust-version = { workspace = true }
 repository = { workspace = true }
 license = { workspace = true }
 build = "build.rs"

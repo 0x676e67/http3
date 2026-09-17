@@ -8,6 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
+rust-version = "1.98"
 repository = "https://github.com/0x676e67/http3"
 
 [workspace.dependencies]

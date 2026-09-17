@@ -458,10 +458,10 @@ where
         T: From<VarInt> + PartialOrd<T> + Copy,
         VarInt: From<T>,
     {
-        if let Some(sent_id) = sent_closing {
-            if *sent_id <= max_id {
-                return Ok(());
-            }
+        if let Some(sent_id) = sent_closing
+            && *sent_id <= max_id
+        {
+            return Ok(());
         }
 
         *sent_closing = Some(max_id);
@@ -911,18 +911,17 @@ where
             debug_assert!(self.qpack_streams.encoder_send_buf.is_none());
         }
 
-        if self.qpack_streams.decoder_recv.is_some() {
-            if let Poll::Ready(Err(error)) = self.poll_qpack_decoder_stream_inner(cx) {
-                return Err(error);
-            }
+        if self.qpack_streams.decoder_recv.is_some()
+            && let Poll::Ready(Err(error)) = self.poll_qpack_decoder_stream_inner(cx)
+        {
+            return Err(error);
         }
 
-        if self.qpack_streams.encoder_recv.is_some()
-            || self.qpack_streams.decoder.dynamic_table_enabled()
+        if (self.qpack_streams.encoder_recv.is_some()
+            || self.qpack_streams.decoder.dynamic_table_enabled())
+            && let Poll::Ready(Err(error)) = self.poll_qpack_encoder_stream_inner(cx)
         {
-            if let Poll::Ready(Err(error)) = self.poll_qpack_encoder_stream_inner(cx) {
-                return Err(error);
-            }
+            return Err(error);
         }
         Ok(())
     }
@@ -1284,19 +1283,19 @@ where
         //# Like the server,
         //# the client MAY send subsequent GOAWAY frames so long as the specified
         //# push ID is no greater than any previously sent value.
-        if let Some(prev_id) = recv_closing.map(VarInt::from) {
-            if prev_id < id {
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
-                //# Receiving a GOAWAY containing a larger identifier than previously
-                //# received MUST be treated as a connection error of type H3_ID_ERROR.
-                return Err(self.handle_connection_error(InternalConnectionError::new(
-                    Code::H3_ID_ERROR,
-                    format!(
-                        "received a GoAway ({}) greater than the former one ({})",
-                        id, prev_id
-                    ),
-                )));
-            }
+        if let Some(prev_id) = recv_closing.map(VarInt::from)
+            && prev_id < id
+        {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
+            //# Receiving a GOAWAY containing a larger identifier than previously
+            //# received MUST be treated as a connection error of type H3_ID_ERROR.
+            return Err(self.handle_connection_error(InternalConnectionError::new(
+                Code::H3_ID_ERROR,
+                format!(
+                    "received a GoAway ({}) greater than the former one ({})",
+                    id, prev_id
+                ),
+            )));
         }
         *recv_closing = Some(id.into());
         self.set_closing();
@@ -1329,19 +1328,18 @@ where
         //# sent when application-layer padding is desired.  They MAY also be
         //# sent on connections where no data is currently being transferred.
         if let GreaseStatus::Started(stream) = &mut self.grease_step {
-            if let Some(stream) = stream {
-                if stream
+            if let Some(stream) = stream
+                && stream
                     .send_data((StreamType::grease(), Frame::Grease))
                     .is_err()
-                {
-                    self.send_grease_stream_flag = false;
+            {
+                self.send_grease_stream_flag = false;
 
-                    #[cfg(feature = "tracing")]
-                    warn!("write data on grease stream failed with");
+                #[cfg(feature = "tracing")]
+                warn!("write data on grease stream failed with");
 
-                    return Poll::Ready(());
-                };
-            }
+                return Poll::Ready(());
+            };
             self.grease_step = GreaseStatus::DataPrepared(stream.take());
         };
 
