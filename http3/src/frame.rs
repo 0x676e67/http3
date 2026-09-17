@@ -251,10 +251,10 @@ impl FrameDecoder {
                 return Ok(None);
             }
 
-            if let Some(min) = self.expected {
-                if src.remaining() < min {
-                    return Ok(None);
-                }
+            if let Some(min) = self.expected
+                && src.remaining() < min
+            {
+                return Ok(None);
             }
 
             let (pos, decoded) = {

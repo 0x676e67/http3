@@ -2,7 +2,7 @@
 name = "interop"
 version = "0.0.0"
 publish = false
-rust-version = "1.96"
+rust-version = { workspace = true }
 edition = { workspace = true }
 repository = { workspace = true }
 

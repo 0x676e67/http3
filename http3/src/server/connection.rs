@@ -215,15 +215,15 @@ where
                     // When the connection is in a graceful shutdown procedure, reject all
                     // incoming requests not belonging to the grace interval. It's possible that
                     // some acceptable request streams arrive after rejected requests.
-                    if let Some(max_id) = self.sent_closing {
-                        if s.send_id() > max_id {
-                            s.stop_sending(Code::H3_REQUEST_REJECTED.value());
-                            s.reset(Code::H3_REQUEST_REJECTED.value());
-                            if self.poll_requests_completion(cx).is_ready() {
-                                break Poll::Ready(Ok(None));
-                            }
-                            continue;
+                    if let Some(max_id) = self.sent_closing
+                        && s.send_id() > max_id
+                    {
+                        s.stop_sending(Code::H3_REQUEST_REJECTED.value());
+                        s.reset(Code::H3_REQUEST_REJECTED.value());
+                        if self.poll_requests_completion(cx).is_ready() {
+                            break Poll::Ready(Ok(None));
                         }
+                        continue;
                     }
                     self.last_accepted_stream = Some(s.send_id());
                     self.ongoing_streams.insert(s.send_id());

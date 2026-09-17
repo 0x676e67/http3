@@ -23,7 +23,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.98"
 repository = "https://github.com/0x676e67/http3"
 license = "Apache-2.0"
 

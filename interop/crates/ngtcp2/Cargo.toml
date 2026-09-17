@@ -3,7 +3,7 @@ name = "ngtcp2"
 version = "0.2.0"
 description = "Rust bindings to ngtcp2 and nghttp3"
 edition = "2024"
-rust-version = "1.96"
+rust-version = { workspace = true }
 publish = false
 repository = { workspace = true }
 readme = "README.md"

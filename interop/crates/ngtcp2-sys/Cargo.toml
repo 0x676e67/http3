@@ -3,7 +3,7 @@ name = "ngtcp2-sys"
 version = "0.2.0"
 description = "FFI bindings to ngtcp2"
 edition = "2024"
-rust-version = "1.96"
+rust-version = { workspace = true }
 build = "build.rs"
 links = "ngtcp2"
 publish = false

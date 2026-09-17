@@ -12,8 +12,7 @@ env:
     --exclude interop
     --exclude bench
   toolchain_style: nightly
-  toolchain_msrv: "1.85"
-  toolchain_http3_quinn_msrv: "1.85"
+  toolchain_msrv: "1.98"
   toolchain_doc: nightly
   toolchain_lint: stable
   toolchain_fuzz: nightly
@@ -78,10 +77,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install Rust ${{ env.toolchain_http3_quinn_msrv }}
+      - name: Install Rust ${{ env.toolchain_msrv }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: ${{ env.toolchain_http3_quinn_msrv }}
+          toolchain: ${{ env.toolchain_msrv }}
       - run: cargo check -p http3-quic
 
   test:
