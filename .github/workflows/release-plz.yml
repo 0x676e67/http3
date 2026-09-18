@@ -25,6 +25,15 @@ jobs:
       - &install-rust
         name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+      # A crates.io publish cannot be undone, and `release-plz release` uploads
+      # the workspace one crate at a time. A manifest error found partway
+      # through leaves the earlier crates published at the new version and the
+      # rest behind, which can only be resolved by burning another version.
+      # Package every publishable crate first so that class of error fails the
+      # job before anything is uploaded. Sibling versions resolve from the
+      # workspace here, so this works even though none of them is published yet.
+      - name: Verify publishable crates
+        run: cargo package -p http3 -p http3-datagram -p http3-quic --no-verify --locked
       - name: Run release-plz
         uses: release-plz/action@v0.5
         with:
