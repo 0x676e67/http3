@@ -202,6 +202,7 @@ version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
+ "bindgen",
  "cc",
  "cmake",
  "dunce",
@@ -236,7 +237,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
- "aws-lc-sys 0.43.0",
+ "aws-lc-sys 0.45.0",
  "bytes",
  "bytesize",
  "cc",
@@ -3652,7 +3653,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
