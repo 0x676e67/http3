@@ -24,8 +24,8 @@ pub const DEFAULT_BODY_BYTES: [usize; 9] = [
     4 * 1024 * 1024,
     MAX_BODY_BYTES,
 ];
-pub(crate) const SERVER_NAME: &str = "localhost";
-pub(crate) const ALPN_H3: &[u8] = b"h3";
+pub const SERVER_NAME: &str = "localhost";
+pub const ALPN_H3: &[u8] = b"h3";
 
 pub fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")

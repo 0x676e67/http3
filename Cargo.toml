@@ -49,7 +49,7 @@ http = "1"
 octets = "0.3.0"
 pin-project-lite = { version = "0.2", default-features = false }
 proptest = "1"
-quic = { version = "0.11", default-features = false }
+quic = { version = "0.12.1", default-features = false }
 quinn = { version = "0.11", default-features = false }
 quinn-proto = { version = "0.11", default-features = false }
 rcgen = "=0.14.9"

@@ -168,7 +168,7 @@ async fn run_public_server_requests_at_addr(
     tls_config.enable_early_data = true;
     tls_config.alpn_protocols = vec![ALPN_H3.into()];
 
-    let mut endpoint = http3_quic::quic::Endpoint::client("[::]:0".parse()?)?;
+    let endpoint = http3_quic::quic::Endpoint::client("[::]:0".parse()?)?;
     endpoint.set_default_client_config(http3_quic::quic::ClientConfig::new(Arc::new(
         http3_quic::quic::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
     )));
@@ -182,7 +182,7 @@ async fn run_public_server_requests_at_addr(
                 format!("timed out connecting to {host} at {addr} after {REAL_CONNECT_TIMEOUT:?}"),
             )
         })??;
-    let quinn_conn = http3_quic::Connection::new(conn);
+    let quic_conn = http3_quic::Connection::new(conn);
 
     let mut builder = http3::client::builder();
     builder
@@ -208,7 +208,7 @@ async fn run_public_server_requests_at_addr(
         builder.qpack_blocked_streams(blocked_streams);
     }
 
-    let (mut driver, send_request) = builder.build(quinn_conn).await?;
+    let (mut driver, send_request) = builder.build(quic_conn).await?;
     let driver_task: JoinHandle<_> =
         tokio::spawn(async move { future::poll_fn(|cx| driver.poll_close(cx)).await });
 

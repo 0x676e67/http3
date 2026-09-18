@@ -5,8 +5,8 @@ use interop::{
     BoxError, ClientInteropConfig, DEFAULT_INTEROP_CASE, FIELD_SECTION_LIMIT_TEST_MAX,
     INTEROP_PADDING_HEADER_NAME, INTEROP_TEST_TIMEOUT, TestCertificate, generate_test_certificate,
     install_crypto_provider, interop_body, interop_case_from_path, interop_response_header_value,
-    run_local_quinn_client_interop_matrix_with_config,
-    run_local_quinn_client_max_field_section_size_limit,
+    run_local_quic_client_interop_matrix_with_config,
+    run_local_quic_client_max_field_section_size_limit,
 };
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::PrivateKeyDer;
@@ -34,7 +34,7 @@ pub async fn run_client_interop(
 
     let client_result = tokio::time::timeout(
         INTEROP_TEST_TIMEOUT,
-        run_local_quinn_client_interop_matrix_with_config(server_addr, &cert, client_config),
+        run_local_quic_client_interop_matrix_with_config(server_addr, &cert, client_config),
     )
     .await;
 
@@ -56,7 +56,7 @@ pub async fn run_max_field_section_size_limit(
 
     let client = tokio::time::timeout(
         INTEROP_TEST_TIMEOUT,
-        run_local_quinn_client_max_field_section_size_limit(server_addr, &cert, client_config),
+        run_local_quic_client_max_field_section_size_limit(server_addr, &cert, client_config),
     );
     let server_reject = tokio::time::timeout(Duration::from_secs(10), reject_rx.recv());
     let (client_result, server_reject) = tokio::join!(client, server_reject);

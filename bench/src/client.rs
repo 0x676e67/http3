@@ -17,12 +17,11 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use http::Uri;
-use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
 use tokio::task::{JoinHandle, JoinSet};
 
 use super::{
-    case::{ALPN_H3, SERVER_ADDR, SERVER_NAME, workspace_root},
+    case::{ALPN_H3, SERVER_ADDR, workspace_root},
     headers::{Directions, REQUEST_HEADERS, RESPONSE_HEADERS},
     result::{ClientResult, MEASUREMENT_PROFILE, RESULT_SCHEMA},
 };
@@ -30,22 +29,28 @@ use super::{
 const REQUEST_URI: &str = "https://localhost:4433/";
 
 #[doc(hidden)]
-pub struct ReadyConnection<S> {
+pub struct ReadyConnection<S, C> {
     pub sender: S,
     pub driver: JoinHandle<Result<()>>,
-    pub quic_connection: quinn::Connection,
+    pub quic_connection: C,
 }
 
 #[doc(hidden)]
 pub trait Adapter: Send + 'static {
     type Sender: Clone + Send + 'static;
+    type Endpoint: Send + Sync;
+    type Connection: Send;
+    type Stats: std::fmt::Debug + Send;
 
     const HTTP3_LIBRARY: &'static str;
+    const QUIC_BACKEND: &'static str;
+    const TRANSPORT_PROFILE: &'static str;
 
     fn connect(
-        connection: quinn::Connection,
+        endpoint: &Self::Endpoint,
+        server_addr: SocketAddr,
         qpack: Directions,
-    ) -> impl Future<Output = Result<ReadyConnection<Self::Sender>>> + Send;
+    ) -> impl Future<Output = Result<ReadyConnection<Self::Sender, Self::Connection>>> + Send;
 
     fn send_request(
         sender: &mut Self::Sender,
@@ -53,6 +58,11 @@ pub trait Adapter: Send + 'static {
         expected_body_size: usize,
         headers: Directions,
     ) -> impl Future<Output = Result<()>> + Send;
+
+    fn endpoint(tls_config: rustls::ClientConfig) -> Result<Self::Endpoint>;
+    fn stats(connection: &Self::Connection) -> Self::Stats;
+    fn path_mtu(stats: &Self::Stats) -> usize;
+    fn wait_idle(endpoint: &Self::Endpoint) -> impl Future<Output = ()> + Send;
 }
 
 #[doc(hidden)]
@@ -157,9 +167,7 @@ async fn run_client<A: Adapter>(
         .checked_mul(expected_body_size)
         .context("total response byte count overflowed usize")?;
 
-    let client_config = client_config()?;
-    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse()?)?;
-    endpoint.set_default_client_config(client_config);
+    let endpoint = A::endpoint(client_config()?)?;
     let server_addr: SocketAddr = SERVER_ADDR.parse()?;
     let collect_stats = std::env::var_os("HTTP3_BENCH_QUINN_STATS").is_some();
     // Reusable setup (runtime, trust store, TLS configuration and UDP endpoint)
@@ -170,10 +178,10 @@ async fn run_client<A: Adapter>(
         sender: sender_guard,
         driver,
         quic_connection,
-    } = connect::<A>(&endpoint, server_addr, qpack).await?;
+    } = A::connect(&endpoint, server_addr, qpack).await?;
     // Optional profiling captures request counters before spawning workers.
     // Its snapshot is inside the timer, so profiling timings are diagnostic only.
-    let stats_before = collect_stats.then(|| quic_connection.stats());
+    let stats_before = collect_stats.then(|| A::stats(&quic_connection));
     let worker_count = requests.min(in_flight);
     // Each worker starts one request, then takes shared slots to keep the window
     // full like the native Client, even when one worker is slower than the rest.
@@ -203,25 +211,28 @@ async fn run_client<A: Adapter>(
     // Measure the whole batch at the caller, including normal task completion.
     // Final statistics, connection shutdown and result formatting stay out.
     let elapsed = benchmark_started.elapsed();
-    let stats_after = quic_connection.stats();
-    let path_max_udp_payload_size = usize::from(stats_after.path.current_mtu);
+    let stats_after = A::stats(&quic_connection);
+    let path_max_udp_payload_size = A::path_mtu(&stats_after);
     if let Some(stats_before) = stats_before {
         // Collection can follow driver work after the last response; these are
         // diagnostic counts, not an exact trace of the timed interval.
-        eprintln!("quinn_before={stats_before:?}\nquinn_after={stats_after:?}");
+        eprintln!(
+            "backend={} before={stats_before:?}\nafter={stats_after:?}",
+            A::QUIC_BACKEND
+        );
     }
     drop(sender_guard);
     drop(quic_connection);
 
     driver.await.context("HTTP/3 connection driver failed")??;
-    endpoint.wait_idle().await;
+    A::wait_idle(&endpoint).await;
 
     Ok(ClientResult {
         schema: RESULT_SCHEMA.to_owned(),
         http3_library: A::HTTP3_LIBRARY.to_owned(),
         qpack: qpack.to_string(),
-        quic_backend: "quinn".to_owned(),
-        transport_profile: "quinn-default-pmtud".to_owned(),
+        quic_backend: A::QUIC_BACKEND.to_owned(),
+        transport_profile: A::TRANSPORT_PROFILE.to_owned(),
         measurement_profile: MEASUREMENT_PROFILE.to_owned(),
         path_max_udp_payload_size,
         requests,
@@ -243,7 +254,7 @@ async fn run_client<A: Adapter>(
     })
 }
 
-fn client_config() -> Result<quinn::ClientConfig> {
+fn client_config() -> Result<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(CertificateDer::from(std::fs::read(
         workspace_root().join("examples/ca.cert"),
@@ -261,26 +272,7 @@ fn client_config() -> Result<quinn::ClientConfig> {
         .with_no_client_auth();
     tls_config.alpn_protocols = vec![ALPN_H3.to_vec()];
 
-    Ok(quinn::ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(tls_config)?,
-    )))
-}
-
-async fn connect<A: Adapter>(
-    endpoint: &quinn::Endpoint,
-    server_addr: SocketAddr,
-    qpack: Directions,
-) -> Result<ReadyConnection<A::Sender>> {
-    let connection = endpoint.connect(server_addr, SERVER_NAME)?.await?;
-    let handshake = connection
-        .handshake_data()
-        .context("QUIC handshake data is unavailable")?
-        .downcast::<quinn::crypto::rustls::HandshakeData>()
-        .map_err(|_| anyhow::anyhow!("QUIC handshake did not use rustls"))?;
-    if handshake.protocol.as_deref() != Some(ALPN_H3) {
-        bail!("TLS did not negotiate h3: {:?}", handshake.protocol);
-    }
-    A::connect(connection, qpack).await
+    Ok(tls_config)
 }
 
 async fn run_request_worker<A: Adapter>(
@@ -354,18 +346,39 @@ macro_rules! client_adapter {
             anyhow::bail!("h3 only supports qpack=none in this benchmark");
         }
     };
-    ($adapter:ident, $http3_crate:ident, $transport:ident, $library:literal) => {
+    ($adapter:ident, $http3_crate:ident, $transport:ident, $backend:ident, $library:literal) => {
         struct $adapter;
 
         impl $crate::client::Adapter for $adapter {
             type Sender = $http3_crate::client::SendRequest<$transport::OpenStreams, bytes::Bytes>;
+            type Endpoint = $backend::Endpoint;
+            type Connection = $backend::Connection;
+            type Stats = $backend::ConnectionStats;
 
             const HTTP3_LIBRARY: &'static str = $library;
+            const QUIC_BACKEND: &'static str = stringify!($backend);
+            const TRANSPORT_PROFILE: &'static str = concat!(stringify!($backend), "-default-pmtud");
 
             async fn connect(
-                connection: quinn::Connection,
+                endpoint: &Self::Endpoint,
+                server_addr: std::net::SocketAddr,
                 qpack: $crate::headers::Directions,
-            ) -> anyhow::Result<$crate::client::ReadyConnection<Self::Sender>> {
+            ) -> anyhow::Result<$crate::client::ReadyConnection<Self::Sender, Self::Connection>> {
+                use anyhow::Context as _;
+
+                let connection = endpoint.connect(server_addr, $crate::case::SERVER_NAME)?.await?;
+                // quic handshake extensions can contain non-Send application data.
+                // Finish inspecting them before awaiting HTTP/3 setup.
+                {
+                    let handshake = connection
+                        .handshake_data()
+                        .context("QUIC handshake data is unavailable")?
+                        .downcast::<$backend::crypto::rustls::HandshakeData>()
+                        .map_err(|_| anyhow::anyhow!("QUIC handshake did not use rustls"))?;
+                    if handshake.protocol.as_deref() != Some($crate::case::ALPN_H3) {
+                        anyhow::bail!("TLS did not negotiate h3: {:?}", handshake.protocol);
+                    }
+                }
                 let quic_connection = connection.clone();
                 let mut builder = $http3_crate::client::builder();
                 builder.send_grease(false);
@@ -453,6 +466,28 @@ macro_rules! client_adapter {
                 }
 
                 Ok(())
+            }
+
+            fn endpoint(tls_config: rustls::ClientConfig) -> anyhow::Result<Self::Endpoint> {
+                let mut endpoint = $backend::Endpoint::client("127.0.0.1:0".parse()?)?;
+                // Quinn requires mutable access; quic also accepts this borrow.
+                let endpoint_ref = &mut endpoint;
+                endpoint_ref.set_default_client_config($backend::ClientConfig::new(std::sync::Arc::new(
+                    $backend::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
+                )));
+                Ok(endpoint)
+            }
+
+            fn stats(connection: &Self::Connection) -> Self::Stats {
+                connection.stats()
+            }
+
+            fn path_mtu(stats: &Self::Stats) -> usize {
+                usize::from(stats.path.current_mtu)
+            }
+
+            async fn wait_idle(endpoint: &Self::Endpoint) {
+                endpoint.wait_idle().await;
             }
         }
     };

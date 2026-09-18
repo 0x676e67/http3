@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use quinn::crypto::rustls::QuicServerConfig;
 
+/// The server half stays on `quinn` for the upstream `h3` peer; the client half
+/// uses `quic`, the backend `http3-quic` is built on.
 pub fn config() -> (
     rcgen::CertifiedKey<rcgen::KeyPair>,
     quinn::ServerConfig,
-    quinn::ClientConfig,
+    quic::ClientConfig,
 ) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -22,7 +24,9 @@ pub fn config() -> (
     let server =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server).unwrap()));
     let client = client_crypto(&cert);
-    let client = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client).unwrap()));
+    let client = quic::ClientConfig::new(Arc::new(
+        quic::crypto::rustls::QuicClientConfig::try_from(client).unwrap(),
+    ));
     (cert, server, client)
 }
 

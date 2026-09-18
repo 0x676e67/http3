@@ -89,7 +89,7 @@ async fn dropping_receive_half_stops_download_without_canceling_upload() {
     bounded(async {
         let (_, server_config, mut client_config) = tls::config();
         const RECEIVE_WINDOW: u32 = 64 * 1024;
-        let mut transport = quinn::TransportConfig::default();
+        let mut transport = quic::TransportConfig::default();
         transport.stream_receive_window(RECEIVE_WINDOW.into());
         client_config.transport_config(Arc::new(transport));
         let (client, server, _endpoints) = quic_pair(server_config, client_config).await;
@@ -228,17 +228,22 @@ async fn finish_after_cancelled_write_delivers_complete_body() {
     .await;
 }
 
+/// Connects a `quic` client to a `quinn` server over loopback UDP.
+///
+/// The two halves are separate crates on purpose: `http3-quic` is built on
+/// `quic`, while the upstream `h3` peer these tests validate against is built on
+/// `quinn`. They interoperate on the wire, not in the type system.
 async fn quic_pair(
     server_config: quinn::ServerConfig,
-    client_config: quinn::ClientConfig,
+    client_config: quic::ClientConfig,
 ) -> (
+    quic::Connection,
     quinn::Connection,
-    quinn::Connection,
-    (quinn::Endpoint, quinn::Endpoint),
+    (quic::Endpoint, quinn::Endpoint),
 ) {
     let server_endpoint =
         quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
-    let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let client_endpoint = quic::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     client_endpoint.set_default_client_config(client_config);
     let client = client_endpoint
         .connect(server_endpoint.local_addr().unwrap(), "localhost")
