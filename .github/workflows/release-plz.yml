@@ -10,6 +10,8 @@ jobs:
     name: Release-plz release
     runs-on: ubuntu-latest
     if: ${{ github.repository == '0x676e67/http3' }}
+    outputs:
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
     permissions:
       contents: write
       id-token: write
@@ -35,6 +37,7 @@ jobs:
       - name: Verify publishable crates
         run: cargo package -p http3 -p http3-datagram -p http3-quic --no-verify --locked
       - name: Run release-plz
+        id: release-plz
         uses: release-plz/action@v0.5
         with:
           command: release
@@ -43,8 +46,19 @@ jobs:
 
   release-plz-pr:
     name: Release-plz PR
+    # Serialised behind the release job. Run in parallel, this job can open the
+    # version bump and changelog pull request while the release job is already
+    # publishing, so a release gets built from a commit whose changelog entry
+    # has not landed yet. Skipped entirely when the release job published
+    # something: the next push to main opens the pull request.
+    needs: release-plz-release
     runs-on: ubuntu-latest
-    if: ${{ github.repository == '0x676e67/http3' }}
+    if: >-
+      ${{
+        github.repository == '0x676e67/http3' &&
+        needs.release-plz-release.result == 'success' &&
+        needs.release-plz-release.outputs.releases_created == 'false'
+      }}
     permissions:
       pull-requests: write
       contents: write
