@@ -49,9 +49,7 @@ http = "1"
 octets = "0.3.0"
 pin-project-lite = { version = "0.2", default-features = false }
 proptest = "1"
-# The published 0.11.0 stalls during HTTP/3 interop; keep the tested Git revision
-# until a working release is available. Do not substitute 0.11.0 when publishing.
-quic = { git = "https://github.com/0x676e67/quic", rev = "c8e14ea948a94ad51ef413c733405b7f91e786a2", default-features = false }
+quic = { version = "0.12.1", default-features = false }
 quinn = { version = "0.11", default-features = false }
 quinn-proto = { version = "0.11", default-features = false }
 rcgen = "=0.14.9"

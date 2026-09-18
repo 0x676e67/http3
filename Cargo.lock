@@ -2678,8 +2678,9 @@ dependencies = [
 
 [[package]]
 name = "quic"
-version = "0.11.0"
-source = "git+https://github.com/0x676e67/quic?rev=c8e14ea948a94ad51ef413c733405b7f91e786a2#c8e14ea948a94ad51ef413c733405b7f91e786a2"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b70e3b16fa5497dfd922f928341ccae420c73c9ba79d060bc1d9a9531d305182"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2695,13 +2696,14 @@ dependencies = [
  "tokio",
  "tracing",
  "web-time",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "quic-proto"
-version = "0.11.16"
-source = "git+https://github.com/0x676e67/quic?rev=c8e14ea948a94ad51ef413c733405b7f91e786a2#c8e14ea948a94ad51ef413c733405b7f91e786a2"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5f83dc13de0097d88834d418eb49574bcb63f86eb9bfb245b60e68cae404935"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -2820,7 +2822,7 @@ dependencies = [
  "libc",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
