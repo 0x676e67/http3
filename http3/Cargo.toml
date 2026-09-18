@@ -1,6 +1,6 @@
 [package]
 name = "http3"
-version = "0.0.8"
+version = "0.1.0"
 rust-version = { workspace = true }
 authors = [
     "0x676e67 <gngppz@gmail.com>",

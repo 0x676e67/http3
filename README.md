@@ -26,7 +26,7 @@ To use `http3`, first add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-http3 = "0.0.8"
+http3 = "0.1.0"
 ```
 
 Next, add this to your crate:

@@ -2,4 +2,7 @@
 # set the path of all the crates to the changelog to the root of the repository
 changelog_path = "./RELEASE.md"
 git_tag_enable = true
-git_tag_name = "v{{ version }}"
+# This workspace publishes three packages, so tags must be namespaced by
+# package. `v{{ version }}` is release-plz's single-package default and
+# would make all three collide on one tag once they share a version number.
+git_tag_name = "{{ package }}-v{{ version }}"
