@@ -318,11 +318,10 @@ where
                 FrameStream::new(BufRecvStream::new(stream)),
                 self.max_field_section_size,
                 self.max_qpack_decode_buffer_size,
-                self.conn_state.clone(),
                 self.send_grease_frame,
+                self.conn_state.clone(),
                 self.decoder.clone(),
-            )
-            .cancel_on_drop(),
+            ),
         };
         // send the grease frame only once
         self.send_grease_frame = false;
