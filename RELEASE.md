@@ -1,3 +1,101 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.0](https://github.com/0x676e67/http3/compare/http3-v0.0.8...http3-v0.1.0) - 2026-09-18
+
+### Added
+
+- *(client,qpack)* implement qpack dynamic table decoder ([#1](https://github.com/0x676e67/http3/pull/1))
+
+### Fixed
+
+- *(client)* reset client request stream on drop ([#5](https://github.com/0x676e67/http3/pull/5))
+- validate received pseudo-header context and ordering ([#87](https://github.com/0x676e67/http3/pull/87))
+- reject oversized received header maps without panicking ([#86](https://github.com/0x676e67/http3/pull/86))
+- *(qpack)* release completed encoder instruction batches
+- *(qpack)* preserve decoder state metadata ([#70](https://github.com/0x676e67/http3/pull/70))
+- *(qpack)* gate stateless decoder export
+- *(qpack)* harden decoder protocol boundaries
+- *(qpack)* harden decoder driver error handling
+- *(qpack)* track decoder feedback per field section
+- *(qpack)* clarify zero required insert count semantics ([#65](https://github.com/0x676e67/http3/pull/65))
+- *(server)* drive peer QPACK encoder stream ([#64](https://github.com/0x676e67/http3/pull/64))
+- *(qpack)* drive peer decoder stream ([#63](https://github.com/0x676e67/http3/pull/63))
+- *(qpack)* validate insert count increments ([#62](https://github.com/0x676e67/http3/pull/62))
+- *(qpack)* publish errors before waking waiters ([#53](https://github.com/0x676e67/http3/pull/53))
+- *(qpack)* reject invalid negative delta base ([#52](https://github.com/0x676e67/http3/pull/52))
+- *(client, qpack)* wait for missing refs without lost wakeups ([#17](https://github.com/0x676e67/http3/pull/17))
+
+### Other
+
+- fix release-plz
+- wait for both peers during graceful shutdown ([#94](https://github.com/0x676e67/http3/pull/94))
+- raise workspace MSRV to Rust 1.98 ([#93](https://github.com/0x676e67/http3/pull/93))
+- *(qpack)* explain field section blocking check
+- fmt
+- reduce QPACK codec and client driver overhead
+- Merge branch 'feat-qpack-huffman-bufmut' into feat-client-io-optimization
+- Merge branch 'main' into feat-qpack-huffman-bufmut
+- Update README.md
+- Formatting of HTTP/3 feature description
+- *(quinn)* sync test receive stream adapter
+- Potential fix for pull request finding
+- *(qpack)* unify field section decoding
+- *(headers)* unify borrowed header iteration
+- *(qpack)* unify borrowed and owned header fields
+- *(client)* optimize HTTP/3 hot paths
+- *(qpack)* correct protocol terminology ([#71](https://github.com/0x676e67/http3/pull/71))
+- Merge pull request #67 from 0x676e67/fix-qpack-decoder-feedback-state
+- *(qpack)* preserve fragmented literal decode progress ([#56](https://github.com/0x676e67/http3/pull/56))
+- *(qpack)* avoid decoder lookup map maintenance ([#57](https://github.com/0x676e67/http3/pull/57))
+- *(buf)* cache remaining byte count ([#55](https://github.com/0x676e67/http3/pull/55))
+- *(qpack)* avoid retaining decoder access wakers ([#54](https://github.com/0x676e67/http3/pull/54))
+- Merge branch 'main' into fix-qpack-decoder-compliance
+- unify workspace license ([#48](https://github.com/0x676e67/http3/pull/48))
+- Update README.md
+- Add documentation link to README
+- *(deps)* update dependencies ([#47](https://github.com/0x676e67/http3/pull/47))
+- *(feature)* rename third-party backend flag to `unstable` ([#46](https://github.com/0x676e67/http3/pull/46))
+- crates for `http3` fork ([#45](https://github.com/0x676e67/http3/pull/45))
+- *(header)* optimize HeaderValue creation via zero-copy sharing ([#33](https://github.com/0x676e67/http3/pull/33))
+- *(http3, client)* add server interop tests ([#21](https://github.com/0x676e67/http3/pull/21))
+- Fix typo in README description
+- Add QPACK support to features list in README
+- Add license badge to README.md
+- Update README with License and Contribution sections
+- Update README
+- Update README.md
+- Update stream.rs
+- Update frame.rs
+- keep nightly jobs current
+- update Rust baseline and workflow tooling
+- rename crates for http3-rs fork
+- Revise README to enhance project description
+- Fix formatting issue in README.md
+- Update README.md
+- Update README.md
+- Fix create/crate typo README ([#326](https://github.com/0x676e67/http3/pull/326))
+- Refactor Error handling to fix bugs ([#271](https://github.com/0x676e67/http3/pull/271))
+- Update README to include MsQuic support and interoperability testing details ([#276](https://github.com/0x676e67/http3/pull/276))
+- *(readme)* wrong link for PROPOSAL.md ([#172](https://github.com/0x676e67/http3/pull/172))
+- runtime independent ([#162](https://github.com/0x676e67/http3/pull/162))
+- document the duvet usage in h3 ([#131](https://github.com/0x676e67/http3/pull/131))
+- Fix doc links ([#132](https://github.com/0x676e67/http3/pull/132))
+- server examples - handle errors correct ([#128](https://github.com/0x676e67/http3/pull/128))
+- Document everything ([#126](https://github.com/0x676e67/http3/pull/126))
+- update links to rfc ([#106](https://github.com/0x676e67/http3/pull/106))
+- Update README.md ([#91](https://github.com/0x676e67/http3/pull/91))
+- Fix readme typo ([#89](https://github.com/0x676e67/http3/pull/89))
+- improve README ([#88](https://github.com/0x676e67/http3/pull/88))
+- Add LICENSE
+- init
+- Initial commit
 ## [unreleased]
 
 ### 🚀 Features
