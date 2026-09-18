@@ -28,7 +28,7 @@ ngtcp2-sys = { workspace = true }
 pingora-runtime = "=0.8.1"
 quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 quic = { workspace = true, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
-quinn-proto = { version = "=0.11.17", default-features = false }
+quinn-proto = { version = "=0.11.18", default-features = false }
 # 0.23.44 requires a newer AWS-LC than the published ngtcp2-sys 0.2.0 uses.
 # Keep one crypto version across the Rust and native stacks.
 rustls = { version = "=0.23.43", default-features = false, features = ["aws-lc-rs", "std"] }
