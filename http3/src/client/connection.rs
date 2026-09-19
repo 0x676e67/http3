@@ -185,7 +185,7 @@ where
         } = parts;
         let headers = Header::request(method, uri, headers, extensions).map_err(|error| {
             StreamError::InvalidRequest {
-                reason: error.to_string(),
+                reason: error.to_string().into_boxed_str(),
             }
         })?;
 

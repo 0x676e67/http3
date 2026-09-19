@@ -1,6 +1,6 @@
 //! Public error types for the `http3` crate.
 use super::{codes::Code, internal_error::InternalConnectionError};
-use crate::quic::ConnectionErrorIncoming;
+use crate::quic::{ConnectionErrorIncoming, StreamId};
 
 /// This enum represents the closure of a connection because of an a closed quic connection
 /// This can be either from this endpoint because of a violation of the protocol or from the remote
@@ -73,15 +73,15 @@ pub enum StreamError {
     #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     InvalidRequest {
         /// Why the request could not be constructed.
-        reason: String,
+        reason: Box<str>,
     },
     /// The server's GOAWAY guarantees this request was not processed.
     #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     GoawayRejected {
         /// The rejected request stream.
-        stream_id: crate::quic::StreamId,
+        stream_id: StreamId,
         /// The first stream the server will not process.
-        boundary: crate::quic::StreamId,
+        boundary: StreamId,
     },
     /// The error occurred on the stream
     #[cfg_attr(not(feature = "unstable"), non_exhaustive)]

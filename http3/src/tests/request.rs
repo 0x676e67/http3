@@ -156,9 +156,10 @@ async fn empty_data_frames_preserve_request_and_response_body() {
         let mut pair = Pair::default();
         let mut endpoint = pair.server();
         let client = async {
-            let (mut driver, mut sender) = client::new(pair.client().await).await.unwrap();
+            let (mut driver, sender) = client::builder().build(pair.client().await).await.unwrap();
+            let mut sender = sender.clone();
             let requests = async {
-                let mut stream = sender
+                let stream = sender
                     .send_request(
                         Request::post("https://localhost/")
                             .header("te", "trailers")
@@ -167,18 +168,18 @@ async fn empty_data_frames_preserve_request_and_response_body() {
                     )
                     .await
                     .unwrap();
+                let (mut send, mut stream) = stream.split();
                 for data in ["", "a", "", "bc", ""] {
-                    stream
-                        .send_data(Bytes::from_static(data.as_bytes()))
+                    send.send_data(Bytes::from_static(data.as_bytes()))
                         .await
                         .unwrap();
                 }
                 if trailers {
                     let mut fields = HeaderMap::new();
                     fields.insert("trailer", "request".parse().unwrap());
-                    stream.send_trailers(fields).await.unwrap();
+                    send.send_trailers(fields).await.unwrap();
                 }
-                stream.finish().await.unwrap();
+                send.finish().await.unwrap();
                 stream.recv_response().await.unwrap();
                 let mut body = BytesMut::new();
                 while let Some(mut data) = stream.recv_data().await.unwrap() {
@@ -196,10 +197,12 @@ async fn empty_data_frames_preserve_request_and_response_body() {
             tokio::select! { biased; _ = requests => (), error = driver.wait_idle() => panic!("connection failed: {error}") }
         };
         let server = async {
-            let mut connection = server::Connection::new(endpoint.next().await)
+            let mut connection = server::builder()
+                .build(endpoint.next().await)
                 .await
                 .unwrap();
-            let (_, mut stream) = get_stream_blocking(&mut connection).await.unwrap();
+            let resolver = connection.accept().await.unwrap().unwrap();
+            let (_, mut stream) = resolver.resolve_request().await.unwrap();
             let mut body = BytesMut::new();
             while let Some(mut data) = stream.recv_data().await.unwrap() {
                 body.extend_from_slice(&data.copy_to_bytes(data.remaining()));

@@ -1114,8 +1114,7 @@ where
             return Poll::Pending;
         };
 
-        let mut budget = crate::frame::MAX_PARSE_STEPS;
-        let res = match ready!(recv.poll_next(cx, &mut budget)) {
+        let res = match ready!(recv.poll_next(cx)) {
             Err(FrameStreamError::Quic(StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error,
             })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
@@ -1726,13 +1725,12 @@ where
             return Poll::Ready(Ok(None));
         }
 
-        let mut budget = crate::frame::MAX_PARSE_STEPS;
         // Empty DATA frames do not end the body. Keep reading until payload,
         // trailers, transport EOF, or Pending; only EOF completes the guard.
         // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
         // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.1
         while !self.stream.has_data() {
-            match ready!(self.stream.poll_next(cx, &mut budget)) {
+            match ready!(self.stream.poll_next(cx)) {
                 Err(frame_stream_error) => {
                     return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
                 }
@@ -1791,11 +1789,10 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
-        let mut budget = crate::frame::MAX_PARSE_STEPS;
         let mut trailers = if let Some(encoded) = self.trailers.take() {
             encoded
         } else {
-            match ready!(self.stream.poll_next(cx, &mut budget)) {
+            match ready!(self.stream.poll_next(cx)) {
                 Err(frame_stream_error) => {
                     return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
                 }
@@ -1843,7 +1840,7 @@ where
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
             //# Receipt of an invalid sequence of frames MUST be treated as a
             //# connection error of type H3_FRAME_UNEXPECTED.
-            match self.stream.poll_next(cx, &mut budget) {
+            match self.stream.poll_next(cx) {
                 Poll::Ready(Err(frame_stream_error)) => {
                     return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
                 }
@@ -2262,9 +2259,8 @@ mod guard {
         pub(crate) fn poll_next(
             &mut self,
             cx: &mut Context<'_>,
-            budget: &mut usize,
         ) -> Poll<Result<Option<Frame<PayloadLen>>, FrameStreamError>> {
-            self.stream_mut().poll_next(cx, budget)
+            self.stream_mut().poll_next(cx)
         }
 
         /// Reads the current frame's payload, leaving cancellation as it is.
