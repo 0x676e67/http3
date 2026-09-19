@@ -28,8 +28,8 @@ use crate::{
 ///
 /// Once a request has been sent via [`crate::client::SendRequest::send_request()`], a response can
 /// be awaited by calling [`RequestStream::recv_response()`]. A body for this request can be sent
-/// with [`RequestStream::send_data()`], then the request shall be completed by either sending
-/// trailers with  [`RequestStream::finish()`].
+/// with [`RequestStream::send_data()`], followed by optional [`RequestStream::send_trailers()`].
+/// Call [`RequestStream::finish()`] to complete the send direction.
 ///
 /// After receiving the response's headers, it's body can be read by [`RequestStream::recv_data()`]
 /// until it returns `None`. Then the trailers will eventually be available via
@@ -40,8 +40,11 @@ use crate::{
 /// TODO: If trailers are polled but the body hasn't been fully received, an UNEXPECT_FRAME error
 /// will be thrown
 ///
-/// Whenever the client wants to cancel this request, it can call [`RequestStream::stop_sending()`],
-/// which will put an end to any transfer concerning it.
+/// Dropping an unfinished stream cancels its open directions with `H3_REQUEST_CANCELLED`.
+/// After [`split()`](Self::split), each half cancels only its own direction. Explicit
+/// [`stop_sending()`](Self::stop_sending) stops receiving; [`stop_stream()`](Self::stop_stream)
+/// stops sending.
+/// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
 ///
 /// While the connection driver runs, pending operations are woken if the server's
 /// GOAWAY excludes this request. They return [`StreamError::GoawayRejected`] and
@@ -87,8 +90,6 @@ use crate::{
 pub struct RequestStream<S, B> {
     pub(super) inner: connection::RequestStream<S, B>,
     rejection: RequestRejection,
-    // Preserve the available directions without imposing SendStream on receive-only APIs.
-    cancel: Option<fn(&mut connection::RequestStream<S, B>)>,
 }
 
 impl<S, B> ConnectionState for RequestStream<S, B> {
@@ -165,11 +166,15 @@ where
         res.map(|result| self.handle_result(result))
     }
 
-    /// Tell the peer to stop sending into the underlying QUIC stream
+    /// Stops receiving the response with `error_code` and releases its QPACK state.
+    ///
+    /// The request's send direction remains open. Dropping the stream afterwards
+    /// does not replace this receive-side code with `H3_REQUEST_CANCELLED`.
+    /// Clients must not use `H3_REQUEST_REJECTED` unless the server requested
+    /// closure of this request with that code.
+    /// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_sending(&mut self, error_code: Code) {
-        // TODO take by value to prevent any further call as this request is cancelled
-        // rename `cancel()` ?
         self.inner.stop_sending(error_code)
     }
 
@@ -289,9 +294,14 @@ where
         self.handle_result(result)
     }
 
-    /// Stop a stream with an error code
+    /// Resets the request's send direction with `error_code`.
     ///
-    /// The code can be [`Code::H3_NO_ERROR`].
+    /// Receiving the response is unaffected. Dropping the stream afterwards does
+    /// not replace this code with `H3_REQUEST_CANCELLED`. The code can be
+    /// [`Code::H3_NO_ERROR`], for example when the peer has declined the upload.
+    /// Clients must not use `H3_REQUEST_REJECTED` unless the server requested
+    /// closure of this request with that code.
+    /// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
     pub fn stop_stream(&mut self, error_code: Code) {
         self.inner.stop_stream(error_code);
     }
@@ -305,22 +315,20 @@ where
         self.handle_result(result)
     }
 
-    /// End the request without trailers.
+    /// Flushes pending request output and closes the send direction with FIN.
     ///
-    /// [`RequestStream::finish()`] must be called to finalize a request.
+    /// Call this after sending the body and any trailers. Once it succeeds,
+    /// dropping the stream does not reset the upload; an unread response is still
+    /// cancelled. Transport failures are returned as [`StreamError`].
+    ///
+    /// Cancelling this future before it returns success leaves reset on Drop
+    /// armed. Retry `finish`, or drop the stream to cancel its open directions.
+    /// See [RFC 9114, Section 4.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1).
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn finish(&mut self) -> Result<(), StreamError> {
         let result = self.rejection.run(self.inner.finish()).await;
         self.handle_result(result)
     }
-
-    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
-    //= type=TODO
-    //# Implementations SHOULD cancel requests by abruptly terminating any
-    //# directions of a stream that are still open.  To do so, an
-    //# implementation resets the sending parts of streams and aborts reading
-    //# on the receiving parts of streams; see Section 2.4 of
-    //# [QUIC-TRANSPORT].
 }
 
 impl<S, B> RequestStream<S, B>
@@ -329,6 +337,11 @@ where
     B: Buf,
 {
     /// Split this stream into two halves that can be driven independently.
+    ///
+    /// Dropping an unfinished send half resets only the upload; dropping an
+    /// unfinished receive half stops only the response and cancels its QPACK
+    /// decoding. Directions already finished or explicitly stopped remain so.
+    /// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
     pub fn split(
         self,
     ) -> (
@@ -338,7 +351,6 @@ where
         let Self {
             inner,
             mut rejection,
-            cancel,
         } = self;
         rejection.notified = None;
         let (send, recv) = inner.split();
@@ -346,20 +358,10 @@ where
             RequestStream {
                 inner: send,
                 rejection: RequestRejection::new(rejection.state.clone(), rejection.stream_id),
-                cancel: cancel.map(|_| {
-                    (|inner: &mut connection::RequestStream<S::SendStream, B>| {
-                        inner.stop_stream(Code::H3_REQUEST_CANCELLED)
-                    }) as fn(&mut _)
-                }),
             },
             RequestStream {
                 inner: recv,
                 rejection,
-                cancel: cancel.map(|_| {
-                    (|inner: &mut connection::RequestStream<S::RecvStream, B>| {
-                        inner.stop_sending(Code::H3_REQUEST_CANCELLED)
-                    }) as fn(&mut _)
-                }),
             },
         )
     }
@@ -372,14 +374,7 @@ where
 {
     pub(super) fn new(inner: connection::RequestStream<S, B>) -> Self {
         let rejection = RequestRejection::new(inner.conn_state.clone(), inner.stream.id());
-        Self {
-            inner,
-            rejection,
-            cancel: Some(|inner| {
-                inner.stop_stream(Code::H3_REQUEST_CANCELLED);
-                inner.stop_sending(Code::H3_REQUEST_CANCELLED);
-            }),
-        }
+        Self { inner, rejection }
     }
 }
 
@@ -454,11 +449,9 @@ impl Drop for RejectionWait<'_> {
 impl<S, B> RequestStream<S, B> {
     fn handle_result<T>(&mut self, result: Result<T, StreamError>) -> Result<T, StreamError> {
         if matches!(&result, Err(StreamError::GoawayRejected { .. })) {
-            if let Some(cancel) = self.cancel.take() {
-                // RFC 9114 section 5.2: abandon directions owned by this handle.
-                // H3_REQUEST_REJECTED is server-only; cancellation uses 0x10c.
-                cancel(&mut self.inner);
-            }
+            // Use the Drop guard's ownership state so completed or explicitly
+            // stopped directions keep their result, including after split.
+            self.inner.cancel_request();
         }
         result
     }

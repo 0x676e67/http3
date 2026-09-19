@@ -11,8 +11,8 @@ mod runner;
 
 use child::{CHILD_MARKER, ChildRole};
 
-bench::client_adapter!(Http3Client, http3, http3_quic, "http3");
-bench::client_adapter!(H3Client, h3, h3_quinn, "h3");
+bench::client_adapter!(Http3Client, http3, http3_quic, quic, "http3");
+bench::client_adapter!(H3Client, h3, h3_quinn, quinn, "h3");
 
 fn clients(criterion: &mut Criterion) {
     runner::run(criterion)

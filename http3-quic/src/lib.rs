@@ -20,17 +20,8 @@ use http3::{
     error::Code,
     quic::{ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf},
 };
-
-#[cfg(all(feature = "quinn", feature = "quic"))]
-compile_error!("features `quinn` and `quic` are mutually exclusive");
-
-#[cfg(all(feature = "quic", not(feature = "quinn")))]
-pub use quic;
 use quic::ReadError;
-#[cfg(any(feature = "quinn", feature = "quic"))]
-pub use quic::{AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
-#[cfg(all(feature = "quinn", not(feature = "quic")))]
-pub use quinn as quic;
+pub use quic::{self, AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -40,7 +31,7 @@ pub mod datagram;
 /// BoxStream with Sync trait
 type BoxStreamSync<'a, T> = Pin<Box<dyn Stream<Item = T> + Sync + Send + 'a>>;
 
-/// A QUIC connection backed
+/// An HTTP/3 transport backed by a QUIC connection.
 ///
 /// Implements [`http3::quic::Connection`] backed by a [`quic::Connection`].
 pub struct Connection {

@@ -1,5 +1,27 @@
 [workspace]
-# set the path of all the crates to the changelog to the root of the repository
+# Keep the changelog at the root of the repository, generated with the
+# git-cliff configuration checked in beside it.
 changelog_path = "./RELEASE.md"
+changelog_config = "./.cliff.toml"
+# Only release when a version bump lands on main, never on an ordinary push.
+release_always = false
+# One release represents the whole workspace: a single `vX.Y.Z` tag and a single
+# GitHub release, rather than one of each per published crate. Both are attached
+# to `http3` below, because a workspace-level tag name would collide across the
+# three crates; the other two are still published, they just do not carry a tag
+# or a release of their own.
+git_tag_enable = false
+git_release_enable = false
+
+[[package]]
+name = "http3"
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
+git_release_enable = true
+git_release_name = "v{{ version }}"
+# GitHub appends its generated notes after the body release-plz supplies, so the
+# body is blank to leave only the generated notes: the merged pull requests with
+# their authors, and the new-contributor list. The changelog above stays as the
+# in-repository record.
+git_release_body = ""
+git_release_generate_notes = true

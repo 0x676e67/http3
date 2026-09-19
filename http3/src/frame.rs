@@ -269,10 +269,10 @@ impl FrameDecoder {
                 return Ok(None);
             }
 
-            if let Some(min) = self.expected {
-                if src.remaining() < min {
-                    return Ok(None);
-                }
+            if let Some(min) = self.expected
+                && src.remaining() < min
+            {
+                return Ok(None);
             }
 
             let (pos, decoded) = {
@@ -894,13 +894,19 @@ mod tests {
             }
             let mut recv = FakeRecv::default();
             recv.chunk(wire.freeze());
-            let mut stream = crate::connection::RequestStream::<_, Bytes>::new(
+            let shared = Arc::default();
+            let decode_state = crate::connection::RequestDecodeState::new(
+                recv.recv_id(),
+                &shared,
+                usize::MAX,
+                None,
+            );
+            let mut stream = crate::connection::RequestStream::<_, Bytes>::with_decode_state(
                 FrameStream::new(BufRecvStream::new(recv)),
                 u64::MAX,
-                usize::MAX,
-                Arc::default(),
+                shared,
                 false,
-                None,
+                decode_state,
             );
             let counter = Arc::new(WakeCounter::default());
             let waker = futures_util::task::waker(counter.clone());
@@ -957,13 +963,19 @@ mod tests {
             Frame::headers(Bytes::from_static(&[2, 0, 0x80])).encode_with_payload(&mut wire);
             let mut recv = FakeRecv::default();
             recv.chunk(wire.freeze());
-            let mut stream = crate::connection::RequestStream::<_, Bytes>::new(
+            let shared = Arc::default();
+            let decode_state = crate::connection::RequestDecodeState::new(
+                recv.recv_id(),
+                &shared,
+                usize::MAX,
+                Some(QpackDecoder::new(decoder, events_tx)),
+            );
+            let mut stream = crate::connection::RequestStream::<_, Bytes>::with_decode_state(
                 FrameStream::new(BufRecvStream::new(recv)),
                 u64::MAX,
-                usize::MAX,
-                Arc::default(),
+                shared,
                 false,
-                Some(QpackDecoder::new(decoder, events_tx)),
+                decode_state,
             );
             let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
             for _ in 0..2 {

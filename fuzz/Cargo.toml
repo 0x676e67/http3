@@ -3,7 +3,7 @@ name = "http3-fuzz-rs"
 version = "0.0.0"
 authors = ["Automatically generated"]
 publish = false
-rust-version = "1.85"
+rust-version = { workspace = true }
 edition = "2024"
 repository = "https://github.com/0x676e67/http3"
 
@@ -17,6 +17,9 @@ bytes = "1.5"
 # Prevent this from interfering with workspaces
 [workspace]
 members = ["."]
+
+[workspace.package]
+rust-version = "1.98"
 
 [[bin]]
 name = "fuzz_varint"

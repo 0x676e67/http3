@@ -316,8 +316,8 @@ where
             FrameStream::new(BufRecvStream::new(stream)),
             self.max_field_section_size,
             self.max_qpack_decode_buffer_size,
-            self.conn_state.clone(),
             self.send_grease_frame,
+            self.conn_state.clone(),
             self.decoder.clone(),
         ));
         // send the grease frame only once
@@ -671,10 +671,10 @@ impl<S: quic::SendStream<B> + quic::RecvStream, B: Buf> Drop for OpeningStream<'
             // Abandoning the response also releases the peer encoder's
             // references; our request encoder still waits for peer feedback.
             // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.2.2
-            if let Some(decoder) = self.decoder {
-                if decoder.queue_stream_cancellation(self.stream.recv_id()) {
-                    self.shared.waker().wake();
-                }
+            if let Some(decoder) = self.decoder
+                && decoder.queue_stream_cancellation(self.stream.recv_id())
+            {
+                self.shared.waker().wake();
             }
         }
     }
@@ -703,6 +703,8 @@ mod integration_tests {
         written: AtomicBool,
         reset: AtomicU64,
         stopped: AtomicU64,
+        reset_calls: AtomicUsize,
+        stop_calls: AtomicUsize,
         wakes: AtomicUsize,
         close_on_open: std::sync::OnceLock<Arc<SharedState>>,
     }
@@ -762,6 +764,7 @@ mod integration_tests {
         }
         fn reset(&mut self, code: u64) {
             self.0.reset.store(code, Ordering::Relaxed);
+            self.0.reset_calls.fetch_add(1, Ordering::Relaxed);
         }
         fn send_id(&self) -> StreamId {
             StreamId::try_from(0).unwrap()
@@ -784,6 +787,7 @@ mod integration_tests {
         }
         fn stop_sending(&mut self, code: u64) {
             self.0.stopped.store(code, Ordering::Relaxed);
+            self.0.stop_calls.fetch_add(1, Ordering::Relaxed);
         }
         fn recv_id(&self) -> StreamId {
             self.send_id()
@@ -1020,6 +1024,78 @@ mod integration_tests {
     }
 
     #[test]
+    fn goaway_preserves_completed_directions_and_cancels_remaining_once() {
+        for split in [false, true] {
+            // Open upload, completed upload, explicitly reset upload.
+            for send_state in 0..3 {
+                for stopped_receive in [false, true] {
+                    let state = Arc::new(State::default());
+                    let mut sender = sender(&state, false);
+                    let mut stream = returned(&mut sender);
+                    let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+                    if send_state == 1 {
+                        assert!(matches!(
+                            std::pin::pin!(stream.finish()).poll(&mut cx),
+                            Poll::Ready(Ok(()))
+                        ));
+                    } else if send_state == 2 {
+                        stream.stop_stream(Code::H3_NO_ERROR);
+                    }
+                    if stopped_receive {
+                        stream.stop_sending(Code::H3_MESSAGE_ERROR);
+                    }
+                    sender
+                        .conn_state
+                        .set_peer_goaway(StreamId::try_from(0).unwrap());
+                    if split {
+                        let (mut send, mut recv) = stream.split();
+                        for _ in 0..2 {
+                            assert!(matches!(
+                                std::pin::pin!(send.finish()).poll(&mut cx),
+                                Poll::Ready(Err(StreamError::GoawayRejected { .. }))
+                            ));
+                            assert!(matches!(
+                                recv.poll_recv_data(&mut cx),
+                                Poll::Ready(Err(StreamError::GoawayRejected { .. }))
+                            ));
+                        }
+                        drop((send, recv));
+                    } else {
+                        for _ in 0..2 {
+                            assert!(matches!(
+                                stream.poll_recv_data(&mut cx),
+                                Poll::Ready(Err(StreamError::GoawayRejected { .. }))
+                            ));
+                        }
+                        drop(stream);
+                    }
+                    assert_eq!(
+                        state.reset_calls.load(Ordering::Relaxed),
+                        usize::from(send_state != 1)
+                    );
+                    assert_eq!(
+                        state.reset.load(Ordering::Relaxed),
+                        match send_state {
+                            0 => Code::H3_REQUEST_CANCELLED.value(),
+                            1 => 0,
+                            _ => Code::H3_NO_ERROR.value(),
+                        }
+                    );
+                    assert_eq!(state.stop_calls.load(Ordering::Relaxed), 1);
+                    assert_eq!(
+                        state.stopped.load(Ordering::Relaxed),
+                        if stopped_receive {
+                            Code::H3_MESSAGE_ERROR.value()
+                        } else {
+                            Code::H3_REQUEST_CANCELLED.value()
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn completed_or_dropped_poll_receiver_unregisters_its_waiter() {
         for complete in [false, true] {
             let state = Arc::new(State::default());
@@ -1190,14 +1266,19 @@ mod integration_tests {
                 assert!(sender.get_conn_error().is_none());
                 assert_eq!(state.opened.load(Ordering::Relaxed), 0);
             }
-            assert!(matches!(
-                std::pin::pin!(sender.send_request(request()))
-                    .as_mut()
-                    .poll(&mut cx),
-                Poll::Ready(Ok(_))
-            ));
+            let stream = returned(&mut sender);
             assert_eq!(state.reset.load(Ordering::Relaxed), 0);
             assert_eq!(state.stopped.load(Ordering::Relaxed), 0);
+            // HEADERS completion transfers cancellation to the returned owner.
+            drop(stream);
+            assert_eq!(
+                state.reset.load(Ordering::Relaxed),
+                Code::H3_REQUEST_CANCELLED.value()
+            );
+            assert_eq!(
+                state.stopped.load(Ordering::Relaxed),
+                Code::H3_REQUEST_CANCELLED.value()
+            );
         }
     }
 

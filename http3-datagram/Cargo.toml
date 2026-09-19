@@ -1,6 +1,6 @@
 [package]
 name = "http3-datagram"
-version = "0.0.2"
+version = { workspace = true }
 rust-version = { workspace = true }
 edition = { workspace = true }
 authors = ["0x676e67 <gngppz@gmail.com>"]

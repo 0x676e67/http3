@@ -26,7 +26,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  toolchain_benchmark_msrv: "1.96"
+  toolchain_benchmark_msrv: "1.98"
 
 jobs:
   benchmark:
@@ -223,7 +223,7 @@ jobs:
             "Fixed native nghttp3/ngtcp2 Server; $PROFILE_BODY_BYTES B; headers=none; qpack=none; concurrency=100; 10 batches x 20000 requests per Client." \
             'Client JSON uses one batch timer covering request-state allocation, connection establishment, all response validation and normal task aggregation.' \
             'Runtime, certificate trust/TLS configuration, socket/address preparation, shutdown and result serialization are excluded from that timer.' \
-            'Rust Client stderr includes request-only Quinn counters; the before snapshot is inside the batch timer.' \
+            'Rust Client stderr includes request-only quic/Quinn counters; the before snapshot is inside the batch timer.' \
             'Sampled wall times are not throughput benchmark results.' > "$profile_dir/README.txt"
           control_dir=$(mktemp -d)
           mkfifo "$control_dir/stdin"

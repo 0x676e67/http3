@@ -1283,7 +1283,8 @@ async fn graceful_shutdown_closes_when_idle() {
 
         let mut count = 0;
 
-        while let Some((_, stream)) = get_stream_blocking(&mut incoming).await {
+        while let Some(resolver) = incoming.accept().await.expect("accept during shutdown") {
+            let (_, stream) = resolver.resolve_request().await.expect("resolve request");
             count += 1;
             if count == 4 {
                 incoming.shutdown(2).await.unwrap();
@@ -1291,13 +1292,17 @@ async fn graceful_shutdown_closes_when_idle() {
 
             response(stream).await;
         }
+        assert_eq!(count, 6, "shutdown must finish the two allowed requests");
     };
 
-    tokio::select! {
-        _ = client_fut => (),
-        r = tokio::time::timeout(Duration::from_millis(100), server_fut)
-            => assert_matches!(r, Ok(())),
-    };
+    // Real QUIC handshakes and CI scheduling are not bounded to 100 ms.
+    // Wait for both peers so an early completion cannot skip the other side's
+    // shutdown assertions. The timeout only guards against a stalled driver.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(server_fut, client_fut);
+    })
+    .await
+    .expect("graceful shutdown stalled");
 }
 
 #[tokio::test]

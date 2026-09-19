@@ -109,12 +109,14 @@ impl ClientResult {
         check_eq("schema", &self.schema, RESULT_SCHEMA)?;
         check_eq("http3_library", &self.http3_library, library.name())?;
         let expected_backend = match library {
-            Http3Library::Http3 | Http3Library::H3 => "quinn",
+            Http3Library::Http3 => "quic",
+            Http3Library::H3 => "quinn",
             Http3Library::Nghttp3 => "ngtcp2",
         };
         check_eq("quic_backend", &self.quic_backend, expected_backend)?;
         let expected_transport_profile = match library {
-            Http3Library::Http3 | Http3Library::H3 => "quinn-default-pmtud",
+            Http3Library::Http3 => "quic-default-pmtud",
+            Http3Library::H3 => "quinn-default-pmtud",
             Http3Library::Nghttp3 => "ngtcp2-1350b-1mib-stream-10mib-connection",
         };
         check_eq(
