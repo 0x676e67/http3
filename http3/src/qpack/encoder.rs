@@ -697,6 +697,40 @@ mod tests {
     }
 
     #[test]
+    fn encode_reuses_acknowledged_field_after_eviction() {
+        let field = HeaderField::new("x-reuse", "three");
+        let capacity = 2 * field.mem_size();
+        let mut table = build_table();
+        table.set_max_size(capacity).unwrap();
+        for value in ["first", "other", "three"] {
+            table.put(HeaderField::new("x-reuse", value)).unwrap();
+        }
+        let mut encoder = Encoder::from(table);
+        let mut feedback = Vec::new();
+        InsertCountIncrement(3).encode(&mut feedback);
+        encoder.on_decoder_recv(&mut Cursor::new(feedback)).unwrap();
+        let mut block = Vec::new();
+        let mut instructions = Vec::new();
+        let required = encoder
+            .encode(0, &mut block, &mut instructions, [&field])
+            .unwrap();
+
+        // Reusing a retained, acknowledged field must not insert a duplicate
+        // or turn this section into one that can block at the decoder.
+        assert!(instructions.is_empty());
+        assert_eq!(required, 3);
+        assert!(!encoder.field_section_is_blocked(required));
+
+        let mut block = Cursor::new(block);
+        assert_eq!(
+            HeaderPrefix::decode(&mut block).unwrap().get(3, capacity),
+            Ok((3, 3))
+        );
+        assert_eq!(Indexed::decode(&mut block), Ok(Indexed::Dynamic(0)));
+        assert!(!block.has_remaining());
+    }
+
+    #[test]
     fn encode_dynamic_insert() {
         let field = HeaderField::new("foo", "bar");
         check_encode_field(&[], &[field], &|mut b, mut e| {
