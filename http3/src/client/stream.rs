@@ -1,6 +1,8 @@
 use std::{
     convert::TryFrom,
-    future::poll_fn,
+    future::{Future, poll_fn},
+    pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -44,6 +46,12 @@ use crate::{
 /// stops sending.
 /// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
 ///
+/// While the connection driver runs, pending operations are woken if the server's
+/// GOAWAY excludes this request. They return [`StreamError::GoawayRejected`] and
+/// cancel the directions owned by this handle. After [`Self::split()`], each half
+/// observes rejection independently. Requests below the GOAWAY boundary continue.
+/// The caller decides whether to retry; this type never retries automatically.
+///
 /// # Examples
 ///
 /// ```rust
@@ -81,6 +89,7 @@ use crate::{
 /// [`stop_sending()`]: #method.stop_sending
 pub struct RequestStream<S, B> {
     pub(super) inner: connection::RequestStream<S, B>,
+    rejection: RequestRejection,
 }
 
 impl<S, B> ConnectionState for RequestStream<S, B> {
@@ -102,14 +111,89 @@ where
     /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_response(&mut self) -> Result<Response<()>, StreamError> {
-        let frame = poll_fn(|cx| self.inner.stream.poll_next(cx))
+        let result = self
+            .rejection
+            .run(Self::recv_response_inner(&mut self.inner))
+            .await;
+        self.handle_result(result)
+    }
+
+    /// Receive some of the request body.
+    // TODO what if called before recv_response ?
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn recv_data(&mut self) -> Result<Option<impl Buf + use<S, B>>, StreamError> {
+        let result = self
+            .rejection
+            .run(poll_fn(|cx| self.inner.poll_recv_data(cx)))
+            .await;
+        self.handle_result(result)
+    }
+
+    /// Receive request body
+    pub fn poll_recv_data(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
+        let result = self.rejection.poll(cx, |cx| self.inner.poll_recv_data(cx));
+        result.map(|result| self.handle_result(result))
+    }
+
+    /// Receive an optional set of trailers for the response.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, StreamError> {
+        let result = self
+            .rejection
+            .run(poll_fn(|cx| self.inner.poll_recv_trailers(cx)))
+            .await;
+        if let Err(StreamError::HeaderTooBig { .. }) = &result {
+            self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
+        }
+        self.handle_result(result)
+    }
+
+    /// Poll receive an optional set of trailers for the response.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_recv_trailers(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
+        let res = self
+            .rejection
+            .poll(cx, |cx| self.inner.poll_recv_trailers(cx));
+        if let Poll::Ready(Err(StreamError::HeaderTooBig { .. })) = &res {
+            self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
+        }
+        res.map(|result| self.handle_result(result))
+    }
+
+    /// Stops receiving the response with `error_code` and releases its QPACK state.
+    ///
+    /// The request's send direction remains open. Dropping the stream afterwards
+    /// does not replace this receive-side code with `H3_REQUEST_CANCELLED`.
+    /// Clients must not use `H3_REQUEST_REJECTED` unless the server requested
+    /// closure of this request with that code.
+    /// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn stop_sending(&mut self, error_code: Code) {
+        self.inner.stop_sending(error_code)
+    }
+
+    /// Returns the underlying stream id
+    pub fn id(&self) -> StreamId {
+        self.inner.stream.id()
+    }
+
+    async fn recv_response_inner(
+        inner: &mut connection::RequestStream<S, B>,
+    ) -> Result<Response<()>, StreamError> {
+        let frame = poll_fn(|cx| inner.stream.poll_next(cx))
             .await
-            .map_err(|e| self.inner.handle_receive_stream_error(e))?
+            .map_err(|e| inner.handle_receive_stream_error(e))?
             .ok_or_else(|| {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                 //# Receipt of an invalid sequence of frames MUST be treated as a
                 //# connection error of type H3_FRAME_UNEXPECTED.
-                self.handle_connection_error_on_stream(InternalConnectionError::new(
+                inner.handle_connection_error_on_stream(InternalConnectionError::new(
                     Code::H3_FRAME_UNEXPECTED,
                     "Stream finished without receiving response headers".to_string(),
                 ))
@@ -135,7 +219,7 @@ where
                 //# Receipt of an invalid sequence of frames MUST be treated as a
                 //# connection error of type H3_FRAME_UNEXPECTED.
                 return Err(
-                    self.handle_connection_error_on_stream(InternalConnectionError::new(
+                    inner.handle_connection_error_on_stream(InternalConnectionError::new(
                         Code::H3_FRAME_UNEXPECTED,
                         "First response frame is not headers".to_string(),
                     )),
@@ -143,33 +227,32 @@ where
             }
         };
 
-        let decoded =
-            match poll_fn(|cx| self.inner.poll_decode_field_section(cx, &mut encoded)).await {
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
-                //# An HTTP/3 implementation MAY impose a limit on the maximum size of
-                //# the message header it will accept on an individual HTTP message.
-                Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
-                    self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
-                    return Err(StreamError::HeaderTooBig {
-                        actual_size: cancel_size,
-                        max_size: self.inner.max_field_section_size,
-                    });
-                }
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    let code = if error.is_internal() {
-                        Code::H3_INTERNAL_ERROR
-                    } else {
-                        Code::QPACK_DECOMPRESSION_FAILED
-                    };
-                    return Err(self.handle_connection_error_on_stream(
-                        InternalConnectionError::new(
-                            code,
-                            format!("failed to decode response headers: {error}"),
-                        ),
-                    ));
-                }
-            };
+        let decoded = match poll_fn(|cx| inner.poll_decode_field_section(cx, &mut encoded)).await {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+            //# An HTTP/3 implementation MAY impose a limit on the maximum size of
+            //# the message header it will accept on an individual HTTP message.
+            Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
+                inner.stop_sending(Code::H3_REQUEST_CANCELLED);
+                return Err(StreamError::HeaderTooBig {
+                    actual_size: cancel_size,
+                    max_size: inner.max_field_section_size,
+                });
+            }
+            Ok(decoded) => decoded,
+            Err(error) => {
+                let code = if error.is_internal() {
+                    Code::H3_INTERNAL_ERROR
+                } else {
+                    Code::QPACK_DECOMPRESSION_FAILED
+                };
+                return Err(
+                    inner.handle_connection_error_on_stream(InternalConnectionError::new(
+                        code,
+                        format!("failed to decode response headers: {error}"),
+                    )),
+                );
+            }
+        };
 
         let qpack::Decoded { fields, .. } = decoded;
 
@@ -177,7 +260,7 @@ where
             .and_then(Header::into_response_parts)
             .map_err(|error| {
                 let code = error.code();
-                self.inner.stop_sending(code);
+                inner.stop_sending(code);
                 StreamError::StreamError {
                     code,
                     reason: format!("rejected response headers: {error}"),
@@ -194,57 +277,6 @@ where
 
         Ok(resp)
     }
-
-    /// Receive some of the request body.
-    // TODO what if called before recv_response ?
-    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub async fn recv_data(&mut self) -> Result<Option<impl Buf + use<S, B>>, StreamError> {
-        poll_fn(|cx| self.poll_recv_data(cx)).await
-    }
-
-    /// Receive request body
-    pub fn poll_recv_data(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
-        self.inner.poll_recv_data(cx)
-    }
-
-    /// Receive an optional set of trailers for the response.
-    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, StreamError> {
-        poll_fn(|cx| self.poll_recv_trailers(cx)).await
-    }
-
-    /// Poll receive an optional set of trailers for the response.
-    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub fn poll_recv_trailers(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
-        let res = self.inner.poll_recv_trailers(cx);
-        if let Poll::Ready(Err(StreamError::HeaderTooBig { .. })) = &res {
-            self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
-        }
-        res
-    }
-
-    /// Stops receiving the response with `error_code` and releases its QPACK state.
-    ///
-    /// The request's send direction remains open. Dropping the stream afterwards
-    /// does not replace this receive-side code with `H3_REQUEST_CANCELLED`.
-    /// Clients must not use `H3_REQUEST_REJECTED` unless the server requested
-    /// closure of this request with that code.
-    /// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
-    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub fn stop_sending(&mut self, error_code: Code) {
-        self.inner.stop_sending(error_code)
-    }
-
-    /// Returns the underlying stream id
-    pub fn id(&self) -> StreamId {
-        self.inner.stream.id()
-    }
 }
 
 impl<S, B> RequestStream<S, B>
@@ -255,7 +287,8 @@ where
     /// Send some data on the request body.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_data(&mut self, buf: B) -> Result<(), StreamError> {
-        self.inner.send_data(buf).await
+        let result = self.rejection.run(self.inner.send_data(buf)).await;
+        self.handle_result(result)
     }
 
     /// Resets the request's send direction with `error_code`.
@@ -275,7 +308,8 @@ where
     /// [`RequestStream::finish()`] must be called to finalize a request.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
-        self.inner.send_trailers(trailers).await
+        let result = self.rejection.run(self.inner.send_trailers(trailers)).await;
+        self.handle_result(result)
     }
 
     /// Flushes pending request output and closes the send direction with FIN.
@@ -289,7 +323,8 @@ where
     /// See [RFC 9114, Section 4.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1).
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn finish(&mut self) -> Result<(), StreamError> {
-        self.inner.finish().await
+        let result = self.rejection.run(self.inner.finish()).await;
+        self.handle_result(result)
     }
 }
 
@@ -310,7 +345,111 @@ where
         RequestStream<S::SendStream, B>,
         RequestStream<S::RecvStream, B>,
     ) {
-        let (send, recv) = self.inner.split();
-        (RequestStream { inner: send }, RequestStream { inner: recv })
+        let Self {
+            inner,
+            mut rejection,
+        } = self;
+        rejection.notified = None;
+        let (send, recv) = inner.split();
+        (
+            RequestStream {
+                inner: send,
+                rejection: RequestRejection::new(rejection.state.clone(), rejection.stream_id),
+            },
+            RequestStream {
+                inner: recv,
+                rejection,
+            },
+        )
+    }
+}
+
+impl<S, B> RequestStream<S, B>
+where
+    S: quic::SendStream<B> + quic::RecvStream,
+    B: Buf,
+{
+    pub(super) fn new(inner: connection::RequestStream<S, B>) -> Self {
+        let rejection = RequestRejection::new(inner.conn_state.clone(), inner.stream.id());
+        Self { inner, rejection }
+    }
+}
+
+// A poll API must retain its waiter across calls. Recreating and dropping a
+// Notified on each Pending would lose the connection driver's wakeup.
+struct RequestRejection {
+    state: Arc<SharedState>,
+    stream_id: StreamId,
+    notified: Option<Pin<Box<tokio::sync::futures::OwnedNotified>>>,
+}
+
+impl RequestRejection {
+    fn new(state: Arc<SharedState>, stream_id: StreamId) -> Self {
+        Self {
+            state,
+            stream_id,
+            notified: None,
+        }
+    }
+
+    fn poll<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        operation: impl FnOnce(&mut Context<'_>) -> Poll<Result<T, StreamError>>,
+    ) -> Poll<Result<T, StreamError>> {
+        if let Some(error) = self.state.request_error(self.stream_id) {
+            self.notified = None;
+            return Poll::Ready(Err(error));
+        }
+        let result = operation(cx);
+        if result.is_ready() {
+            self.notified = None;
+            return result;
+        }
+        loop {
+            let notified = self
+                .notified
+                .get_or_insert_with(|| Box::pin(self.state.notified()));
+            let changed = notified.as_mut().poll(cx);
+            // Register before rechecking: GOAWAY can arrive during operation's
+            // poll or while the notification is being installed.
+            if let Some(error) = self.state.request_error(self.stream_id) {
+                self.notified = None;
+                return Poll::Ready(Err(error));
+            }
+            if changed.is_pending() {
+                return Poll::Pending;
+            }
+            notified.set(self.state.notified());
+        }
+    }
+
+    async fn run<T>(
+        &mut self,
+        operation: impl Future<Output = Result<T, StreamError>>,
+    ) -> Result<T, StreamError> {
+        let mut operation = std::pin::pin!(operation);
+        let waiter = RejectionWait(self);
+        poll_fn(|cx| waiter.0.poll(cx, |cx| operation.as_mut().poll(cx))).await
+    }
+}
+
+// Canceling an async operation unregisters its task even if the stream is kept.
+struct RejectionWait<'a>(&'a mut RequestRejection);
+
+impl Drop for RejectionWait<'_> {
+    fn drop(&mut self) {
+        self.0.notified = None;
+    }
+}
+
+impl<S, B> RequestStream<S, B> {
+    fn handle_result<T>(&mut self, result: Result<T, StreamError>) -> Result<T, StreamError> {
+        if matches!(&result, Err(StreamError::GoawayRejected { .. })) {
+            // Use the Drop guard's ownership state so completed or explicitly
+            // stopped directions keep their result, including after split.
+            self.inner.cancel_request();
+        }
+        result
     }
 }

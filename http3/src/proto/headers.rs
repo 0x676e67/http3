@@ -273,6 +273,9 @@ impl Header {
     pub fn into_response_parts(
         self,
     ) -> Result<(StatusCode, HeaderMap, PseudoHeaderSensitivity), HeaderError> {
+        if self.fields.contains_key(header::TE) {
+            return Err(HeaderError::invalid_name("te"));
+        }
         if self.pseudo.method.is_some()
             || self.pseudo.scheme.is_some()
             || self.pseudo.authority.is_some()
@@ -301,6 +304,9 @@ impl Header {
     /// Unlike initial request/response headers, trailers have no message-control
     /// fields. See [RFC 9114 Section 4.3](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3).
     pub fn into_trailers(self) -> Result<HeaderMap, HeaderError> {
+        if self.fields.contains_key(header::TE) {
+            return Err(HeaderError::invalid_name("te"));
+        }
         if self.pseudo.len != 0 {
             return Err(HeaderError::UnexpectedPseudo);
         }
@@ -490,6 +496,22 @@ impl Field {
         //# treated as malformed.
 
         if name[0] != b':' {
+            // Connection-specific fields are malformed in HTTP/3. TE is
+            // restricted further by the request/response/trailer context.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2
+            if matches!(
+                name,
+                b"connection"
+                    | b"proxy-connection"
+                    | b"keep-alive"
+                    | b"transfer-encoding"
+                    | b"upgrade"
+            ) {
+                return Err(HeaderError::invalid_name(name));
+            }
+            if name == b"te" && !value.as_ref().eq_ignore_ascii_case(b"trailers") {
+                return Err(HeaderError::invalid_value(name, value));
+            }
             let shared_value = match value {
                 Cow::Borrowed(value) => bytes::Bytes::from_static(value),
                 Cow::Owned(value) => bytes::Bytes::from(value),

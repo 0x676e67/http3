@@ -60,7 +60,7 @@ fn take_qpack_encode_buffer(buffer: &mut BytesMut) -> Bytes {
 ///
 /// Existing instances are atomically counted internally, so whenever all of them have been
 /// dropped, the connection will be automatically closed with HTTP/3 connection error code
-/// `HTTP_NO_ERROR = 0`.
+/// `H3_NO_ERROR = 0x100`.
 ///
 /// # Examples
 ///
@@ -112,7 +112,7 @@ fn take_qpack_encode_buffer(buffer: &mut BytesMut) -> Bytes {
 /// trailers.insert("trailer", "value".parse()?);
 /// // Send them and finish the send stream
 /// req_stream.send_trailers(trailers).await?;
-/// // We don't need to finish the send stream, as `send_trailers()` did it for us
+/// req_stream.finish().await?;
 ///
 /// // Receive the response.
 /// let response = req_stream.recv_response().await?;
@@ -183,11 +183,10 @@ where
             extensions,
             ..
         } = parts;
-        let headers = Header::request(method, uri, headers, extensions).map_err(|_e| {
-            self.handle_connection_error_on_stream(InternalConnectionError {
-                code: Code::H3_INTERNAL_ERROR,
-                message: "Failed to build request headers".to_string(),
-            })
+        let headers = Header::request(method, uri, headers, extensions).map_err(|error| {
+            StreamError::InvalidRequest {
+                reason: error.to_string().into_boxed_str(),
+            }
         })?;
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
@@ -245,29 +244,32 @@ where
                         "request field section size overflowed".to_string(),
                     ))
                 })?;
-            stream = future::poll_fn(|cx| self.open.poll_open_bidi(cx))
-                .await
-                .map_err(|e| self.handle_quic_stream_error(e))?;
             if mem_size > peer_max_field_section_size {
                 return Err(StreamError::HeaderTooBig {
                     actual_size: mem_size,
                     max_size: peer_max_field_section_size,
                 });
             }
+            stream = Self::open_request_stream_with_state(&mut self.open, &self.conn_state).await?;
+            let mut guard =
+                OpeningStream::<_, B>::new(&mut stream, self.decoder.as_ref(), &self.conn_state);
 
-            let encoder_instructions_queued =
-                match encoder.encode(stream.send_id(), &mut self.qpack_encode_buffer, &headers) {
-                    Ok(encoded) => encoded,
-                    Err(error) => {
-                        clear_qpack_encode_buffer(&mut self.qpack_encode_buffer);
-                        return Err(self.handle_connection_error_on_stream(
-                            InternalConnectionError::new(
-                                Code::H3_INTERNAL_ERROR,
-                                format!("failed to encode request headers: {error}"),
-                            ),
-                        ));
-                    }
-                };
+            let encoder_instructions_queued = match encoder.encode(
+                guard.stream.send_id(),
+                &mut self.qpack_encode_buffer,
+                &headers,
+            ) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    clear_qpack_encode_buffer(&mut self.qpack_encode_buffer);
+                    return Err(self.handle_connection_error_on_stream(
+                        InternalConnectionError::new(
+                            Code::H3_INTERNAL_ERROR,
+                            format!("failed to encode request headers: {error}"),
+                        ),
+                    ));
+                }
+            };
 
             drop(headers);
             let block = take_qpack_encode_buffer(&mut self.qpack_encode_buffer);
@@ -278,9 +280,8 @@ where
             // Keep dynamic references tracked once encoding commits. A canceled
             // write may already be peer-visible and can still produce a Section
             // Acknowledgment or Stream Cancellation.
-            stream::write(&mut stream, Frame::Headers(block))
-                .await
-                .map_err(|error| self.handle_quic_stream_error(error))?;
+            Self::write_headers(guard.stream, block, &self.conn_state).await?;
+            guard.complete = true;
         } else {
             let mem_size = match qpack::encode_stateless(&mut self.qpack_encode_buffer, &headers) {
                 Ok(mem_size) => mem_size,
@@ -298,34 +299,70 @@ where
             // Keep the default path encoded before waiting for stream credit.
             drop(headers);
             let block = take_qpack_encode_buffer(&mut self.qpack_encode_buffer);
-            stream = future::poll_fn(|cx| self.open.poll_open_bidi(cx))
-                .await
-                .map_err(|e| self.handle_quic_stream_error(e))?;
             if mem_size > peer_max_field_section_size {
                 return Err(StreamError::HeaderTooBig {
                     actual_size: mem_size,
                     max_size: peer_max_field_section_size,
                 });
             }
-
-            stream::write(&mut stream, Frame::Headers(block))
-                .await
-                .map_err(|e| self.handle_quic_stream_error(e))?;
+            stream = Self::open_request_stream_with_state(&mut self.open, &self.conn_state).await?;
+            let mut guard =
+                OpeningStream::<_, B>::new(&mut stream, self.decoder.as_ref(), &self.conn_state);
+            Self::write_headers(guard.stream, block, &self.conn_state).await?;
+            guard.complete = true;
         }
 
-        let request_stream = RequestStream {
-            inner: connection::RequestStream::new(
-                FrameStream::new(BufRecvStream::new(stream)),
-                self.max_field_section_size,
-                self.max_qpack_decode_buffer_size,
-                self.send_grease_frame,
-                self.conn_state.clone(),
-                self.decoder.clone(),
-            ),
-        };
+        let request_stream = RequestStream::new(connection::RequestStream::new(
+            FrameStream::new(BufRecvStream::new(stream)),
+            self.max_field_section_size,
+            self.max_qpack_decode_buffer_size,
+            self.send_grease_frame,
+            self.conn_state.clone(),
+            self.decoder.clone(),
+        ));
         // send the grease frame only once
         self.send_grease_frame = false;
         Ok(request_stream)
+    }
+
+    async fn write_headers(
+        stream: &mut T::BidiStream,
+        block: Bytes,
+        state: &SharedState,
+    ) -> Result<(), StreamError> {
+        let rejected = std::pin::pin!(state.wait_rejected(stream.send_id()));
+        let writing = std::pin::pin!(stream::write(stream, Frame::Headers(block)));
+        match future::select(rejected, writing).await {
+            future::Either::Left((error, _)) => Err(error),
+            future::Either::Right((result, _)) => {
+                result.map_err(|e| state.handle_quic_stream_error(e))
+            }
+        }
+    }
+
+    async fn open_request_stream_with_state(
+        open: &mut T,
+        state: &SharedState,
+    ) -> Result<T::BidiStream, StreamError> {
+        let result = {
+            let closing = std::pin::pin!(state.wait_closing());
+            let opening = std::pin::pin!(future::poll_fn(|cx| open.poll_open_bidi(cx)));
+            match future::select(closing, opening).await {
+                future::Either::Left(_) => {
+                    return Err(state
+                        .check_peer_connection_closing()
+                        .unwrap_or(StreamError::RemoteClosing));
+                }
+                future::Either::Right((result, _)) => result,
+            }
+        };
+        let mut stream = result.map_err(|e| state.handle_quic_stream_error(e))?;
+        if let Some(error) = state.check_peer_connection_closing() {
+            // GOAWAY can race the transport's successful open.
+            let _guard = OpeningStream::<_, B>::new(&mut stream, None, state);
+            return Err(error);
+        }
+        Ok(stream)
     }
 }
 
@@ -377,14 +414,14 @@ where
 /// Client connection driver
 ///
 /// Maintains the internal state of an HTTP/3 connection, including control and QPACK.
-/// It needs to be polled continuously via [`poll_close()`]. On connection closure, this
-/// will resolve to `Ok(())` if the peer sent `HTTP_NO_ERROR`, or `Err()` if a connection-level
-/// error occurred.
+/// It needs to be polled continuously via [`poll_close()`]. On connection closure,
+/// this returns a [`ConnectionError`]; use [`ConnectionError::is_h3_no_error()`]
+/// to distinguish a normal close from an error.
 ///
 /// [`shutdown()`] initiates a graceful shutdown of this connection. After calling it, no request
-/// initiation will be further allowed. Then [`poll_close()`] will resolve when all ongoing requests
-/// and push streams complete. Finally, a connection closure with `HTTP_NO_ERROR` code will be
-/// sent to the server.
+/// initiation will be further allowed. Continue driving the connection while
+/// existing requests finish. This method sends GOAWAY; it does not itself wait
+/// for requests to finish or close the QUIC connection.
 ///
 /// # Examples
 ///
@@ -557,6 +594,7 @@ where
                     if let Err(err) = self.inner.process_goaway(&mut self.recv_closing, id) {
                         return Poll::Ready(err);
                     }
+                    self.inner.shared.set_peer_goaway(StreamId::from(id));
 
                     #[cfg(feature = "tracing")]
                     info!("Server initiated graceful shutdown, last: StreamId({})", id);
@@ -600,6 +638,748 @@ where
         }
 
         Poll::Pending
+    }
+}
+
+// Protect the open stream before its public RequestStream owner exists.
+// https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1
+struct OpeningStream<'a, S: quic::SendStream<B> + quic::RecvStream, B: Buf> {
+    stream: &'a mut S,
+    complete: bool,
+    buffer: PhantomData<fn(B)>,
+    decoder: Option<&'a QpackDecoder>,
+    shared: &'a SharedState,
+}
+
+impl<'a, S: quic::SendStream<B> + quic::RecvStream, B: Buf> OpeningStream<'a, S, B> {
+    fn new(stream: &'a mut S, decoder: Option<&'a QpackDecoder>, shared: &'a SharedState) -> Self {
+        Self {
+            stream,
+            complete: false,
+            buffer: PhantomData,
+            decoder,
+            shared,
+        }
+    }
+}
+
+impl<S: quic::SendStream<B> + quic::RecvStream, B: Buf> Drop for OpeningStream<'_, S, B> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.stream.reset(Code::H3_REQUEST_CANCELLED.value());
+            self.stream.stop_sending(Code::H3_REQUEST_CANCELLED.value());
+            // Abandoning the response also releases the peer encoder's
+            // references; our request encoder still waits for peer feedback.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.2.2
+            if let Some(decoder) = self.decoder
+                && decoder.queue_stream_cancellation(self.stream.recv_id())
+            {
+                self.shared.waker().wake();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+
+    use futures_util::task::{ArcWake, waker};
+
+    use super::*;
+    use crate::quic::{OpenStreams, RecvStream, StreamErrorIncoming, WriteBuf};
+
+    #[derive(Default)]
+    struct State {
+        block_open: AtomicBool,
+        block_write: AtomicBool,
+        block_finish: AtomicBool,
+        read: std::sync::Mutex<Option<Bytes>>,
+        reject_on_read: std::sync::OnceLock<Arc<SharedState>>,
+        opened: AtomicUsize,
+        written: AtomicBool,
+        reset: AtomicU64,
+        stopped: AtomicU64,
+        reset_calls: AtomicUsize,
+        stop_calls: AtomicUsize,
+        wakes: AtomicUsize,
+        close_on_open: std::sync::OnceLock<Arc<SharedState>>,
+    }
+
+    impl ArcWake for State {
+        fn wake_by_ref(state: &Arc<Self>) {
+            state.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Clone)]
+    struct Mock(Arc<State>);
+
+    impl OpenStreams<Bytes> for Mock {
+        type BidiStream = Self;
+        type SendStream = Self;
+        fn poll_open_bidi(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<Self, StreamErrorIncoming>> {
+            if self.0.block_open.load(Ordering::Relaxed) {
+                return Poll::Pending;
+            }
+            self.0.opened.fetch_add(1, Ordering::Relaxed);
+            if let Some(shared) = self.0.close_on_open.get() {
+                shared.set_closing();
+            }
+            Poll::Ready(Ok(self.clone()))
+        }
+        fn poll_open_send(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<Self, StreamErrorIncoming>> {
+            unreachable!()
+        }
+        fn close(&mut self, _: Code, _: &[u8]) {}
+    }
+
+    impl SendStream<Bytes> for Mock {
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+            if self.0.block_write.load(Ordering::Relaxed) {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+        fn send_data<D: Into<WriteBuf<Bytes>>>(&mut self, _: D) -> Result<(), StreamErrorIncoming> {
+            self.0.written.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        fn poll_finish(&mut self, _: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+            if self.0.block_finish.load(Ordering::Relaxed) {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+        fn reset(&mut self, code: u64) {
+            self.0.reset.store(code, Ordering::Relaxed);
+            self.0.reset_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        fn send_id(&self) -> StreamId {
+            StreamId::try_from(0).unwrap()
+        }
+    }
+
+    impl RecvStream for Mock {
+        type Buf = Bytes;
+        fn poll_data(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
+            if let Some(shared) = self.0.reject_on_read.get() {
+                shared.set_peer_goaway(StreamId::try_from(0).unwrap());
+            }
+            if let Some(bytes) = self.0.read.lock().unwrap().take() {
+                return Poll::Ready(Ok(Some(bytes)));
+            }
+            Poll::Pending
+        }
+        fn stop_sending(&mut self, code: u64) {
+            self.0.stopped.store(code, Ordering::Relaxed);
+            self.0.stop_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        fn recv_id(&self) -> StreamId {
+            self.send_id()
+        }
+    }
+
+    impl quic::BidiStream<Bytes> for Mock {
+        type SendStream = Self;
+        type RecvStream = Self;
+        fn split(self) -> (Self, Self) {
+            (self.clone(), self)
+        }
+    }
+
+    fn sender(state: &Arc<State>, dynamic: bool) -> SendRequest<Mock, Bytes> {
+        let encoder = dynamic.then(|| {
+            let encoder = QpackEncoder::default();
+            encoder.configure(4096, 4096).unwrap();
+            encoder.take_pending_instructions().unwrap();
+            assert!(encoder.ready().unwrap());
+            encoder
+        });
+        SendRequest {
+            open: Mock(state.clone()),
+            conn_state: Arc::default(),
+            decoder: None,
+            encoder,
+            max_field_section_size: 65536,
+            max_qpack_decode_buffer_size: 262144,
+            sender_count: Arc::new(AtomicUsize::new(1)),
+            _buf: PhantomData,
+            send_grease_frame: false,
+            qpack_encode_buffer: BytesMut::new(),
+        }
+    }
+
+    fn request() -> http::Request<()> {
+        http::Request::get("https://localhost/").body(()).unwrap()
+    }
+
+    fn returned(sender: &mut SendRequest<Mock, Bytes>) -> RequestStream<Mock, Bytes> {
+        match std::pin::pin!(sender.send_request(request())).poll(&mut Context::from_waker(
+            futures_util::task::noop_waker_ref(),
+        )) {
+            Poll::Ready(Ok(stream)) => stream,
+            _ => panic!("request did not open"),
+        }
+    }
+
+    fn request_operation(
+        stream: &mut RequestStream<Mock, Bytes>,
+        operation: usize,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), StreamError>> + '_>> {
+        Box::pin(async move {
+            match operation {
+                0 => stream.recv_response().await.map(|_| ()),
+                1 => stream.recv_data().await.map(|_| ()),
+                2 => stream.recv_trailers().await.map(|_| ()),
+                3 => stream.send_data(Bytes::from_static(b"body")).await,
+                4 => stream.send_trailers(http::HeaderMap::new()).await,
+                5 => stream.finish().await,
+                _ => unreachable!(),
+            }
+        })
+    }
+
+    fn prepare_response_body(
+        stream: &mut RequestStream<Mock, Bytes>,
+        state: &State,
+        operation: usize,
+    ) {
+        if matches!(operation, 1 | 2) {
+            *state.read.lock().unwrap() = Some(Bytes::from_static(&[1, 3, 0, 0, 0xd9]));
+            assert!(matches!(
+                std::pin::pin!(stream.recv_response()).poll(&mut Context::from_waker(futures_util::task::noop_waker_ref())),
+                Poll::Ready(Ok(response)) if response.status() == 200
+            ));
+        }
+    }
+
+    #[test]
+    fn goaway_wakes_returned_request_operations_and_cancels_directions() {
+        for terminal_error in [false, true] {
+            for operation in 0..6 {
+                let state = Arc::new(State::default());
+                let mut sender = sender(&state, false);
+                let mut stream = returned(&mut sender);
+                prepare_response_body(&mut stream, &state, operation);
+                state.block_write.store(true, Ordering::Relaxed);
+                state.block_finish.store(true, Ordering::Relaxed);
+                let waker = waker(state.clone());
+                let mut cx = Context::from_waker(&waker);
+                let mut waiting = request_operation(&mut stream, operation);
+                assert!(waiting.as_mut().poll(&mut cx).is_pending());
+                if terminal_error {
+                    sender
+                        .conn_state
+                        .set_conn_error(quic::ConnectionErrorIncoming::Timeout.into());
+                } else {
+                    sender
+                        .conn_state
+                        .set_peer_goaway(StreamId::try_from(0).unwrap());
+                }
+                assert_eq!(
+                    state.wakes.load(Ordering::Relaxed),
+                    1,
+                    "operation {operation}"
+                );
+                match waiting.as_mut().poll(&mut cx) {
+                    Poll::Ready(Err(StreamError::ConnectionError(ConnectionError::Timeout)))
+                        if terminal_error => {}
+                    Poll::Ready(Err(StreamError::GoawayRejected {
+                        stream_id,
+                        boundary,
+                    })) if !terminal_error => {
+                        assert_eq!(stream_id, boundary);
+                    }
+                    _ => panic!("operation {operation} did not receive its error"),
+                }
+                drop(waiting);
+                let code = if terminal_error {
+                    0
+                } else {
+                    Code::H3_REQUEST_CANCELLED.value()
+                };
+                assert_eq!(state.reset.load(Ordering::Relaxed), code);
+                assert_eq!(state.stopped.load(Ordering::Relaxed), code);
+            }
+        }
+    }
+
+    #[test]
+    fn goaway_wakes_both_split_halves_independently() {
+        for send_operation in 3..6 {
+            for recv_operation in 0..3 {
+                let state = Arc::new(State::default());
+                let mut sender = sender(&state, false);
+                let (mut send, mut recv) = returned(&mut sender).split();
+                prepare_response_body(&mut recv, &state, recv_operation);
+                state.block_write.store(true, Ordering::Relaxed);
+                state.block_finish.store(true, Ordering::Relaxed);
+                let send_wakes = Arc::new(State::default());
+                let recv_wakes = Arc::new(State::default());
+                let send_waker = waker(send_wakes.clone());
+                let recv_waker = waker(recv_wakes.clone());
+                let mut send_cx = Context::from_waker(&send_waker);
+                let mut recv_cx = Context::from_waker(&recv_waker);
+                let mut sending = request_operation(&mut send, send_operation);
+                let mut receiving = request_operation(&mut recv, recv_operation);
+                assert!(sending.as_mut().poll(&mut send_cx).is_pending());
+                assert!(receiving.as_mut().poll(&mut recv_cx).is_pending());
+                sender
+                    .conn_state
+                    .set_peer_goaway(StreamId::try_from(0).unwrap());
+                assert_eq!(send_wakes.wakes.load(Ordering::Relaxed), 1);
+                assert_eq!(recv_wakes.wakes.load(Ordering::Relaxed), 1);
+                assert!(matches!(
+                    receiving.as_mut().poll(&mut recv_cx),
+                    Poll::Ready(Err(StreamError::GoawayRejected { .. }))
+                ));
+                assert_eq!(
+                    state.stopped.load(Ordering::Relaxed),
+                    Code::H3_REQUEST_CANCELLED.value()
+                );
+                assert_eq!(state.reset.load(Ordering::Relaxed), 0);
+                assert!(matches!(
+                    sending.as_mut().poll(&mut send_cx),
+                    Poll::Ready(Err(StreamError::GoawayRejected { .. }))
+                ));
+                assert_eq!(
+                    state.reset.load(Ordering::Relaxed),
+                    Code::H3_REQUEST_CANCELLED.value()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_request_operations_unregister_their_waiters() {
+        for operation in 0..6 {
+            let state = Arc::new(State::default());
+            let mut sender = sender(&state, false);
+            let mut stream = returned(&mut sender);
+            prepare_response_body(&mut stream, &state, operation);
+            state.block_write.store(true, Ordering::Relaxed);
+            state.block_finish.store(true, Ordering::Relaxed);
+            let task_waker = waker(state.clone());
+            let mut cx = Context::from_waker(&task_waker);
+            let mut waiting = request_operation(&mut stream, operation);
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            drop(waiting);
+            sender
+                .conn_state
+                .set_peer_goaway(StreamId::try_from(0).unwrap());
+            assert_eq!(state.wakes.load(Ordering::Relaxed), 0);
+            // The request is retained, so a later operation must still see rejection.
+            assert!(matches!(
+                request_operation(&mut stream, operation)
+                    .as_mut()
+                    .poll(&mut cx),
+                Poll::Ready(Err(StreamError::GoawayRejected { .. }))
+            ));
+        }
+    }
+
+    #[test]
+    fn goaway_during_transport_poll_is_not_lost() {
+        let state = Arc::new(State::default());
+        let mut sender = sender(&state, false);
+        let mut stream = returned(&mut sender);
+        state.reject_on_read.set(sender.conn_state.clone()).unwrap();
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(matches!(
+            std::pin::pin!(stream.recv_response()).poll(&mut cx),
+            Poll::Ready(Err(StreamError::GoawayRejected { .. }))
+        ));
+    }
+
+    #[test]
+    fn goaway_is_checked_before_ready_writes() {
+        let state = Arc::new(State::default());
+        let mut sender = sender(&state, false);
+        let mut stream = returned(&mut sender);
+        state.written.store(false, Ordering::Relaxed);
+        sender
+            .conn_state
+            .set_peer_goaway(StreamId::try_from(0).unwrap());
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(matches!(
+            std::pin::pin!(stream.send_data(Bytes::from_static(b"body"))).poll(&mut cx),
+            Poll::Ready(Err(StreamError::GoawayRejected { .. }))
+        ));
+        assert!(!state.written.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn goaway_preserves_completed_directions_and_cancels_remaining_once() {
+        for split in [false, true] {
+            // Open upload, completed upload, explicitly reset upload.
+            for send_state in 0..3 {
+                for stopped_receive in [false, true] {
+                    let state = Arc::new(State::default());
+                    let mut sender = sender(&state, false);
+                    let mut stream = returned(&mut sender);
+                    let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+                    if send_state == 1 {
+                        assert!(matches!(
+                            std::pin::pin!(stream.finish()).poll(&mut cx),
+                            Poll::Ready(Ok(()))
+                        ));
+                    } else if send_state == 2 {
+                        stream.stop_stream(Code::H3_NO_ERROR);
+                    }
+                    if stopped_receive {
+                        stream.stop_sending(Code::H3_MESSAGE_ERROR);
+                    }
+                    sender
+                        .conn_state
+                        .set_peer_goaway(StreamId::try_from(0).unwrap());
+                    if split {
+                        let (mut send, mut recv) = stream.split();
+                        for _ in 0..2 {
+                            assert!(matches!(
+                                std::pin::pin!(send.finish()).poll(&mut cx),
+                                Poll::Ready(Err(StreamError::GoawayRejected { .. }))
+                            ));
+                            assert!(matches!(
+                                recv.poll_recv_data(&mut cx),
+                                Poll::Ready(Err(StreamError::GoawayRejected { .. }))
+                            ));
+                        }
+                        drop((send, recv));
+                    } else {
+                        for _ in 0..2 {
+                            assert!(matches!(
+                                stream.poll_recv_data(&mut cx),
+                                Poll::Ready(Err(StreamError::GoawayRejected { .. }))
+                            ));
+                        }
+                        drop(stream);
+                    }
+                    assert_eq!(
+                        state.reset_calls.load(Ordering::Relaxed),
+                        usize::from(send_state != 1)
+                    );
+                    assert_eq!(
+                        state.reset.load(Ordering::Relaxed),
+                        match send_state {
+                            0 => Code::H3_REQUEST_CANCELLED.value(),
+                            1 => 0,
+                            _ => Code::H3_NO_ERROR.value(),
+                        }
+                    );
+                    assert_eq!(state.stop_calls.load(Ordering::Relaxed), 1);
+                    assert_eq!(
+                        state.stopped.load(Ordering::Relaxed),
+                        if stopped_receive {
+                            Code::H3_MESSAGE_ERROR.value()
+                        } else {
+                            Code::H3_REQUEST_CANCELLED.value()
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completed_or_dropped_poll_receiver_unregisters_its_waiter() {
+        for complete in [false, true] {
+            let state = Arc::new(State::default());
+            let mut sender = sender(&state, false);
+            let mut stream = returned(&mut sender);
+            prepare_response_body(&mut stream, &state, 1);
+            let task_waker = waker(state.clone());
+            let mut cx = Context::from_waker(&task_waker);
+            assert!(stream.poll_recv_data(&mut cx).is_pending());
+            if complete {
+                *state.read.lock().unwrap() = Some(Bytes::from_static(&[0, 1, b'x']));
+                assert!(
+                    matches!(stream.poll_recv_data(&mut cx), Poll::Ready(Ok(Some(data))) if data.remaining() == 1)
+                );
+                sender
+                    .conn_state
+                    .set_peer_goaway(StreamId::try_from(0).unwrap());
+            } else {
+                drop(stream);
+                sender
+                    .conn_state
+                    .set_peer_goaway(StreamId::try_from(0).unwrap());
+            }
+            assert_eq!(state.wakes.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn goaway_interrupts_qpack_blocked_response_and_cancels_decoder() {
+        let state = Arc::new(State::default());
+        let mut sender = sender(&state, false);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        sender.decoder = Some(QpackDecoder::new(
+            qpack::Decoder::new(256, 1).unwrap(),
+            events_tx,
+        ));
+        let mut stream = returned(&mut sender);
+        // HEADERS with Required Insert Count 1, but the insertion has not arrived.
+        *state.read.lock().unwrap() = Some(Bytes::from_static(&[1, 3, 2, 0, 0x80]));
+        let task_waker = waker(state.clone());
+        let mut cx = Context::from_waker(&task_waker);
+        let mut waiting = Box::pin(stream.recv_response());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(qpack::QpackEvent::RegisterBlocked {
+                required_ref: 1,
+                ..
+            })
+        ));
+        sender
+            .conn_state
+            .set_peer_goaway(StreamId::try_from(0).unwrap());
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            waiting.as_mut().poll(&mut cx),
+            Poll::Ready(Err(StreamError::GoawayRejected { .. }))
+        ));
+        drop(waiting);
+        drop(stream);
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(qpack::QpackEvent::ReleaseBlocked {
+                required_ref: 1,
+                ..
+            })
+        ));
+        assert!(
+            matches!(events_rx.try_recv(), Ok(qpack::QpackEvent::StreamCancel(id)) if id.into_inner() == 0)
+        );
+        assert!(events_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn goaway_wakes_poll_receivers_and_rearms_after_lower_boundary() {
+        for trailers in [false, true] {
+            let state = Arc::new(State::default());
+            let mut sender = sender(&state, false);
+            let mut stream = returned(&mut sender);
+            prepare_response_body(&mut stream, &state, if trailers { 2 } else { 1 });
+            let first_wakes = Arc::new(State::default());
+            let second_wakes = Arc::new(State::default());
+            let first_waker = waker(first_wakes.clone());
+            let second_waker = waker(second_wakes.clone());
+            let mut first_cx = Context::from_waker(&first_waker);
+            let mut second_cx = Context::from_waker(&second_waker);
+            let mut poll = |cx: &mut Context<'_>| {
+                if trailers {
+                    stream.poll_recv_trailers(cx).map_ok(|_| ())
+                } else {
+                    stream.poll_recv_data(cx).map_ok(|_| ())
+                }
+            };
+            assert!(poll(&mut first_cx).is_pending());
+            sender
+                .conn_state
+                .set_peer_goaway(StreamId::try_from(4).unwrap());
+            assert_eq!(first_wakes.wakes.load(Ordering::Relaxed), 1);
+            assert!(poll(&mut second_cx).is_pending());
+            sender
+                .conn_state
+                .set_peer_goaway(StreamId::try_from(0).unwrap());
+            assert_eq!(second_wakes.wakes.load(Ordering::Relaxed), 1);
+            assert_eq!(first_wakes.wakes.load(Ordering::Relaxed), 1);
+            assert!(matches!(
+                poll(&mut second_cx),
+                Poll::Ready(Err(StreamError::GoawayRejected { .. }))
+            ));
+        }
+    }
+
+    #[test]
+    fn pending_headers_cancel_both_directions_in_both_encoders() {
+        for dynamic in [false, true] {
+            let state = Arc::new(State::default());
+            state.block_write.store(true, Ordering::Relaxed);
+            let mut sender = sender(&state, dynamic);
+            let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+            sender.decoder = Some(QpackDecoder::new(
+                qpack::Decoder::new(4096, 16).unwrap(),
+                events_tx,
+            ));
+            let mut sending = Box::pin(sender.send_request(request()));
+            assert!(
+                sending
+                    .as_mut()
+                    .poll(&mut Context::from_waker(
+                        futures_util::task::noop_waker_ref()
+                    ))
+                    .is_pending()
+            );
+            assert!(state.written.load(Ordering::Relaxed));
+            drop(sending);
+            assert!(
+                matches!(events_rx.try_recv(), Ok(qpack::QpackEvent::StreamCancel(id)) if id.into_inner() == 0)
+            );
+            assert!(events_rx.try_recv().is_err());
+            assert_eq!(
+                state.reset.load(Ordering::Relaxed),
+                Code::H3_REQUEST_CANCELLED.value()
+            );
+            assert_eq!(
+                state.stopped.load(Ordering::Relaxed),
+                Code::H3_REQUEST_CANCELLED.value()
+            );
+        }
+    }
+
+    #[test]
+    fn successful_headers_disarm_guard_and_invalid_requests_preserve_connection() {
+        for dynamic in [false, true] {
+            let state = Arc::new(State::default());
+            let mut sender = sender(&state, dynamic);
+            let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+            for invalid in [
+                http::Request::get("/").body(()).unwrap(),
+                http::Request::get("https://localhost/")
+                    .header("host", "other")
+                    .body(())
+                    .unwrap(),
+            ] {
+                assert!(matches!(
+                    std::pin::pin!(sender.send_request(invalid))
+                        .as_mut()
+                        .poll(&mut cx),
+                    Poll::Ready(Err(StreamError::InvalidRequest { .. }))
+                ));
+                assert!(sender.get_conn_error().is_none());
+                assert_eq!(state.opened.load(Ordering::Relaxed), 0);
+            }
+            let stream = returned(&mut sender);
+            assert_eq!(state.reset.load(Ordering::Relaxed), 0);
+            assert_eq!(state.stopped.load(Ordering::Relaxed), 0);
+            // HEADERS completion transfers cancellation to the returned owner.
+            drop(stream);
+            assert_eq!(
+                state.reset.load(Ordering::Relaxed),
+                Code::H3_REQUEST_CANCELLED.value()
+            );
+            assert_eq!(
+                state.stopped.load(Ordering::Relaxed),
+                Code::H3_REQUEST_CANCELLED.value()
+            );
+        }
+    }
+
+    #[test]
+    fn goaway_wakes_all_credit_waiters_and_handles_open_race() {
+        let state = Arc::new(State::default());
+        state.block_open.store(true, Ordering::Relaxed);
+        let mut first = sender(&state, false);
+        let mut second = first.clone();
+        let shared = first.conn_state.clone();
+        let waker = waker(state.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut a = Box::pin(first.send_request(request()));
+        let mut b = Box::pin(second.send_request(request()));
+        assert!(a.as_mut().poll(&mut cx).is_pending());
+        assert!(b.as_mut().poll(&mut cx).is_pending());
+        shared.set_closing();
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 2);
+        assert!(matches!(
+            a.as_mut().poll(&mut cx),
+            Poll::Ready(Err(StreamError::RemoteClosing))
+        ));
+        assert!(matches!(
+            b.as_mut().poll(&mut cx),
+            Poll::Ready(Err(StreamError::RemoteClosing))
+        ));
+        assert_eq!(state.opened.load(Ordering::Relaxed), 0);
+
+        let state = Arc::new(State::default());
+        let mut sender = sender(&state, false);
+        state.close_on_open.set(sender.conn_state.clone()).unwrap();
+        assert!(matches!(
+            std::pin::pin!(sender.send_request(request()))
+                .as_mut()
+                .poll(&mut cx),
+            Poll::Ready(Err(StreamError::RemoteClosing))
+        ));
+        assert!(!state.written.load(Ordering::Relaxed));
+        assert_eq!(
+            state.reset.load(Ordering::Relaxed),
+            Code::H3_REQUEST_CANCELLED.value()
+        );
+        assert_eq!(
+            state.stopped.load(Ordering::Relaxed),
+            Code::H3_REQUEST_CANCELLED.value()
+        );
+    }
+
+    #[test]
+    fn decreasing_goaway_rejects_pending_headers_only_at_boundary() {
+        for dynamic in [false, true] {
+            let state = Arc::new(State::default());
+            state.block_write.store(true, Ordering::Relaxed);
+            let mut sender = sender(&state, dynamic);
+            let shared = sender.conn_state.clone();
+            let waker = waker(state.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut sending = Box::pin(sender.send_request(request()));
+            assert!(sending.as_mut().poll(&mut cx).is_pending());
+            shared.set_peer_goaway(StreamId::try_from(4).unwrap());
+            shared.set_closing();
+            assert!(sending.as_mut().poll(&mut cx).is_pending());
+            shared.set_peer_goaway(StreamId::try_from(0).unwrap());
+            assert!(state.wakes.load(Ordering::Relaxed) >= 2);
+            assert!(
+                matches!(sending.as_mut().poll(&mut cx), Poll::Ready(Err(StreamError::GoawayRejected { stream_id, boundary })) if stream_id == boundary)
+            );
+            drop(sending);
+            assert_eq!(
+                state.reset.load(Ordering::Relaxed),
+                Code::H3_REQUEST_CANCELLED.value()
+            );
+            assert_eq!(
+                state.stopped.load(Ordering::Relaxed),
+                Code::H3_REQUEST_CANCELLED.value()
+            );
+        }
+    }
+
+    #[test]
+    fn connection_error_wakes_credit_and_rejection_waiters() {
+        let state = Arc::new(State::default());
+        state.block_open.store(true, Ordering::Relaxed);
+        let mut sender = sender(&state, false);
+        let shared = sender.conn_state.clone();
+        let waker = waker(state.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut opening = Box::pin(sender.send_request(request()));
+        let mut rejected = Box::pin(shared.wait_rejected(StreamId::try_from(0).unwrap()));
+        assert!(opening.as_mut().poll(&mut cx).is_pending());
+        assert!(rejected.as_mut().poll(&mut cx).is_pending());
+        shared.set_conn_error(quic::ConnectionErrorIncoming::Timeout.into());
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 2);
+        assert!(matches!(
+            opening.as_mut().poll(&mut cx),
+            Poll::Ready(Err(StreamError::ConnectionError(ConnectionError::Timeout)))
+        ));
+        assert!(matches!(
+            rejected.as_mut().poll(&mut cx),
+            Poll::Ready(StreamError::ConnectionError(ConnectionError::Timeout))
+        ));
     }
 }
 
