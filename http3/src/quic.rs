@@ -186,6 +186,19 @@ pub trait SendStream<B: Buf> {
     /// Poll to finish the sending side of the stream.
     fn poll_finish(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), StreamErrorIncoming>>;
 
+    /// Polls the peer's response to the send direction.
+    ///
+    /// Resolves to `Ok(Some(code))` once the peer sends `STOP_SENDING`, and to
+    /// `Ok(None)` once the peer has acknowledged all data and the FIN. Fails when
+    /// the connection is lost. It may be polled before or after
+    /// [`poll_finish`](Self::poll_finish), never changes the stream state, and
+    /// must arrange a wakeup when returning `Poll::Pending`.
+    /// See [RFC 9000, Section 3.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-3.1).
+    fn poll_stopped(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>>;
+
     /// Send a QUIC reset code.
     fn reset(&mut self, reset_code: u64);
 

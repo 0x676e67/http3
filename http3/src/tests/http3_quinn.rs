@@ -28,6 +28,10 @@ use tracing::instrument;
 /// BoxStream with Sync trait
 type BoxStreamSync<'a, T> = Pin<Box<dyn Stream<Item = T> + Sync + Send + 'a>>;
 
+/// Boxed [`quinn::SendStream::stopped`] future, created by the first `poll_stopped`.
+type Stopped =
+    Pin<Box<dyn Future<Output = Result<Option<VarInt>, quinn::StoppedError>> + Send + Sync>>;
+
 /// A QUIC connection backed by Quinn
 ///
 /// Implements a [`quic::Connection`] backed by a [`quinn::Connection`].
@@ -305,6 +309,13 @@ where
         self.send.poll_finish(cx)
     }
 
+    fn poll_stopped(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        self.send.poll_stopped(cx)
+    }
+
     fn reset(&mut self, reset_code: u64) {
         self.send.reset(reset_code)
     }
@@ -425,12 +436,26 @@ fn convert_write_error_to_stream_error(error: quinn::WriteError) -> StreamErrorI
     }
 }
 
+fn convert_stopped_error_to_stream_error(error: quinn::StoppedError) -> StreamErrorIncoming {
+    match error {
+        quinn::StoppedError::ConnectionLost(connection_error) => {
+            StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: convert_connection_error(connection_error),
+            }
+        }
+        error @ quinn::StoppedError::ZeroRttRejected => {
+            StreamErrorIncoming::Unknown(Box::new(error))
+        }
+    }
+}
+
 /// Quinn-backed send stream
 ///
 /// Implements a [`quic::SendStream`] backed by a [`quinn::SendStream`].
 pub struct SendStream<B: Buf> {
     stream: quinn::SendStream,
     writing: Option<WriteBuf<B>>,
+    stopped: Option<Stopped>,
 }
 
 impl<B> SendStream<B>
@@ -441,6 +466,7 @@ where
         Self {
             stream,
             writing: None,
+            stopped: None,
         }
     }
 }
@@ -473,6 +499,23 @@ where
             self.stream
                 .finish()
                 .map_err(|e| StreamErrorIncoming::Unknown(Box::new(e))),
+        )
+    }
+
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    fn poll_stopped(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        let stopped = self
+            .stopped
+            .get_or_insert_with(|| Box::pin(self.stream.stopped()));
+        let result = ready!(stopped.as_mut().poll(cx));
+        self.stopped = None;
+        Poll::Ready(
+            result
+                .map(|code| code.map(VarInt::into_inner))
+                .map_err(convert_stopped_error_to_stream_error),
         )
     }
 

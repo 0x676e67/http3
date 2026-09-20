@@ -2544,3 +2544,64 @@ async fn request_stream_drop_resets_request_body() {
 
     tokio::join!(server_fut, client_fut);
 }
+
+#[tokio::test]
+async fn poll_stopped_reports_stop_sending_and_acknowledged_fin() {
+    init_tracing();
+    const STOP_CODE: u64 = 0x10c;
+
+    let mut pair = Pair::default();
+    let endpoint = pair.server_inner();
+    let client_fut = async {
+        let (mut driver, mut client) = client::new(pair.client().await).await.unwrap();
+        let requests = async {
+            // The upload stays open, so only STOP_SENDING can complete the wait.
+            let mut stream = client
+                .send_request(Request::get("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap();
+            let stopped = future::poll_fn(|cx| stream.poll_stopped(cx)).await.unwrap();
+            assert_eq!(stopped, Some(Code::from(STOP_CODE)));
+            assert_matches!(
+                stream.send_data(Bytes::from_static(b"late")).await,
+                Err(StreamError::RemoteTerminate { code }) if code == Code::from(STOP_CODE)
+            );
+            drop(stream);
+
+            let (mut send, _recv) = client
+                .send_request(Request::get("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap()
+                .split();
+            send.finish().await.unwrap();
+            assert_eq!(
+                future::poll_fn(|cx| send.poll_stopped(cx)).await.unwrap(),
+                None
+            );
+        };
+        tokio::select! {
+            biased;
+            _ = requests => (),
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("connection failed: {error:?}"),
+        }
+    };
+    let peer = async {
+        let connection = endpoint.accept().await.unwrap().await.unwrap();
+        let mut control = connection.open_uni().await.unwrap();
+        let mut bytes = BytesMut::new();
+        StreamType::CONTROL.encode(&mut bytes);
+        Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut bytes);
+        control.write_all(&bytes).await.unwrap();
+        let (_send, mut recv) = connection.accept_bi().await.unwrap();
+        recv.stop(http3_quinn::VarInt::from_u64(STOP_CODE).unwrap())
+            .unwrap();
+        let (_send, mut recv) = connection.accept_bi().await.unwrap();
+        recv.read_to_end(usize::MAX).await.unwrap();
+        let _ = connection.closed().await;
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(client_fut, peer);
+    })
+    .await
+    .unwrap();
+}
