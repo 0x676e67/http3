@@ -35,10 +35,7 @@ pub(crate) struct SharedRecv(Mutex<Receive>);
 /// QUIC retains responsibility for FIN, reset, and stop idempotence; this adapter
 /// only keeps the receiver accessible to external stop handles.
 struct Receive {
-    /// Removed when the owning reader drops, even if stop handles remain alive.
     stream: Option<quic::RecvStream>,
-    /// Latest pending read's waiter, retained because native stop removes it
-    /// from the connection without waking it.
     waker: Option<Waker>,
 }
 
