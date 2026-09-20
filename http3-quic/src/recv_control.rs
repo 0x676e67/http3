@@ -23,18 +23,33 @@ impl http3::quic::StopRecv for RecvStop {
     }
 }
 
+/// Native receive storage shared by one reader and its independent stop handles.
+///
+/// The mutex serializes individual read polls, stop calls, and reader teardown.
+/// It is never held across an await; a pending reader is woken after the lock is
+/// released. HTTP frame buffers and QPACK state are not stored here.
 pub(crate) struct SharedRecv(Mutex<Receive>);
 
+/// Mutable receiver ownership and notification state protected by `SharedRecv`.
+///
+/// QUIC retains responsibility for FIN, reset, and stop idempotence; this adapter
+/// only keeps the receiver accessible to external stop handles.
 struct Receive {
+    /// Removed when the owning reader drops, even if stop handles remain alive.
     stream: Option<quic::RecvStream>,
+    /// Latest pending read's waiter, retained because native stop removes it
+    /// from the connection without waking it.
     waker: Option<Waker>,
 }
 
 impl SharedRecv {
+    /// Takes the reader's native stream and any waiter registered before sharing.
     pub(crate) fn new(stream: Option<quic::RecvStream>, waker: Option<Waker>) -> Self {
         Self(Mutex::new(Receive { stream, waker }))
     }
 
+    /// Polls one native read, retaining its waiter only while the read is pending.
+    /// Native read errors are mapped through the adapter's existing conversion.
     pub(crate) fn poll_data(
         &self,
         cx: &mut Context<'_>,
@@ -63,6 +78,9 @@ impl SharedRecv {
         result
     }
 
+    /// Submits a native stop and wakes the pending reader after releasing locks.
+    /// Invalid QUIC codes are ignored; the native stream preserves the first
+    /// stop code. A handle outliving the reader has no stream left to stop.
     pub(crate) fn stop(&self, code: u64) {
         let Ok(code) = VarInt::from_u64(code) else {
             return;
@@ -83,6 +101,9 @@ impl SharedRecv {
         }
     }
 
+    /// Stops remaining receive work with fallback code zero and releases the
+    /// native stream without waiting for the last control handle to drop.
+    /// An earlier HTTP cancellation code is preserved by native stop idempotence.
     pub(crate) fn drop_reader(&self) {
         self.stop(0);
         let stream = self
