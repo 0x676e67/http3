@@ -259,7 +259,11 @@ async fn server_goaway_reaches_response_operations_at_each_boundary() {
                 second.finish().await.unwrap();
                 assert_eq!(first.id().into_inner(), 0);
                 assert_eq!(second.id().into_inner(), 4);
-                assert_matches!(second.recv_response().await, Err(StreamError::GoawayRejected { stream_id, boundary }) if stream_id.into_inner() == 4 && boundary.into_inner() == 4);
+                assert_matches!(
+                    second.recv_response().await,
+                    Err(StreamError::GoawayRejected { stream_id, boundary })
+                        if stream_id.into_inner() == 4 && boundary.into_inner() == 4
+                );
                 let mut waiting = Box::pin(first.recv_response());
                 assert!(
                     future::poll_fn(|cx| std::task::Poll::Ready(
@@ -269,7 +273,11 @@ async fn server_goaway_reaches_response_operations_at_each_boundary() {
                 );
                 lower_tx.send(()).unwrap();
                 if reject_lower {
-                    assert_matches!(waiting.await, Err(StreamError::GoawayRejected { stream_id, boundary }) if stream_id.into_inner() == 0 && boundary.into_inner() == 0);
+                    assert_matches!(
+                        waiting.await,
+                        Err(StreamError::GoawayRejected { stream_id, boundary })
+                            if stream_id.into_inner() == 0 && boundary.into_inner() == 0
+                    );
                 } else {
                     assert_eq!(waiting.await.unwrap().status(), 200);
                     assert!(first.recv_data().await.unwrap().is_none());
@@ -370,7 +378,11 @@ async fn rejected_request_fields(
         send.write_all(&bytes).await.unwrap();
         send.finish().unwrap();
         if !trailers {
-            assert_matches!(recv.read_to_end(1024).await, Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(actual))) if actual.into_inner() == code.value());
+            assert_matches!(
+                recv.read_to_end(1024).await,
+                Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(actual)))
+                    if actual.into_inner() == code.value()
+            );
         }
         rejected_rx.await.unwrap();
         let (mut next_send, mut next_recv) = connection.open_bi().await.unwrap();

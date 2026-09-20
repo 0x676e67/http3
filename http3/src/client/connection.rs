@@ -1107,9 +1107,10 @@ mod integration_tests {
             assert!(stream.poll_recv_data(&mut cx).is_pending());
             if complete {
                 *state.read.lock().unwrap() = Some(Bytes::from_static(&[0, 1, b'x']));
-                assert!(
-                    matches!(stream.poll_recv_data(&mut cx), Poll::Ready(Ok(Some(data))) if data.remaining() == 1)
-                );
+                assert!(matches!(
+                    stream.poll_recv_data(&mut cx),
+                    Poll::Ready(Ok(Some(data))) if data.remaining() == 1
+                ));
                 sender
                     .conn_state
                     .set_peer_goaway(StreamId::try_from(0).unwrap());
@@ -1163,9 +1164,10 @@ mod integration_tests {
                 ..
             })
         ));
-        assert!(
-            matches!(events_rx.try_recv(), Ok(qpack::QpackEvent::StreamCancel(id)) if id.into_inner() == 0)
-        );
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(qpack::QpackEvent::StreamCancel(id)) if id.into_inner() == 0
+        ));
         assert!(events_rx.try_recv().is_err());
     }
 
@@ -1229,9 +1231,10 @@ mod integration_tests {
             );
             assert!(state.written.load(Ordering::Relaxed));
             drop(sending);
-            assert!(
-                matches!(events_rx.try_recv(), Ok(qpack::QpackEvent::StreamCancel(id)) if id.into_inner() == 0)
-            );
+            assert!(matches!(
+                events_rx.try_recv(),
+                Ok(qpack::QpackEvent::StreamCancel(id)) if id.into_inner() == 0
+            ));
             assert!(events_rx.try_recv().is_err());
             assert_eq!(
                 state.reset.load(Ordering::Relaxed),
@@ -1343,9 +1346,11 @@ mod integration_tests {
             assert!(sending.as_mut().poll(&mut cx).is_pending());
             shared.set_peer_goaway(StreamId::try_from(0).unwrap());
             assert!(state.wakes.load(Ordering::Relaxed) >= 2);
-            assert!(
-                matches!(sending.as_mut().poll(&mut cx), Poll::Ready(Err(StreamError::GoawayRejected { stream_id, boundary })) if stream_id == boundary)
-            );
+            assert!(matches!(
+                sending.as_mut().poll(&mut cx),
+                Poll::Ready(Err(StreamError::GoawayRejected { stream_id, boundary }))
+                    if stream_id == boundary
+            ));
             drop(sending);
             assert_eq!(
                 state.reset.load(Ordering::Relaxed),

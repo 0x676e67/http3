@@ -52,6 +52,12 @@ use crate::{
 /// observes rejection independently. Requests below the GOAWAY boundary continue.
 /// The caller decides whether to retry; this type never retries automatically.
 ///
+/// Receive operations check for published GOAWAY rejection and connection errors
+/// before polling the receive stream, including its buffered data. Consequently,
+/// a published error can prevent delivery of already-buffered response bytes;
+/// callers must not rely on draining those bytes after a connection failure.
+/// Bytes returned to the caller before the error are unaffected.
+///
 /// # Examples
 ///
 /// ```rust
@@ -118,7 +124,10 @@ where
         self.handle_result(result)
     }
 
-    /// Receive some of the request body.
+    /// Receives response body data.
+    ///
+    /// Published request errors take precedence over buffered data; see
+    /// [`RequestStream`]'s error handling contract.
     // TODO what if called before recv_response ?
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_data(&mut self) -> Result<Option<impl Buf + use<S, B>>, StreamError> {
@@ -129,7 +138,8 @@ where
         self.handle_result(result)
     }
 
-    /// Receive request body
+    /// Polls for response body data with the same error precedence as
+    /// [`Self::recv_data`].
     pub fn poll_recv_data(
         &mut self,
         cx: &mut Context<'_>,

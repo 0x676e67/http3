@@ -177,6 +177,7 @@ impl SharedState {
 
     /// Waits until the connection is marked closing or a connection error is published.
     ///
+    /// Either local shutdown or a peer GOAWAY can mark the connection closing.
     /// Used to interrupt opening a new request while waiting for stream credit.
     /// Returns immediately when first polled if either condition is already set;
     /// callers then inspect the shared state for the reason. This does not wait

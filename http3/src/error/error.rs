@@ -115,9 +115,10 @@ pub enum StreamError {
         /// The applicable field section size limit
         max_size: u64,
     },
-    /// Received a GoAway frame from the remote
+    /// The connection is closing and cannot open a new request or server push.
     ///
-    /// Stream operations cannot be performed
+    /// Despite the name, this can follow either a peer GOAWAY or local shutdown.
+    /// Existing requests below the peer's GOAWAY boundary can still complete.
     #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     RemoteClosing,
     /// Undefined error propagated by the quic layer
