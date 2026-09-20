@@ -27,7 +27,9 @@ impl http3::quic::StopRecv for RecvStop {
 ///
 /// The mutex serializes individual read polls, stop calls, and reader teardown.
 /// It is never held across an await; a pending reader is woken after the lock is
-/// released. HTTP frame buffers and QPACK state are not stored here.
+/// released. The native stop API requires exclusive access to the receiver, so
+/// an atomic cancellation flag alone cannot replace this lock. HTTP frame
+/// buffers and QPACK state are not stored here.
 pub(crate) struct SharedRecv(Mutex<Receive>);
 
 /// Mutable receiver ownership and notification state protected by `SharedRecv`.
@@ -84,8 +86,8 @@ impl SharedRecv {
         };
         let waker = {
             let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            // Native stop owns FIN/reset/0-RTT handling and preserves the first
-            // code. Repeated calls return ClosedStream without another STOP.
+            // Native stop owns FIN/reset/0-RTT handling and repeat calls.
+            // QUIC also owns STOP_SENDING retransmission (RFC 9000, Section 3.5).
             if let Some(stream) = &mut state.stream {
                 let _ = stream.stop(code);
             }
@@ -98,17 +100,19 @@ impl SharedRecv {
         }
     }
 
-    /// Stops remaining receive work with fallback code zero and releases the
-    /// native stream without waiting for the last control handle to drop.
-    /// An earlier HTTP cancellation code is preserved by native stop idempotence.
+    /// Releases the native reader even if independent stop handles remain alive.
+    /// Native Drop stops unfinished receive work with code zero and preserves an
+    /// earlier explicit stop. A pending reader is woken after releasing the lock.
     pub(crate) fn drop_reader(&self) {
-        self.stop(0);
-        let stream = self
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .stream
-            .take();
-        drop(stream);
+        let waker = {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            // Keep native Drop serialized with stop calls. It already performs
+            // the fallback stop, so calling stop(0) first would be redundant.
+            drop(state.stream.take());
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }

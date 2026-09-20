@@ -360,3 +360,69 @@ async fn independent_receive_stop_releases_qpack_and_sends_one_cancellation() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn native_reader_drop_wakes_pending_read_and_preserves_stop_code() {
+    use http3::quic::{
+        self, BidiStream, RecvStream, RecvStreamControl, SendStream, SendStreamUnframed, StopRecv,
+    };
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (_client_ep, _server_ep, client_conn, server) = pair().await;
+        let mut transport = http3_quic::Connection::new(client_conn);
+        for explicit in [false, true] {
+            let (mut peer_send, mut peer_recv) = server.open_bi().await.unwrap();
+            peer_send.write_all(b"x").await.unwrap();
+            let stream = poll_fn(|cx| {
+                <http3_quic::Connection as quic::Connection<Bytes>>::poll_accept_bidi(
+                    &mut transport,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+            let (mut upload, mut recv) = stream.split();
+            assert_eq!(
+                poll_fn(|cx| recv.poll_data(cx)).await.unwrap().unwrap(),
+                Bytes::from_static(b"x")
+            );
+            let stop = recv.stop_handle();
+            drop(stop.clone());
+            let wakes = Arc::new(Wakes::default());
+            let task_waker = waker(wakes.clone());
+            assert!(
+                recv.poll_data(&mut Context::from_waker(&task_waker))
+                    .is_pending()
+            );
+            let code = if explicit {
+                Code::H3_MESSAGE_ERROR.value()
+            } else {
+                0
+            };
+            if explicit {
+                stop.stop_sending(code);
+                stop.stop_sending(Code::H3_INTERNAL_ERROR.value());
+            }
+            // Exercise adapter teardown directly, without the HTTP Drop guard.
+            drop(recv);
+            assert!(wakes.0.load(Ordering::SeqCst) > 0);
+            stop.stop_sending(Code::H3_REQUEST_CANCELLED.value());
+            assert_eq!(
+                peer_send.stopped().await.unwrap().unwrap().into_inner(),
+                code
+            );
+            let mut bytes = Bytes::from_static(b"upload survives");
+            while !bytes.is_empty() {
+                poll_fn(|cx| upload.poll_send(cx, &mut bytes))
+                    .await
+                    .unwrap();
+            }
+            poll_fn(|cx| upload.poll_finish(cx)).await.unwrap();
+            assert_eq!(peer_recv.read_to_end(64).await.unwrap(), b"upload survives");
+        }
+        assert!(server.close_reason().is_none());
+        server.close(0u32.into(), b"done");
+    })
+    .await
+    .unwrap();
+}

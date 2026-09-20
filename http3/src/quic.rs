@@ -275,6 +275,10 @@ pub trait RecvStreamControl: RecvStream {
 /// wake a pending reader, and preserve the first stop code across repeat calls
 /// and reader Drop. They must not reset the send direction. Codes are QUIC
 /// application error codes (at most 2^62 - 1); local stops are not peer resets.
+/// Repeated API calls are allowed; the transport owns STOP_SENDING retransmission
+/// as described in [RFC 9000, Section 3.5](https://www.rfc-editor.org/rfc/rfc9000.html#section-3.5).
+/// Preserving the first code is this trait's contract, not a wire-level limit on
+/// the number of STOP_SENDING frames.
 /// No Send/Sync or Clone bounds are imposed on single-threaded backends.
 pub trait StopRecv {
     /// Submits a local stop. Peer receipt is not guaranteed when this returns.
