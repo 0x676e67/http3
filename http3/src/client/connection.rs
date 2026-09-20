@@ -351,7 +351,7 @@ where
                 future::Either::Left(_) => {
                     return Err(state
                         .check_peer_connection_closing()
-                        .unwrap_or(StreamError::RemoteClosing));
+                        .unwrap_or(StreamError::ConnectionClosing));
                 }
                 future::Either::Right((result, _)) => result,
             }
@@ -1302,11 +1302,11 @@ mod integration_tests {
         assert_eq!(state.wakes.load(Ordering::Relaxed), 2);
         assert!(matches!(
             a.as_mut().poll(&mut cx),
-            Poll::Ready(Err(StreamError::RemoteClosing))
+            Poll::Ready(Err(StreamError::ConnectionClosing))
         ));
         assert!(matches!(
             b.as_mut().poll(&mut cx),
-            Poll::Ready(Err(StreamError::RemoteClosing))
+            Poll::Ready(Err(StreamError::ConnectionClosing))
         ));
         assert_eq!(state.opened.load(Ordering::Relaxed), 0);
 
@@ -1317,7 +1317,7 @@ mod integration_tests {
             std::pin::pin!(sender.send_request(request()))
                 .as_mut()
                 .poll(&mut cx),
-            Poll::Ready(Err(StreamError::RemoteClosing))
+            Poll::Ready(Err(StreamError::ConnectionClosing))
         ));
         assert!(!state.written.load(Ordering::Relaxed));
         assert_eq!(

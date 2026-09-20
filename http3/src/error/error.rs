@@ -117,10 +117,10 @@ pub enum StreamError {
     },
     /// The connection is closing and cannot open a new request or server push.
     ///
-    /// Despite the name, this can follow either a peer GOAWAY or local shutdown.
+    /// This can follow either a peer GOAWAY or local shutdown.
     /// Existing requests below the peer's GOAWAY boundary can still complete.
     #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
-    RemoteClosing,
+    ConnectionClosing,
     /// Undefined error propagated by the quic layer
     #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     Undefined(Box<dyn std::error::Error + Send + Sync>),
@@ -191,7 +191,7 @@ impl std::fmt::Display for StreamError {
                 actual_size, max_size
             ),
             StreamError::Undefined(err) => write!(f, "Undefined error: {}", err),
-            StreamError::RemoteClosing => write!(f, "Remote is closing the connection"),
+            StreamError::ConnectionClosing => write!(f, "Connection is closing"),
         }
     }
 }

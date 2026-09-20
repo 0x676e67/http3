@@ -156,7 +156,7 @@ pub trait CloseStream: ConnectionState {
             )));
         }
         if self.is_closing() {
-            return Some(StreamError::RemoteClosing);
+            return Some(StreamError::ConnectionClosing);
         };
         None
     }
