@@ -2133,6 +2133,15 @@ where
     }
 }
 
+impl<S, B> RequestStream<S, B> {
+    /// Abandons this handle's remaining directions after GOAWAY rejection.
+    /// Uses the same ownership state as Drop and releases QPACK at most once.
+    pub(crate) fn cancel_request(&mut self) {
+        self.decode_state.cancel_reading();
+        self.stream.cancel_remaining();
+    }
+}
+
 mod guard {
     use std::{
         ops::Deref,
@@ -2197,17 +2206,7 @@ mod guard {
 
     impl<S, B> Drop for StreamGuard<S, B> {
         fn drop(&mut self) {
-            let Some(stream) = self.inner.as_mut() else {
-                return;
-            };
-
-            if let Some(reset) = self.reset_on_drop {
-                reset(stream, Code::H3_REQUEST_CANCELLED);
-            }
-
-            if let Some(stop_sending) = self.stop_sending_on_drop {
-                stop_sending(stream, Code::H3_REQUEST_CANCELLED);
-            }
+            self.cancel_remaining();
         }
     }
 
@@ -2303,6 +2302,22 @@ mod guard {
 
         fn send_id(&self) -> quic::StreamId {
             self.deref().send_id()
+        }
+    }
+
+    impl<S, B> StreamGuard<S, B> {
+        /// Cancels only directions still owned by this handle. Taking callbacks
+        /// makes explicit rejection followed by Drop idempotent.
+        pub(super) fn cancel_remaining(&mut self) {
+            let Some(stream) = self.inner.as_mut() else {
+                return;
+            };
+            if let Some(reset) = self.reset_on_drop.take() {
+                reset(stream, Code::H3_REQUEST_CANCELLED);
+            }
+            if let Some(stop_sending) = self.stop_sending_on_drop.take() {
+                stop_sending(stream, Code::H3_REQUEST_CANCELLED);
+            }
         }
     }
 }
