@@ -136,6 +136,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(release-plz)* verify publishable crates before publishing
 
 ## [unreleased]
+## [0.2.0](https://github.com/0x676e67/http3/compare/v0.1.1..v0.2.0) - 2026-09-20
+
+### Features
+
+- *(quic)* [**breaking**] Add SendStream::poll_stopped - ([eb622d3](https://github.com/0x676e67/http3/commit/eb622d30c7afd922f5a76f38b7eb041407219654))
+
+## [0.2.0](https://github.com/0x676e67/http3/compare/v0.1.1..v0.2.0) - 2026-09-20
+
+## [0.2.0](https://github.com/0x676e67/http3/compare/v0.1.1..v0.2.0) - 2026-09-20
+
+### Features
+
+- *(quic)* [**breaking**] Add SendStream::poll_stopped - ([eb622d3](https://github.com/0x676e67/http3/commit/eb622d30c7afd922f5a76f38b7eb041407219654))
+
+### Bug Fixes
+
+- *(qpack)* Preserve absolute Base after dynamic table eviction ([#104](https://github.com/0x676e67/http3/issues/104)) - ([087a340](https://github.com/0x676e67/http3/commit/087a3404c80e31dac4616a0fb1c8a424ffa51b60))
+- Simplify frame polling and address review feedback - ([3c80fa6](https://github.com/0x676e67/http3/commit/3c80fa615e9831425cad773754f56964c49b2def))
+
+### Refactor
+
+- *(error)* [**breaking**] Rename RemoteClosing to ConnectionClosing - ([7df8ad7](https://github.com/0x676e67/http3/commit/7df8ad7941b784a7d046386a0e066bf1373f336f))
+
+### Documentation
+
+- *(client)* Clarify closing and buffered receive errors - ([8b9f34d](https://github.com/0x676e67/http3/commit/8b9f34d7e1f1ff5358d1b1fa6d72a78c14f1ad7c))
+
 
 ### 🚀 Features
 
