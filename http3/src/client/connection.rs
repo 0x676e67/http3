@@ -734,12 +734,14 @@ mod integration_tests {
             }
             Poll::Ready(Ok(self.clone()))
         }
+
         fn poll_open_send(
             &mut self,
             _: &mut Context<'_>,
         ) -> Poll<Result<Self, StreamErrorIncoming>> {
             unreachable!()
         }
+
         fn close(&mut self, _: Code, _: &[u8]) {}
     }
 
@@ -751,10 +753,12 @@ mod integration_tests {
                 Poll::Ready(Ok(()))
             }
         }
+
         fn send_data<D: Into<WriteBuf<Bytes>>>(&mut self, _: D) -> Result<(), StreamErrorIncoming> {
             self.0.written.store(true, Ordering::Relaxed);
             Ok(())
         }
+
         fn poll_finish(&mut self, _: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
             if self.0.block_finish.load(Ordering::Relaxed) {
                 Poll::Pending
@@ -762,16 +766,19 @@ mod integration_tests {
                 Poll::Ready(Ok(()))
             }
         }
+
         fn poll_stopped(
             &mut self,
             _: &mut Context<'_>,
         ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
             Poll::Pending
         }
+
         fn reset(&mut self, code: u64) {
             self.0.reset.store(code, Ordering::Relaxed);
             self.0.reset_calls.fetch_add(1, Ordering::Relaxed);
         }
+
         fn send_id(&self) -> StreamId {
             StreamId::try_from(0).unwrap()
         }
