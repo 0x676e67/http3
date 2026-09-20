@@ -683,7 +683,7 @@ impl<S: quic::SendStream<B> + quic::RecvStream, B: Buf> Drop for OpeningStream<'
 #[cfg(test)]
 mod integration_tests {
     use std::{
-        future::Future,
+        future::{Future, poll_fn},
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
     };
 
@@ -761,6 +761,12 @@ mod integration_tests {
             } else {
                 Poll::Ready(Ok(()))
             }
+        }
+        fn poll_stopped(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+            Poll::Pending
         }
         fn reset(&mut self, code: u64) {
             self.0.reset.store(code, Ordering::Relaxed);
@@ -849,6 +855,7 @@ mod integration_tests {
                 3 => stream.send_data(Bytes::from_static(b"body")).await,
                 4 => stream.send_trailers(http::HeaderMap::new()).await,
                 5 => stream.finish().await,
+                6 => poll_fn(|cx| stream.poll_stopped(cx)).await.map(|_| ()),
                 _ => unreachable!(),
             }
         })
@@ -871,7 +878,7 @@ mod integration_tests {
     #[test]
     fn goaway_wakes_returned_request_operations_and_cancels_directions() {
         for terminal_error in [false, true] {
-            for operation in 0..6 {
+            for operation in 0..7 {
                 let state = Arc::new(State::default());
                 let mut sender = sender(&state, false);
                 let mut stream = returned(&mut sender);
@@ -921,7 +928,7 @@ mod integration_tests {
 
     #[test]
     fn goaway_wakes_both_split_halves_independently() {
-        for send_operation in 3..6 {
+        for send_operation in 3..7 {
             for recv_operation in 0..3 {
                 let state = Arc::new(State::default());
                 let mut sender = sender(&state, false);

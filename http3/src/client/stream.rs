@@ -336,6 +336,21 @@ where
         let result = self.rejection.run(self.inner.finish()).await;
         self.handle_result(result)
     }
+
+    /// Polls for the server stopping or acknowledging the request's send direction.
+    ///
+    /// Resolves to `Some(code)` after `STOP_SENDING` and to `None` once the whole
+    /// upload, including the FIN sent by [`finish()`](Self::finish), is acknowledged.
+    /// Polling never changes the stream's state, so this works before and after
+    /// `finish()` and on a split send half. A GOAWAY excluding this request is
+    /// reported as [`StreamError::GoawayRejected`], like any other operation.
+    pub fn poll_stopped(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Code>, StreamError>> {
+        let result = self.rejection.poll(cx, |cx| self.inner.poll_stopped(cx));
+        result.map(|result| self.handle_result(result))
+    }
 }
 
 impl<S, B> RequestStream<S, B>

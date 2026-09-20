@@ -641,6 +641,13 @@ where
         self.stream.poll_finish(cx)
     }
 
+    fn poll_stopped(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        self.stream.poll_stopped(cx)
+    }
+
     fn reset(&mut self, reset_code: u64) {
         self.stream.reset(reset_code)
     }
