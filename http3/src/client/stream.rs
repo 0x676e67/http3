@@ -401,7 +401,8 @@ where
 }
 
 // A poll API must retain its waiter across calls. Recreating and dropping a
-// Notified on each Pending would lose the connection driver's wakeup.
+// Notified on each Pending would lose the connection driver's wakeup. The
+// allocation outlives individual operations; only its registration is reset.
 struct RequestRejection {
     state: Arc<SharedState>,
     stream_id: StreamId,
@@ -423,12 +424,12 @@ impl RequestRejection {
         operation: impl FnOnce(&mut Context<'_>) -> Poll<Result<T, StreamError>>,
     ) -> Poll<Result<T, StreamError>> {
         if let Some(error) = self.state.request_error(self.stream_id) {
-            self.notified = None;
+            self.disarm();
             return Poll::Ready(Err(error));
         }
         let result = operation(cx);
         if result.is_ready() {
-            self.notified = None;
+            self.disarm();
             return result;
         }
         loop {
@@ -439,12 +440,19 @@ impl RequestRejection {
             // Register before rechecking: GOAWAY can arrive during operation's
             // poll or while the notification is being installed.
             if let Some(error) = self.state.request_error(self.stream_id) {
-                self.notified = None;
+                notified.set(self.state.notified());
                 return Poll::Ready(Err(error));
             }
             if changed.is_pending() {
                 return Poll::Pending;
             }
+            notified.set(self.state.notified());
+        }
+    }
+
+    /// Unregisters the waiter but keeps its allocation for the next operation.
+    fn disarm(&mut self) {
+        if let Some(notified) = self.notified.as_mut() {
             notified.set(self.state.notified());
         }
     }
@@ -464,7 +472,7 @@ struct RejectionWait<'a>(&'a mut RequestRejection);
 
 impl Drop for RejectionWait<'_> {
     fn drop(&mut self) {
-        self.0.notified = None;
+        self.0.disarm();
     }
 }
 
