@@ -67,3 +67,7 @@ tracing-tree = "0.4"
 opt-level = 3
 codegen-units = 1
 incremental = false
+
+# Unreleased quic: poll-based stream, datagram and stopped APIs.
+[patch.crates-io]
+quic = { git = "https://github.com/0x676e67/quic", rev = "cf8da36d6265dcb5daf221c20a1114876a3882c2" }

@@ -5,14 +5,12 @@
 
 use std::{
     convert::TryInto,
-    future::Future,
     pin::Pin,
     sync::Arc,
     task::{self, Poll, ready},
 };
 
 use bytes::{Buf, Bytes};
-use futures_util::{Stream, StreamExt, stream};
 use http3::{
     error::Code,
     quic::{ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf},
@@ -25,38 +23,17 @@ use tracing::instrument;
 #[cfg(feature = "datagram")]
 pub mod datagram;
 
-/// Boxed stream retaining the backend's `Send + Sync` guarantees.
-type BoxStreamSync<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + Sync + 'a>>;
-
-/// Boxed [`quic::SendStream::stopped`] future, created by the first `poll_stopped`.
-type Stopped =
-    Pin<Box<dyn Future<Output = Result<Option<VarInt>, quic::StoppedError>> + Send + Sync>>;
-
 /// An HTTP/3 transport backed by a QUIC connection.
 ///
 /// Implements [`http3::quic::Connection`] backed by a [`quic::Connection`].
 pub struct Connection {
     conn: quic::Connection,
-    incoming_bi: BoxStreamSync<'static, <AcceptBi<'static> as Future>::Output>,
-    opening_bi: Option<BoxStreamSync<'static, <OpenBi<'static> as Future>::Output>>,
-    incoming_uni: BoxStreamSync<'static, <AcceptUni<'static> as Future>::Output>,
-    opening_uni: Option<BoxStreamSync<'static, <OpenUni<'static> as Future>::Output>>,
 }
 
 impl Connection {
     /// Create a [`Connection`] from a [`quic::Connection`]
     pub fn new(conn: quic::Connection) -> Self {
-        Self {
-            conn: conn.clone(),
-            incoming_bi: Box::pin(stream::unfold(conn.clone(), |conn| async {
-                Some((conn.accept_bi().await, conn))
-            })),
-            opening_bi: None,
-            incoming_uni: Box::pin(stream::unfold(conn.clone(), |conn| async {
-                Some((conn.accept_uni().await, conn))
-            })),
-            opening_uni: None,
-        }
+        Self { conn }
     }
 }
 
@@ -72,9 +49,8 @@ where
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
-        let (send, recv) = ready!(self.incoming_bi.poll_next_unpin(cx))
-            .expect("self.incoming_bi BoxStream never returns None")
-            .map_err(convert_connection_error)?;
+        let (send, recv) =
+            ready!(self.conn.poll_accept_bi(cx)).map_err(convert_connection_error)?;
         Poll::Ready(Ok(Self::BidiStream {
             send: Self::SendStream::new(send),
             recv: Self::RecvStream::new(recv),
@@ -86,18 +62,20 @@ where
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Self::RecvStream, ConnectionErrorIncoming>> {
-        let recv = ready!(self.incoming_uni.poll_next_unpin(cx))
-            .expect("self.incoming_uni BoxStream never returns None")
-            .map_err(convert_connection_error)?;
+        let recv = ready!(self.conn.poll_accept_uni(cx)).map_err(convert_connection_error)?;
         Poll::Ready(Ok(Self::RecvStream::new(recv)))
     }
 
     fn opener(&self) -> Self::OpenStreams {
         OpenStreams {
             conn: self.conn.clone(),
-            opening_bi: None,
-            opening_uni: None,
         }
+    }
+}
+
+fn convert_connection_error_to_stream_error(error: quic::ConnectionError) -> StreamErrorIncoming {
+    StreamErrorIncoming::ConnectionErrorIncoming {
+        connection_error: convert_connection_error(error),
     }
 }
 
@@ -133,16 +111,8 @@ where
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
-        let bi = self.opening_bi.get_or_insert_with(|| {
-            Box::pin(stream::unfold(self.conn.clone(), |conn| async {
-                Some((conn.open_bi().await, conn))
-            }))
-        });
-        let (send, recv) = ready!(bi.poll_next_unpin(cx))
-            .expect("BoxStream does not return None")
-            .map_err(|e| StreamErrorIncoming::ConnectionErrorIncoming {
-                connection_error: convert_connection_error(e),
-            })?;
+        let (send, recv) =
+            ready!(self.conn.poll_open_bi(cx)).map_err(convert_connection_error_to_stream_error)?;
         Poll::Ready(Ok(Self::BidiStream {
             send: Self::SendStream::new(send),
             recv: RecvStream::new(recv),
@@ -154,17 +124,8 @@ where
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Self::SendStream, StreamErrorIncoming>> {
-        let uni = self.opening_uni.get_or_insert_with(|| {
-            Box::pin(stream::unfold(self.conn.clone(), |conn| async {
-                Some((conn.open_uni().await, conn))
-            }))
-        });
-
-        let send = ready!(uni.poll_next_unpin(cx))
-            .expect("BoxStream does not return None")
-            .map_err(|e| StreamErrorIncoming::ConnectionErrorIncoming {
-                connection_error: convert_connection_error(e),
-            })?;
+        let send = ready!(self.conn.poll_open_uni(cx))
+            .map_err(convert_connection_error_to_stream_error)?;
         Poll::Ready(Ok(Self::SendStream::new(send)))
     }
 
@@ -179,12 +140,10 @@ where
 
 /// Stream opener backed by a QUIC connection
 ///
-/// Implements [`http3::quic::OpenStreams`] using [`quic::Connection`],
-/// [`quic::OpenBi`], [`quic::OpenUni`].
+/// Implements [`http3::quic::OpenStreams`] using [`quic::Connection`].
+#[derive(Clone)]
 pub struct OpenStreams {
     conn: quic::Connection,
-    opening_bi: Option<BoxStreamSync<'static, <OpenBi<'static> as Future>::Output>>,
-    opening_uni: Option<BoxStreamSync<'static, <OpenUni<'static> as Future>::Output>>,
 }
 
 impl<B> http3::quic::OpenStreams<B> for OpenStreams
@@ -199,17 +158,8 @@ where
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
-        let bi = self.opening_bi.get_or_insert_with(|| {
-            Box::pin(stream::unfold(self.conn.clone(), |conn| async {
-                Some((conn.open_bi().await, conn))
-            }))
-        });
-
-        let (send, recv) = ready!(bi.poll_next_unpin(cx))
-            .expect("BoxStream does not return None")
-            .map_err(|e| StreamErrorIncoming::ConnectionErrorIncoming {
-                connection_error: convert_connection_error(e),
-            })?;
+        let (send, recv) =
+            ready!(self.conn.poll_open_bi(cx)).map_err(convert_connection_error_to_stream_error)?;
         Poll::Ready(Ok(Self::BidiStream {
             send: Self::SendStream::new(send),
             recv: RecvStream::new(recv),
@@ -221,17 +171,8 @@ where
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Self::SendStream, StreamErrorIncoming>> {
-        let uni = self.opening_uni.get_or_insert_with(|| {
-            Box::pin(stream::unfold(self.conn.clone(), |conn| async {
-                Some((conn.open_uni().await, conn))
-            }))
-        });
-
-        let send = ready!(uni.poll_next_unpin(cx))
-            .expect("BoxStream does not return None")
-            .map_err(|e| StreamErrorIncoming::ConnectionErrorIncoming {
-                connection_error: convert_connection_error(e),
-            })?;
+        let send = ready!(self.conn.poll_open_uni(cx))
+            .map_err(convert_connection_error_to_stream_error)?;
         Poll::Ready(Ok(Self::SendStream::new(send)))
     }
 
@@ -241,16 +182,6 @@ where
             VarInt::from_u64(code.value()).expect("error code VarInt"),
             reason,
         );
-    }
-}
-
-impl Clone for OpenStreams {
-    fn clone(&self) -> Self {
-        Self {
-            conn: self.conn.clone(),
-            opening_bi: None,
-            opening_uni: None,
-        }
     }
 }
 
@@ -455,7 +386,6 @@ fn convert_stopped_error_to_stream_error(error: quic::StoppedError) -> StreamErr
 pub struct SendStream<B: Buf> {
     stream: quic::SendStream,
     writing: Option<WriteBuf<B>>,
-    stopped: Option<Stopped>,
 }
 
 impl<B> SendStream<B>
@@ -466,7 +396,6 @@ where
         Self {
             stream,
             writing: None,
-            stopped: None,
         }
     }
 }
@@ -507,13 +436,8 @@ where
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
-        let stopped = self
-            .stopped
-            .get_or_insert_with(|| Box::pin(self.stream.stopped()));
-        let result = ready!(stopped.as_mut().poll(cx));
-        self.stopped = None;
         Poll::Ready(
-            result
+            ready!(self.stream.poll_stopped(cx))
                 .map(|code| code.map(VarInt::into_inner))
                 .map_err(convert_stopped_error_to_stream_error),
         )

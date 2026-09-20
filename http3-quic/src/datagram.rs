@@ -2,21 +2,15 @@
 //!
 //! This module implements the traits defined in http3-datagram.
 
-use std::{
-    future::Future,
-    task::{Poll, ready},
-};
-
 use bytes::{Buf, Bytes};
-use futures_util::{StreamExt, stream};
 use http3_datagram::{
     ConnectionErrorIncoming,
     datagram::EncodedDatagram,
     quic_traits::{DatagramConnectionExt, RecvDatagram, SendDatagram, SendDatagramErrorIncoming},
 };
 
-use super::quic::{ReadDatagram, SendDatagramError};
-use crate::{BoxStreamSync, Connection, convert_connection_error};
+use super::quic::SendDatagramError;
+use crate::{Connection, convert_connection_error};
 
 /// A Struct which allows to send datagrams over a QUIC connection.
 pub struct SendDatagramHandler {
@@ -37,7 +31,7 @@ impl<B: Buf> SendDatagram<B> for SendDatagramHandler {
 
 /// A Struct which allows to receive datagrams over a QUIC connection.
 pub struct RecvDatagramHandler {
-    datagrams: BoxStreamSync<'static, <ReadDatagram<'static> as Future>::Output>,
+    conn: super::quic::Connection,
 }
 
 impl RecvDatagram for RecvDatagramHandler {
@@ -46,11 +40,9 @@ impl RecvDatagram for RecvDatagramHandler {
         &mut self,
         cx: &mut core::task::Context<'_>,
     ) -> std::task::Poll<Result<Self::Buffer, ConnectionErrorIncoming>> {
-        Poll::Ready(
-            ready!(self.datagrams.poll_next_unpin(cx))
-                .expect("self. datagrams never returns None")
-                .map_err(convert_connection_error),
-        )
+        self.conn
+            .poll_read_datagram(cx)
+            .map_err(convert_connection_error)
     }
 }
 
@@ -66,9 +58,7 @@ impl<B: Buf> DatagramConnectionExt<B> for Connection {
 
     fn recv_datagram_handler(&self) -> Self::RecvDatagramHandler {
         RecvDatagramHandler {
-            datagrams: Box::pin(stream::unfold(self.conn.clone(), |conn| async {
-                Some((conn.read_datagram().await, conn))
-            })),
+            conn: self.conn.clone(),
         }
     }
 }
