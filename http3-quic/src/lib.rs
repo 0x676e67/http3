@@ -28,6 +28,9 @@ use tracing::instrument;
 #[cfg(feature = "datagram")]
 pub mod datagram;
 
+mod recv_control;
+pub use recv_control::RecvStop;
+
 /// BoxStream with Sync trait
 type BoxStreamSync<'a, T> = Pin<Box<dyn Stream<Item = T> + Sync + Send + 'a>>;
 
@@ -346,14 +349,24 @@ where
 ///
 /// Implements [`http3::quic::RecvStream`] backed by a [`quic::RecvStream`].
 pub struct RecvStream {
-    stream: quic::RecvStream,
+    stream: Option<quic::RecvStream>,
+    control: Option<Arc<recv_control::SharedRecv>>,
+    waiter: Option<task::Waker>,
+    id: quic::StreamId,
     is_0rtt: bool,
 }
 
 impl RecvStream {
     fn new(stream: quic::RecvStream) -> Self {
         let is_0rtt = stream.is_0rtt();
-        Self { stream, is_0rtt }
+        let id = stream.id();
+        Self {
+            stream: Some(stream),
+            control: None,
+            waiter: None,
+            id,
+            is_0rtt,
+        }
     }
 }
 
@@ -365,8 +378,16 @@ impl http3::quic::RecvStream for RecvStream {
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
-        let mut read_chunk = std::pin::pin!(self.stream.read_chunk(usize::MAX, true));
-        let chunk = ready!(read_chunk.as_mut().poll(cx));
+        if let Some(control) = &self.control {
+            return control.poll_data(cx);
+        }
+        let Some(stream) = &mut self.stream else {
+            return Poll::Ready(Ok(None));
+        };
+        let mut read_chunk = std::pin::pin!(stream.read_chunk(usize::MAX, true));
+        let chunk = read_chunk.as_mut().poll(cx);
+        self.waiter = chunk.is_pending().then(|| cx.waker().clone());
+        let chunk = ready!(chunk);
         Poll::Ready(Ok(chunk
             .map_err(convert_read_error_to_stream_error)?
             .map(|c| c.bytes)))
@@ -374,13 +395,19 @@ impl http3::quic::RecvStream for RecvStream {
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn stop_sending(&mut self, error_code: u64) {
+        if let Some(control) = &self.control {
+            control.stop(error_code);
+            return;
+        }
         let error_code = VarInt::from_u64(error_code).expect("invalid error_code");
-        let _ = self.stream.stop(error_code);
+        if let Some(stream) = &mut self.stream {
+            let _ = stream.stop(error_code);
+        }
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn recv_id(&self) -> StreamId {
-        let num: u64 = self.stream.id().into();
+        let num: u64 = self.id.into();
 
         num.try_into().expect("invalid stream id")
     }
@@ -393,6 +420,36 @@ impl http3::quic::Is0rtt for RecvStream {
     /// level. Because read data is subject to replay attacks.
     fn is_0rtt(&self) -> bool {
         self.is_0rtt
+    }
+}
+
+impl http3::quic::RecvStreamControl for RecvStream {
+    type Stop = RecvStop;
+
+    fn stop_handle(&mut self) -> Self::Stop {
+        let control = self.control.get_or_insert_with(|| {
+            Arc::new(recv_control::SharedRecv::new(
+                self.stream.take(),
+                self.waiter.take(),
+            ))
+        });
+        RecvStop(control.clone())
+    }
+}
+
+impl<B: Buf> http3::quic::RecvStreamControl for BidiStream<B> {
+    type Stop = RecvStop;
+
+    fn stop_handle(&mut self) -> Self::Stop {
+        self.recv.stop_handle()
+    }
+}
+
+impl Drop for RecvStream {
+    fn drop(&mut self) {
+        if let Some(control) = &self.control {
+            control.drop_reader();
+        }
     }
 }
 
