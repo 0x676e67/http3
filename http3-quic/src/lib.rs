@@ -12,11 +12,7 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
-use futures_util::{
-    StreamExt,
-    future::BoxFuture,
-    stream::{self, BoxStream},
-};
+use futures_util::{Stream, StreamExt, stream};
 use http3::{
     error::Code,
     quic::{ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf},
@@ -29,18 +25,22 @@ use tracing::instrument;
 #[cfg(feature = "datagram")]
 pub mod datagram;
 
+/// Boxed stream retaining the backend's `Send + Sync` guarantees.
+type BoxStreamSync<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + Sync + 'a>>;
+
 /// Boxed [`quic::SendStream::stopped`] future, created by the first `poll_stopped`.
-type Stopped = BoxFuture<'static, Result<Option<VarInt>, quic::StoppedError>>;
+type Stopped =
+    Pin<Box<dyn Future<Output = Result<Option<VarInt>, quic::StoppedError>> + Send + Sync>>;
 
 /// An HTTP/3 transport backed by a QUIC connection.
 ///
 /// Implements [`http3::quic::Connection`] backed by a [`quic::Connection`].
 pub struct Connection {
     conn: quic::Connection,
-    incoming_bi: BoxStream<'static, <AcceptBi<'static> as Future>::Output>,
-    opening_bi: Option<BoxStream<'static, <OpenBi<'static> as Future>::Output>>,
-    incoming_uni: BoxStream<'static, <AcceptUni<'static> as Future>::Output>,
-    opening_uni: Option<BoxStream<'static, <OpenUni<'static> as Future>::Output>>,
+    incoming_bi: BoxStreamSync<'static, <AcceptBi<'static> as Future>::Output>,
+    opening_bi: Option<BoxStreamSync<'static, <OpenBi<'static> as Future>::Output>>,
+    incoming_uni: BoxStreamSync<'static, <AcceptUni<'static> as Future>::Output>,
+    opening_uni: Option<BoxStreamSync<'static, <OpenUni<'static> as Future>::Output>>,
 }
 
 impl Connection {
@@ -183,8 +183,8 @@ where
 /// [`quic::OpenBi`], [`quic::OpenUni`].
 pub struct OpenStreams {
     conn: quic::Connection,
-    opening_bi: Option<BoxStream<'static, <OpenBi<'static> as Future>::Output>>,
-    opening_uni: Option<BoxStream<'static, <OpenUni<'static> as Future>::Output>>,
+    opening_bi: Option<BoxStreamSync<'static, <OpenBi<'static> as Future>::Output>>,
+    opening_uni: Option<BoxStreamSync<'static, <OpenUni<'static> as Future>::Output>>,
 }
 
 impl<B> http3::quic::OpenStreams<B> for OpenStreams

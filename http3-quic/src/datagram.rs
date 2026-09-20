@@ -8,10 +8,7 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
-use futures_util::{
-    StreamExt,
-    stream::{self, BoxStream},
-};
+use futures_util::{StreamExt, stream};
 use http3_datagram::{
     ConnectionErrorIncoming,
     datagram::EncodedDatagram,
@@ -19,7 +16,7 @@ use http3_datagram::{
 };
 
 use super::quic::{ReadDatagram, SendDatagramError};
-use crate::{Connection, convert_connection_error};
+use crate::{BoxStreamSync, Connection, convert_connection_error};
 
 /// A Struct which allows to send datagrams over a QUIC connection.
 pub struct SendDatagramHandler {
@@ -40,7 +37,7 @@ impl<B: Buf> SendDatagram<B> for SendDatagramHandler {
 
 /// A Struct which allows to receive datagrams over a QUIC connection.
 pub struct RecvDatagramHandler {
-    datagrams: BoxStream<'static, <ReadDatagram<'static> as Future>::Output>,
+    datagrams: BoxStreamSync<'static, <ReadDatagram<'static> as Future>::Output>,
 }
 
 impl RecvDatagram for RecvDatagramHandler {
