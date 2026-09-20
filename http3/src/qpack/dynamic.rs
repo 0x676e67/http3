@@ -378,7 +378,7 @@ impl DynamicTable {
             || self.track_blocks.len() < MAX_TRACKED_STREAMS;
 
         DynamicTableEncoder {
-            base: self.vas.largest_ref(),
+            base: self.vas.total_inserted(),
             table: self,
             block_refs: HashMap::new(),
             committed: false,
