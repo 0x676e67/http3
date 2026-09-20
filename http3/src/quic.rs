@@ -257,3 +257,26 @@ pub trait Is0rtt {
     /// `false` otherwise.
     fn is_0rtt(&self) -> bool;
 }
+
+/// Optional independent control of a stream's receive direction.
+/// Existing [`RecvStream`] implementations need not implement this capability.
+pub trait RecvStreamControl: RecvStream {
+    /// Handle that stops receiving without borrowing the reader.
+    type Stop: StopRecv;
+
+    /// Creates a stop handle, optionally allocating shared receive state.
+    /// Dropping a handle must not stop the stream. It must remain valid across split.
+    fn stop_handle(&mut self) -> Self::Stop;
+}
+
+/// Stops a receive direction independently of its reader.
+///
+/// Implementations must submit STOP_SENDING without requiring another read poll,
+/// wake a pending reader, and preserve the first stop code across repeat calls
+/// and reader Drop. They must not reset the send direction. Codes are QUIC
+/// application error codes (at most 2^62 - 1); local stops are not peer resets.
+/// No Send/Sync or Clone bounds are imposed on single-threaded backends.
+pub trait StopRecv {
+    /// Submits a local stop. Peer receipt is not guaranteed when this returns.
+    fn stop_sending(&self, code: u64);
+}

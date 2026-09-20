@@ -13,7 +13,10 @@ use quic::StreamId;
 use tracing::instrument;
 
 use crate::{
-    connection::{self},
+    connection::{
+        recv_control::ReceiveState,
+        {self},
+    },
     error::{
         Code, StreamError, connection_error_creators::CloseStream,
         internal_error::InternalConnectionError,
@@ -90,6 +93,8 @@ use crate::{
 pub struct RequestStream<S, B> {
     pub(super) inner: connection::RequestStream<S, B>,
     rejection: RequestRejection,
+    recv_control: Option<Arc<ReceiveState>>,
+    recv_waiter: Option<std::task::Waker>,
 }
 
 impl<S, B> ConnectionState for RequestStream<S, B> {
@@ -113,7 +118,10 @@ where
     pub async fn recv_response(&mut self) -> Result<Response<()>, StreamError> {
         let result = self
             .rejection
-            .run(Self::recv_response_inner(&mut self.inner))
+            .run(
+                self.recv_control.as_deref(),
+                Self::recv_response_inner(&mut self.inner),
+            )
             .await;
         self.handle_result(result)
     }
@@ -124,7 +132,10 @@ where
     pub async fn recv_data(&mut self) -> Result<Option<impl Buf + use<S, B>>, StreamError> {
         let result = self
             .rejection
-            .run(poll_fn(|cx| self.inner.poll_recv_data(cx)))
+            .run(
+                self.recv_control.as_deref(),
+                poll_fn(|cx| self.inner.poll_recv_data(cx)),
+            )
             .await;
         self.handle_result(result)
     }
@@ -134,7 +145,11 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
-        let result = self.rejection.poll(cx, |cx| self.inner.poll_recv_data(cx));
+        let result = self.rejection.poll(cx, self.recv_control.as_deref(), |cx| {
+            self.inner.poll_recv_data(cx)
+        });
+        self.recv_waiter =
+            (self.recv_control.is_none() && result.is_pending()).then(|| cx.waker().clone());
         result.map(|result| self.handle_result(result))
     }
 
@@ -143,7 +158,10 @@ where
     pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, StreamError> {
         let result = self
             .rejection
-            .run(poll_fn(|cx| self.inner.poll_recv_trailers(cx)))
+            .run(
+                self.recv_control.as_deref(),
+                poll_fn(|cx| self.inner.poll_recv_trailers(cx)),
+            )
             .await;
         if let Err(StreamError::HeaderTooBig { .. }) = &result {
             self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
@@ -157,9 +175,11 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
-        let res = self
-            .rejection
-            .poll(cx, |cx| self.inner.poll_recv_trailers(cx));
+        let res = self.rejection.poll(cx, self.recv_control.as_deref(), |cx| {
+            self.inner.poll_recv_trailers(cx)
+        });
+        self.recv_waiter =
+            (self.recv_control.is_none() && res.is_pending()).then(|| cx.waker().clone());
         if let Poll::Ready(Err(StreamError::HeaderTooBig { .. })) = &res {
             self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
         }
@@ -287,7 +307,7 @@ where
     /// Send some data on the request body.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_data(&mut self, buf: B) -> Result<(), StreamError> {
-        let result = self.rejection.run(self.inner.send_data(buf)).await;
+        let result = self.rejection.run(None, self.inner.send_data(buf)).await;
         self.handle_result(result)
     }
 
@@ -308,7 +328,10 @@ where
     /// [`RequestStream::finish()`] must be called to finalize a request.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
-        let result = self.rejection.run(self.inner.send_trailers(trailers)).await;
+        let result = self
+            .rejection
+            .run(None, self.inner.send_trailers(trailers))
+            .await;
         self.handle_result(result)
     }
 
@@ -323,7 +346,7 @@ where
     /// See [RFC 9114, Section 4.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1).
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn finish(&mut self) -> Result<(), StreamError> {
-        let result = self.rejection.run(self.inner.finish()).await;
+        let result = self.rejection.run(None, self.inner.finish()).await;
         self.handle_result(result)
     }
 }
@@ -348,6 +371,8 @@ where
         let Self {
             inner,
             mut rejection,
+            recv_control,
+            recv_waiter,
         } = self;
         rejection.notified = None;
         let (send, recv) = inner.split();
@@ -355,10 +380,14 @@ where
             RequestStream {
                 inner: send,
                 rejection: RequestRejection::new(rejection.state.clone(), rejection.stream_id),
+                recv_control: None,
+                recv_waiter: None,
             },
             RequestStream {
                 inner: recv,
                 rejection,
+                recv_control,
+                recv_waiter,
             },
         )
     }
@@ -371,7 +400,12 @@ where
 {
     pub(super) fn new(inner: connection::RequestStream<S, B>) -> Self {
         let rejection = RequestRejection::new(inner.conn_state.clone(), inner.stream.id());
-        Self { inner, rejection }
+        Self {
+            inner,
+            rejection,
+            recv_control: None,
+            recv_waiter: None,
+        }
     }
 }
 
@@ -395,13 +429,14 @@ impl RequestRejection {
     fn poll<T>(
         &mut self,
         cx: &mut Context<'_>,
+        receive: Option<&ReceiveState>,
         operation: impl FnOnce(&mut Context<'_>) -> Poll<Result<T, StreamError>>,
     ) -> Poll<Result<T, StreamError>> {
         if let Some(error) = self.state.request_error(self.stream_id) {
             self.notified = None;
             return Poll::Ready(Err(error));
         }
-        let result = operation(cx);
+        let result = ReceiveState::poll(receive, cx, operation);
         if result.is_ready() {
             self.notified = None;
             return result;
@@ -426,20 +461,24 @@ impl RequestRejection {
 
     async fn run<T>(
         &mut self,
+        receive: Option<&ReceiveState>,
         operation: impl Future<Output = Result<T, StreamError>>,
     ) -> Result<T, StreamError> {
         let mut operation = std::pin::pin!(operation);
-        let waiter = RejectionWait(self);
-        poll_fn(|cx| waiter.0.poll(cx, |cx| operation.as_mut().poll(cx))).await
+        let waiter = RejectionWait(self, receive);
+        poll_fn(|cx| waiter.0.poll(cx, receive, |cx| operation.as_mut().poll(cx))).await
     }
 }
 
 // Canceling an async operation unregisters its task even if the stream is kept.
-struct RejectionWait<'a>(&'a mut RequestRejection);
+struct RejectionWait<'a>(&'a mut RequestRejection, Option<&'a ReceiveState>);
 
 impl Drop for RejectionWait<'_> {
     fn drop(&mut self) {
         self.0.notified = None;
+        if let Some(receive) = self.1 {
+            receive.clear_waiter();
+        }
     }
 }
 
@@ -451,5 +490,23 @@ impl<S, B> RequestStream<S, B> {
             self.inner.cancel_request();
         }
         result
+    }
+}
+
+impl<S: quic::RecvStreamControl, B> RequestStream<S, B> {
+    /// Creates independent control of this request's receive direction.
+    ///
+    /// The first call allocates shared cancellation/QPACK metadata; the backend
+    /// may also allocate or add synchronization to its receive path. Existing
+    /// callers and backends that do not use this optional capability are unchanged.
+    /// The handle remains valid after split. It never resets the upload direction.
+    /// See [`super::RecvControl`] for completion, cancellation, and buffer lifetimes.
+    pub fn recv_control(&mut self) -> super::RecvControl<S::Stop> {
+        let control = self.inner.recv_control();
+        if let Some(waker) = self.recv_waiter.take() {
+            control.state.register(&waker);
+        }
+        self.recv_control = Some(control.state.clone());
+        control
     }
 }

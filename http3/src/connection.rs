@@ -9,6 +9,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{future, ready};
 use guard::StreamGuard;
 use http::HeaderMap;
+use recv_control::{QpackReceive, ReceiveState};
 use stream::WriteBuf;
 use tokio::sync::mpsc;
 #[cfg(feature = "tracing")]
@@ -1489,6 +1490,7 @@ pub(crate) struct DecoderGuard {
     blocked: Option<usize>,
     decoder: QpackDecoder,
     prefix: Option<qpack::FieldSectionPrefix>,
+    control: Option<Arc<ReceiveState>>,
 }
 
 impl DecoderGuard {
@@ -1499,6 +1501,9 @@ impl DecoderGuard {
     ///
     /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
     fn block(&mut self, required_ref: usize, waker: &Waker) -> Result<(), qpack::DecoderError> {
+        if let Some(control) = &self.control {
+            return control.block(required_ref, waker);
+        }
         if self.blocked.is_some_and(|blocked| blocked != required_ref) {
             self.unblock();
         }
@@ -1516,6 +1521,10 @@ impl DecoderGuard {
     ///
     /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
     fn unblock(&mut self) {
+        if let Some(control) = &self.control {
+            control.unblock();
+            return;
+        }
         if let Some(required_ref) = self.blocked.take() {
             self.decoder
                 .release_blocked_stream(self.stream_id, required_ref);
@@ -1529,6 +1538,9 @@ impl DecoderGuard {
     ///
     /// See [RFC 9204, Section 4.4.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1).
     fn acknowledge(&mut self, dyn_ref: bool) -> Result<(), qpack::DecoderError> {
+        if let Some(control) = &self.control {
+            return control.acknowledge(dyn_ref);
+        }
         if dyn_ref {
             self.decoder.queue_section_acknowledgment(self.stream_id)?;
             self.shared.waker().wake();
@@ -1543,6 +1555,10 @@ impl DecoderGuard {
     ///
     /// See [RFC 9204, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
     fn finish_reading(&mut self) {
+        if let Some(control) = &self.control {
+            control.finish_qpack();
+            return;
+        }
         self.unblock();
         self.cancel_on_drop = false;
     }
@@ -1554,6 +1570,10 @@ impl DecoderGuard {
     ///
     /// See [RFC 9204, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
     fn cancel_reading(&mut self) {
+        if let Some(control) = &self.control {
+            control.cancel_qpack();
+            return;
+        }
         self.unblock();
         if std::mem::take(&mut self.cancel_on_drop)
             && self.decoder.queue_stream_cancellation(self.stream_id)
@@ -1592,6 +1612,7 @@ impl RequestDecodeState {
                 blocked: None,
                 decoder,
                 prefix: None,
+                control: None,
             })),
             None => Self::Stateless {
                 max_encoded_string_size,
@@ -1918,8 +1939,8 @@ where
     /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1>.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_sending(&mut self, err_code: Code) {
-        self.cancel_qpack_reading();
         self.stream.stop_sending(err_code);
+        self.cancel_qpack_reading();
     }
 
     #[inline(always)]
@@ -2142,185 +2163,44 @@ impl<S, B> RequestStream<S, B> {
     }
 }
 
-mod guard {
-    use std::{
-        ops::Deref,
-        task::{Context, Poll},
-    };
-
-    use bytes::Buf;
-
-    use crate::{
-        error::Code,
-        frame::{FrameStream, FrameStreamError},
-        proto::frame::{Frame, PayloadLen},
-        quic::{self, SendStream, StreamErrorIncoming},
-        stream::WriteBuf,
-    };
-
-    type Cancel<S, B> = fn(&mut FrameStream<S, B>, Code);
-
-    /// Cancels a client's open stream directions when their owner is dropped.
-    ///
-    /// Callbacks retain each direction's trait capability after splitting, without
-    /// requiring receive-only streams to implement `SendStream` (or vice versa).
-    /// Server streams start disarmed and retain their transport's drop behavior.
-    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1>.
-    pub(crate) struct StreamGuard<S, B> {
-        inner: Option<FrameStream<S, B>>,
-        reset_on_drop: Option<Cancel<S, B>>,
-        stop_sending_on_drop: Option<Cancel<S, B>>,
-    }
-
-    impl<S, B> StreamGuard<S, B> {
-        /// Wraps a stream with both cancellation callbacks disabled.
-        /// Used for server streams and halves whose callbacks are transferred by split.
-        pub(super) fn without_cancellation(stream: FrameStream<S, B>) -> Self {
-            Self {
-                inner: Some(stream),
-                reset_on_drop: None,
-                stop_sending_on_drop: None,
-            }
-        }
-
-        /// Disables receive cancellation after EOF and any buffered trailers are processed.
-        /// The send direction keeps its current state.
-        pub(super) fn finish_reading(&mut self) {
-            self.stop_sending_on_drop = None;
-        }
-
-        /// The inner stream. `None` only while `split` is consuming this guard,
-        /// which drops it without borrowing.
-        fn stream_mut(&mut self) -> &mut FrameStream<S, B> {
-            self.inner.as_mut().expect("stream is present")
-        }
-    }
-
-    impl<S, B> Deref for StreamGuard<S, B> {
-        type Target = FrameStream<S, B>;
-
-        fn deref(&self) -> &Self::Target {
-            self.inner.as_ref().expect("stream is present")
-        }
-    }
-
-    impl<S, B> Drop for StreamGuard<S, B> {
-        fn drop(&mut self) {
-            self.cancel_remaining();
-        }
-    }
-
-    impl<S: quic::RecvStream, B> StreamGuard<S, B> {
-        /// Stops receiving with the caller's code and prevents Drop from replacing it.
-        /// This does not reset the send direction or release QPACK state.
-        pub(super) fn stop_sending(&mut self, code: Code) {
-            self.stop_sending_on_drop = None;
-            self.stream_mut().stop_sending(code);
-        }
-    }
-
-    impl<S: quic::SendStream<B> + quic::RecvStream, B: Buf> StreamGuard<S, B> {
-        /// Wraps a new client stream with cancellation armed for both directions.
-        /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1>.
-        pub(super) fn new(stream: FrameStream<S, B>) -> Self {
-            Self {
-                inner: Some(stream),
-                reset_on_drop: Some(|stream, code| stream.reset(code.into())),
-                stop_sending_on_drop: Some(|stream, code| stream.stop_sending(code)),
-            }
-        }
-    }
-
-    impl<S: quic::BidiStream<B>, B: Buf> StreamGuard<S, B> {
-        /// Transfers each open direction to its half without cancelling either one.
-        /// A direction already finished or explicitly stopped stays disarmed.
-        pub(super) fn split(
-            mut self,
-        ) -> (StreamGuard<S::SendStream, B>, StreamGuard<S::RecvStream, B>) {
-            let (send, recv) = self.inner.take().expect("stream is present").split();
-            let mut send = StreamGuard::without_cancellation(send);
-            let mut recv = StreamGuard::without_cancellation(recv);
-
-            if self.reset_on_drop.take().is_some() {
-                send.reset_on_drop = Some(|stream, code| stream.reset(code.into()));
-            }
-
-            if self.stop_sending_on_drop.take().is_some() {
-                recv.stop_sending_on_drop = Some(|stream, code| stream.stop_sending(code));
-            }
-
-            (send, recv)
-        }
-    }
-
-    impl<S: quic::RecvStream, B> StreamGuard<S, B> {
-        /// Reads the next frame. Receiving does not complete either direction,
-        /// so this leaves both cancellation callbacks as they are.
-        pub(crate) fn poll_next(
-            &mut self,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<Option<Frame<PayloadLen>>, FrameStreamError>> {
-            self.stream_mut().poll_next(cx)
-        }
-
-        /// Reads the current frame's payload, leaving cancellation as it is.
-        pub(crate) fn poll_data(
-            &mut self,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<Option<impl Buf + use<S, B>>, FrameStreamError>> {
-            self.stream_mut().poll_data(cx)
-        }
-    }
-
-    impl<S, B> SendStream<B> for StreamGuard<S, B>
-    where
-        S: SendStream<B>,
-        B: Buf,
-    {
-        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-            self.stream_mut().poll_ready(cx)
-        }
-
-        fn send_data<D: Into<WriteBuf<B>>>(&mut self, data: D) -> Result<(), StreamErrorIncoming> {
-            self.stream_mut().send_data(data)
-        }
-
-        fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-            let result = self.stream_mut().poll_finish(cx);
-            // Pending or failed FIN does not complete the send direction. If the
-            // request is then dropped, its cancellation callback must still run.
-            if matches!(result, Poll::Ready(Ok(()))) {
-                self.reset_on_drop = None;
-            }
-            result
-        }
-
-        fn reset(&mut self, reset_code: u64) {
-            self.reset_on_drop = None;
-            self.stream_mut().reset(reset_code);
-        }
-
-        fn send_id(&self) -> quic::StreamId {
-            self.deref().send_id()
-        }
-    }
-
-    impl<S, B> StreamGuard<S, B> {
-        /// Cancels only directions still owned by this handle. Taking callbacks
-        /// makes explicit rejection followed by Drop idempotent.
-        pub(super) fn cancel_remaining(&mut self) {
-            let Some(stream) = self.inner.as_mut() else {
-                return;
+impl<S: quic::RecvStreamControl, B> RequestStream<S, B> {
+    pub(crate) fn recv_control(&mut self) -> recv_control::RecvControl<S::Stop> {
+        let state = if let Some(state) = &self.stream.control {
+            state.clone()
+        } else {
+            let (qpack, armed, blocked) = match &mut self.decode_state {
+                RequestDecodeState::Dynamic(guard) => (
+                    Some(QpackReceive {
+                        stream_id: guard.stream_id,
+                        decoder: guard.decoder.clone(),
+                    }),
+                    std::mem::take(&mut guard.cancel_on_drop),
+                    guard.blocked.take(),
+                ),
+                _ => (None, false, None),
             };
-            if let Some(reset) = self.reset_on_drop.take() {
-                reset(stream, Code::H3_REQUEST_CANCELLED);
+            let state = Arc::new(ReceiveState::new(
+                qpack,
+                armed,
+                blocked,
+                self.stream.receive_finished(),
+                self.stream.recv_stop_code,
+            ));
+            if let RequestDecodeState::Dynamic(guard) = &mut self.decode_state {
+                guard.control = Some(state.clone());
             }
-            if let Some(stop_sending) = self.stop_sending_on_drop.take() {
-                stop_sending(stream, Code::H3_REQUEST_CANCELLED);
-            }
+            self.stream.control = Some(state.clone());
+            state
+        };
+        recv_control::RecvControl {
+            stop: self.stream.stop_handle(),
+            state,
         }
     }
 }
+
+mod guard;
+pub(crate) mod recv_control;
 
 #[cfg(test)]
 mod qpack_field_section_tests {
@@ -2343,6 +2223,7 @@ mod qpack_field_section_tests {
                 blocked: None,
                 decoder,
                 prefix: None,
+                control: None,
             },
             events_recv,
         )
@@ -2430,6 +2311,68 @@ mod qpack_field_section_tests {
             Ok(QpackEvent::StreamCancel(StreamId(0)))
         ));
         assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn controlled_qpack_orders_cancel_ack_and_completion() {
+        for cancel_first in [false, true] {
+            let (events_send, mut events) = mpsc::unbounded_channel();
+            let state = ReceiveState::new(
+                Some(QpackReceive {
+                    stream_id: StreamId(0),
+                    decoder: QpackDecoder::new(qpack::Decoder::new(64, 1).unwrap(), events_send),
+                }),
+                true,
+                None,
+                false,
+                None,
+            );
+            let waker = futures_util::task::noop_waker();
+            state.block(1, &waker).unwrap();
+            assert!(matches!(
+                events.try_recv(),
+                Ok(QpackEvent::RegisterBlocked { .. })
+            ));
+            if !cancel_first {
+                state.acknowledge(true).unwrap();
+                assert!(matches!(events.try_recv(), Ok(QpackEvent::HeaderAck(_))));
+            }
+            state.cancel(Code::H3_MESSAGE_ERROR);
+            assert!(matches!(
+                events.try_recv(),
+                Ok(QpackEvent::ReleaseBlocked { .. })
+            ));
+            assert!(matches!(events.try_recv(), Ok(QpackEvent::StreamCancel(_))));
+            state.acknowledge(true).unwrap();
+            state.block(2, &waker).unwrap();
+            state.finish();
+            assert_eq!(
+                state.cancel(Code::H3_INTERNAL_ERROR),
+                Some(Code::H3_MESSAGE_ERROR)
+            );
+            assert!(events.try_recv().is_err());
+        }
+        let (guard, mut events) = field_section_guard();
+        let state = ReceiveState::new(
+            Some(QpackReceive {
+                stream_id: guard.stream_id,
+                decoder: guard.decoder.clone(),
+            }),
+            true,
+            None,
+            false,
+            None,
+        );
+        // QPACK EOS may precede delivery of HTTP data already in the reader's buffer.
+        state.finish_qpack();
+        assert_eq!(
+            state.cancel(Code::H3_MESSAGE_ERROR),
+            Some(Code::H3_MESSAGE_ERROR)
+        );
+        assert!(events.try_recv().is_err());
+        let completed = ReceiveState::new(None, false, None, false, None);
+        completed.finish();
+        assert_eq!(completed.cancel(Code::H3_MESSAGE_ERROR), None);
     }
 
     #[test]
@@ -2691,6 +2634,25 @@ mod request_drop_tests {
 
     fn stream() -> (RequestStream<Probe, Bytes>, Probe) {
         stream_with_probe(Probe::default())
+    }
+
+    #[test]
+    fn fin_during_selected_cancellation_keeps_drop_code() {
+        let (mut request, probe) = stream();
+        let state = Arc::new(ReceiveState::new(None, false, None, false, None));
+        request.stream.control = Some(state.clone());
+        // The external stop has selected a code but has not entered the transport.
+        state.cancel(Code::H3_MESSAGE_ERROR);
+        // A read already in progress now observes FIN before its post-poll check.
+        request.finish_reading();
+        drop(request);
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [
+                ("reset", Code::H3_REQUEST_CANCELLED.value()),
+                ("stop", Code::H3_MESSAGE_ERROR.value()),
+            ]
+        );
     }
 
     fn stream_with_probe(probe: Probe) -> (RequestStream<Probe, Bytes>, Probe) {

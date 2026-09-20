@@ -8,3 +8,5 @@ mod builder;
 pub use builder::{Builder, builder, new};
 pub use connection::{Connection, SendRequest};
 pub use stream::RequestStream;
+
+pub use crate::connection::recv_control::RecvControl;

@@ -822,6 +822,12 @@ where
     }
 }
 
+impl<S: quic::RecvStreamControl, B> BufRecvStream<S, B> {
+    pub(crate) fn stop_handle(&mut self) -> S::Stop {
+        self.stream.stop_handle()
+    }
+}
+
 fn convert_to_std_io_error(error: StreamErrorIncoming) -> std::io::Error {
     std::io::Error::other(error)
 }
