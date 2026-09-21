@@ -1506,30 +1506,60 @@ async fn client_driver_drop_ends_pending_response_and_sender() {
         let (accepted, seen) = oneshot::channel();
         let client = async {
             let (driver, mut sender) = client::new(pair.client().await).await.unwrap();
-            let mut stream = sender.send_request(Request::post("https://localhost/").body(()).unwrap()).await.unwrap();
+            let mut stream = sender
+                .send_request(Request::post("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap();
             seen.await.unwrap();
             let response = stream.recv_response();
             let mut response = std::pin::pin!(response);
             assert!(futures_util::poll!(response.as_mut()).is_pending());
             drop(driver);
-            assert_matches!(response.await, Err(StreamError::ConnectionError(ConnectionError::Local {
-                error: LocalError::Application { code: Code::H3_NO_ERROR, .. }
-            })));
-            assert_matches!(sender.send_request(Request::get("https://localhost/next").body(()).unwrap()).await.map(|_| ()),
+            assert_matches!(
+                response.await,
                 Err(StreamError::ConnectionError(ConnectionError::Local {
-                    error: LocalError::Application { code: Code::H3_NO_ERROR, .. }
-                })));
+                    error: LocalError::Application {
+                        code: Code::H3_NO_ERROR,
+                        ..
+                    }
+                }))
+            );
+            let result = sender
+                .send_request(Request::get("https://localhost/next").body(()).unwrap())
+                .await
+                .map(|_| ());
+            assert_matches!(
+                result,
+                Err(StreamError::ConnectionError(ConnectionError::Local {
+                    error: LocalError::Application {
+                        code: Code::H3_NO_ERROR,
+                        ..
+                    }
+                }))
+            );
         };
         let peer = async {
             let mut incoming = server::Connection::new(server.next().await).await.unwrap();
-            let (_, mut stream) = incoming.accept().await.unwrap().unwrap().resolve_request().await.unwrap();
+            let (_, mut stream) = incoming
+                .accept()
+                .await
+                .unwrap()
+                .unwrap()
+                .resolve_request()
+                .await
+                .unwrap();
             accepted.send(()).unwrap();
-            assert_matches!(stream.recv_data().await.map(|_| ()),
-                Err(StreamError::ConnectionError(ConnectionError::Remote(ConnectionErrorIncoming::ApplicationClose { error_code, .. })))
-                if error_code == Code::H3_NO_ERROR.value());
+            assert_matches!(
+                stream.recv_data().await.map(|_| ()),
+                Err(StreamError::ConnectionError(ConnectionError::Remote(
+                    ConnectionErrorIncoming::ApplicationClose { error_code, .. }
+                ))) if error_code == Code::H3_NO_ERROR.value()
+            );
         };
         tokio::join!(client, peer);
-    }).await.expect("driver drop did not wake request");
+    })
+    .await
+    .expect("driver drop did not wake request");
 }
 
 #[tokio::test]
@@ -1549,15 +1579,21 @@ async fn client_driver_drop_preserves_published_error() {
                 .into(),
             );
             drop(driver);
-            assert_matches!(sender.get_conn_error(), Some(crate::error::internal_error::ErrorOrigin::Internal(error))
-            if error.code == Code::H3_EXCESSIVE_LOAD && error.message == "first error");
+            assert_matches!(
+                sender.get_conn_error(),
+                Some(crate::error::internal_error::ErrorOrigin::Internal(error))
+                    if error.code == Code::H3_EXCESSIVE_LOAD && error.message == "first error"
+            );
         },
         async {
             let mut incoming = server::Connection::new(server.next().await).await.unwrap();
             ready.send(()).unwrap();
-            assert_matches!(incoming.accept().await.map(|_| ()),
-            Err(ConnectionError::Remote(ConnectionErrorIncoming::ApplicationClose { error_code, .. }))
-            if error_code == Code::H3_EXCESSIVE_LOAD.value());
+            assert_matches!(
+                incoming.accept().await.map(|_| ()),
+                Err(ConnectionError::Remote(
+                    ConnectionErrorIncoming::ApplicationClose { error_code, .. }
+                )) if error_code == Code::H3_EXCESSIVE_LOAD.value()
+            );
         }
     );
 }

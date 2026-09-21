@@ -423,51 +423,43 @@ where
 ///
 /// ## Shutdown a connection gracefully
 ///
+/// The application tracks its outstanding transfers. Here `requests_done`
+/// resolves after responses, uploads and any required transport acknowledgments
+/// have completed. Apply an application deadline if those transfers can stall.
+///
 /// ```rust
 /// # use bytes::Buf;
 /// # use futures_util::future;
-/// # use http3::quic;
-/// # use http3::client::Connection;
-/// # use http3::client::SendRequest;
-/// # use tokio::{self, sync::oneshot, task::JoinHandle};
-/// # async fn doc<C, B>(mut connection: Connection<C, B>)
-/// #    -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+/// # use http3::{client::Connection, quic};
+/// # async fn doc<C, B>(
+/// #     mut connection: Connection<C, B>,
+/// #     requests_done: impl std::future::Future<Output = ()>,
+/// # ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 /// # where
-/// #    C: quic::Connection<B> + Send + 'static,
-/// #    C::SendStream: quic::SendStreamUnframed<B>,
-/// #    C::SendStream: Send + 'static,
-/// #    C::RecvStream: Send + 'static,
-/// #    B: Buf + Send + 'static,
+/// #     C: quic::Connection<B>,
+/// #     C::SendStream: quic::SendStreamUnframed<B>,
+/// #     B: Buf,
 /// # {
-/// // Prepare a channel to stop the driver thread
-/// let (shutdown_tx, shutdown_rx) = oneshot::channel();
-///
-/// // Run the driver on a different task
-/// let driver = tokio::spawn(async move {
-///     tokio::select! {
-///         // Drive the connection
-///         closed = future::poll_fn(|cx| connection.poll_close(cx)) => closed,
-///         // Listen for shutdown condition
-///         max_streams = shutdown_rx => {
-///             // Initiate shutdown
-///             connection.shutdown(max_streams?).await?;
-///             // Wait for peer closure; applications may instead finish their
-///             // outstanding requests and then drop the driver.
-///             future::poll_fn(|cx| connection.poll_close(cx)).await
+/// // Stop initiating requests and reject further server pushes.
+/// connection.shutdown(0).await?;
+/// tokio::select! {
+///     () = requests_done => {},
+///     error = future::poll_fn(|cx| connection.poll_close(cx)) => {
+///         if !error.is_h3_no_error() {
+///             return Err(error.into());
 ///         }
-///     };
-///
-///     Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-/// });
-///
-/// // Do client things, wait for close condition...
-///
-/// // Initiate shutdown
-/// shutdown_tx.send(2);
-/// // Wait for the connection to be closed
-/// driver.await?
+///     }
+/// }
+/// // Transfers are complete, or the peer has already closed the connection.
+/// drop(connection);
+/// # Ok(())
 /// # }
 /// ```
+///
+/// Waiting for peer closure after the transfers is optional. If desired, poll
+/// `poll_close()` with an application timeout before dropping the driver:
+/// [RFC 9114 Section 5.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-5.2)
+/// allows the peer to leave the connection idle instead of closing it.
 /// [`poll_close()`]: struct.Connection.html#method.poll_close
 /// [`shutdown()`]: struct.Connection.html#method.shutdown
 pub struct Connection<C, B>
