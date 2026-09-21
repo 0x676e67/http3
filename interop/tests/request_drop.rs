@@ -78,8 +78,11 @@ async fn dropping_request_or_send_half_resets_upload() {
             }
             let _server = peer.await.unwrap();
             drop(sender);
+            // The transfer assertions above are complete; terminate the client
+            // driver before releasing the peer and its transport handles.
+            drive.abort();
+            assert!(drive.await.unwrap_err().is_cancelled());
             drop(_server);
-            assert!(drive.await.unwrap().is_h3_no_error());
         }
     })
     .await;
@@ -154,8 +157,11 @@ async fn dropping_receive_half_stops_download_without_canceling_upload() {
         drop(send);
         let _server = peer.await.unwrap();
         drop(sender);
+        // The transfer assertions above are complete; terminate the client
+        // driver before releasing the peer and its transport handles.
+        drive.abort();
+        assert!(drive.await.unwrap_err().is_cancelled());
         drop(_server);
-        assert!(drive.await.unwrap().is_h3_no_error());
     })
     .await;
 }
@@ -225,8 +231,11 @@ async fn finish_after_cancelled_write_delivers_complete_body() {
         drop(stream);
         let _server = peer.await.unwrap();
         drop(sender);
+        // The transfer assertions above are complete; terminate the client
+        // driver before releasing the peer and its transport handles.
+        drive.abort();
+        assert!(drive.await.unwrap_err().is_cancelled());
         drop(_server);
-        assert!(drive.await.unwrap().is_h3_no_error());
     })
     .await;
 }

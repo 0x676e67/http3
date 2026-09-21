@@ -224,7 +224,15 @@ async fn run_client<A: Adapter>(
     drop(sender_guard);
     drop(quic_connection);
 
-    driver.await.context("HTTP/3 connection driver failed")??;
+    // Requests are complete and timing has stopped. Our driver owns closure;
+    // upstream h3 still closes through the final sender and must finish polling.
+    if A::HTTP3_LIBRARY == "http3" {
+        driver.abort();
+    }
+    match driver.await {
+        Err(error) if error.is_cancelled() => {}
+        result => result.context("HTTP/3 connection driver failed")??,
+    }
     A::wait_idle(&endpoint).await;
 
     Ok(ClientResult {
