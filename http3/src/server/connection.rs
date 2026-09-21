@@ -37,6 +37,11 @@ use crate::{
 /// Create a new Instance with [`Connection::new()`].
 /// Accept incoming requests with [`Connection::accept()`].
 /// And shutdown a connection with [`Connection::shutdown()`].
+///
+/// Dropping the driver immediately closes the connection and publishes
+/// `H3_NO_ERROR` to live request streams unless an earlier error takes precedence.
+/// Complete required transfers before dropping it; see
+/// [RFC 9114 Section 5.3](https://www.rfc-editor.org/rfc/rfc9114.html#section-5.3).
 pub struct Connection<C, B>
 where
     C: quic::Connection<B>,
@@ -332,10 +337,11 @@ where
 {
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn drop(&mut self) {
-        self.inner.close_connection(
-            Code::H3_NO_ERROR,
-            "Connection was closed by the server".to_string(),
-        );
+        self.inner
+            .handle_connection_error(InternalConnectionError::new(
+                Code::H3_NO_ERROR,
+                "Connection was closed by the server".to_string(),
+            ));
     }
 }
 

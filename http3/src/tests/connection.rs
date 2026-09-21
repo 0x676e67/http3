@@ -1597,3 +1597,71 @@ async fn client_driver_drop_preserves_published_error() {
         }
     );
 }
+
+#[tokio::test]
+async fn server_driver_drop_publishes_close_and_preserves_first_error() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        // Normal drop, an error published by a stream, and an already handled error.
+        for state in 0..3 {
+            let expected = if state == 0 {
+                Code::H3_NO_ERROR
+            } else {
+                Code::H3_EXCESSIVE_LOAD
+            };
+            let mut pair = Pair::default();
+            let mut server = pair.server();
+            let (started, ready) = oneshot::channel();
+            let client = async {
+                let (mut driver, mut sender) = client::new(pair.client().await).await.unwrap();
+                let _stream = sender
+                    .send_request(Request::post("https://localhost/").body(()).unwrap())
+                    .await
+                    .unwrap();
+                started.send(()).unwrap();
+                let error = future::poll_fn(|cx| driver.poll_close(cx)).await;
+                assert_matches!(
+                    error,
+                    ConnectionError::Remote(ConnectionErrorIncoming::ApplicationClose {
+                        error_code, ..
+                    }) if error_code == expected.value()
+                );
+            };
+            let peer = async {
+                let mut incoming = server::Connection::new(server.next().await).await.unwrap();
+                let (_, mut stream) = incoming
+                    .accept()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .resolve_request()
+                    .await
+                    .unwrap();
+                ready.await.unwrap();
+                let receive = stream.recv_data();
+                let mut receive = std::pin::pin!(receive);
+                assert!(futures_util::poll!(receive.as_mut()).is_pending());
+                if state != 0 {
+                    let error = crate::error::internal_error::InternalConnectionError::new(
+                        expected,
+                        "first error".to_string(),
+                    );
+                    if state == 1 {
+                        incoming.set_conn_error(error.into());
+                    } else {
+                        incoming.inner.handle_connection_error(error);
+                    }
+                }
+                drop(incoming);
+                assert_matches!(
+                    receive.await.map(|_| ()),
+                    Err(StreamError::ConnectionError(ConnectionError::Local {
+                        error: LocalError::Application { code, .. }
+                    })) if code == expected
+                );
+            };
+            tokio::join!(client, peer);
+        }
+    })
+    .await
+    .expect("server driver drop did not complete pending requests");
+}
