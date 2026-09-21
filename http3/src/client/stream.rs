@@ -1,7 +1,6 @@
 use std::{
     convert::TryFrom,
     future::{Future, poll_fn},
-    pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -46,11 +45,14 @@ use crate::{
 /// stops sending.
 /// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
 ///
-/// While the connection driver runs, pending operations are woken if the server's
-/// GOAWAY excludes this request. They return [`StreamError::GoawayRejected`] and
-/// cancel the directions owned by this handle. After [`Self::split()`], each half
-/// observes rejection independently. Requests below the GOAWAY boundary continue.
-/// The caller decides whether to retry; this type never retries automatically.
+/// Every operation first checks whether the server's GOAWAY excludes this
+/// request and then returns [`StreamError::GoawayRejected`] and cancels the
+/// directions owned by this handle. An operation already waiting on the
+/// transport learns of the GOAWAY when the transport next wakes it, usually
+/// through the server's reset or the connection closing; the GOAWAY itself
+/// wakes nothing. After [`Self::split()`], each half observes rejection
+/// independently. Requests below the GOAWAY boundary continue. The caller
+/// decides whether to retry; this type never retries automatically.
 ///
 /// Receive operations check for published GOAWAY rejection and connection errors
 /// before polling the receive stream, including its buffered data. Consequently,
@@ -370,11 +372,7 @@ where
         RequestStream<S::SendStream, B>,
         RequestStream<S::RecvStream, B>,
     ) {
-        let Self {
-            inner,
-            mut rejection,
-        } = self;
-        rejection.notified = None;
+        let Self { inner, rejection } = self;
         let (send, recv) = inner.split();
         (
             RequestStream {
@@ -400,71 +398,42 @@ where
     }
 }
 
-// A poll API must retain its waiter across calls. Recreating and dropping a
-// Notified on each Pending would lose the connection driver's wakeup.
+// GOAWAY rejection is a state snapshot checked around each poll. The server's
+// reset or the closing connection provides the transport wakeup.
 struct RequestRejection {
     state: Arc<SharedState>,
     stream_id: StreamId,
-    notified: Option<Pin<Box<tokio::sync::futures::OwnedNotified>>>,
 }
 
 impl RequestRejection {
     fn new(state: Arc<SharedState>, stream_id: StreamId) -> Self {
-        Self {
-            state,
-            stream_id,
-            notified: None,
-        }
+        Self { state, stream_id }
     }
 
     fn poll<T>(
-        &mut self,
+        &self,
         cx: &mut Context<'_>,
         operation: impl FnOnce(&mut Context<'_>) -> Poll<Result<T, StreamError>>,
     ) -> Poll<Result<T, StreamError>> {
         if let Some(error) = self.state.request_error(self.stream_id) {
-            self.notified = None;
             return Poll::Ready(Err(error));
         }
         let result = operation(cx);
-        if result.is_ready() {
-            self.notified = None;
-            return result;
-        }
-        loop {
-            let notified = self
-                .notified
-                .get_or_insert_with(|| Box::pin(self.state.notified()));
-            let changed = notified.as_mut().poll(cx);
-            // Register before rechecking: GOAWAY can arrive during operation's
-            // poll or while the notification is being installed.
+        if result.is_pending() {
+            // GOAWAY can be published during the transport poll without a wakeup.
             if let Some(error) = self.state.request_error(self.stream_id) {
-                self.notified = None;
                 return Poll::Ready(Err(error));
             }
-            if changed.is_pending() {
-                return Poll::Pending;
-            }
-            notified.set(self.state.notified());
         }
+        result
     }
 
     async fn run<T>(
-        &mut self,
+        &self,
         operation: impl Future<Output = Result<T, StreamError>>,
     ) -> Result<T, StreamError> {
         let mut operation = std::pin::pin!(operation);
-        let waiter = RejectionWait(self);
-        poll_fn(|cx| waiter.0.poll(cx, |cx| operation.as_mut().poll(cx))).await
-    }
-}
-
-// Canceling an async operation unregisters its task even if the stream is kept.
-struct RejectionWait<'a>(&'a mut RequestRejection);
-
-impl Drop for RejectionWait<'_> {
-    fn drop(&mut self) {
-        self.0.notified = None;
+        poll_fn(|cx| self.poll(cx, |cx| operation.as_mut().poll(cx))).await
     }
 }
 
