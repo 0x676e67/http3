@@ -651,7 +651,6 @@ where
         C::SendStream: quic::SendStreamUnframed<B>,
     {
         let _ = self.poll_connection_error(cx)?;
-
         self.poll_qpack_encoder_stream_inner(cx)
     }
 
@@ -798,7 +797,6 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), ConnectionError>> {
         let _ = self.poll_connection_error(cx)?;
-
         self.poll_qpack_decoder_stream_inner(cx)
     }
 
@@ -1084,7 +1082,6 @@ where
         // check if a connection error occurred on a stream
         let _ = self.poll_connection_error(cx)?;
         self.poll_accept_recv(cx)?;
-
         self.poll_control_frame(cx)
     }
 
@@ -1102,7 +1099,6 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Frame<PayloadLen>, ConnectionError>> {
         let _ = self.poll_connection_error(cx)?;
-
         self.poll_control_frame(cx)
     }
 
