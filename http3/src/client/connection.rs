@@ -460,6 +460,7 @@ where
 /// `poll_close()` with an application timeout before dropping the driver:
 /// [RFC 9114 Section 5.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-5.2)
 /// allows the peer to leave the connection idle instead of closing it.
+///
 /// [`poll_close()`]: struct.Connection.html#method.poll_close
 /// [`shutdown()`]: struct.Connection.html#method.shutdown
 pub struct Connection<C, B>
