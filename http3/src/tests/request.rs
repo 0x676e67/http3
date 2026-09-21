@@ -259,6 +259,8 @@ async fn server_goaway_reaches_response_operations_at_each_boundary() {
                 second.finish().await.unwrap();
                 assert_eq!(first.id().into_inner(), 0);
                 assert_eq!(second.id().into_inner(), 4);
+                // The GOAWAY wakes nothing; wait until the driver published it.
+                goaway_published(&sender, 4).await;
                 assert_matches!(
                     second.recv_response().await,
                     Err(StreamError::GoawayRejected { stream_id, boundary })
@@ -273,6 +275,7 @@ async fn server_goaway_reaches_response_operations_at_each_boundary() {
                 );
                 lower_tx.send(()).unwrap();
                 if reject_lower {
+                    goaway_published(&sender, 0).await;
                     assert_matches!(
                         waiting.await,
                         Err(StreamError::GoawayRejected { stream_id, boundary })
@@ -294,19 +297,22 @@ async fn server_goaway_reaches_response_operations_at_each_boundary() {
             Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut wire);
             control.write_all(&wire).await.unwrap();
             let (mut first_send, _first_recv) = connection.accept_bi().await.unwrap();
-            let (second_send, _second_recv) = connection.accept_bi().await.unwrap();
+            let (mut second_send, _second_recv) = connection.accept_bi().await.unwrap();
             wire.clear();
             Frame::<Bytes>::Goaway(VarInt::from(4_u32)).encode(&mut wire);
             control.write_all(&wire).await.unwrap();
-            assert_eq!(
-                second_send.stopped().await.unwrap().unwrap().into_inner(),
-                Code::H3_REQUEST_CANCELLED.value()
-            );
+            // Excluded requests are reset as RFC 9114, Section 5.2 recommends.
+            second_send
+                .reset(::quinn::VarInt::from_u64(Code::H3_REQUEST_REJECTED.value()).unwrap())
+                .unwrap();
             lower_rx.await.unwrap();
             wire.clear();
             if reject_lower {
                 Frame::<Bytes>::Goaway(VarInt::from(0_u32)).encode(&mut wire);
                 control.write_all(&wire).await.unwrap();
+                first_send
+                    .reset(::quinn::VarInt::from_u64(Code::H3_REQUEST_REJECTED.value()).unwrap())
+                    .unwrap();
             } else {
                 Frame::headers(vec![0, 0, 0xd9]).encode_with_payload(&mut wire);
                 first_send.write_all(&wire).await.unwrap();
@@ -319,6 +325,16 @@ async fn server_goaway_reaches_response_operations_at_each_boundary() {
         })
         .await
         .unwrap();
+    }
+}
+
+/// Yields until the client driver published a GOAWAY at or below `boundary`.
+async fn goaway_published<T: ConnectionState>(state: &T, boundary: u64) {
+    while state
+        .peer_goaway()
+        .is_none_or(|id| id.into_inner() > boundary)
+    {
+        tokio::task::yield_now().await;
     }
 }
 

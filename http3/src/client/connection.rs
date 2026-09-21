@@ -330,13 +330,13 @@ where
         block: Bytes,
         state: &SharedState,
     ) -> Result<(), StreamError> {
-        let rejected = std::pin::pin!(state.wait_rejected(stream.send_id()));
-        let writing = std::pin::pin!(stream::write(stream, Frame::Headers(block)));
-        match future::select(rejected, writing).await {
-            future::Either::Left((error, _)) => Err(error),
-            future::Either::Right((result, _)) => {
-                result.map_err(|e| state.handle_quic_stream_error(e))
-            }
+        stream::write(stream, Frame::Headers(block))
+            .await
+            .map_err(|e| state.handle_quic_stream_error(e))?;
+        // GOAWAY can arrive while the headers are in flight.
+        match state.request_error(stream.send_id()) {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -344,19 +344,9 @@ where
         open: &mut T,
         state: &SharedState,
     ) -> Result<T::BidiStream, StreamError> {
-        let result = {
-            let closing = std::pin::pin!(state.wait_closing());
-            let opening = std::pin::pin!(future::poll_fn(|cx| open.poll_open_bidi(cx)));
-            match future::select(closing, opening).await {
-                future::Either::Left(_) => {
-                    return Err(state
-                        .check_peer_connection_closing()
-                        .unwrap_or(StreamError::ConnectionClosing));
-                }
-                future::Either::Right((result, _)) => result,
-            }
-        };
-        let mut stream = result.map_err(|e| state.handle_quic_stream_error(e))?;
+        let mut stream = future::poll_fn(|cx| open.poll_open_bidi(cx))
+            .await
+            .map_err(|e| state.handle_quic_stream_error(e))?;
         if let Some(error) = state.check_peer_connection_closing() {
             // GOAWAY can race the transport's successful open.
             let _guard = OpeningStream::<_, B>::new(&mut stream, None, state);
@@ -883,7 +873,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn goaway_wakes_returned_request_operations_and_cancels_directions() {
+    fn goaway_rejects_returned_request_operations_on_next_poll_and_cancels_directions() {
         for terminal_error in [false, true] {
             for operation in 0..7 {
                 let state = Arc::new(State::default());
@@ -907,7 +897,7 @@ mod integration_tests {
                 }
                 assert_eq!(
                     state.wakes.load(Ordering::Relaxed),
-                    1,
+                    0,
                     "operation {operation}"
                 );
                 match waiting.as_mut().poll(&mut cx) {
@@ -934,7 +924,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn goaway_wakes_both_split_halves_independently() {
+    fn goaway_rejects_both_split_halves_independently() {
         for send_operation in 3..7 {
             for recv_operation in 0..3 {
                 let state = Arc::new(State::default());
@@ -956,8 +946,8 @@ mod integration_tests {
                 sender
                     .conn_state
                     .set_peer_goaway(StreamId::try_from(0).unwrap());
-                assert_eq!(send_wakes.wakes.load(Ordering::Relaxed), 1);
-                assert_eq!(recv_wakes.wakes.load(Ordering::Relaxed), 1);
+                assert_eq!(send_wakes.wakes.load(Ordering::Relaxed), 0);
+                assert_eq!(recv_wakes.wakes.load(Ordering::Relaxed), 0);
                 assert!(matches!(
                     receiving.as_mut().poll(&mut recv_cx),
                     Poll::Ready(Err(StreamError::GoawayRejected { .. }))
@@ -976,34 +966,6 @@ mod integration_tests {
                     Code::H3_REQUEST_CANCELLED.value()
                 );
             }
-        }
-    }
-
-    #[test]
-    fn cancelled_request_operations_unregister_their_waiters() {
-        for operation in 0..6 {
-            let state = Arc::new(State::default());
-            let mut sender = sender(&state, false);
-            let mut stream = returned(&mut sender);
-            prepare_response_body(&mut stream, &state, operation);
-            state.block_write.store(true, Ordering::Relaxed);
-            state.block_finish.store(true, Ordering::Relaxed);
-            let task_waker = waker(state.clone());
-            let mut cx = Context::from_waker(&task_waker);
-            let mut waiting = request_operation(&mut stream, operation);
-            assert!(waiting.as_mut().poll(&mut cx).is_pending());
-            drop(waiting);
-            sender
-                .conn_state
-                .set_peer_goaway(StreamId::try_from(0).unwrap());
-            assert_eq!(state.wakes.load(Ordering::Relaxed), 0);
-            // The request is retained, so a later operation must still see rejection.
-            assert!(matches!(
-                request_operation(&mut stream, operation)
-                    .as_mut()
-                    .poll(&mut cx),
-                Poll::Ready(Err(StreamError::GoawayRejected { .. }))
-            ));
         }
     }
 
@@ -1110,36 +1072,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn completed_or_dropped_poll_receiver_unregisters_its_waiter() {
-        for complete in [false, true] {
-            let state = Arc::new(State::default());
-            let mut sender = sender(&state, false);
-            let mut stream = returned(&mut sender);
-            prepare_response_body(&mut stream, &state, 1);
-            let task_waker = waker(state.clone());
-            let mut cx = Context::from_waker(&task_waker);
-            assert!(stream.poll_recv_data(&mut cx).is_pending());
-            if complete {
-                *state.read.lock().unwrap() = Some(Bytes::from_static(&[0, 1, b'x']));
-                assert!(matches!(
-                    stream.poll_recv_data(&mut cx),
-                    Poll::Ready(Ok(Some(data))) if data.remaining() == 1
-                ));
-                sender
-                    .conn_state
-                    .set_peer_goaway(StreamId::try_from(0).unwrap());
-            } else {
-                drop(stream);
-                sender
-                    .conn_state
-                    .set_peer_goaway(StreamId::try_from(0).unwrap());
-            }
-            assert_eq!(state.wakes.load(Ordering::Relaxed), 0);
-        }
-    }
-
-    #[test]
-    fn goaway_interrupts_qpack_blocked_response_and_cancels_decoder() {
+    fn goaway_rejection_cancels_qpack_blocked_response_on_next_poll() {
         let state = Arc::new(State::default());
         let mut sender = sender(&state, false);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1164,7 +1097,7 @@ mod integration_tests {
         sender
             .conn_state
             .set_peer_goaway(StreamId::try_from(0).unwrap());
-        assert_eq!(state.wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 0);
         assert!(matches!(
             waiting.as_mut().poll(&mut cx),
             Poll::Ready(Err(StreamError::GoawayRejected { .. }))
@@ -1186,7 +1119,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn goaway_wakes_poll_receivers_and_rearms_after_lower_boundary() {
+    fn goaway_rejects_poll_receivers_only_at_or_below_their_stream() {
         for trailers in [false, true] {
             let state = Arc::new(State::default());
             let mut sender = sender(&state, false);
@@ -1206,16 +1139,17 @@ mod integration_tests {
                 }
             };
             assert!(poll(&mut first_cx).is_pending());
+            // A boundary above this request changes nothing for it.
             sender
                 .conn_state
                 .set_peer_goaway(StreamId::try_from(4).unwrap());
-            assert_eq!(first_wakes.wakes.load(Ordering::Relaxed), 1);
+            assert_eq!(first_wakes.wakes.load(Ordering::Relaxed), 0);
             assert!(poll(&mut second_cx).is_pending());
             sender
                 .conn_state
                 .set_peer_goaway(StreamId::try_from(0).unwrap());
-            assert_eq!(second_wakes.wakes.load(Ordering::Relaxed), 1);
-            assert_eq!(first_wakes.wakes.load(Ordering::Relaxed), 1);
+            assert_eq!(second_wakes.wakes.load(Ordering::Relaxed), 0);
+            assert_eq!(first_wakes.wakes.load(Ordering::Relaxed), 0);
             assert!(matches!(
                 poll(&mut second_cx),
                 Poll::Ready(Err(StreamError::GoawayRejected { .. }))
@@ -1262,6 +1196,108 @@ mod integration_tests {
     }
 
     #[test]
+    fn closing_rejects_blocked_opens_once_the_transport_completes_them() {
+        let state = Arc::new(State::default());
+        state.block_open.store(true, Ordering::Relaxed);
+        let mut first = sender(&state, false);
+        let mut second = first.clone();
+        let shared = first.conn_state.clone();
+        let waker = waker(state.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut a = Box::pin(first.send_request(request()));
+        let mut b = Box::pin(second.send_request(request()));
+        assert!(a.as_mut().poll(&mut cx).is_pending());
+        assert!(b.as_mut().poll(&mut cx).is_pending());
+        // Closing wakes nothing; the open is rejected once the transport
+        // completes it, and the unusable stream is cancelled.
+        shared.set_closing();
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 0);
+        assert!(a.as_mut().poll(&mut cx).is_pending());
+        state.block_open.store(false, Ordering::Relaxed);
+        assert!(matches!(
+            a.as_mut().poll(&mut cx),
+            Poll::Ready(Err(StreamError::ConnectionClosing))
+        ));
+        assert!(matches!(
+            b.as_mut().poll(&mut cx),
+            Poll::Ready(Err(StreamError::ConnectionClosing))
+        ));
+        assert_eq!(state.opened.load(Ordering::Relaxed), 2);
+        assert!(!state.written.load(Ordering::Relaxed));
+        assert_eq!(
+            state.reset.load(Ordering::Relaxed),
+            Code::H3_REQUEST_CANCELLED.value()
+        );
+        assert_eq!(
+            state.stopped.load(Ordering::Relaxed),
+            Code::H3_REQUEST_CANCELLED.value()
+        );
+
+        let state = Arc::new(State::default());
+        let mut sender = sender(&state, false);
+        state.close_on_open.set(sender.conn_state.clone()).unwrap();
+        assert!(matches!(
+            std::pin::pin!(sender.send_request(request()))
+                .as_mut()
+                .poll(&mut cx),
+            Poll::Ready(Err(StreamError::ConnectionClosing))
+        ));
+        assert!(!state.written.load(Ordering::Relaxed));
+        assert_eq!(
+            state.reset.load(Ordering::Relaxed),
+            Code::H3_REQUEST_CANCELLED.value()
+        );
+        assert_eq!(
+            state.stopped.load(Ordering::Relaxed),
+            Code::H3_REQUEST_CANCELLED.value()
+        );
+    }
+
+    #[test]
+    fn decreasing_goaway_rejects_written_headers_only_at_boundary() {
+        for dynamic in [false, true] {
+            for (boundary, rejected) in [(4, false), (0, true)] {
+                let state = Arc::new(State::default());
+                state.block_write.store(true, Ordering::Relaxed);
+                let mut sender = sender(&state, dynamic);
+                let shared = sender.conn_state.clone();
+                let waker = waker(state.clone());
+                let mut cx = Context::from_waker(&waker);
+                let mut sending = Box::pin(sender.send_request(request()));
+                assert!(sending.as_mut().poll(&mut cx).is_pending());
+                shared.set_peer_goaway(StreamId::try_from(boundary).unwrap());
+                shared.set_closing();
+                // The blocked write is not interrupted; the boundary is checked
+                // once the headers are written.
+                assert_eq!(state.wakes.load(Ordering::Relaxed), 0);
+                assert!(sending.as_mut().poll(&mut cx).is_pending());
+                state.block_write.store(false, Ordering::Relaxed);
+                let result = sending.as_mut().poll(&mut cx);
+                if rejected {
+                    assert!(matches!(
+                        result,
+                        Poll::Ready(Err(StreamError::GoawayRejected { stream_id, boundary }))
+                            if stream_id == boundary
+                    ));
+                    drop(sending);
+                    assert_eq!(
+                        state.reset.load(Ordering::Relaxed),
+                        Code::H3_REQUEST_CANCELLED.value()
+                    );
+                    assert_eq!(
+                        state.stopped.load(Ordering::Relaxed),
+                        Code::H3_REQUEST_CANCELLED.value()
+                    );
+                } else {
+                    assert!(matches!(result, Poll::Ready(Ok(_))));
+                    assert_eq!(state.reset.load(Ordering::Relaxed), 0);
+                    assert_eq!(state.stopped.load(Ordering::Relaxed), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn successful_headers_disarm_guard_and_invalid_requests_preserve_connection() {
         for dynamic in [false, true] {
             let state = Arc::new(State::default());
@@ -1297,108 +1333,6 @@ mod integration_tests {
                 Code::H3_REQUEST_CANCELLED.value()
             );
         }
-    }
-
-    #[test]
-    fn goaway_wakes_all_credit_waiters_and_handles_open_race() {
-        let state = Arc::new(State::default());
-        state.block_open.store(true, Ordering::Relaxed);
-        let mut first = sender(&state, false);
-        let mut second = first.clone();
-        let shared = first.conn_state.clone();
-        let waker = waker(state.clone());
-        let mut cx = Context::from_waker(&waker);
-        let mut a = Box::pin(first.send_request(request()));
-        let mut b = Box::pin(second.send_request(request()));
-        assert!(a.as_mut().poll(&mut cx).is_pending());
-        assert!(b.as_mut().poll(&mut cx).is_pending());
-        shared.set_closing();
-        assert_eq!(state.wakes.load(Ordering::Relaxed), 2);
-        assert!(matches!(
-            a.as_mut().poll(&mut cx),
-            Poll::Ready(Err(StreamError::ConnectionClosing))
-        ));
-        assert!(matches!(
-            b.as_mut().poll(&mut cx),
-            Poll::Ready(Err(StreamError::ConnectionClosing))
-        ));
-        assert_eq!(state.opened.load(Ordering::Relaxed), 0);
-
-        let state = Arc::new(State::default());
-        let mut sender = sender(&state, false);
-        state.close_on_open.set(sender.conn_state.clone()).unwrap();
-        assert!(matches!(
-            std::pin::pin!(sender.send_request(request()))
-                .as_mut()
-                .poll(&mut cx),
-            Poll::Ready(Err(StreamError::ConnectionClosing))
-        ));
-        assert!(!state.written.load(Ordering::Relaxed));
-        assert_eq!(
-            state.reset.load(Ordering::Relaxed),
-            Code::H3_REQUEST_CANCELLED.value()
-        );
-        assert_eq!(
-            state.stopped.load(Ordering::Relaxed),
-            Code::H3_REQUEST_CANCELLED.value()
-        );
-    }
-
-    #[test]
-    fn decreasing_goaway_rejects_pending_headers_only_at_boundary() {
-        for dynamic in [false, true] {
-            let state = Arc::new(State::default());
-            state.block_write.store(true, Ordering::Relaxed);
-            let mut sender = sender(&state, dynamic);
-            let shared = sender.conn_state.clone();
-            let waker = waker(state.clone());
-            let mut cx = Context::from_waker(&waker);
-            let mut sending = Box::pin(sender.send_request(request()));
-            assert!(sending.as_mut().poll(&mut cx).is_pending());
-            shared.set_peer_goaway(StreamId::try_from(4).unwrap());
-            shared.set_closing();
-            assert!(sending.as_mut().poll(&mut cx).is_pending());
-            shared.set_peer_goaway(StreamId::try_from(0).unwrap());
-            assert!(state.wakes.load(Ordering::Relaxed) >= 2);
-            assert!(matches!(
-                sending.as_mut().poll(&mut cx),
-                Poll::Ready(Err(StreamError::GoawayRejected { stream_id, boundary }))
-                    if stream_id == boundary
-            ));
-            drop(sending);
-            assert_eq!(
-                state.reset.load(Ordering::Relaxed),
-                Code::H3_REQUEST_CANCELLED.value()
-            );
-            assert_eq!(
-                state.stopped.load(Ordering::Relaxed),
-                Code::H3_REQUEST_CANCELLED.value()
-            );
-        }
-    }
-
-    #[test]
-    fn connection_error_wakes_credit_and_rejection_waiters() {
-        let state = Arc::new(State::default());
-        state.block_open.store(true, Ordering::Relaxed);
-        let mut sender = sender(&state, false);
-        let shared = sender.conn_state.clone();
-        let waker = waker(state.clone());
-        let mut cx = Context::from_waker(&waker);
-        let mut opening = Box::pin(sender.send_request(request()));
-        let mut rejected = Box::pin(shared.wait_rejected(StreamId::try_from(0).unwrap()));
-        assert!(opening.as_mut().poll(&mut cx).is_pending());
-        assert!(rejected.as_mut().poll(&mut cx).is_pending());
-        shared.set_conn_error(quic::ConnectionErrorIncoming::Timeout.into());
-        assert_eq!(state.wakes.load(Ordering::Relaxed), 2);
-        assert!(matches!(
-            opening.as_mut().poll(&mut cx),
-            Poll::Ready(Err(StreamError::ConnectionError(ConnectionError::Timeout)))
-        ));
-        assert!(matches!(
-            rejected.as_mut().poll(&mut cx),
-            Poll::Ready(StreamError::ConnectionError(ConnectionError::Timeout))
-        ));
     }
 }
 
