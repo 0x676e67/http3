@@ -3,7 +3,7 @@
 use std::{
     marker::PhantomData,
     mem,
-    sync::{Arc, atomic::AtomicUsize},
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -58,9 +58,9 @@ fn take_qpack_encode_buffer(buffer: &mut BytesMut) -> Bytes {
 ///
 /// This struct is cloneable so multiple requests can be sent concurrently.
 ///
-/// Existing instances are atomically counted internally, so whenever all of them have been
-/// dropped, the connection will be automatically closed with HTTP/3 connection error code
-/// `H3_NO_ERROR = 0x100`.
+/// Dropping a sender, including the last clone, does not close the connection.
+/// Keep driving the [`Connection`] while requests are active. Dropping the
+/// connection driver terminates the connection and its outstanding requests.
 ///
 /// # Examples
 ///
@@ -136,8 +136,6 @@ where
     pub(super) encoder: Option<QpackEncoder>,
     pub(super) max_field_section_size: u64, // largest field section we accept
     pub(super) max_qpack_decode_buffer_size: usize,
-    // counts instances of SendRequest to close the connection when the last is dropped.
-    pub(super) sender_count: Arc<AtomicUsize>,
     pub(super) _buf: PhantomData<fn(B)>,
     pub(super) send_grease_frame: bool,
     pub(super) qpack_encode_buffer: BytesMut,
@@ -362,9 +360,6 @@ where
     B: Buf,
 {
     fn clone(&self) -> Self {
-        self.sender_count
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
-
         Self {
             conn_state: self.conn_state.clone(),
             decoder: self.decoder.clone(),
@@ -372,7 +367,6 @@ where
             open: self.open.clone(),
             max_field_section_size: self.max_field_section_size,
             max_qpack_decode_buffer_size: self.max_qpack_decode_buffer_size,
-            sender_count: self.sender_count.clone(),
             _buf: PhantomData,
             send_grease_frame: self.send_grease_frame,
             // Encoding buffers are worker-local mutable state. Sharing their
@@ -382,28 +376,16 @@ where
     }
 }
 
-impl<T, B> Drop for SendRequest<T, B>
-where
-    T: quic::OpenStreams<B>,
-    B: Buf,
-{
-    fn drop(&mut self) {
-        if self
-            .sender_count
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
-            == 1
-        {
-            self.handle_connection_error_on_stream(InternalConnectionError::new(
-                Code::H3_NO_ERROR,
-                "Connection closed by client".to_string(),
-            ));
-        }
-    }
-}
-
 /// Client connection driver
 ///
-/// Maintains the internal state of an HTTP/3 connection, including control and QPACK.
+/// Owns the HTTP/3 connection lifetime, including control streams and QPACK.
+/// Dropping it closes the connection with `H3_NO_ERROR` unless an earlier error
+/// already determined the outcome. Dropping request senders does not stop it.
+///
+/// Dropping the driver is immediate closure, not graceful shutdown: finish any
+/// required transfers and transport acknowledgments first. See
+/// [RFC 9114 Section 5.3](https://www.rfc-editor.org/rfc/rfc9114.html#section-5.3).
+///
 /// It needs to be polled continuously via [`poll_close()`]. On connection closure,
 /// this returns a [`ConnectionError`]; use [`ConnectionError::is_h3_no_error()`]
 /// to distinguish a normal close from an error.
@@ -468,8 +450,9 @@ where
 ///         // Listen for shutdown condition
 ///         max_streams = shutdown_rx => {
 ///             // Initiate shutdown
-///             connection.shutdown(max_streams?);
-///             // Wait for ongoing work to complete
+///             connection.shutdown(max_streams?).await?;
+///             // Wait for peer closure; applications may instead finish their
+///             // outstanding requests and then drop the driver.
 ///             future::poll_fn(|cx| connection.poll_close(cx)).await
 ///         }
 ///     };
@@ -631,6 +614,21 @@ where
     }
 }
 
+impl<C, B> Drop for Connection<C, B>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    fn drop(&mut self) {
+        // Publish the cause and wake QPACK waiters before closing the transport.
+        self.inner
+            .handle_connection_error(InternalConnectionError::new(
+                Code::H3_NO_ERROR,
+                "Connection driver dropped".to_string(),
+            ));
+    }
+}
+
 // Protect the open stream before its public RequestStream owner exists.
 // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1
 struct OpeningStream<'a, S: quic::SendStream<B> + quic::RecvStream, B: Buf> {
@@ -674,7 +672,7 @@ impl<S: quic::SendStream<B> + quic::RecvStream, B: Buf> Drop for OpeningStream<'
 mod integration_tests {
     use std::{
         future::{Future, poll_fn},
-        sync::atomic::{AtomicBool, AtomicU64, Ordering},
+        sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     };
 
     use futures_util::task::{ArcWake, waker};
@@ -820,7 +818,6 @@ mod integration_tests {
             encoder,
             max_field_section_size: 65536,
             max_qpack_decode_buffer_size: 262144,
-            sender_count: Arc::new(AtomicUsize::new(1)),
             _buf: PhantomData,
             send_grease_frame: false,
             qpack_encode_buffer: BytesMut::new(),

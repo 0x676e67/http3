@@ -60,18 +60,10 @@ async fn accept_request_end_on_client_close() {
     let (tx, rx) = oneshot::channel::<()>();
     let client_fut = async move {
         let client = client.await;
-        let (mut driver, client) = client::new(client).await.expect("client init");
-        let driver = async move {
-            let _ = future::poll_fn(|cx: &mut std::task::Context<'_>| driver.poll_close(cx)).await;
-        };
-
-        let client_fut = async move {
-            // wait for the server to accept the connection
-            rx.await.unwrap();
-            // client is dropped, it will send H3_NO_ERROR
-            drop(client);
-        };
-        tokio::join!(driver, client_fut);
+        let (driver, _client) = client::new(client).await.expect("client init");
+        rx.await.unwrap();
+        // The driver owns the connection even while a sender is still alive.
+        drop(driver);
     };
 
     let server_fut = async {
@@ -167,7 +159,7 @@ async fn server_send_data_without_finish() {
 }
 
 #[tokio::test]
-async fn client_close_only_on_last_sender_drop() {
+async fn client_stays_open_after_last_sender_drop() {
     init_tracing();
     let mut pair = Pair::default();
     let mut server = pair.server();
@@ -238,16 +230,9 @@ async fn client_close_only_on_last_sender_drop() {
         drop(send1);
         drop(send2);
 
-        let drive = future::poll_fn(|cx| conn.poll_close(cx)).await;
-        assert_matches!(
-            drive,
-            ConnectionError::Local {
-                error: LocalError::Application {
-                    code: Code::H3_NO_ERROR,
-                    ..
-                }
-            }
-        );
+        assert!(futures_util::poll!(future::poll_fn(|cx| conn.poll_close(cx))).is_pending());
+        assert!(request_stream_1.get_conn_error().is_none());
+        drop(conn);
     };
 
     tokio::join!(server_fut, client_fut);
@@ -1217,21 +1202,16 @@ async fn graceful_shutdown_grace_interval() {
             tokio::time::sleep(Duration::from_millis(15)).await;
             request(send_request).await
         };
-        let driver = future::poll_fn(|cx| driver.poll_close(cx));
-
-        let (too_late, driver) = tokio::join!(too_late, driver);
+        let too_late = tokio::select! {
+            result = too_late => result,
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => {
+                panic!("connection closed before GOAWAY rejection: {error:?}");
+            }
+        };
         assert_matches!(first, Ok(_));
         assert_matches!(in_flight, Ok(_));
         assert_matches!(too_late.unwrap_err(), StreamError::ConnectionClosing);
-        assert_matches!(
-            driver,
-            ConnectionError::Local {
-                error: LocalError::Application {
-                    code: Code::H3_NO_ERROR,
-                    ..
-                }
-            }
-        );
+        drop(driver);
     };
 
     let server_fut = async {
@@ -1450,4 +1430,134 @@ where
         .await
         .unwrap();
     stream.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn client_sender_drop_preserves_split_request() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut pair = Pair::default();
+        let mut server = pair.server();
+        let client = async {
+            let (mut driver, mut sender) = client::new(pair.client().await).await.unwrap();
+            let clone = sender.clone();
+            let stream = sender
+                .send_request(Request::post("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap();
+            let (mut send, mut recv) = stream.split();
+            drop(sender);
+            drop(clone);
+            let exchange = async {
+                send.send_data(Bytes::from_static(b"upload")).await.unwrap();
+                send.finish().await.unwrap();
+                assert_eq!(recv.recv_response().await.unwrap().status(), 200);
+                let mut body = BytesMut::new();
+                while let Some(mut data) = recv.recv_data().await.unwrap() {
+                    body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+                }
+                assert_eq!(&body[..], b"response");
+                assert!(recv.recv_trailers().await.unwrap().is_none());
+                assert_eq!(
+                    future::poll_fn(|cx| send.poll_stopped(cx)).await.unwrap(),
+                    None
+                );
+            };
+            tokio::select! {
+                () = exchange => {},
+                error = driver.wait_idle() => panic!("driver closed with live request: {error:?}"),
+            }
+            assert!(driver.get_conn_error().is_none());
+            drop(driver);
+        };
+        let peer = async {
+            let mut incoming = server::Connection::new(server.next().await).await.unwrap();
+            let (_, mut stream) = incoming
+                .accept()
+                .await
+                .unwrap()
+                .unwrap()
+                .resolve_request()
+                .await
+                .unwrap();
+            let mut body = BytesMut::new();
+            while let Some(mut data) = stream.recv_data().await.unwrap() {
+                body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+            }
+            assert_eq!(&body[..], b"upload");
+            stream.send_response(Response::new(())).await.unwrap();
+            stream
+                .send_data(Bytes::from_static(b"response"))
+                .await
+                .unwrap();
+            stream.finish().await.unwrap();
+            assert!(incoming.accept().await.err().unwrap().is_h3_no_error());
+        };
+        tokio::join!(client, peer);
+    })
+    .await
+    .expect("split request lifecycle timed out");
+}
+
+#[tokio::test]
+async fn client_driver_drop_ends_pending_response_and_sender() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut pair = Pair::default();
+        let mut server = pair.server();
+        let (accepted, seen) = oneshot::channel();
+        let client = async {
+            let (driver, mut sender) = client::new(pair.client().await).await.unwrap();
+            let mut stream = sender.send_request(Request::post("https://localhost/").body(()).unwrap()).await.unwrap();
+            seen.await.unwrap();
+            let response = stream.recv_response();
+            let mut response = std::pin::pin!(response);
+            assert!(futures_util::poll!(response.as_mut()).is_pending());
+            drop(driver);
+            assert_matches!(response.await, Err(StreamError::ConnectionError(ConnectionError::Local {
+                error: LocalError::Application { code: Code::H3_NO_ERROR, .. }
+            })));
+            assert_matches!(sender.send_request(Request::get("https://localhost/next").body(()).unwrap()).await.map(|_| ()),
+                Err(StreamError::ConnectionError(ConnectionError::Local {
+                    error: LocalError::Application { code: Code::H3_NO_ERROR, .. }
+                })));
+        };
+        let peer = async {
+            let mut incoming = server::Connection::new(server.next().await).await.unwrap();
+            let (_, mut stream) = incoming.accept().await.unwrap().unwrap().resolve_request().await.unwrap();
+            accepted.send(()).unwrap();
+            assert_matches!(stream.recv_data().await.map(|_| ()),
+                Err(StreamError::ConnectionError(ConnectionError::Remote(ConnectionErrorIncoming::ApplicationClose { error_code, .. })))
+                if error_code == Code::H3_NO_ERROR.value());
+        };
+        tokio::join!(client, peer);
+    }).await.expect("driver drop did not wake request");
+}
+
+#[tokio::test]
+async fn client_driver_drop_preserves_published_error() {
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+    let (ready, seen) = oneshot::channel();
+    tokio::join!(
+        async {
+            let (driver, sender) = client::new(pair.client().await).await.unwrap();
+            seen.await.unwrap();
+            sender.set_conn_error(
+                crate::error::internal_error::InternalConnectionError::new(
+                    Code::H3_EXCESSIVE_LOAD,
+                    "first error".to_string(),
+                )
+                .into(),
+            );
+            drop(driver);
+            assert_matches!(sender.get_conn_error(), Some(crate::error::internal_error::ErrorOrigin::Internal(error))
+            if error.code == Code::H3_EXCESSIVE_LOAD && error.message == "first error");
+        },
+        async {
+            let mut incoming = server::Connection::new(server.next().await).await.unwrap();
+            ready.send(()).unwrap();
+            assert_matches!(incoming.accept().await.map(|_| ()),
+            Err(ConnectionError::Remote(ConnectionErrorIncoming::ApplicationClose { error_code, .. }))
+            if error_code == Code::H3_EXCESSIVE_LOAD.value());
+        }
+    );
 }

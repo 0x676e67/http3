@@ -462,7 +462,10 @@ async fn get() {
                 .expect("body");
             assert_eq!(body.chunk(), b"wonderful hypertext");
         };
-        tokio::join!(req_fut, drive_fut)
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        }
     };
 
     let server_fut = async {
@@ -573,7 +576,12 @@ async fn client_dynamic_qpack_request_round_trip() {
         }
 
         drop(send);
-        future::poll_fn(|cx| driver.poll_close(cx)).await
+        driver.inner.handle_connection_error(
+            crate::error::internal_error::InternalConnectionError::new(
+                Code::H3_NO_ERROR,
+                "test complete".to_string(),
+            ),
+        )
     };
 
     let server_fut = async {
@@ -1052,7 +1060,10 @@ async fn get_with_trailers_unknown_content_type() {
                 .expect("trailers none");
             assert_eq!(trailers.get("trailer").unwrap(), &"value");
         };
-        tokio::join!(req_fut, drive_fut);
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        };
     };
 
     let server_fut = async {
@@ -1121,7 +1132,10 @@ async fn get_with_trailers_known_content_type() {
                 .expect("trailers none");
             assert_eq!(trailers.get("trailer").unwrap(), &"value");
         };
-        tokio::join!(req_fut, drive_fut);
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        };
     };
 
     let server_fut = async {
@@ -1186,7 +1200,10 @@ async fn post() {
 
             request_stream.recv_response().await.expect("recv response");
         };
-        tokio::join!(req_fut, drive_fut);
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        };
     };
 
     let server_fut = async {
@@ -1246,7 +1263,10 @@ async fn header_too_big_response_from_server() {
                 StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
             );
         };
-        tokio::join!(req_fut, drive_fut);
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        };
     };
 
     let server_fut = async {
@@ -2423,17 +2443,26 @@ where
                 }
             }
 
-            // drop the SendRequest to let driver know there will be no more requests
+            // The owner below closes the driver after this request finishes.
             drop(send);
 
             Result::<(), quinn::ReadError>::Ok(())
         };
 
-        let driver = async {
-            Result::<(), ConnectionError>::Err(future::poll_fn(|cx| driver.poll_close(cx)).await)
-        };
-
-        tokio::join!(client, driver)
+        let mut client = std::pin::pin!(client);
+        tokio::select! {
+            result = &mut client => {
+                let error = driver.inner.handle_connection_error(
+                    crate::error::internal_error::InternalConnectionError::new(
+                        Code::H3_NO_ERROR, "test complete".to_string(),
+                    ),
+                );
+                (result, Err::<(), _>(error))
+            }
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => {
+                (client.await, Err::<(), _>(error))
+            }
+        }
     };
 
     let server_fut = async {
