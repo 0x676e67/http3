@@ -43,6 +43,7 @@ pub trait Adapter: Send + 'static {
     type Stats: std::fmt::Debug + Send;
 
     const HTTP3_LIBRARY: &'static str;
+    const DRIVER_OWNS_CLOSE: bool;
     const QUIC_BACKEND: &'static str;
     const TRANSPORT_PROFILE: &'static str;
 
@@ -224,7 +225,15 @@ async fn run_client<A: Adapter>(
     drop(sender_guard);
     drop(quic_connection);
 
-    driver.await.context("HTTP/3 connection driver failed")??;
+    // Requests are complete and timing has stopped. Our driver owns closure;
+    // upstream h3 still closes through the final sender and must finish polling.
+    if A::DRIVER_OWNS_CLOSE {
+        driver.abort();
+    }
+    match driver.await {
+        Err(error) if error.is_cancelled() => {}
+        result => result.context("HTTP/3 connection driver failed")??,
+    }
     A::wait_idle(&endpoint).await;
 
     Ok(ClientResult {
@@ -346,7 +355,10 @@ macro_rules! client_adapter {
             anyhow::bail!("h3 only supports qpack=none in this benchmark");
         }
     };
-    ($adapter:ident, $http3_crate:ident, $transport:ident, $backend:ident, $library:literal) => {
+    (
+        $adapter:ident, $http3_crate:ident, $transport:ident, $backend:ident,
+        $library:literal, $driver_owns_close:literal
+    ) => {
         struct $adapter;
 
         impl $crate::client::Adapter for $adapter {
@@ -356,6 +368,7 @@ macro_rules! client_adapter {
             type Stats = $backend::ConnectionStats;
 
             const HTTP3_LIBRARY: &'static str = $library;
+            const DRIVER_OWNS_CLOSE: bool = $driver_owns_close;
             const QUIC_BACKEND: &'static str = stringify!($backend);
             const TRANSPORT_PROFILE: &'static str = concat!(stringify!($backend), "-default-pmtud");
 
