@@ -512,15 +512,16 @@ impl Field {
             if name == b"te" && !value.as_ref().eq_ignore_ascii_case(b"trailers") {
                 return Err(HeaderError::invalid_value(name, value));
             }
-            let shared_value = match value {
+            let value = match value {
                 Cow::Borrowed(value) => bytes::Bytes::from_static(value),
                 Cow::Owned(value) => bytes::Bytes::from(value),
             };
-            let diagnostic = shared_value.clone();
+            // The constructor validates and consumes the bytes, so its error
+            // stands in for the value rather than cloning every valid one.
             return Ok(Field::Header((
                 HeaderName::from_lowercase(name).map_err(|_| HeaderError::invalid_name(name))?,
-                HeaderValue::from_maybe_shared(shared_value)
-                    .map_err(|_| HeaderError::invalid_value(name, diagnostic))?,
+                HeaderValue::from_maybe_shared(value)
+                    .map_err(|error| HeaderError::invalid_value_from(name, error))?,
             )));
         }
 
@@ -765,7 +766,18 @@ impl HeaderError {
         HeaderError::InvalidHeaderValue(format!(
             "{:?} {:?}",
             String::from_utf8_lossy(name.as_ref()),
-            value.as_ref()
+            String::from_utf8_lossy(value.as_ref())
+        ))
+    }
+
+    fn invalid_value_from<N>(name: N, err: header::InvalidHeaderValue) -> Self
+    where
+        N: AsRef<[u8]>,
+    {
+        HeaderError::InvalidHeaderValue(format!(
+            "{:?} {}",
+            String::from_utf8_lossy(name.as_ref()),
+            err
         ))
     }
 }
