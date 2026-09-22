@@ -2827,6 +2827,10 @@ async fn poll_response_resumes_or_cancels_blocked_headers_after_split() {
                     send.stopped().await.unwrap().unwrap().into_inner(),
                     Code::H3_REQUEST_CANCELLED.value(),
                 );
+                // Keep the peer alive until the client observes the cancellation
+                // acknowledgment; a peer close must not race its select branch.
+                done_tx.send(()).unwrap();
+                connection.closed().await;
             } else {
                 let mut instructions = BytesMut::new();
                 qpack::DynamicTableSizeUpdate(64).encode(&mut instructions);
@@ -2839,8 +2843,8 @@ async fn poll_response_resumes_or_cancels_blocked_headers_after_split() {
                 send.write_all(&final_head).await.unwrap();
                 send.finish().unwrap();
                 connection.closed().await;
+                done_tx.send(()).unwrap();
             }
-            done_tx.send(()).unwrap();
         };
         tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(client, peer);
