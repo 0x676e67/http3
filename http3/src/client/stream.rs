@@ -298,7 +298,8 @@ where
 {
     /// Sends a body buffer, flushing previously queued output first.
     ///
-    /// Cancellation after the buffer is queued leaves it owned by the stream.
+    /// Cancellation before the buffer is queued drops it. Once queued, the
+    /// buffer remains owned by the stream if this future is cancelled.
     /// Continue with [`Self::poll_ready`] or [`Self::finish`]; sending the same
     /// buffer again would append another DATA frame.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
