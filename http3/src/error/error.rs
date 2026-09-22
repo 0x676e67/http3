@@ -68,6 +68,13 @@ pub enum LocalError {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum StreamError {
+    /// A send operation is not valid in the current local stream state.
+    /// No frame is queued and the connection remains usable.
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
+    InvalidStreamState {
+        /// Why the operation cannot be performed.
+        reason: Box<str>,
+    },
     /// A locally constructed request is invalid. No request was sent and the
     /// connection remains usable.
     #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
@@ -167,6 +174,9 @@ impl std::error::Error for ConnectionError {}
 impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            StreamError::InvalidStreamState { reason } => {
+                write!(f, "Invalid stream state: {reason}")
+            }
             StreamError::InvalidRequest { reason } => write!(f, "Invalid request: {reason}"),
             StreamError::GoawayRejected {
                 stream_id,

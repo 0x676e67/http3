@@ -225,6 +225,46 @@ where
     pub fn send_id(&self) -> StreamId {
         self.inner.stream.send_id()
     }
+
+    /// Flushes a queued DATA or trailers frame into the QUIC transport.
+    ///
+    /// `Pending` registers the task for another poll. Success permits another
+    /// DATA frame while the body is open; it does not reserve QUIC flow-control
+    /// credit or wait for acknowledgment. After trailers, only finish is allowed.
+    /// Dropping the polling future leaves queued bytes owned by the stream.
+    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        self.inner.poll_ready(cx)
+    }
+
+    /// Queues one owned body buffer as a DATA frame without waiting for I/O.
+    ///
+    /// First complete [`Self::poll_ready`]; after success, drive `poll_ready` or
+    /// [`Self::poll_finish`] to flush the frame. The buffer is consumed even on
+    /// error. Pending output, trailers, finish or reset cause a local
+    /// [`StreamError::InvalidStreamState`] without discarding queued bytes.
+    pub fn start_send_data(&mut self, buf: B) -> Result<(), StreamError> {
+        self.inner.start_send_data(buf)
+    }
+
+    /// Queues the final field section without waiting for I/O.
+    ///
+    /// First complete [`Self::poll_ready`]. Success forbids further DATA or
+    /// trailers; call [`Self::poll_finish`] to flush and send FIN. The peer's
+    /// field section limit is checked before queuing; an error consumes the
+    /// supplied headers. Invalid send order is a local error, not a wire error.
+    pub fn start_send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
+        self.inner.start_send_trailers(trailers)
+    }
+
+    /// Flushes pending DATA, trailers and optional GREASE, then submits FIN.
+    ///
+    /// Once polled, no more content may be queued. After `Pending`, retrying
+    /// continues the same finish operation without repeating queued frames.
+    /// Success is repeatable and does not wait for FIN acknowledgment; use
+    /// [`Self::poll_stopped`] for that. Receiving is unaffected.
+    pub fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        self.inner.poll_finish(cx)
+    }
 }
 
 impl<S, B> RequestStream<S, B>
