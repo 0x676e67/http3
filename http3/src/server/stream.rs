@@ -201,6 +201,18 @@ where
         self.inner.finish().await
     }
 
+    /// Polls for the client stopping or acknowledging the response's send direction.
+    ///
+    /// Resolves to `Some(code)` after `STOP_SENDING` and to `None` once the whole
+    /// response, including the FIN, is acknowledged. Polling never changes the
+    /// stream's state.
+    pub fn poll_stopped(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Code>, StreamError>> {
+        self.inner.poll_stopped(cx)
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
     //= type=TODO
     //# Implementations SHOULD cancel requests by abruptly terminating any

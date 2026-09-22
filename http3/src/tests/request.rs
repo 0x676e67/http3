@@ -259,6 +259,8 @@ async fn server_goaway_reaches_response_operations_at_each_boundary() {
                 second.finish().await.unwrap();
                 assert_eq!(first.id().into_inner(), 0);
                 assert_eq!(second.id().into_inner(), 4);
+                // The GOAWAY wakes nothing; wait until the driver published it.
+                goaway_published(&sender, 4).await;
                 assert_matches!(
                     second.recv_response().await,
                     Err(StreamError::GoawayRejected { stream_id, boundary })
@@ -273,6 +275,7 @@ async fn server_goaway_reaches_response_operations_at_each_boundary() {
                 );
                 lower_tx.send(()).unwrap();
                 if reject_lower {
+                    goaway_published(&sender, 0).await;
                     assert_matches!(
                         waiting.await,
                         Err(StreamError::GoawayRejected { stream_id, boundary })
@@ -294,19 +297,22 @@ async fn server_goaway_reaches_response_operations_at_each_boundary() {
             Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut wire);
             control.write_all(&wire).await.unwrap();
             let (mut first_send, _first_recv) = connection.accept_bi().await.unwrap();
-            let (second_send, _second_recv) = connection.accept_bi().await.unwrap();
+            let (mut second_send, _second_recv) = connection.accept_bi().await.unwrap();
             wire.clear();
             Frame::<Bytes>::Goaway(VarInt::from(4_u32)).encode(&mut wire);
             control.write_all(&wire).await.unwrap();
-            assert_eq!(
-                second_send.stopped().await.unwrap().unwrap().into_inner(),
-                Code::H3_REQUEST_CANCELLED.value()
-            );
+            // Excluded requests are reset as RFC 9114, Section 5.2 recommends.
+            second_send
+                .reset(::quinn::VarInt::from_u64(Code::H3_REQUEST_REJECTED.value()).unwrap())
+                .unwrap();
             lower_rx.await.unwrap();
             wire.clear();
             if reject_lower {
                 Frame::<Bytes>::Goaway(VarInt::from(0_u32)).encode(&mut wire);
                 control.write_all(&wire).await.unwrap();
+                first_send
+                    .reset(::quinn::VarInt::from_u64(Code::H3_REQUEST_REJECTED.value()).unwrap())
+                    .unwrap();
             } else {
                 Frame::headers(vec![0, 0, 0xd9]).encode_with_payload(&mut wire);
                 first_send.write_all(&wire).await.unwrap();
@@ -319,6 +325,16 @@ async fn server_goaway_reaches_response_operations_at_each_boundary() {
         })
         .await
         .unwrap();
+    }
+}
+
+/// Yields until the client driver published a GOAWAY at or below `boundary`.
+async fn goaway_published<T: ConnectionState>(state: &T, boundary: u64) {
+    while state
+        .peer_goaway()
+        .is_none_or(|id| id.into_inner() > boundary)
+    {
+        tokio::task::yield_now().await;
     }
 }
 
@@ -446,7 +462,10 @@ async fn get() {
                 .expect("body");
             assert_eq!(body.chunk(), b"wonderful hypertext");
         };
-        tokio::join!(req_fut, drive_fut)
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        }
     };
 
     let server_fut = async {
@@ -557,7 +576,12 @@ async fn client_dynamic_qpack_request_round_trip() {
         }
 
         drop(send);
-        future::poll_fn(|cx| driver.poll_close(cx)).await
+        driver.inner.handle_connection_error(
+            crate::error::internal_error::InternalConnectionError::new(
+                Code::H3_NO_ERROR,
+                "test complete".to_string(),
+            ),
+        )
     };
 
     let server_fut = async {
@@ -1036,7 +1060,10 @@ async fn get_with_trailers_unknown_content_type() {
                 .expect("trailers none");
             assert_eq!(trailers.get("trailer").unwrap(), &"value");
         };
-        tokio::join!(req_fut, drive_fut);
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        };
     };
 
     let server_fut = async {
@@ -1105,7 +1132,10 @@ async fn get_with_trailers_known_content_type() {
                 .expect("trailers none");
             assert_eq!(trailers.get("trailer").unwrap(), &"value");
         };
-        tokio::join!(req_fut, drive_fut);
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        };
     };
 
     let server_fut = async {
@@ -1170,7 +1200,10 @@ async fn post() {
 
             request_stream.recv_response().await.expect("recv response");
         };
-        tokio::join!(req_fut, drive_fut);
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        };
     };
 
     let server_fut = async {
@@ -1230,7 +1263,10 @@ async fn header_too_big_response_from_server() {
                 StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
             );
         };
-        tokio::join!(req_fut, drive_fut);
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        };
     };
 
     let server_fut = async {
@@ -2407,17 +2443,26 @@ where
                 }
             }
 
-            // drop the SendRequest to let driver know there will be no more requests
+            // The owner below closes the driver after this request finishes.
             drop(send);
 
             Result::<(), quinn::ReadError>::Ok(())
         };
 
-        let driver = async {
-            Result::<(), ConnectionError>::Err(future::poll_fn(|cx| driver.poll_close(cx)).await)
-        };
-
-        tokio::join!(client, driver)
+        let mut client = std::pin::pin!(client);
+        tokio::select! {
+            result = &mut client => {
+                let error = driver.inner.handle_connection_error(
+                    crate::error::internal_error::InternalConnectionError::new(
+                        Code::H3_NO_ERROR, "test complete".to_string(),
+                    ),
+                );
+                (result, Err::<(), _>(error))
+            }
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => {
+                (client.await, Err::<(), _>(error))
+            }
+        }
     };
 
     let server_fut = async {
@@ -2543,4 +2588,65 @@ async fn request_stream_drop_resets_request_body() {
     };
 
     tokio::join!(server_fut, client_fut);
+}
+
+#[tokio::test]
+async fn poll_stopped_reports_stop_sending_and_acknowledged_fin() {
+    init_tracing();
+    const STOP_CODE: u64 = 0x10c;
+
+    let mut pair = Pair::default();
+    let endpoint = pair.server_inner();
+    let client_fut = async {
+        let (mut driver, mut client) = client::new(pair.client().await).await.unwrap();
+        let requests = async {
+            // The upload stays open, so only STOP_SENDING can complete the wait.
+            let mut stream = client
+                .send_request(Request::get("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap();
+            let stopped = future::poll_fn(|cx| stream.poll_stopped(cx)).await.unwrap();
+            assert_eq!(stopped, Some(Code::from(STOP_CODE)));
+            assert_matches!(
+                stream.send_data(Bytes::from_static(b"late")).await,
+                Err(StreamError::RemoteTerminate { code }) if code == Code::from(STOP_CODE)
+            );
+            drop(stream);
+
+            let (mut send, _recv) = client
+                .send_request(Request::get("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap()
+                .split();
+            send.finish().await.unwrap();
+            assert_eq!(
+                future::poll_fn(|cx| send.poll_stopped(cx)).await.unwrap(),
+                None
+            );
+        };
+        tokio::select! {
+            biased;
+            _ = requests => (),
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("connection failed: {error:?}"),
+        }
+    };
+    let peer = async {
+        let connection = endpoint.accept().await.unwrap().await.unwrap();
+        let mut control = connection.open_uni().await.unwrap();
+        let mut bytes = BytesMut::new();
+        StreamType::CONTROL.encode(&mut bytes);
+        Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut bytes);
+        control.write_all(&bytes).await.unwrap();
+        let (_send, mut recv) = connection.accept_bi().await.unwrap();
+        recv.stop(http3_quinn::VarInt::from_u64(STOP_CODE).unwrap())
+            .unwrap();
+        let (_send, mut recv) = connection.accept_bi().await.unwrap();
+        recv.read_to_end(usize::MAX).await.unwrap();
+        let _ = connection.closed().await;
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(client_fut, peer);
+    })
+    .await
+    .unwrap();
 }

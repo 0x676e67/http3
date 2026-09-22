@@ -210,12 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err::<(), ConnectionError>(future::poll_fn(|cx| driver.poll_close(cx)).await)
     };
 
-    // In the following block, we want to take ownership of `send_request`:
-    // the connection will be closed only when all `SendRequest`s instances
-    // are dropped.
-    //
-    //             So we "move" it.
-    //                  vvvv
+    // Keep the driver alive until all request tasks have finished.
     let request = async move {
         let mut requests = Vec::with_capacity(opt.requests);
 
@@ -276,7 +271,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok::<_, StreamError>(())
     };
 
-    let (req_res, drive_res) = tokio::join!(request, drive);
+    let (req_res, drive_res) = tokio::select! {
+        result = request => (result, Ok(())),
+        result = drive => (Ok(()), result),
+    };
 
     if let Err(err) = req_res {
         if err.is_h3_no_error() {

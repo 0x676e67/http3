@@ -651,7 +651,6 @@ where
         C::SendStream: quic::SendStreamUnframed<B>,
     {
         let _ = self.poll_connection_error(cx)?;
-
         self.poll_qpack_encoder_stream_inner(cx)
     }
 
@@ -798,7 +797,6 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), ConnectionError>> {
         let _ = self.poll_connection_error(cx)?;
-
         self.poll_qpack_decoder_stream_inner(cx)
     }
 
@@ -1084,7 +1082,6 @@ where
         // check if a connection error occurred on a stream
         let _ = self.poll_connection_error(cx)?;
         self.poll_accept_recv(cx)?;
-
         self.poll_control_frame(cx)
     }
 
@@ -1102,7 +1099,6 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Frame<PayloadLen>, ConnectionError>> {
         let _ = self.poll_connection_error(cx)?;
-
         self.poll_control_frame(cx)
     }
 
@@ -2094,6 +2090,18 @@ where
             .await
             .map_err(|e| self.handle_quic_stream_error(e))
     }
+
+    /// Polls for the peer stopping or acknowledging the send direction.
+    /// Never changes stream state; see [`quic::SendStream::poll_stopped`].
+    pub fn poll_stopped(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Code>, StreamError>> {
+        self.stream
+            .poll_stopped(cx)
+            .map_ok(|code| code.map(Code::from))
+            .map_err(|e| self.handle_quic_stream_error(e))
+    }
 }
 
 impl<S, B> RequestStream<S, B>
@@ -2293,6 +2301,13 @@ mod guard {
                 self.reset_on_drop = None;
             }
             result
+        }
+
+        fn poll_stopped(
+            &mut self,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+            self.stream_mut().poll_stopped(cx)
         }
 
         fn reset(&mut self, reset_code: u64) {
@@ -2670,6 +2685,13 @@ mod request_drop_tests {
             }
             self.events.lock().unwrap().push(("fin", 0));
             Poll::Ready(Ok(()))
+        }
+
+        fn poll_stopped(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+            Poll::Pending
         }
 
         fn reset(&mut self, code: u64) {
