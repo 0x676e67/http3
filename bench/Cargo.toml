@@ -41,7 +41,7 @@ criterion = "0.8.2"
 wait-timeout = "0.2.1"
 
 [build-dependencies]
-cc = "=1.4.6"
+cc = "=1.4.7"
 
 [lib]
 test = false
