@@ -2730,3 +2730,122 @@ async fn poll_send_api_round_trip_with_trailers_and_split() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn poll_response_resumes_or_cancels_blocked_headers_after_split() {
+    for cancel in [false, true] {
+        let mut pair = Pair::default();
+        let server = pair.server_inner();
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let client = async {
+            let (mut driver, mut sender) = client::builder()
+                .qpack_max_table_capacity(64)
+                .qpack_blocked_streams(1)
+                .build::<_, _, Bytes>(pair.client().await)
+                .await
+                .unwrap();
+            let mut stream = sender
+                .send_request(Request::get("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap();
+            stream.finish().await.unwrap();
+            {
+                let mut response = std::pin::pin!(stream.recv_response());
+                future::poll_fn(|cx| {
+                    assert!(driver.poll_close(cx).is_pending());
+                    assert!(response.as_mut().poll(cx).is_pending());
+                    if driver.inner.qpack_blocked_stream_count() == 1 {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+            }
+            // Drop the waiting async future, then transfer the partially decoded
+            // HEADERS to the receive half. Neither step abandons the field section.
+            let (_send, mut recv) = stream.split();
+            assert_eq!(driver.inner.qpack_blocked_stream_count(), 1);
+            if cancel {
+                drop(recv);
+                // Cancellation is queued to the connection's QPACK driver.
+                future::poll_fn(|cx| {
+                    assert!(driver.poll_close(cx).is_pending());
+                    if driver.inner.qpack_blocked_stream_count() == 0 {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+                blocked_tx.send(()).unwrap();
+                tokio::select! {
+                    result = done_rx => result.unwrap(),
+                    error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("driver failed: {error:?}"),
+                }
+            } else {
+                blocked_tx.send(()).unwrap();
+                let response = async {
+                    let headers = future::poll_fn(|cx| recv.poll_recv_response(cx))
+                        .await
+                        .unwrap();
+                    assert_eq!(headers.status(), 103);
+                    // A completed informational section must not be delivered twice.
+                    assert_eq!(recv.recv_response().await.unwrap().status(), 200);
+                    assert!(recv.recv_data().await.unwrap().is_none());
+                    assert!(recv.recv_trailers().await.unwrap().is_none());
+                };
+                tokio::select! {
+                    () = response => (),
+                    error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("driver failed: {error:?}"),
+                }
+                assert_eq!(driver.inner.qpack_blocked_stream_count(), 0);
+                drop(driver);
+                done_rx.await.unwrap();
+            }
+        };
+        let peer = async {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            let mut control_stream = connection.open_uni().await.unwrap();
+            let mut control = BytesMut::new();
+            StreamType::CONTROL.encode(&mut control);
+            Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut control);
+            control_stream.write_all(&control).await.unwrap();
+            let mut encoder_stream = connection.open_uni().await.unwrap();
+            let mut encoder = BytesMut::new();
+            StreamType::ENCODER.encode(&mut encoder);
+            encoder_stream.write_all(&encoder).await.unwrap();
+            let (mut send, _recv) = connection.accept_bi().await.unwrap();
+            let mut bytes = BytesMut::new();
+            // RIC 1 and relative index 0 wait for the first dynamic insertion.
+            Frame::headers(vec![0x02, 0x00, 0x80]).encode_with_payload(&mut bytes);
+            send.write_all(&bytes).await.unwrap();
+            blocked_rx.await.unwrap();
+            if cancel {
+                assert_eq!(
+                    send.stopped().await.unwrap().unwrap().into_inner(),
+                    Code::H3_REQUEST_CANCELLED.value(),
+                );
+            } else {
+                let mut instructions = BytesMut::new();
+                qpack::DynamicTableSizeUpdate(64).encode(&mut instructions);
+                qpack::InsertWithoutNameRef::new(":status", "103")
+                    .encode(&mut instructions)
+                    .unwrap();
+                encoder_stream.write_all(&instructions).await.unwrap();
+                let mut final_head = BytesMut::new();
+                Frame::headers(vec![0x00, 0x00, 0xd9]).encode_with_payload(&mut final_head);
+                send.write_all(&final_head).await.unwrap();
+                send.finish().unwrap();
+                connection.closed().await;
+            }
+            done_tx.send(()).unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(client, peer);
+        })
+        .await
+        .expect("blocked response did not resume or cancel");
+    }
+}
