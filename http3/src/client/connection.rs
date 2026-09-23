@@ -728,8 +728,7 @@ mod integration_tests {
 
     impl SendStream<Bytes> for Mock {
         fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-            if self.0.block_write.load(Ordering::Relaxed)
-                && self.0.written.load(Ordering::Relaxed)
+            if self.0.block_write.load(Ordering::Relaxed) && self.0.written.load(Ordering::Relaxed)
             {
                 Poll::Pending
             } else {
