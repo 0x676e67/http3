@@ -491,10 +491,11 @@ where
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    fn poll_finish(
-        &mut self,
-        _cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), StreamErrorIncoming>> {
+    fn poll_finish(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+        // A FIN must follow all buffered frame bytes, or the peer sees a
+        // truncated message. See RFC 9114 Section 4.1.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
+        ready!(self.poll_ready(cx))?;
         Poll::Ready(
             self.stream
                 .finish()
