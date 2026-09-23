@@ -1622,6 +1622,7 @@ pub struct RequestStream<S, B> {
 // Tracks frame ownership and the point after which no more HTTP content may be queued.
 #[derive(Clone, Copy, PartialEq)]
 enum SendState {
+    AwaitingResponse,
     Ready,
     Data,
     Trailers,
@@ -1681,7 +1682,7 @@ where
             max_field_section_size,
             trailers: None,
             send_grease_frame: grease,
-            send_state: SendState::Ready,
+            send_state: SendState::AwaitingResponse,
             decode_state,
         }
     }
@@ -2148,12 +2149,33 @@ where
     }
 
     fn check_send_ready(&self) -> Result<(), StreamError> {
+        if self.send_state == SendState::AwaitingResponse {
+            // A response starts with HEADERS, not DATA or trailers.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
+            return Err(StreamError::InvalidStreamState {
+                reason: "send response HEADERS before DATA or trailers".into(),
+            });
+        }
         if self.send_state != SendState::Ready {
             return Err(StreamError::InvalidStreamState {
                 reason: "flush pending DATA before sending; no content is allowed after trailers, finish, or reset".into(),
             });
         }
         Ok(())
+    }
+
+    /// Allows response HEADERS to be queued before DATA or trailers.
+    pub(crate) fn response_headers_started(&mut self) -> Result<(), StreamError> {
+        match self.send_state {
+            SendState::AwaitingResponse => {
+                self.send_state = SendState::Ready;
+                Ok(())
+            }
+            SendState::Ready => Ok(()),
+            _ => Err(StreamError::InvalidStreamState {
+                reason: "flush pending output before sending response HEADERS".into(),
+            }),
+        }
     }
 }
 

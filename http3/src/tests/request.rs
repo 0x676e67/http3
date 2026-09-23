@@ -2853,3 +2853,61 @@ async fn poll_response_resumes_or_cancels_blocked_headers_after_split() {
         .expect("blocked response did not resume or cancel");
     }
 }
+
+#[tokio::test]
+async fn server_requires_response_headers_before_body_or_trailers() {
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+    let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+    let client_fut = async {
+        let (mut driver, mut sender) = client::new(pair.client().await).await.unwrap();
+        let request = async move {
+            let mut stream = sender
+                .send_request(Request::get("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap();
+            stream.finish().await.unwrap();
+            assert_eq!(stream.recv_response().await.unwrap().status(), StatusCode::OK);
+            let mut body = Vec::new();
+            while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+                body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+            }
+            assert_eq!(body, b"body");
+            read_tx.send(()).unwrap();
+        };
+        tokio::select! {
+            () = request => (),
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("connection failed: {error:?}"),
+        }
+    };
+    let server_fut = async {
+        let mut driver = server::Connection::new(server.next().await).await.unwrap();
+        let (_, mut stream) = get_stream_blocking(&mut driver).await.unwrap();
+        future::poll_fn(|cx| stream.poll_ready(cx)).await.unwrap();
+        assert_matches!(
+            stream.start_send_data(Bytes::from_static(b"early")),
+            Err(StreamError::InvalidStreamState { .. })
+        );
+        assert_matches!(
+            stream.start_send_trailers(HeaderMap::new()),
+            Err(StreamError::InvalidStreamState { .. })
+        );
+        assert_matches!(
+            stream.send_data(Bytes::from_static(b"early")).await,
+            Err(StreamError::InvalidStreamState { .. })
+        );
+        assert_matches!(
+            stream.send_trailers(HeaderMap::new()).await,
+            Err(StreamError::InvalidStreamState { .. })
+        );
+        stream.send_response(Response::new(())).await.unwrap();
+        stream.send_data(Bytes::from_static(b"body")).await.unwrap();
+        stream.finish().await.unwrap();
+        read_rx.await.unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .unwrap();
+}

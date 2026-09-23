@@ -168,6 +168,7 @@ where
             });
         }
 
+        self.inner.response_headers_started()?;
         stream::write(&mut self.inner.stream, Frame::Headers(block.freeze()))
             .await
             .map_err(|e| self.handle_quic_stream_error(e))?;
