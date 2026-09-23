@@ -268,26 +268,23 @@ where
             }
         };
 
-        let decoded = match inner.poll_decode_field_section(cx, &mut encoded) {
+        let fields = match inner.poll_decode_field_section(cx, &mut encoded) {
             Poll::Pending => {
                 *response = Some(encoded);
                 return Poll::Pending;
             }
-            Poll::Ready(decoded) => decoded,
-        };
-        let decoded = match decoded {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
             //# An HTTP/3 implementation MAY impose a limit on the maximum size of
             //# the message header it will accept on an individual HTTP message.
-            Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
+            Poll::Ready(Err(qpack::DecoderError::HeaderTooLong(cancel_size))) => {
                 inner.stop_sending(Code::H3_REQUEST_CANCELLED);
                 return Poll::Ready(Err(StreamError::HeaderTooBig {
                     actual_size: cancel_size,
                     max_size: inner.max_field_section_size,
                 }));
             }
-            Ok(decoded) => decoded,
-            Err(error) => {
+            Poll::Ready(Ok(qpack::Decoded { fields, .. })) => fields,
+            Poll::Ready(Err(error)) => {
                 let code = if error.is_internal() {
                     Code::H3_INTERNAL_ERROR
                 } else {
@@ -301,8 +298,6 @@ where
                 )));
             }
         };
-
-        let qpack::Decoded { fields, .. } = decoded;
 
         let (status, headers, pseudo_sensitivity) = Header::try_from(fields)
             .and_then(Header::into_response_parts)
