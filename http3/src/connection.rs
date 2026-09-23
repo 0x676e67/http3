@@ -2150,12 +2150,13 @@ where
     fn check_send_ready(&self) -> Result<(), StreamError> {
         if self.send_state != SendState::Ready {
             return Err(StreamError::InvalidStreamState {
-                reason: "flush pending DATA before sending; no content is allowed after trailers, finish, or reset".into(),
+                reason: "flush the pending frame before sending; no content is allowed after trailers, finish, or reset".into(),
             });
         }
         Ok(())
     }
 
+    /// Queues response HEADERS until the next successful `poll_ready` flush.
     pub(crate) fn start_send_headers(&mut self, block: Bytes) -> Result<(), StreamError> {
         self.check_send_ready()?;
         self.stream
