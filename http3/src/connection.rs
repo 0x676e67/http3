@@ -2158,24 +2158,24 @@ where
         }
         if self.send_state != SendState::Ready {
             return Err(StreamError::InvalidStreamState {
-                reason: "flush pending DATA before sending; no content is allowed after trailers, finish, or reset".into(),
+                reason: "flush the pending frame before sending; no content is allowed after trailers, finish, or reset".into(),
             });
         }
         Ok(())
     }
 
-    /// Allows response HEADERS to be queued before DATA or trailers.
-    pub(crate) fn response_headers_started(&mut self) -> Result<(), StreamError> {
-        match self.send_state {
-            SendState::AwaitingResponse => {
-                self.send_state = SendState::Ready;
-                Ok(())
-            }
-            SendState::Ready => Ok(()),
-            _ => Err(StreamError::InvalidStreamState {
-                reason: "flush pending output before sending response HEADERS".into(),
-            }),
+    /// Queues response HEADERS until the next successful `poll_ready` flush.
+    pub(crate) fn start_send_headers(&mut self, block: Bytes) -> Result<(), StreamError> {
+        // The first response HEADERS leaves AwaitingResponse here, in the same
+        // step that queues it, so a cancelled flush cannot unlock early DATA.
+        if self.send_state != SendState::AwaitingResponse {
+            self.check_send_ready()?;
         }
+        self.stream
+            .send_data(Frame::Headers(block))
+            .map_err(|e| self.handle_quic_stream_error(e))?;
+        self.send_state = SendState::Data;
+        Ok(())
     }
 }
 

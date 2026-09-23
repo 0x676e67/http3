@@ -20,11 +20,10 @@ use crate::{
         Code, StreamError, connection_error_creators::CloseStream,
         internal_error::InternalConnectionError,
     },
-    proto::{frame::Frame, headers::Header},
+    proto::headers::Header,
     qpack,
     quic::{self, SendStream as _},
     shared_state::{ConnectionState, SharedState},
-    stream::{self},
 };
 
 /// Manage request and response transfer for an incoming request
@@ -168,12 +167,9 @@ where
             });
         }
 
-        self.inner.response_headers_started()?;
-        stream::write(&mut self.inner.stream, Frame::Headers(block.freeze()))
-            .await
-            .map_err(|e| self.handle_quic_stream_error(e))?;
-
-        Ok(())
+        future::poll_fn(|cx| self.inner.poll_ready(cx)).await?;
+        self.inner.start_send_headers(block.freeze())?;
+        future::poll_fn(|cx| self.inner.poll_ready(cx)).await
     }
 
     /// Send some data on the response body.
