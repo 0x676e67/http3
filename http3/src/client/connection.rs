@@ -1210,7 +1210,8 @@ mod integration_tests {
                     ))
                     .is_pending()
             );
-            assert!(state.written.load(Ordering::Relaxed));
+            // The initial readiness check blocks before handing headers to the transport.
+            assert!(!state.written.load(Ordering::Relaxed));
             drop(sending);
             assert!(matches!(
                 events_rx.try_recv(),
