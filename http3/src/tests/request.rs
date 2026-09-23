@@ -2650,3 +2650,83 @@ async fn poll_stopped_reports_stop_sending_and_acknowledged_fin() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn poll_send_api_round_trip_with_trailers_and_split() {
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+    let client_fut = async {
+        let (mut driver, mut client) = client::new(pair.client().await).await.unwrap();
+        let requests = async {
+            for _ in 0..2 {
+                let stream = client
+                    .send_request(Request::post("https://localhost/").body(()).unwrap())
+                    .await
+                    .unwrap();
+                let (mut send, mut recv) = stream.split();
+                future::poll_fn(|cx| send.poll_ready(cx)).await.unwrap();
+                send.start_send_data(Bytes::from(vec![42; 128 * 1024]))
+                    .unwrap();
+                assert_matches!(
+                    send.start_send_data(Bytes::new()),
+                    Err(StreamError::InvalidStreamState { .. })
+                );
+                future::poll_fn(|cx| send.poll_ready(cx)).await.unwrap();
+                let mut trailers = HeaderMap::new();
+                trailers.insert("x-trailer", "request".parse().unwrap());
+                send.start_send_trailers(trailers).unwrap();
+                future::poll_fn(|cx| send.poll_finish(cx)).await.unwrap();
+                assert_eq!(recv.recv_response().await.unwrap().status(), StatusCode::OK);
+                let mut body = Vec::new();
+                while let Some(mut data) = recv.recv_data().await.unwrap() {
+                    body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+                }
+                assert_eq!(body, vec![24; 128 * 1024]);
+                assert_eq!(
+                    recv.recv_trailers().await.unwrap().unwrap()["x-trailer"],
+                    "response"
+                );
+                assert_eq!(
+                    future::poll_fn(|cx| send.poll_stopped(cx)).await.unwrap(),
+                    None
+                );
+            }
+        };
+        tokio::select! {
+            biased;
+            () = requests => (),
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("connection failed: {error:?}"),
+        }
+    };
+    let server_fut = async {
+        let mut driver = server::Connection::new(server.next().await).await.unwrap();
+        for _ in 0..2 {
+            let (_, mut stream) = get_stream_blocking(&mut driver).await.unwrap();
+            let mut body = Vec::new();
+            while let Some(mut data) = stream.recv_data().await.unwrap() {
+                body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+            }
+            assert_eq!(body, vec![42; 128 * 1024]);
+            assert_eq!(
+                stream.recv_trailers().await.unwrap().unwrap()["x-trailer"],
+                "request"
+            );
+            stream.send_response(Response::new(())).await.unwrap();
+            let mut send = stream;
+            future::poll_fn(|cx| send.poll_ready(cx)).await.unwrap();
+            send.start_send_data(Bytes::from(vec![24; 128 * 1024]))
+                .unwrap();
+            // Mix poll and async operations on the server, too.
+            let mut trailers = HeaderMap::new();
+            trailers.insert("x-trailer", "response".parse().unwrap());
+            send.send_trailers(trailers).await.unwrap();
+            future::poll_fn(|cx| send.poll_finish(cx)).await.unwrap();
+        }
+        let _ = driver.accept().await;
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .unwrap();
+}

@@ -1615,7 +1615,19 @@ pub struct RequestStream<S, B> {
     pub(super) conn_state: Arc<SharedState>,
     pub(super) max_field_section_size: u64,
     send_grease_frame: bool,
+    send_state: SendState,
     decode_state: RequestDecodeState,
+}
+
+// Tracks frame ownership and the point after which no more HTTP content may be queued.
+#[derive(Clone, Copy, PartialEq)]
+enum SendState {
+    Ready,
+    Data,
+    Trailers,
+    Finishing,
+    Finished,
+    Reset,
 }
 
 impl<S, B> RequestStream<S, B>
@@ -1649,6 +1661,7 @@ where
             stream: StreamGuard::new(stream),
             max_field_section_size,
             send_grease_frame: grease,
+            send_state: SendState::Ready,
             trailers: None,
             conn_state,
             decode_state,
@@ -1668,6 +1681,7 @@ where
             max_field_section_size,
             trailers: None,
             send_grease_frame: grease,
+            send_state: SendState::Ready,
             decode_state,
         }
     }
@@ -1999,17 +2013,70 @@ where
     /// Send some data on the response body.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_data(&mut self, buf: B) -> Result<(), StreamError> {
-        let frame = Frame::Data(buf);
-
-        stream::write(&mut self.stream, frame)
-            .await
-            .map_err(|e| self.handle_quic_stream_error(e))?;
-        Ok(())
+        future::poll_fn(|cx| self.poll_ready(cx)).await?;
+        self.start_send_data(buf)?;
+        future::poll_fn(|cx| self.poll_ready(cx)).await
     }
 
     /// Send a set of trailers to end the request.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
+        future::poll_fn(|cx| self.poll_ready(cx)).await?;
+        self.start_send_trailers(trailers)?;
+        future::poll_fn(|cx| self.poll_ready(cx)).await
+    }
+
+    /// Resets the send direction with `code`, preserving the receive direction.
+    /// A later Drop does not replace this code with `H3_REQUEST_CANCELLED`.
+    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1>.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn stop_stream(&mut self, code: Code) {
+        self.stream.reset(code.into());
+        self.send_state = SendState::Reset;
+    }
+
+    /// Finishes the send direction after flushing any pending output.
+    /// Only successful completion disables reset on Drop; a pending or failed
+    /// finish leaves cancellation armed. Receiving is unaffected.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn finish(&mut self) -> Result<(), StreamError> {
+        future::poll_fn(|cx| self.poll_finish(cx)).await
+    }
+
+    /// Polls for the peer stopping or acknowledging the send direction.
+    /// Never changes stream state; see [`quic::SendStream::poll_stopped`].
+    pub fn poll_stopped(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Code>, StreamError>> {
+        self.stream
+            .poll_stopped(cx)
+            .map_ok(|code| code.map(Code::from))
+            .map_err(|e| self.handle_quic_stream_error(e))
+    }
+
+    /// Flushes the pending frame without waiting for peer acknowledgment.
+    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        ready!(self.stream.poll_ready(cx)).map_err(|e| self.handle_quic_stream_error(e))?;
+        if self.send_state == SendState::Data {
+            self.send_state = SendState::Ready;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    /// Queues one DATA frame after the previous frame has been flushed.
+    pub fn start_send_data(&mut self, buf: B) -> Result<(), StreamError> {
+        self.check_send_ready()?;
+        self.stream
+            .send_data(Frame::Data(buf))
+            .map_err(|e| self.handle_quic_stream_error(e))?;
+        self.send_state = SendState::Data;
+        Ok(())
+    }
+
+    /// Queues the final field section after the previous frame has been flushed.
+    pub fn start_send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
+        self.check_send_ready()?;
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
         //= type=TODO
         //# Characters in field names MUST be
@@ -2045,62 +2112,48 @@ where
             });
         }
 
-        stream::write(&mut self.stream, Frame::Headers(block.freeze()))
-            .await
+        self.stream
+            .send_data(Frame::Headers(block.freeze()))
             .map_err(|e| self.handle_quic_stream_error(e))?;
-
+        self.send_state = SendState::Trailers;
         Ok(())
     }
 
-    /// Resets the send direction with `code`, preserving the receive direction.
-    /// A later Drop does not replace this code with `H3_REQUEST_CANCELLED`.
-    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1>.
-    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub fn stop_stream(&mut self, code: Code) {
-        self.stream.reset(code.into());
-    }
-
-    /// Finishes the send direction after flushing any pending output.
-    /// Only successful completion disables reset on Drop; a pending or failed
-    /// finish leaves cancellation armed. Receiving is unaffected.
-    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub async fn finish(&mut self) -> Result<(), StreamError> {
-        // A cancelled send_data/send_trailers future can leave a frame queued
-        // in the backend. Flush it before appending GREASE or closing with FIN.
-        // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
-        future::poll_fn(|cx| self.stream.poll_ready(cx))
-            .await
-            .map_err(|e| self.handle_quic_stream_error(e))?;
-
+    /// Flushes all queued frames, emits GREASE once, then submits FIN.
+    pub fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        if self.send_state == SendState::Reset {
+            return Poll::Ready(Err(StreamError::InvalidStreamState {
+                reason: "send direction was reset".into(),
+            }));
+        }
+        if self.send_state == SendState::Finished {
+            return Poll::Ready(Ok(()));
+        }
+        self.send_state = SendState::Finishing;
+        ready!(self.poll_ready(cx))?;
         if self.send_grease_frame {
-            // send a grease frame once per Connection
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
-            //= type=implication
-            //# Frame types of the format 0x1f * N + 0x21 for non-negative integer
-            //# values of N are reserved to exercise the requirement that unknown
-            //# types be ignored (Section 9).  These frames have no semantics, and
-            //# they MAY be sent on any stream where frames are allowed to be sent.
-            stream::write(&mut self.stream, Frame::Grease)
-                .await
+            // Reserved frames may follow trailers.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
+            // Commit this flag when queued, so cancelling a pending flush cannot
+            // cause the next poll to append another GREASE frame.
+            self.stream
+                .send_data(Frame::Grease)
                 .map_err(|e| self.handle_quic_stream_error(e))?;
             self.send_grease_frame = false;
+            ready!(self.poll_ready(cx))?;
         }
-
-        future::poll_fn(|cx| self.stream.poll_finish(cx))
-            .await
-            .map_err(|e| self.handle_quic_stream_error(e))
+        ready!(self.stream.poll_finish(cx)).map_err(|e| self.handle_quic_stream_error(e))?;
+        self.send_state = SendState::Finished;
+        Poll::Ready(Ok(()))
     }
 
-    /// Polls for the peer stopping or acknowledging the send direction.
-    /// Never changes stream state; see [`quic::SendStream::poll_stopped`].
-    pub fn poll_stopped(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<Code>, StreamError>> {
-        self.stream
-            .poll_stopped(cx)
-            .map_ok(|code| code.map(Code::from))
-            .map_err(|e| self.handle_quic_stream_error(e))
+    fn check_send_ready(&self) -> Result<(), StreamError> {
+        if self.send_state != SendState::Ready {
+            return Err(StreamError::InvalidStreamState {
+                reason: "flush pending DATA before sending; no content is allowed after trailers, finish, or reset".into(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -2127,6 +2180,7 @@ where
                 conn_state: self.conn_state.clone(),
                 max_field_section_size: 0,
                 send_grease_frame: self.send_grease_frame,
+                send_state: self.send_state,
                 decode_state: RequestDecodeState::SendOnly,
             },
             RequestStream {
@@ -2135,6 +2189,7 @@ where
                 conn_state: self.conn_state,
                 max_field_section_size: self.max_field_section_size,
                 send_grease_frame: self.send_grease_frame,
+                send_state: self.send_state,
                 decode_state: self.decode_state,
             },
         )
@@ -2631,6 +2686,9 @@ mod request_drop_tests {
         backpressure: bool,
         pending_write: bool,
         pending_read: bool,
+        pressure_each_frame: bool,
+        queued: Bytes,
+        wire: Arc<Mutex<Vec<u8>>>,
     }
 
     impl quic::RecvStream for Probe {
@@ -2657,19 +2715,30 @@ mod request_drop_tests {
 
     impl quic::SendStream<Bytes> for Probe {
         fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-            if std::mem::take(&mut self.backpressure) {
+            if self.pending_write && std::mem::take(&mut self.backpressure) {
+                // A frame prefix can be committed before transport backpressure.
+                let prefix = self.queued.split_to(self.queued.len().min(1));
+                self.wire.lock().unwrap().extend_from_slice(&prefix);
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
             if std::mem::take(&mut self.pending_write) {
                 self.events.lock().unwrap().push(("flushed", 0));
             }
+            self.wire.lock().unwrap().extend_from_slice(&self.queued);
+            self.queued = Bytes::new();
             Poll::Ready(Ok(()))
         }
 
-        fn send_data<D: Into<WriteBuf<Bytes>>>(&mut self, _: D) -> Result<(), StreamErrorIncoming> {
+        fn send_data<D: Into<WriteBuf<Bytes>>>(
+            &mut self,
+            data: D,
+        ) -> Result<(), StreamErrorIncoming> {
             assert!(!self.pending_write, "previous frame has not been flushed");
+            self.backpressure |= self.pressure_each_frame;
             self.pending_write = self.backpressure;
+            let mut data = data.into();
+            self.queued = data.copy_to_bytes(data.remaining());
             Ok(())
         }
 
@@ -3069,5 +3138,112 @@ mod request_drop_tests {
                 ("stop", Code::H3_REQUEST_CANCELLED.value()),
             ]
         );
+    }
+    #[tokio::test]
+    async fn poll_send_retains_pending_data_and_mixes_with_async() {
+        let (mut stream, probe) = stream_with_probe(Probe {
+            pressure_each_frame: true,
+            ..Probe::default()
+        });
+        stream.start_send_data(Bytes::from_static(b"one")).unwrap();
+        assert!(matches!(
+            stream.start_send_data(Bytes::from_static(b"discarded")),
+            Err(StreamError::InvalidStreamState { .. })
+        ));
+        assert!(
+            future::poll_fn(|cx| stream.poll_ready(cx))
+                .now_or_never()
+                .is_none()
+        );
+        // The cancelled poll retains the frame; the async entry flushes it first.
+        stream.send_data(Bytes::from_static(b"two")).await.unwrap();
+        stream.finish().await.unwrap();
+        assert_eq!(&*probe.wire.lock().unwrap(), b"\x00\x03one\x00\x03two");
+        assert!(stream.get_conn_error().is_none());
+    }
+
+    #[test]
+    fn poll_finish_survives_pending_grease_and_split() {
+        let (mut stream, probe) = stream_with_probe(Probe {
+            pressure_each_frame: true,
+            ..Probe::default()
+        });
+        stream.send_grease_frame = true;
+        stream.start_send_data(Bytes::from_static(b"body")).unwrap();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(stream.poll_finish(&mut cx).is_pending()); // DATA
+        assert!(stream.poll_finish(&mut cx).is_pending()); // GREASE
+        assert!(matches!(
+            stream.start_send_data(Bytes::new()),
+            Err(StreamError::InvalidStreamState { .. })
+        ));
+        let (mut send, recv) = stream.split();
+        assert!(matches!(send.poll_finish(&mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(send.poll_finish(&mut cx), Poll::Ready(Ok(()))));
+        // FIN submission must not be mistaken for peer acknowledgment.
+        assert!(send.poll_stopped(&mut cx).is_pending());
+        drop(send);
+        let bytes = probe.wire.lock().unwrap();
+        assert_eq!(&bytes[..6], b"\x00\x04body");
+        let mut grease = &bytes[6..];
+        let ty = crate::proto::varint::VarInt::decode(&mut grease)
+            .unwrap()
+            .into_inner();
+        assert_eq!((ty - 0x21) % 0x1f, 0);
+        assert_eq!(grease, b"\x06grease");
+        assert_eq!(
+            probe
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| *name == "fin")
+                .count(),
+            1
+        );
+        assert!(
+            !probe
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| *name == "reset")
+        );
+        drop(recv);
+    }
+
+    #[tokio::test]
+    async fn poll_trailers_enforce_limit_and_send_order() {
+        let (mut stream, probe) = stream();
+        stream.set_settings(crate::config::Settings {
+            max_field_section_size: 40,
+            ..crate::config::Settings::default()
+        });
+        let mut fields = HeaderMap::new();
+        fields.insert("trailer", "too large".parse().unwrap());
+        assert!(matches!(
+            stream.start_send_trailers(fields),
+            Err(StreamError::HeaderTooBig { .. })
+        ));
+        assert!(probe.wire.lock().unwrap().is_empty());
+        stream.send_data(Bytes::from_static(b"ok")).await.unwrap();
+        let mut fields = HeaderMap::new();
+        fields.insert("x", "y".parse().unwrap());
+        stream.start_send_trailers(fields).unwrap();
+        future::poll_fn(|cx| stream.poll_ready(cx)).await.unwrap();
+        assert!(matches!(
+            stream.start_send_trailers(HeaderMap::new()),
+            Err(StreamError::InvalidStreamState { .. })
+        ));
+        assert!(matches!(
+            stream.send_data(Bytes::new()).await,
+            Err(StreamError::InvalidStreamState { .. })
+        ));
+        stream.finish().await.unwrap();
+        assert!(stream.get_conn_error().is_none());
+        assert!(matches!(
+            stream.start_send_data(Bytes::new()),
+            Err(StreamError::InvalidStreamState { .. })
+        ));
     }
 }

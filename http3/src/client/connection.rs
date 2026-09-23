@@ -843,6 +843,8 @@ mod integration_tests {
                 4 => stream.send_trailers(http::HeaderMap::new()).await,
                 5 => stream.finish().await,
                 6 => poll_fn(|cx| stream.poll_stopped(cx)).await.map(|_| ()),
+                7 => poll_fn(|cx| stream.poll_ready(cx)).await,
+                8 => poll_fn(|cx| stream.poll_finish(cx)).await,
                 _ => unreachable!(),
             }
         })
@@ -863,9 +865,47 @@ mod integration_tests {
     }
 
     #[test]
+    fn start_send_observes_published_request_errors_before_queuing() {
+        for connection_error in [false, true] {
+            for trailers in [false, true] {
+                let state = Arc::new(State::default());
+                let mut sender = sender(&state, false);
+                let stream = returned(&mut sender);
+                let (mut stream, _recv) = stream.split();
+                state.written.store(false, Ordering::Relaxed);
+                if connection_error {
+                    sender
+                        .conn_state
+                        .set_conn_error(quic::ConnectionErrorIncoming::Timeout.into());
+                } else {
+                    sender
+                        .conn_state
+                        .set_peer_goaway(StreamId::try_from(0).unwrap());
+                }
+                let result = if trailers {
+                    stream.start_send_trailers(http::HeaderMap::new())
+                } else {
+                    stream.start_send_data(Bytes::from_static(b"body"))
+                };
+                if connection_error {
+                    assert!(matches!(
+                        result,
+                        Err(StreamError::ConnectionError(ConnectionError::Timeout))
+                    ));
+                } else {
+                    assert!(matches!(result, Err(StreamError::GoawayRejected { .. })));
+                    assert_eq!(state.reset_calls.load(Ordering::Relaxed), 1);
+                    assert_eq!(state.stop_calls.load(Ordering::Relaxed), 0);
+                }
+                assert!(!state.written.load(Ordering::Relaxed));
+            }
+        }
+    }
+
+    #[test]
     fn goaway_rejects_returned_request_operations_on_next_poll_and_cancels_directions() {
         for terminal_error in [false, true] {
-            for operation in 0..7 {
+            for operation in 0..9 {
                 let state = Arc::new(State::default());
                 let mut sender = sender(&state, false);
                 let mut stream = returned(&mut sender);

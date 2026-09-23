@@ -296,11 +296,17 @@ where
     S: quic::SendStream<B>,
     B: Buf,
 {
-    /// Send some data on the request body.
+    /// Sends a body buffer, flushing previously queued output first.
+    ///
+    /// Cancellation before the buffer is queued drops it. Once queued, the
+    /// buffer remains owned by the stream if this future is cancelled.
+    /// Continue with [`Self::poll_ready`] or [`Self::finish`]; sending the same
+    /// buffer again would append another DATA frame.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_data(&mut self, buf: B) -> Result<(), StreamError> {
-        let result = self.rejection.run(self.inner.send_data(buf)).await;
-        self.handle_result(result)
+        poll_fn(|cx| self.poll_ready(cx)).await?;
+        self.start_send_data(buf)?;
+        poll_fn(|cx| self.poll_ready(cx)).await
     }
 
     /// Resets the request's send direction with `error_code`.
@@ -318,10 +324,13 @@ where
     /// Send a set of trailers to end the request.
     ///
     /// [`RequestStream::finish()`] must be called to finalize a request.
+    /// Once queued, cancellation leaves the trailers owned by the stream;
+    /// continue with `finish` rather than submitting the trailers again.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
-        let result = self.rejection.run(self.inner.send_trailers(trailers)).await;
-        self.handle_result(result)
+        poll_fn(|cx| self.poll_ready(cx)).await?;
+        self.start_send_trailers(trailers)?;
+        poll_fn(|cx| self.poll_ready(cx)).await
     }
 
     /// Flushes pending request output and closes the send direction with FIN.
@@ -335,8 +344,7 @@ where
     /// See [RFC 9114, Section 4.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1).
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn finish(&mut self) -> Result<(), StreamError> {
-        let result = self.rejection.run(self.inner.finish()).await;
-        self.handle_result(result)
+        poll_fn(|cx| self.poll_finish(cx)).await
     }
 
     /// Polls for the server stopping or acknowledging the request's send direction.
@@ -351,6 +359,56 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Code>, StreamError>> {
         let result = self.rejection.poll(cx, |cx| self.inner.poll_stopped(cx));
+        result.map(|result| self.handle_result(result))
+    }
+
+    /// Flushes a queued DATA or trailers frame into the QUIC transport.
+    ///
+    /// `Pending` registers the task for another poll. Success permits another
+    /// DATA frame while the body is open; it does not reserve QUIC flow-control
+    /// credit or wait for acknowledgment. After trailers, only finish is allowed.
+    /// Dropping the polling future leaves queued bytes owned by the stream.
+    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        let result = self.rejection.poll(cx, |cx| self.inner.poll_ready(cx));
+        result.map(|result| self.handle_result(result))
+    }
+
+    /// Queues one owned body buffer as a DATA frame without waiting for I/O.
+    ///
+    /// First complete [`Self::poll_ready`]; after success, drive `poll_ready` or
+    /// [`Self::poll_finish`] to flush the frame. The buffer is consumed even on
+    /// error. Pending output, trailers, finish or reset cause a local
+    /// [`StreamError::InvalidStreamState`] without discarding queued bytes.
+    pub fn start_send_data(&mut self, buf: B) -> Result<(), StreamError> {
+        let result = match self.rejection.state.request_error(self.rejection.stream_id) {
+            Some(error) => Err(error),
+            None => self.inner.start_send_data(buf),
+        };
+        self.handle_result(result)
+    }
+
+    /// Queues the final field section without waiting for I/O.
+    ///
+    /// First complete [`Self::poll_ready`]. Success forbids further DATA or
+    /// trailers; call [`Self::poll_finish`] to flush and send FIN. The peer's
+    /// field section limit is checked before queuing; an error consumes the
+    /// supplied headers. Invalid send order is a local error, not a wire error.
+    pub fn start_send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
+        let result = match self.rejection.state.request_error(self.rejection.stream_id) {
+            Some(error) => Err(error),
+            None => self.inner.start_send_trailers(trailers),
+        };
+        self.handle_result(result)
+    }
+
+    /// Flushes pending DATA, trailers and optional GREASE, then submits FIN.
+    ///
+    /// Once polled, no more content may be queued. Pending or failed completion
+    /// preserves reset on Drop; retrying continues the same finish operation.
+    /// Success is repeatable and does not wait for FIN acknowledgment; use
+    /// [`Self::poll_stopped`] for that. Receiving is unaffected.
+    pub fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        let result = self.rejection.poll(cx, |cx| self.inner.poll_finish(cx));
         result.map(|result| self.handle_result(result))
     }
 }
