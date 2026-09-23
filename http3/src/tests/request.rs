@@ -2853,3 +2853,59 @@ async fn poll_response_resumes_or_cancels_blocked_headers_after_split() {
         .expect("blocked response did not resume or cancel");
     }
 }
+
+#[tokio::test]
+async fn cancelled_send_response_rejects_data_until_headers_flush() {
+    const HEADER_LEN: usize = 4 * 1024 * 1024;
+
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let client_fut = async {
+        let (mut driver, mut sender) = client::builder()
+            .max_field_section_size(8 * 1024 * 1024)
+            .build::<_, _, Bytes>(pair.client().await)
+            .await
+            .unwrap();
+        let request = async {
+            let mut stream = sender
+                .send_request(Request::get("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap();
+            stream.finish().await.unwrap();
+            done_rx.await.unwrap();
+        };
+        tokio::select! {
+            () = request => (),
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("connection failed: {error:?}"),
+        }
+    };
+    let server_fut = async {
+        let mut driver = server::Connection::new(server.next().await).await.unwrap();
+        let (_, mut stream) = get_stream_blocking(&mut driver).await.unwrap();
+        let response = Response::builder()
+            .header("x-large", "a".repeat(HEADER_LEN))
+            .body(())
+            .unwrap();
+        {
+            let mut sending = std::pin::pin!(stream.send_response(response));
+            future::poll_fn(|cx| match sending.as_mut().poll(cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("send_response unexpectedly completed: {result:?}")
+                }
+            })
+            .await;
+        }
+        assert_matches!(
+            stream.start_send_data(Bytes::from_static(b"tail")),
+            Err(StreamError::InvalidStreamState { .. })
+        );
+        done_tx.send(()).unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .unwrap();
+}

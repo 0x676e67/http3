@@ -168,11 +168,9 @@ where
             });
         }
 
-        stream::write(&mut self.inner.stream, Frame::Headers(block.freeze()))
-            .await
-            .map_err(|e| self.handle_quic_stream_error(e))?;
-
-        Ok(())
+        futures_util::future::poll_fn(|cx| self.inner.poll_ready(cx)).await?;
+        self.inner.start_send_headers(block.freeze())?;
+        futures_util::future::poll_fn(|cx| self.inner.poll_ready(cx)).await
     }
 
     /// Send some data on the response body.

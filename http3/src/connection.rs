@@ -2155,6 +2155,15 @@ where
         }
         Ok(())
     }
+
+    pub(crate) fn start_send_headers(&mut self, block: Bytes) -> Result<(), StreamError> {
+        self.check_send_ready()?;
+        self.stream
+            .send_data(Frame::Headers(block))
+            .map_err(|e| self.handle_quic_stream_error(e))?;
+        self.send_state = SendState::Data;
+        Ok(())
+    }
 }
 
 impl<S, B> RequestStream<S, B>
