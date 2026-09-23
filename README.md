@@ -1,14 +1,11 @@
 # http3
 
-A Tokio aware, HTTP/3 implementation for Rust.
 
 [![CI](https://github.com/0x676e67/http3/actions/workflows/CI.yml/badge.svg)](https://github.com/0x676e67/http3/actions/workflows/CI.yml)
 [![GitHub License](https://img.shields.io/github/license/0x676e67/http3)](https://github.com/0x676e67/http3/blob/main/LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/http3.svg)](https://crates.io/crates/http3)
 
-More information about this crate can be found in the [crate documentation][docs].
-
-[docs]: https://docs.rs/http3
+A [Sans-I/O][sans-io] aware, HTTP/3 implementation for Rust.
 
 ## Features
 
@@ -18,7 +15,7 @@ More information about this crate can be found in the [crate documentation][docs
 - Works with different QUIC transport implementations.
 - Passes HTTP/3 interoperability tests.
 - Focus on performance, interoperability, and correctness.
-- Built on [Tokio](https://tokio.rs).
+- Carries forward [h3]'s implementation.
 
 ## Usage
 
@@ -26,7 +23,7 @@ To use `http3`, first add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-http3 = "0.0.8"
+http3 = "0.1.1"
 ```
 
 Next, add this to your crate:
@@ -47,6 +44,6 @@ Licensed under either of Apache License, Version 2.0 ([LICENSE](./LICENSE) or ht
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the [Apache-2.0](./LICENSE) license, shall be licensed as above, without any additional terms or conditions.
 
-## Accolades
-
-The project is based on a fork of [h3](https://github.com/hyperium/h3).
+[docs]: https://docs.rs/http3
+[sans-io]: https://sans-io.readthedocs.io/how-to-sans-io.html
+[H3]: https://github.com/hyperium/h3

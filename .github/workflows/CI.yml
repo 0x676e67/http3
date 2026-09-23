@@ -12,8 +12,7 @@ env:
     --exclude interop
     --exclude bench
   toolchain_style: nightly
-  toolchain_msrv: "1.85"
-  toolchain_http3_quinn_msrv: "1.85"
+  toolchain_msrv: "1.98"
   toolchain_doc: nightly
   toolchain_lint: stable
   toolchain_fuzz: nightly
@@ -42,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_style }}
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: ${{ env.toolchain_style }}
           components: rustfmt
@@ -54,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_lint }}
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: ${{ env.toolchain_lint }}
           components: clippy
@@ -67,7 +66,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_msrv }}
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: ${{ env.toolchain_msrv }}
       - run: cargo check -p http3
@@ -78,10 +77,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install Rust ${{ env.toolchain_http3_quinn_msrv }}
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install Rust ${{ env.toolchain_msrv }}
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          toolchain: ${{ env.toolchain_http3_quinn_msrv }}
+          toolchain: ${{ env.toolchain_msrv }}
       - run: cargo check -p http3-quic
 
   test:
@@ -110,7 +109,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-multilib libc6-dev-i386 libclang-dev
       - name: Install Rust ${{ matrix.toolchain }}
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: ${{ matrix.toolchain }}
           target: ${{ matrix.target }}
@@ -128,7 +127,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_doc }}
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: ${{ env.toolchain_doc }}
       - run: cargo rustdoc -p http3 -- -D rustdoc::broken_intra_doc_links -D warnings
@@ -140,7 +139,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust ${{ env.toolchain_fuzz }}
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: ${{ env.toolchain_fuzz }}
       - name: Install cargo-fuzz
@@ -169,7 +168,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust stable
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
       - name: Run server and client examples test

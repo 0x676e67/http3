@@ -185,10 +185,10 @@ impl VirtualAddressSpace {
         }
     }
 
-    pub fn largest_ref(&self) -> usize {
-        self.delta
-    }
-
+    /// Returns the total insertion count, also used as Base when encoding a field section.
+    ///
+    /// Eviction changes the retained window, not this absolute reference point.
+    /// See [RFC 9204, Section 4.5.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.2).
     pub fn total_inserted(&self) -> usize {
         self.inserted
     }
@@ -318,12 +318,20 @@ mod tests {
     }
 
     #[test]
-    fn largest_ref() {
+    fn total_inserted_survives_eviction() {
         let mut vas = VirtualAddressSpace::default();
         (0..7).for_each(|_| {
             vas.add().unwrap();
         });
-        assert_eq!(vas.largest_ref(), 7);
+        assert_eq!(vas.total_inserted(), 7);
+        for _ in 0..3 {
+            vas.drop().unwrap();
+        }
+        // Eviction advances the retained window, not the absolute insertion count.
+        assert_eq!(vas.total_inserted(), 7);
+        assert_eq!(vas.index(0), Ok(4));
+        assert_eq!(vas.add(), Ok(8));
+        assert_eq!(vas.total_inserted(), 8);
     }
 
     #[test]

@@ -12,37 +12,29 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
-use futures_util::{
-    Stream, StreamExt,
-    stream::{self},
-};
+use futures_util::{Stream, StreamExt, stream};
 use http3::{
     error::Code,
     quic::{ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf},
 };
-
-#[cfg(all(feature = "quinn", feature = "quic"))]
-compile_error!("features `quinn` and `quic` are mutually exclusive");
-
-#[cfg(all(feature = "quic", not(feature = "quinn")))]
-pub use quic;
 use quic::ReadError;
-#[cfg(any(feature = "quinn", feature = "quic"))]
-pub use quic::{AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
-#[cfg(all(feature = "quinn", not(feature = "quic")))]
-pub use quinn as quic;
+pub use quic::{self, AcceptBi, AcceptUni, Endpoint, OpenBi, OpenUni, VarInt};
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
 #[cfg(feature = "datagram")]
 pub mod datagram;
 
-/// BoxStream with Sync trait
-type BoxStreamSync<'a, T> = Pin<Box<dyn Stream<Item = T> + Sync + Send + 'a>>;
+/// Boxed stream retaining the backend's `Send + Sync` guarantees.
+type BoxStreamSync<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + Sync + 'a>>;
 
-/// A QUIC connection backed
+/// Boxed [`quic::SendStream::stopped`] future, created by the first `poll_stopped`.
+type Stopped =
+    Pin<Box<dyn Future<Output = Result<Option<VarInt>, quic::StoppedError>> + Send + Sync>>;
+
+/// An HTTP/3 transport backed by a QUIC connection.
 ///
-/// Implements a [`quic::Connection`] backed by a [`quic::Connection`].
+/// Implements [`http3::quic::Connection`] backed by a [`quic::Connection`].
 pub struct Connection {
     conn: quic::Connection,
     incoming_bi: BoxStreamSync<'static, <AcceptBi<'static> as Future>::Output>,
@@ -187,8 +179,8 @@ where
 
 /// Stream opener backed by a QUIC connection
 ///
-/// Implements [`quic::OpenStreams`] using [`quinn::Connection`],
-/// [`quinn::OpenBi`], [`quinn::OpenUni`].
+/// Implements [`http3::quic::OpenStreams`] using [`quic::Connection`],
+/// [`quic::OpenBi`], [`quic::OpenUni`].
 pub struct OpenStreams {
     conn: quic::Connection,
     opening_bi: Option<BoxStreamSync<'static, <OpenBi<'static> as Future>::Output>>,
@@ -264,7 +256,7 @@ impl Clone for OpenStreams {
 
 /// QUIC-backed bidirectional stream
 ///
-/// Implements [`quic::BidiStream`] which allows the stream to be split
+/// Implements [`http3::quic::BidiStream`] which allows the stream to be split
 /// into two structs each implementing one direction.
 pub struct BidiStream<B>
 where
@@ -317,6 +309,13 @@ where
         self.send.poll_finish(cx)
     }
 
+    fn poll_stopped(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        self.send.poll_stopped(cx)
+    }
+
     fn reset(&mut self, reset_code: u64) {
         self.send.reset(reset_code)
     }
@@ -353,7 +352,7 @@ where
 
 /// QUIC-backed receive stream
 ///
-/// Implements a [`quic::RecvStream`] backed by a [`quinn::RecvStream`].
+/// Implements [`http3::quic::RecvStream`] backed by a [`quic::RecvStream`].
 pub struct RecvStream {
     stream: quic::RecvStream,
     is_0rtt: bool,
@@ -437,12 +436,26 @@ fn convert_write_error_to_stream_error(error: quic::WriteError) -> StreamErrorIn
     }
 }
 
+fn convert_stopped_error_to_stream_error(error: quic::StoppedError) -> StreamErrorIncoming {
+    match error {
+        quic::StoppedError::ConnectionLost(connection_error) => {
+            StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: convert_connection_error(connection_error),
+            }
+        }
+        error @ quic::StoppedError::ZeroRttRejected => {
+            StreamErrorIncoming::Unknown(Box::new(error))
+        }
+    }
+}
+
 /// QUIC-backed send stream
 ///
-/// Implements a [`quic::SendStream`] backed by a [`quic::SendStream`].
+/// Implements [`http3::quic::SendStream`] backed by a [`quic::SendStream`].
 pub struct SendStream<B: Buf> {
     stream: quic::SendStream,
     writing: Option<WriteBuf<B>>,
+    stopped: Option<Stopped>,
 }
 
 impl<B> SendStream<B>
@@ -453,6 +466,7 @@ where
         Self {
             stream,
             writing: None,
+            stopped: None,
         }
     }
 }
@@ -485,6 +499,23 @@ where
             self.stream
                 .finish()
                 .map_err(|e| StreamErrorIncoming::Unknown(Box::new(e))),
+        )
+    }
+
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    fn poll_stopped(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        let stopped = self
+            .stopped
+            .get_or_insert_with(|| Box::pin(self.stream.stopped()));
+        let result = ready!(stopped.as_mut().poll(cx));
+        self.stopped = None;
+        Poll::Ready(
+            result
+                .map(|code| code.map(VarInt::into_inner))
+                .map_err(convert_stopped_error_to_stream_error),
         )
     }
 

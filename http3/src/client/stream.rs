@@ -1,7 +1,8 @@
 use std::{
     convert::TryFrom,
-    future::poll_fn,
-    task::{Context, Poll},
+    future::{Future, poll_fn},
+    sync::Arc,
+    task::{Context, Poll, ready},
 };
 
 use bytes::Buf;
@@ -23,8 +24,8 @@ use crate::{
 ///
 /// Once a request has been sent via [`crate::client::SendRequest::send_request()`], a response can
 /// be awaited by calling [`RequestStream::recv_response()`]. A body for this request can be sent
-/// with [`RequestStream::send_data()`], then the request shall be completed by either sending
-/// trailers with  [`RequestStream::finish()`].
+/// with [`RequestStream::send_data()`], followed by optional [`RequestStream::send_trailers()`].
+/// Call [`RequestStream::finish()`] to complete the send direction.
 ///
 /// After receiving the response's headers, it's body can be read by [`RequestStream::recv_data()`]
 /// until it returns `None`. Then the trailers will eventually be available via
@@ -35,8 +36,26 @@ use crate::{
 /// TODO: If trailers are polled but the body hasn't been fully received, an UNEXPECT_FRAME error
 /// will be thrown
 ///
-/// Whenever the client wants to cancel this request, it can call [`RequestStream::stop_sending()`],
-/// which will put an end to any transfer concerning it.
+/// Dropping an unfinished stream cancels its open directions with `H3_REQUEST_CANCELLED`.
+/// After [`split()`](Self::split), each half cancels only its own direction. Explicit
+/// [`stop_sending()`](Self::stop_sending) stops receiving; [`stop_stream()`](Self::stop_stream)
+/// stops sending.
+/// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
+///
+/// Every operation first checks whether the server's GOAWAY excludes this
+/// request and then returns [`StreamError::GoawayRejected`] and cancels the
+/// directions owned by this handle. An operation already waiting on the
+/// transport learns of the GOAWAY when the transport next wakes it, usually
+/// through the server's reset or the connection closing; the GOAWAY itself
+/// wakes nothing. After [`Self::split()`], each half observes rejection
+/// independently. Requests below the GOAWAY boundary continue. The caller
+/// decides whether to retry; this type never retries automatically.
+///
+/// Receive operations check for published GOAWAY rejection and connection errors
+/// before polling the receive stream, including its buffered data. Consequently,
+/// a published error can prevent delivery of already-buffered response bytes;
+/// callers must not rely on draining those bytes after a connection failure.
+/// Bytes returned to the caller before the error are unaffected.
 ///
 /// # Examples
 ///
@@ -75,6 +94,7 @@ use crate::{
 /// [`stop_sending()`]: #method.stop_sending
 pub struct RequestStream<S, B> {
     pub(super) inner: connection::RequestStream<S, B>,
+    rejection: RequestRejection,
 }
 
 impl<S, B> ConnectionState for RequestStream<S, B> {
@@ -92,31 +112,114 @@ where
     /// Receive the HTTP/3 response
     ///
     /// This should be called before trying to receive any data with [`recv_data()`].
+    /// Cancelling this future retains decoding progress for the next call;
+    /// see [`Self::poll_recv_response`].
     ///
     /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_response(&mut self) -> Result<Response<()>, StreamError> {
-        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
-        //= type=TODO
-        //# A client MUST treat
-        //# receipt of a PUSH_PROMISE frame that contains a larger push ID than
-        //# the client has advertised as a connection error of H3_ID_ERROR.
+        poll_fn(|cx| self.poll_recv_response(cx)).await
+    }
 
-        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
-        //= type=TODO
-        //# If a client
-        //# receives a push ID that has already been promised and detects a
-        //# mismatch, it MUST respond with a connection error of type
-        //# H3_GENERAL_PROTOCOL_ERROR.
+    /// Receives response body data.
+    ///
+    /// Published request errors take precedence over buffered data; see
+    /// [`RequestStream`]'s error handling contract.
+    // TODO what if called before recv_response ?
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn recv_data(&mut self) -> Result<Option<impl Buf + use<S, B>>, StreamError> {
+        let result = self
+            .rejection
+            .run(poll_fn(|cx| self.inner.poll_recv_data(cx)))
+            .await;
+        self.handle_result(result)
+    }
 
-        let qpack::Decoded { fields, .. } =
-            poll_fn(|cx| self.inner.poll_recv_response_headers(cx)).await?;
+    /// Polls for response body data with the same error precedence as
+    /// [`Self::recv_data`].
+    pub fn poll_recv_data(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
+        let result = self.rejection.poll(cx, |cx| self.inner.poll_recv_data(cx));
+        result.map(|result| self.handle_result(result))
+    }
+
+    /// Receive an optional set of trailers for the response.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, StreamError> {
+        let result = self
+            .rejection
+            .run(poll_fn(|cx| self.inner.poll_recv_trailers(cx)))
+            .await;
+        if let Err(StreamError::HeaderTooBig { .. }) = &result {
+            self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
+        }
+        self.handle_result(result)
+    }
+
+    /// Poll receive an optional set of trailers for the response.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_recv_trailers(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
+        let res = self
+            .rejection
+            .poll(cx, |cx| self.inner.poll_recv_trailers(cx));
+        if let Poll::Ready(Err(StreamError::HeaderTooBig { .. })) = &res {
+            self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
+        }
+        res.map(|result| self.handle_result(result))
+    }
+
+    /// Stops receiving the response with `error_code` and releases its QPACK state.
+    ///
+    /// The request's send direction remains open. Dropping the stream afterwards
+    /// does not replace this receive-side code with `H3_REQUEST_CANCELLED`.
+    /// Clients must not use `H3_REQUEST_REJECTED` unless the server requested
+    /// closure of this request with that code.
+    /// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn stop_sending(&mut self, error_code: Code) {
+        self.inner.stop_sending(error_code)
+    }
+
+    /// Returns the underlying stream id
+    pub fn id(&self) -> StreamId {
+        self.inner.stream.id()
+    }
+
+    /// Polls for one response head, including informational responses.
+    ///
+    /// Call before receiving DATA or trailers. `Pending` retains the HEADERS
+    /// and QPACK progress in this stream and registers the current waker;
+    /// continue polling this method or [`Self::recv_response`] to resume.
+    /// Dropping a waiting future does not cancel reception; use
+    /// [`Self::stop_sending`] or drop the stream to abandon it.
+    ///
+    /// Uses the same validation and error precedence as [`Self::recv_response`].
+    pub fn poll_recv_response(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Response<()>, StreamError>> {
+        let result = self
+            .rejection
+            .poll(cx, |cx| Self::poll_recv_response_inner(&mut self.inner, cx));
+        result.map(|result| self.handle_result(result))
+    }
+
+    fn poll_recv_response_inner(
+        inner: &mut connection::RequestStream<S, B>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Response<()>, StreamError>> {
+        let qpack::Decoded { fields, .. } = ready!(inner.poll_recv_response_headers(cx))?;
 
         let (status, headers, pseudo_sensitivity) = Header::try_from(fields)
             .and_then(Header::into_response_parts)
             .map_err(|error| {
                 let code = error.code();
-                self.inner.stop_sending(code);
+                inner.stop_sending(code);
                 StreamError::StreamError {
                     code,
                     reason: format!("rejected response headers: {error}"),
@@ -131,54 +234,7 @@ where
         }
         *resp.version_mut() = http::Version::HTTP_3;
 
-        Ok(resp)
-    }
-
-    /// Receive some of the request body.
-    // TODO what if called before recv_response ?
-    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub async fn recv_data(&mut self) -> Result<Option<impl Buf + use<S, B>>, StreamError> {
-        poll_fn(|cx| self.poll_recv_data(cx)).await
-    }
-
-    /// Receive request body
-    pub fn poll_recv_data(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
-        self.inner.poll_recv_data(cx)
-    }
-
-    /// Receive an optional set of trailers for the response.
-    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, StreamError> {
-        poll_fn(|cx| self.poll_recv_trailers(cx)).await
-    }
-
-    /// Poll receive an optional set of trailers for the response.
-    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub fn poll_recv_trailers(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
-        let res = self.inner.poll_recv_trailers(cx);
-        if let Poll::Ready(Err(StreamError::HeaderTooBig { .. })) = &res {
-            self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
-        }
-        res
-    }
-
-    /// Tell the peer to stop sending into the underlying QUIC stream
-    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub fn stop_sending(&mut self, error_code: Code) {
-        // TODO take by value to prevent any further call as this request is cancelled
-        // rename `cancel()` ?
-        self.inner.stop_sending(error_code)
-    }
-
-    /// Returns the underlying stream id
-    pub fn id(&self) -> StreamId {
-        self.inner.stream.id()
+        Poll::Ready(Ok(resp))
     }
 }
 
@@ -187,15 +243,27 @@ where
     S: quic::SendStream<B>,
     B: Buf,
 {
-    /// Send some data on the request body.
+    /// Sends a body buffer, flushing previously queued output first.
+    ///
+    /// Cancellation before the buffer is queued drops it. Once queued, the
+    /// buffer remains owned by the stream if this future is cancelled.
+    /// Continue with [`Self::poll_ready`] or [`Self::finish`]; sending the same
+    /// buffer again would append another DATA frame.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_data(&mut self, buf: B) -> Result<(), StreamError> {
-        self.inner.send_data(buf).await
+        poll_fn(|cx| self.poll_ready(cx)).await?;
+        self.start_send_data(buf)?;
+        poll_fn(|cx| self.poll_ready(cx)).await
     }
 
-    /// Stop a stream with an error code
+    /// Resets the request's send direction with `error_code`.
     ///
-    /// The code can be [`Code::H3_NO_ERROR`].
+    /// Receiving the response is unaffected. Dropping the stream afterwards does
+    /// not replace this code with `H3_REQUEST_CANCELLED`. The code can be
+    /// [`Code::H3_NO_ERROR`], for example when the peer has declined the upload.
+    /// Clients must not use `H3_REQUEST_REJECTED` unless the server requested
+    /// closure of this request with that code.
+    /// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
     pub fn stop_stream(&mut self, error_code: Code) {
         self.inner.stop_stream(error_code);
     }
@@ -203,26 +271,93 @@ where
     /// Send a set of trailers to end the request.
     ///
     /// [`RequestStream::finish()`] must be called to finalize a request.
+    /// Once queued, cancellation leaves the trailers owned by the stream;
+    /// continue with `finish` rather than submitting the trailers again.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
-        self.inner.send_trailers(trailers).await
+        poll_fn(|cx| self.poll_ready(cx)).await?;
+        self.start_send_trailers(trailers)?;
+        poll_fn(|cx| self.poll_ready(cx)).await
     }
 
-    /// End the request without trailers.
+    /// Flushes pending request output and closes the send direction with FIN.
     ///
-    /// [`RequestStream::finish()`] must be called to finalize a request.
+    /// Call this after sending the body and any trailers. Once it succeeds,
+    /// dropping the stream does not reset the upload; an unread response is still
+    /// cancelled. Transport failures are returned as [`StreamError`].
+    ///
+    /// Cancelling this future before it returns success leaves reset on Drop
+    /// armed. Retry `finish`, or drop the stream to cancel its open directions.
+    /// See [RFC 9114, Section 4.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1).
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn finish(&mut self) -> Result<(), StreamError> {
-        self.inner.finish().await
+        poll_fn(|cx| self.poll_finish(cx)).await
     }
 
-    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
-    //= type=TODO
-    //# Implementations SHOULD cancel requests by abruptly terminating any
-    //# directions of a stream that are still open.  To do so, an
-    //# implementation resets the sending parts of streams and aborts reading
-    //# on the receiving parts of streams; see Section 2.4 of
-    //# [QUIC-TRANSPORT].
+    /// Polls for the server stopping or acknowledging the request's send direction.
+    ///
+    /// Resolves to `Some(code)` after `STOP_SENDING` and to `None` once the whole
+    /// upload, including the FIN sent by [`finish()`](Self::finish), is acknowledged.
+    /// Polling never changes the stream's state, so this works before and after
+    /// `finish()` and on a split send half. A GOAWAY excluding this request is
+    /// reported as [`StreamError::GoawayRejected`], like any other operation.
+    pub fn poll_stopped(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Code>, StreamError>> {
+        let result = self.rejection.poll(cx, |cx| self.inner.poll_stopped(cx));
+        result.map(|result| self.handle_result(result))
+    }
+
+    /// Flushes a queued DATA or trailers frame into the QUIC transport.
+    ///
+    /// `Pending` registers the task for another poll. Success permits another
+    /// DATA frame while the body is open; it does not reserve QUIC flow-control
+    /// credit or wait for acknowledgment. After trailers, only finish is allowed.
+    /// Dropping the polling future leaves queued bytes owned by the stream.
+    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        let result = self.rejection.poll(cx, |cx| self.inner.poll_ready(cx));
+        result.map(|result| self.handle_result(result))
+    }
+
+    /// Queues one owned body buffer as a DATA frame without waiting for I/O.
+    ///
+    /// First complete [`Self::poll_ready`]; after success, drive `poll_ready` or
+    /// [`Self::poll_finish`] to flush the frame. The buffer is consumed even on
+    /// error. Pending output, trailers, finish or reset cause a local
+    /// [`StreamError::InvalidStreamState`] without discarding queued bytes.
+    pub fn start_send_data(&mut self, buf: B) -> Result<(), StreamError> {
+        let result = match self.rejection.state.request_error(self.rejection.stream_id) {
+            Some(error) => Err(error),
+            None => self.inner.start_send_data(buf),
+        };
+        self.handle_result(result)
+    }
+
+    /// Queues the final field section without waiting for I/O.
+    ///
+    /// First complete [`Self::poll_ready`]. Success forbids further DATA or
+    /// trailers; call [`Self::poll_finish`] to flush and send FIN. The peer's
+    /// field section limit is checked before queuing; an error consumes the
+    /// supplied headers. Invalid send order is a local error, not a wire error.
+    pub fn start_send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
+        let result = match self.rejection.state.request_error(self.rejection.stream_id) {
+            Some(error) => Err(error),
+            None => self.inner.start_send_trailers(trailers),
+        };
+        self.handle_result(result)
+    }
+
+    /// Flushes pending DATA, trailers and optional GREASE, then submits FIN.
+    ///
+    /// Once polled, no more content may be queued. Pending or failed completion
+    /// preserves reset on Drop; retrying continues the same finish operation.
+    /// Success is repeatable and does not wait for FIN acknowledgment; use
+    /// [`Self::poll_stopped`] for that. Receiving is unaffected.
+    pub fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        let result = self.rejection.poll(cx, |cx| self.inner.poll_finish(cx));
+        result.map(|result| self.handle_result(result))
+    }
 }
 
 impl<S, B> RequestStream<S, B>
@@ -231,13 +366,90 @@ where
     B: Buf,
 {
     /// Split this stream into two halves that can be driven independently.
+    ///
+    /// Dropping an unfinished send half resets only the upload; dropping an
+    /// unfinished receive half stops only the response and cancels its QPACK
+    /// decoding. Pending response headers stay with the receive half.
+    /// Directions already finished or explicitly stopped remain so.
+    /// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
     pub fn split(
         self,
     ) -> (
         RequestStream<S::SendStream, B>,
         RequestStream<S::RecvStream, B>,
     ) {
-        let (send, recv) = self.inner.split();
-        (RequestStream { inner: send }, RequestStream { inner: recv })
+        let Self { inner, rejection } = self;
+        let (send, recv) = inner.split();
+        (
+            RequestStream {
+                inner: send,
+                rejection: RequestRejection::new(rejection.state.clone(), rejection.stream_id),
+            },
+            RequestStream {
+                inner: recv,
+                rejection,
+            },
+        )
+    }
+}
+
+impl<S, B> RequestStream<S, B>
+where
+    S: quic::SendStream<B> + quic::RecvStream,
+    B: Buf,
+{
+    pub(super) fn new(inner: connection::RequestStream<S, B>) -> Self {
+        let rejection = RequestRejection::new(inner.conn_state.clone(), inner.stream.id());
+        Self { inner, rejection }
+    }
+}
+
+// GOAWAY rejection is a state snapshot checked around each poll. The server's
+// reset or the closing connection provides the transport wakeup.
+struct RequestRejection {
+    state: Arc<SharedState>,
+    stream_id: StreamId,
+}
+
+impl RequestRejection {
+    fn new(state: Arc<SharedState>, stream_id: StreamId) -> Self {
+        Self { state, stream_id }
+    }
+
+    fn poll<T>(
+        &self,
+        cx: &mut Context<'_>,
+        operation: impl FnOnce(&mut Context<'_>) -> Poll<Result<T, StreamError>>,
+    ) -> Poll<Result<T, StreamError>> {
+        if let Some(error) = self.state.request_error(self.stream_id) {
+            return Poll::Ready(Err(error));
+        }
+        let result = operation(cx);
+        if result.is_pending() {
+            // GOAWAY can be published during the transport poll without a wakeup.
+            if let Some(error) = self.state.request_error(self.stream_id) {
+                return Poll::Ready(Err(error));
+            }
+        }
+        result
+    }
+
+    async fn run<T>(
+        &self,
+        operation: impl Future<Output = Result<T, StreamError>>,
+    ) -> Result<T, StreamError> {
+        let mut operation = std::pin::pin!(operation);
+        poll_fn(|cx| self.poll(cx, |cx| operation.as_mut().poll(cx))).await
+    }
+}
+
+impl<S, B> RequestStream<S, B> {
+    fn handle_result<T>(&mut self, result: Result<T, StreamError>) -> Result<T, StreamError> {
+        if matches!(&result, Err(StreamError::GoawayRejected { .. })) {
+            // Use the Drop guard's ownership state so completed or explicitly
+            // stopped directions keep their result, including after split.
+            self.inner.cancel_request();
+        }
+        result
     }
 }

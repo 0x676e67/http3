@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let Certs { cert, key } = opt.certs;
 
-    // create quinn server endpoint and bind UDP socket
+    // create quic server endpoint and bind UDP socket
 
     // both cert and key must be DER-encoded
     let cert = CertificateDer::from(std::fs::read(cert)?);
@@ -94,8 +94,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tls_config.alpn_protocols = vec![ALPN.into()];
 
     let server_config =
-        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config)?));
-    let endpoint = quinn::Endpoint::server(server_config, opt.listen)?;
+        quic::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config)?));
+    // Bind without forcing dual-stack operation: enabling it for [::1]
+    // before binding fails on Windows.
+    let socket = std::net::UdpSocket::bind(opt.listen)?;
+    let endpoint = quic::Endpoint::new(
+        quic::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        Arc::new(quic::TokioRuntime),
+    )?;
 
     info!("listening on {}", opt.listen);
 

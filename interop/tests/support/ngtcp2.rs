@@ -4,8 +4,8 @@ use interop::{
     BoxError, ClientInteropConfig, DEFAULT_INTEROP_CASE, INTEROP_PADDING_HEADER_NAME,
     INTEROP_TEST_TIMEOUT, generate_test_certificate, install_crypto_provider, interop_body,
     interop_case_from_path, interop_response_header_value,
-    run_local_quinn_client_interop_matrix_with_config,
-    run_local_quinn_client_max_field_section_size_limit,
+    run_local_quic_client_interop_matrix_with_config,
+    run_local_quic_client_max_field_section_size_limit,
 };
 use ngtcp2::{Header as Ngtcp2Header, Http3Event, Http3SettingsExt, nghttp3_settings};
 use tokio_ngtcp2::Server;
@@ -108,7 +108,7 @@ pub async fn run_client_interop(
 
     let client_result = tokio::time::timeout(
         INTEROP_TEST_TIMEOUT,
-        run_local_quinn_client_interop_matrix_with_config(server_addr, &cert, client_config),
+        run_local_quic_client_interop_matrix_with_config(server_addr, &cert, client_config),
     )
     .await;
 
@@ -169,7 +169,7 @@ pub async fn run_max_field_section_size_limit(
 
     let client_result = tokio::time::timeout(
         INTEROP_TEST_TIMEOUT,
-        run_local_quinn_client_max_field_section_size_limit(server_addr, &cert, client_config),
+        run_local_quic_client_max_field_section_size_limit(server_addr, &cert, client_config),
     )
     .await;
 

@@ -1,9 +1,6 @@
 //! HTTP/3 client builder
 
-use std::{
-    marker::PhantomData,
-    sync::{Arc, atomic::AtomicUsize},
-};
+use std::marker::PhantomData;
 
 use bytes::{Buf, Bytes, BytesMut};
 
@@ -220,7 +217,6 @@ impl Builder {
             encoder: inner.dynamic_qpack_encoder(),
             max_field_section_size: self.config.settings.max_field_section_size,
             max_qpack_decode_buffer_size: self.config.qpack_decode_buffer_size,
-            sender_count: Arc::new(AtomicUsize::new(1)),
             send_grease_frame: self.config.send_grease,
             qpack_encode_buffer: BytesMut::new(),
             _buf: PhantomData,

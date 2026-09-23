@@ -386,6 +386,13 @@ where
         self.stream.poll_finish(cx)
     }
 
+    fn poll_stopped(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        self.stream.poll_stopped(cx)
+    }
+
     fn reset(&mut self, reset_code: u64) {
         self.stream.reset(reset_code)
     }
@@ -1257,6 +1264,195 @@ mod tests {
 
     // Helpers
 
+    #[test]
+    fn ignored_frames_and_fragmented_headers_preserve_state() {
+        for fragmented in [false, true] {
+            let mut wire = BytesMut::new();
+            for _ in 0..96 {
+                FrameType::grease().encode(&mut wire);
+                VarInt::from(0_u32).encode(&mut wire);
+            }
+            Frame::headers(&b"header"[..]).encode_with_payload(&mut wire);
+            let mut recv = FakeRecv::default();
+            if fragmented {
+                for byte in wire {
+                    recv.chunk(Bytes::from(vec![byte]));
+                }
+            } else {
+                recv.chunk(wire.freeze());
+            }
+            let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+            let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+            assert_matches!(stream.poll_next(&mut cx),
+                Poll::Ready(Ok(Some(Frame::Headers(block)))) if block.as_ref() == b"header");
+            assert_matches!(stream.poll_next(&mut cx), Poll::Ready(Ok(None)));
+        }
+    }
+
+    #[test]
+    fn empty_data_preserves_body_trailers_and_fin() {
+        for trailers in [false, true] {
+            let mut wire = BytesMut::new();
+            for _ in 0..96 {
+                Frame::Data(Bytes::new()).encode_with_payload(&mut wire);
+            }
+            for data in [
+                Bytes::from_static(b"a"),
+                Bytes::new(),
+                Bytes::from_static(b"bc"),
+                Bytes::new(),
+            ] {
+                Frame::Data(data).encode_with_payload(&mut wire);
+            }
+            if trailers {
+                let mut fields = http::HeaderMap::new();
+                fields.insert("trailer", "value".parse().unwrap());
+                let mut block = BytesMut::new();
+                crate::qpack::encode_stateless(
+                    &mut block,
+                    &crate::proto::headers::Header::trailer(fields),
+                )
+                .unwrap();
+                Frame::headers(block.freeze()).encode_with_payload(&mut wire);
+            }
+            let mut recv = FakeRecv::default();
+            recv.chunk(wire.freeze());
+            let shared = Arc::default();
+            let decode_state = crate::connection::RequestDecodeState::new(
+                recv.recv_id(),
+                &shared,
+                usize::MAX,
+                None,
+            );
+            let mut stream = crate::connection::RequestStream::<_, Bytes>::with_decode_state(
+                FrameStream::new(BufRecvStream::new(recv)),
+                u64::MAX,
+                shared,
+                false,
+                decode_state,
+            );
+            let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+            let mut body = BytesMut::new();
+            let mut ended = false;
+            for _ in 0..16 {
+                match stream.poll_recv_data(&mut cx) {
+                    Poll::Pending => (),
+                    Poll::Ready(Ok(Some(mut data))) => {
+                        body.extend_from_slice(&data.copy_to_bytes(data.remaining()))
+                    }
+                    Poll::Ready(Ok(None)) => {
+                        ended = true;
+                        break;
+                    }
+                    Poll::Ready(Err(error)) => panic!("body failed: {error}"),
+                }
+            }
+            assert!(ended);
+            assert_eq!(&body[..], b"abc");
+            assert!(matches!(
+                stream.poll_recv_data(&mut cx),
+                Poll::Ready(Ok(None))
+            ));
+            match stream.poll_recv_trailers(&mut cx) {
+                Poll::Ready(Ok(Some(fields))) if trailers => {
+                    assert_eq!(fields["trailer"], "value")
+                }
+                Poll::Ready(Ok(None)) if !trailers => (),
+                other => panic!("unexpected trailers: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_body_eof_keeps_unread_dynamic_trailers_cancellable() {
+        use crate::qpack::{self, QpackDecoder, QpackEvent};
+
+        for consume_trailers in [false, true] {
+            let mut instructions = Vec::new();
+            qpack::DynamicTableSizeUpdate(256).encode(&mut instructions);
+            qpack::InsertWithoutNameRef::new(b"trailer".as_slice(), b"value".as_slice())
+                .encode(&mut instructions)
+                .unwrap();
+            let mut decoder = qpack::Decoder::new(256, 1).unwrap();
+            decoder
+                .on_encoder_recv(&mut instructions.as_slice(), &mut Vec::new())
+                .unwrap();
+            let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut wire = BytesMut::new();
+            // Required Insert Count = 1, Base = 1, dynamic relative index = 0.
+            // RFC 9204 sections 4.5.1 and 4.5.2.
+            Frame::headers(Bytes::from_static(&[2, 0, 0x80])).encode_with_payload(&mut wire);
+            let mut recv = FakeRecv::default();
+            recv.chunk(wire.freeze());
+            let shared = Arc::default();
+            let decode_state = crate::connection::RequestDecodeState::new(
+                recv.recv_id(),
+                &shared,
+                usize::MAX,
+                Some(QpackDecoder::new(decoder, events_tx)),
+            );
+            let mut stream = crate::connection::RequestStream::<_, Bytes>::with_decode_state(
+                FrameStream::new(BufRecvStream::new(recv)),
+                u64::MAX,
+                shared,
+                false,
+                decode_state,
+            );
+            let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+            for _ in 0..2 {
+                assert!(matches!(
+                    stream.poll_recv_data(&mut cx),
+                    Poll::Ready(Ok(None))
+                ));
+            }
+            assert!(events_rx.try_recv().is_err());
+            if consume_trailers {
+                assert!(matches!(
+                    stream.poll_recv_trailers(&mut cx),
+                    Poll::Ready(Ok(Some(fields))) if fields["trailer"] == "value"
+                ));
+            }
+            drop(stream);
+            match events_rx.try_recv().unwrap() {
+                QpackEvent::HeaderAck(id) if consume_trailers => assert_eq!(id.into_inner(), 0),
+                QpackEvent::StreamCancel(id) if !consume_trailers => assert_eq!(id.into_inner(), 0),
+                other => panic!("unexpected decoder event: {other:?}"),
+            }
+            assert!(events_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn trailers_ignore_unknown_frames_before_fin() {
+        let mut fields = http::HeaderMap::new();
+        fields.insert("trailer", "value".parse().unwrap());
+        let mut block = BytesMut::new();
+        crate::qpack::encode_stateless(&mut block, &crate::proto::headers::Header::trailer(fields))
+            .unwrap();
+        let mut wire = BytesMut::new();
+        Frame::headers(block.freeze()).encode_with_payload(&mut wire);
+        for _ in 0..96 {
+            FrameType::grease().encode(&mut wire);
+            VarInt::from(0_u32).encode(&mut wire);
+        }
+        let mut recv = FakeRecv::default();
+        recv.chunk(wire.freeze());
+        let shared = Arc::default();
+        let decode_state =
+            crate::connection::RequestDecodeState::new(recv.recv_id(), &shared, usize::MAX, None);
+        let frames = FrameStream::new(BufRecvStream::new(recv));
+        let mut stream = crate::connection::RequestStream::<_, Bytes>::with_decode_state(
+            frames,
+            u64::MAX,
+            shared,
+            false,
+            decode_state,
+        );
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert_matches!(stream.poll_recv_trailers(&mut cx),
+            Poll::Ready(Ok(Some(fields))) if fields["trailer"] == "value");
+    }
+
     #[derive(Default)]
     struct FakeRecv {
         chunks: VecDeque<Bytes>,
@@ -1300,7 +1496,7 @@ mod tests {
         }
 
         fn recv_id(&self) -> StreamId {
-            unimplemented!()
+            StreamId::try_from(0).unwrap()
         }
     }
 

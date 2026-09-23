@@ -37,6 +37,11 @@ use crate::{
 /// Create a new Instance with [`Connection::new()`].
 /// Accept incoming requests with [`Connection::accept()`].
 /// And shutdown a connection with [`Connection::shutdown()`].
+///
+/// Dropping the driver immediately closes the connection and publishes
+/// `H3_NO_ERROR` to live request streams unless an earlier error takes precedence.
+/// Complete required transfers before dropping it; see
+/// [RFC 9114 Section 5.3](https://www.rfc-editor.org/rfc/rfc9114.html#section-5.3).
 pub struct Connection<C, B>
 where
     C: quic::Connection<B>,
@@ -215,15 +220,15 @@ where
                     // When the connection is in a graceful shutdown procedure, reject all
                     // incoming requests not belonging to the grace interval. It's possible that
                     // some acceptable request streams arrive after rejected requests.
-                    if let Some(max_id) = self.sent_closing {
-                        if s.send_id() > max_id {
-                            s.stop_sending(Code::H3_REQUEST_REJECTED.value());
-                            s.reset(Code::H3_REQUEST_REJECTED.value());
-                            if self.poll_requests_completion(cx).is_ready() {
-                                break Poll::Ready(Ok(None));
-                            }
-                            continue;
+                    if let Some(max_id) = self.sent_closing
+                        && s.send_id() > max_id
+                    {
+                        s.stop_sending(Code::H3_REQUEST_REJECTED.value());
+                        s.reset(Code::H3_REQUEST_REJECTED.value());
+                        if self.poll_requests_completion(cx).is_ready() {
+                            break Poll::Ready(Ok(None));
                         }
+                        continue;
                     }
                     self.last_accepted_stream = Some(s.send_id());
                     self.ongoing_streams.insert(s.send_id());
@@ -332,10 +337,11 @@ where
 {
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn drop(&mut self) {
-        self.inner.close_connection(
-            Code::H3_NO_ERROR,
-            "Connection was closed by the server".to_string(),
-        );
+        self.inner
+            .handle_connection_error(InternalConnectionError::new(
+                Code::H3_NO_ERROR,
+                "Connection was closed by the server".to_string(),
+            ));
     }
 }
 

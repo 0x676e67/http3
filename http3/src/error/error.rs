@@ -1,6 +1,6 @@
 //! Public error types for the `http3` crate.
 use super::{codes::Code, internal_error::InternalConnectionError};
-use crate::quic::ConnectionErrorIncoming;
+use crate::quic::{ConnectionErrorIncoming, StreamId};
 
 /// This enum represents the closure of a connection because of an a closed quic connection
 /// This can be either from this endpoint because of a violation of the protocol or from the remote
@@ -68,6 +68,28 @@ pub enum LocalError {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum StreamError {
+    /// A send operation is not valid in the current local stream state.
+    /// No frame is queued and the connection remains usable.
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
+    InvalidStreamState {
+        /// Why the operation cannot be performed.
+        reason: Box<str>,
+    },
+    /// A locally constructed request is invalid. No request was sent and the
+    /// connection remains usable.
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
+    InvalidRequest {
+        /// Why the request could not be constructed.
+        reason: Box<str>,
+    },
+    /// The server's GOAWAY guarantees this request was not processed.
+    #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
+    GoawayRejected {
+        /// The rejected request stream.
+        stream_id: StreamId,
+        /// The first stream the server will not process.
+        boundary: StreamId,
+    },
     /// The error occurred on the stream
     #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     StreamError {
@@ -100,11 +122,12 @@ pub enum StreamError {
         /// The applicable field section size limit
         max_size: u64,
     },
-    /// Received a GoAway frame from the remote
+    /// The connection is closing and cannot open a new request or server push.
     ///
-    /// Stream operations cannot be performed
+    /// This can follow either a peer GOAWAY or local shutdown.
+    /// Existing requests below the peer's GOAWAY boundary can still complete.
     #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
-    RemoteClosing,
+    ConnectionClosing,
     /// Undefined error propagated by the quic layer
     #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     Undefined(Box<dyn std::error::Error + Send + Sync>),
@@ -151,6 +174,19 @@ impl std::error::Error for ConnectionError {}
 impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            StreamError::InvalidStreamState { reason } => {
+                write!(f, "Invalid stream state: {reason}")
+            }
+            StreamError::InvalidRequest { reason } => write!(f, "Invalid request: {reason}"),
+            StreamError::GoawayRejected {
+                stream_id,
+                boundary,
+            } => {
+                write!(
+                    f,
+                    "Request {stream_id} rejected by GOAWAY boundary {boundary}"
+                )
+            }
             StreamError::StreamError { code, reason } => {
                 write!(f, "Stream error: {:?} - {}", code, reason)
             }
@@ -165,7 +201,7 @@ impl std::fmt::Display for StreamError {
                 actual_size, max_size
             ),
             StreamError::Undefined(err) => write!(f, "Undefined error: {}", err),
-            StreamError::RemoteClosing => write!(f, "Remote is closing the connection"),
+            StreamError::ConnectionClosing => write!(f, "Connection is closing"),
         }
     }
 }

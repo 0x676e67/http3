@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("DNS lookup for {:?}: {:?}", uri, addr);
 
-    // create quinn client endpoint
+    // create quic client endpoint
 
     let mut roots = rustls::RootCertStore::empty();
     if !opt.skip_verify {
@@ -180,9 +180,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .set_certificate_verifier(Arc::new(SkipServerVerification::new()));
     }
 
-    let mut client_endpoint = http3_quic::quic::Endpoint::client("[::]:0".parse().unwrap())?;
-    let client_config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
+    let client_endpoint = http3_quic::quic::Endpoint::client("[::]:0".parse().unwrap())?;
+    let client_config = quic::ClientConfig::new(Arc::new(
+        quic::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
     ));
     client_endpoint.set_default_client_config(client_config);
 
@@ -194,8 +194,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // http3 works with different QUIC implementations via
     // a generic interface, that is, the [`quic::Connection`] trait.
-    // http3-quic implements the transport traits with Quinn.
-    let quinn_conn = http3_quic::Connection::new(conn);
+    // http3-quic implements the transport traits with quic.
+    let quic_conn = http3_quic::Connection::new(conn);
 
     let (mut driver, send_request) = http3::client::builder()
         .max_field_section_size(262144u64)
@@ -203,19 +203,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .qpack_blocked_streams(opt.qpack_blocked_streams)
         .enable_datagram(true)
         .send_grease(true)
-        .build(quinn_conn)
+        .build(quic_conn)
         .await?;
 
     let drive = async move {
         Err::<(), ConnectionError>(future::poll_fn(|cx| driver.poll_close(cx)).await)
     };
 
-    // In the following block, we want to take ownership of `send_request`:
-    // the connection will be closed only when all `SendRequest`s instances
-    // are dropped.
-    //
-    //             So we "move" it.
-    //                  vvvv
+    // Keep the driver alive until all request tasks have finished.
     let request = async move {
         let mut requests = Vec::with_capacity(opt.requests);
 
@@ -276,7 +271,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok::<_, StreamError>(())
     };
 
-    let (req_res, drive_res) = tokio::join!(request, drive);
+    let (req_res, drive_res) = tokio::select! {
+        result = request => (result, Ok(())),
+        result = drive => (Ok(()), result),
+    };
 
     if let Err(err) = req_res {
         if err.is_h3_no_error() {

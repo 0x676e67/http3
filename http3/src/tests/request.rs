@@ -99,6 +99,245 @@ async fn rejected_response_fields(
     .unwrap();
 }
 
+#[tokio::test]
+async fn connection_specific_fields_are_stream_errors_in_each_context() {
+    use qpack::HeaderField;
+    for (name, value) in [
+        (b"connection".as_slice(), b"close".as_slice()),
+        (b"proxy-connection", b"close"),
+        (b"keep-alive", b"timeout=5"),
+        (b"transfer-encoding", b"chunked"),
+        (b"upgrade", b"websocket"),
+        (b"te", b"gzip"),
+    ] {
+        for trailers in [false, true] {
+            let field = HeaderField::new(name, value);
+            let mut response = if trailers {
+                Vec::new()
+            } else {
+                vec![HeaderField::new(":status", "200")]
+            };
+            response.push(field.clone());
+            rejected_response_fields(response, trailers, Code::H3_MESSAGE_ERROR).await;
+            let mut request = if trailers {
+                Vec::new()
+            } else {
+                vec![
+                    HeaderField::new(":method", "GET"),
+                    HeaderField::new(":scheme", "https"),
+                    HeaderField::new(":authority", "localhost"),
+                    HeaderField::new(":path", "/"),
+                ]
+            };
+            request.push(field);
+            rejected_request_fields(request, trailers, Code::H3_MESSAGE_ERROR).await;
+        }
+    }
+    for trailers in [false, true] {
+        let mut fields = if trailers {
+            Vec::new()
+        } else {
+            vec![HeaderField::new(":status", "200")]
+        };
+        fields.push(HeaderField::new("te", "trailers"));
+        rejected_response_fields(fields, trailers, Code::H3_MESSAGE_ERROR).await;
+    }
+    rejected_request_fields(
+        vec![HeaderField::new("te", "trailers")],
+        true,
+        Code::H3_MESSAGE_ERROR,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn empty_data_frames_preserve_request_and_response_body() {
+    for trailers in [false, true] {
+        let mut pair = Pair::default();
+        let mut endpoint = pair.server();
+        let client = async {
+            let (mut driver, sender) = client::builder().build(pair.client().await).await.unwrap();
+            let mut sender = sender.clone();
+            let requests = async {
+                let stream = sender
+                    .send_request(
+                        Request::post("https://localhost/")
+                            .header("te", "trailers")
+                            .body(())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let (mut send, mut stream) = stream.split();
+                for data in ["", "a", "", "bc", ""] {
+                    send.send_data(Bytes::from_static(data.as_bytes()))
+                        .await
+                        .unwrap();
+                }
+                if trailers {
+                    let mut fields = HeaderMap::new();
+                    fields.insert("trailer", "request".parse().unwrap());
+                    send.send_trailers(fields).await.unwrap();
+                }
+                send.finish().await.unwrap();
+                stream.recv_response().await.unwrap();
+                let mut body = BytesMut::new();
+                while let Some(mut data) = stream.recv_data().await.unwrap() {
+                    body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+                }
+                assert_eq!(&body[..], b"abc");
+                assert!(stream.recv_data().await.unwrap().is_none());
+                let fields = stream.recv_trailers().await.unwrap();
+                if trailers {
+                    assert_eq!(fields.unwrap()["trailer"], "response");
+                } else {
+                    assert!(fields.is_none());
+                }
+            };
+            tokio::select! { biased; _ = requests => (), error = driver.wait_idle() => panic!("connection failed: {error}") }
+        };
+        let server = async {
+            let mut connection = server::builder()
+                .build(endpoint.next().await)
+                .await
+                .unwrap();
+            let resolver = connection.accept().await.unwrap().unwrap();
+            let (_, mut stream) = resolver.resolve_request().await.unwrap();
+            let mut body = BytesMut::new();
+            while let Some(mut data) = stream.recv_data().await.unwrap() {
+                body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+            }
+            assert_eq!(&body[..], b"abc");
+            assert!(stream.recv_data().await.unwrap().is_none());
+            let fields = stream.recv_trailers().await.unwrap();
+            if trailers {
+                assert_eq!(fields.unwrap()["trailer"], "request");
+            } else {
+                assert!(fields.is_none());
+            }
+            stream.send_response(Response::new(())).await.unwrap();
+            for data in ["", "a", "", "bc", ""] {
+                stream
+                    .send_data(Bytes::from_static(data.as_bytes()))
+                    .await
+                    .unwrap();
+            }
+            if trailers {
+                let mut fields = HeaderMap::new();
+                fields.insert("trailer", "response".parse().unwrap());
+                stream.send_trailers(fields).await.unwrap();
+            }
+            stream.finish().await.unwrap();
+            let _ = connection.accept().await;
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(client, server);
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn server_goaway_reaches_response_operations_at_each_boundary() {
+    for reject_lower in [false, true] {
+        let mut pair = Pair::default();
+        let endpoint = pair.server_inner();
+        let (lower_tx, lower_rx) = tokio::sync::oneshot::channel();
+        let client = async {
+            let (mut driver, mut sender) = client::new(pair.client().await).await.unwrap();
+            let requests = async {
+                let mut first = sender
+                    .send_request(Request::get("https://localhost/").body(()).unwrap())
+                    .await
+                    .unwrap();
+                let mut second = sender
+                    .send_request(Request::get("https://localhost/").body(()).unwrap())
+                    .await
+                    .unwrap();
+                first.finish().await.unwrap();
+                second.finish().await.unwrap();
+                assert_eq!(first.id().into_inner(), 0);
+                assert_eq!(second.id().into_inner(), 4);
+                // The GOAWAY wakes nothing; wait until the driver published it.
+                goaway_published(&sender, 4).await;
+                assert_matches!(
+                    second.recv_response().await,
+                    Err(StreamError::GoawayRejected { stream_id, boundary })
+                        if stream_id.into_inner() == 4 && boundary.into_inner() == 4
+                );
+                let mut waiting = Box::pin(first.recv_response());
+                assert!(
+                    future::poll_fn(|cx| std::task::Poll::Ready(
+                        waiting.as_mut().poll(cx).is_pending()
+                    ))
+                    .await
+                );
+                lower_tx.send(()).unwrap();
+                if reject_lower {
+                    goaway_published(&sender, 0).await;
+                    assert_matches!(
+                        waiting.await,
+                        Err(StreamError::GoawayRejected { stream_id, boundary })
+                            if stream_id.into_inner() == 0 && boundary.into_inner() == 0
+                    );
+                } else {
+                    assert_eq!(waiting.await.unwrap().status(), 200);
+                    assert!(first.recv_data().await.unwrap().is_none());
+                }
+                assert!(sender.get_conn_error().is_none());
+            };
+            tokio::select! { biased; _ = requests => (), error = driver.wait_idle() => panic!("connection failed: {error}") }
+        };
+        let peer = async {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            let mut control = connection.open_uni().await.unwrap();
+            let mut wire = BytesMut::new();
+            StreamType::CONTROL.encode(&mut wire);
+            Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut wire);
+            control.write_all(&wire).await.unwrap();
+            let (mut first_send, _first_recv) = connection.accept_bi().await.unwrap();
+            let (mut second_send, _second_recv) = connection.accept_bi().await.unwrap();
+            wire.clear();
+            Frame::<Bytes>::Goaway(VarInt::from(4_u32)).encode(&mut wire);
+            control.write_all(&wire).await.unwrap();
+            // Excluded requests are reset as RFC 9114, Section 5.2 recommends.
+            second_send
+                .reset(::quinn::VarInt::from_u64(Code::H3_REQUEST_REJECTED.value()).unwrap())
+                .unwrap();
+            lower_rx.await.unwrap();
+            wire.clear();
+            if reject_lower {
+                Frame::<Bytes>::Goaway(VarInt::from(0_u32)).encode(&mut wire);
+                control.write_all(&wire).await.unwrap();
+                first_send
+                    .reset(::quinn::VarInt::from_u64(Code::H3_REQUEST_REJECTED.value()).unwrap())
+                    .unwrap();
+            } else {
+                Frame::headers(vec![0, 0, 0xd9]).encode_with_payload(&mut wire);
+                first_send.write_all(&wire).await.unwrap();
+                first_send.finish().unwrap();
+            }
+            let _ = connection.closed().await;
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(client, peer);
+        })
+        .await
+        .unwrap();
+    }
+}
+
+/// Yields until the client driver published a GOAWAY at or below `boundary`.
+async fn goaway_published<T: ConnectionState>(state: &T, boundary: u64) {
+    while state
+        .peer_goaway()
+        .is_none_or(|id| id.into_inner() > boundary)
+    {
+        tokio::task::yield_now().await;
+    }
+}
+
 async fn rejected_request_fields(
     fields: Vec<qpack::HeaderField<'static>>,
     trailers: bool,
@@ -155,7 +394,11 @@ async fn rejected_request_fields(
         send.write_all(&bytes).await.unwrap();
         send.finish().unwrap();
         if !trailers {
-            assert_matches!(recv.read_to_end(1024).await, Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(actual))) if actual.into_inner() == code.value());
+            assert_matches!(
+                recv.read_to_end(1024).await,
+                Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(actual)))
+                    if actual.into_inner() == code.value()
+            );
         }
         rejected_rx.await.unwrap();
         let (mut next_send, mut next_recv) = connection.open_bi().await.unwrap();
@@ -219,7 +462,10 @@ async fn get() {
                 .expect("body");
             assert_eq!(body.chunk(), b"wonderful hypertext");
         };
-        tokio::join!(req_fut, drive_fut)
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        }
     };
 
     let server_fut = async {
@@ -330,7 +576,12 @@ async fn client_dynamic_qpack_request_round_trip() {
         }
 
         drop(send);
-        future::poll_fn(|cx| driver.poll_close(cx)).await
+        driver.inner.handle_connection_error(
+            crate::error::internal_error::InternalConnectionError::new(
+                Code::H3_NO_ERROR,
+                "test complete".to_string(),
+            ),
+        )
     };
 
     let server_fut = async {
@@ -598,8 +849,24 @@ async fn client_keeps_blocked_field_section_prefix_across_table_updates() {
                 // remains available to wake the blocked decoder in both cases.
                 drop(send);
             };
-            let (_, connection) =
-                tokio::join!(response, future::poll_fn(|cx| driver.poll_close(cx)),);
+            let connection = if evict {
+                let (_, connection) =
+                    tokio::join!(response, future::poll_fn(|cx| driver.poll_close(cx)));
+                connection
+            } else {
+                tokio::select! {
+                    () = response => {},
+                    error = future::poll_fn(|cx| driver.poll_close(cx)) => {
+                        panic!("connection closed before response completed: {error:?}");
+                    }
+                }
+                driver.inner.handle_connection_error(
+                    crate::error::internal_error::InternalConnectionError::new(
+                        Code::H3_NO_ERROR,
+                        "test complete".to_string(),
+                    ),
+                )
+            };
             assert_matches!(
                 connection,
                 ConnectionError::Local {
@@ -854,7 +1121,10 @@ async fn recv_trailers_before_body_keeps_body_readable() {
                     .is_none()
             );
         };
-        tokio::join!(req_fut, drive_fut)
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        }
     };
 
     let server_fut = async {
@@ -919,7 +1189,10 @@ async fn get_with_trailers_unknown_content_type() {
                 .expect("trailers none");
             assert_eq!(trailers.get("trailer").unwrap(), &"value");
         };
-        tokio::join!(req_fut, drive_fut);
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        };
     };
 
     let server_fut = async {
@@ -988,7 +1261,10 @@ async fn get_with_trailers_known_content_type() {
                 .expect("trailers none");
             assert_eq!(trailers.get("trailer").unwrap(), &"value");
         };
-        tokio::join!(req_fut, drive_fut);
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        };
     };
 
     let server_fut = async {
@@ -1061,7 +1337,10 @@ async fn post() {
             }
             assert_eq!(response_body, b"wonderful hypertext");
         };
-        tokio::join!(req_fut, drive_fut);
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        };
     };
 
     let server_fut = async {
@@ -1126,7 +1405,10 @@ async fn header_too_big_response_from_server() {
                 StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
             );
         };
-        tokio::join!(req_fut, drive_fut);
+        tokio::select! {
+            () = req_fut => {},
+            error = drive_fut => panic!("connection closed before request completed: {error:?}"),
+        };
     };
 
     let server_fut = async {
@@ -1236,72 +1518,54 @@ async fn header_too_big_response_from_server_trailers() {
 
 #[tokio::test]
 async fn header_too_big_client_error() {
-    init_tracing();
     let mut pair = Pair::default();
-    let mut server = pair.server();
-
+    let mut endpoint = pair.server();
     let client_fut = async {
-        let (mut driver, mut client) = client::new(pair.client().await).await.expect("client init");
-        let drive_fut = async {
+        let (mut driver, mut client) = client::new(pair.client().await).await.unwrap();
+        client.set_settings(Settings {
+            max_field_section_size: 200,
+            ..Settings::default()
+        });
+        let requests = async {
+            let request = Request::get("http://localhost/salut")
+                .header("large", "x".repeat(200))
+                .body(())
+                .unwrap();
             assert_matches!(
-                future::poll_fn(|cx| driver.poll_close(cx)).await,
-                ConnectionError::Remote(ConnectionErrorIncoming::ApplicationClose{
-                    error_code: code,
-                    ..
-                }) if code == Code::H3_NO_ERROR.value()
+                client.send_request(request).await.map(|_| ()),
+                Err(StreamError::HeaderTooBig { max_size: 200, .. })
+            );
+            assert!(client.get_conn_error().is_none());
+            let mut stream = client
+                .send_request(Request::get("http://localhost/salut").body(()).unwrap())
+                .await
+                .unwrap();
+            // Local size rejection must not consume a stream or emit HEADERS.
+            assert_eq!(stream.id().into_inner(), 0);
+            stream.finish().await.unwrap();
+            assert_eq!(
+                stream.recv_response().await.unwrap().status(),
+                StatusCode::OK
             );
         };
-        let req_fut = async {
-            // pretend client already received server's settings
-            let settings = Settings {
-                max_field_section_size: 12,
-                ..Settings::default()
-            };
-            // Sets the settings if not already received
-            client.set_settings(settings);
-
-            let req = Request::get("http://localhost/salut").body(()).unwrap();
-            let err_kind = client.send_request(req).await.map(|_| ()).unwrap_err();
-
-            assert_matches!(
-                err_kind,
-                StreamError::HeaderTooBig {
-                    actual_size: 179,
-                    max_size: 12,
-                    ..
-                }
-            );
-        };
-        tokio::join! {req_fut, drive_fut }
+        tokio::select! { biased; _ = requests => (), error = driver.wait_idle() => panic!("connection failed: {error}") }
     };
-
     let server_fut = async {
-        let conn = server.next().await;
-
-        let mut incoming_req = server::builder()
-            .max_field_section_size(12)
-            .build(conn)
+        let mut incoming = server::builder()
+            .max_field_section_size(200)
+            .build(endpoint.next().await)
             .await
             .unwrap();
-
-        let incoming = incoming_req.accept().await.unwrap().unwrap();
-
-        // client does not send any data, so the server will not receive any data, resulting in a
-        // H3_REQUEST_INCOMPLETE
-        assert_matches!(
-            incoming
-                .resolve_request()
-                .await
-                .err()
-                .expect("should return an error"),
-            StreamError::StreamError {
-                code: Code::H3_REQUEST_INCOMPLETE,
-                reason: _
-            }
-        );
+        let (_, mut stream) = get_stream_blocking(&mut incoming).await.unwrap();
+        stream.send_response(Response::new(())).await.unwrap();
+        stream.finish().await.unwrap();
+        let _ = incoming.accept().await;
     };
-
-    tokio::join!(server_fut, client_fut);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(server_fut, client_fut);
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -2321,17 +2585,26 @@ where
                 }
             }
 
-            // drop the SendRequest to let driver know there will be no more requests
+            // The owner below closes the driver after this request finishes.
             drop(send);
 
             Result::<(), quinn::ReadError>::Ok(())
         };
 
-        let driver = async {
-            Result::<(), ConnectionError>::Err(future::poll_fn(|cx| driver.poll_close(cx)).await)
-        };
-
-        tokio::join!(client, driver)
+        let mut client = std::pin::pin!(client);
+        tokio::select! {
+            result = &mut client => {
+                let error = driver.inner.handle_connection_error(
+                    crate::error::internal_error::InternalConnectionError::new(
+                        Code::H3_NO_ERROR, "test complete".to_string(),
+                    ),
+                );
+                (result, Err::<(), _>(error))
+            }
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => {
+                (client.await, Err::<(), _>(error))
+            }
+        }
     };
 
     let server_fut = async {
@@ -2408,5 +2681,317 @@ where
         );
         // Stream closes with no error
         assert_matches!(server_result_stream, Ok(()));
+    }
+}
+
+#[tokio::test]
+async fn request_stream_drop_resets_request_body() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+    let (server_accepted_tx, server_accepted_rx) = tokio::sync::oneshot::channel();
+    let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
+
+    let client_fut = async {
+        let (mut driver, mut client) = client::new(pair.client().await).await.expect("client init");
+        let drive_fut = async { future::poll_fn(|cx| driver.poll_close(cx)).await };
+        let req_fut = async move {
+            let request_stream = client
+                .send_request(Request::get("http://localhost/drop").body(()).unwrap())
+                .await
+                .expect("request");
+            let _ = server_accepted_rx.await;
+            drop(request_stream);
+
+            let _ = server_done_rx.await;
+            drop(client);
+        };
+        tokio::join!(req_fut, drive_fut)
+    };
+
+    let server_fut = async {
+        let conn = server.next().await;
+        let mut incoming_req = server::Connection::new(conn).await.unwrap();
+
+        let (_request, mut request_stream) = get_stream_blocking(&mut incoming_req)
+            .await
+            .expect("accept");
+        let _ = server_accepted_tx.send(());
+
+        match request_stream.recv_data().await {
+            Err(StreamError::RemoteTerminate { code }) => {
+                assert_eq!(code, Code::H3_REQUEST_CANCELLED.value());
+            }
+            Err(err) => panic!("unexpected stream error: {err:?}"),
+            Ok(_) => panic!("expected request stream reset"),
+        }
+
+        let _ = server_done_tx.send(());
+    };
+
+    tokio::join!(server_fut, client_fut);
+}
+
+#[tokio::test]
+async fn poll_stopped_reports_stop_sending_and_acknowledged_fin() {
+    init_tracing();
+    const STOP_CODE: u64 = 0x10c;
+
+    let mut pair = Pair::default();
+    let endpoint = pair.server_inner();
+    let client_fut = async {
+        let (mut driver, mut client) = client::new(pair.client().await).await.unwrap();
+        let requests = async {
+            // The upload stays open, so only STOP_SENDING can complete the wait.
+            let mut stream = client
+                .send_request(Request::get("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap();
+            let stopped = future::poll_fn(|cx| stream.poll_stopped(cx)).await.unwrap();
+            assert_eq!(stopped, Some(Code::from(STOP_CODE)));
+            assert_matches!(
+                stream.send_data(Bytes::from_static(b"late")).await,
+                Err(StreamError::RemoteTerminate { code }) if code == Code::from(STOP_CODE)
+            );
+            drop(stream);
+
+            let (mut send, _recv) = client
+                .send_request(Request::get("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap()
+                .split();
+            send.finish().await.unwrap();
+            assert_eq!(
+                future::poll_fn(|cx| send.poll_stopped(cx)).await.unwrap(),
+                None
+            );
+        };
+        tokio::select! {
+            biased;
+            _ = requests => (),
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("connection failed: {error:?}"),
+        }
+    };
+    let peer = async {
+        let connection = endpoint.accept().await.unwrap().await.unwrap();
+        let mut control = connection.open_uni().await.unwrap();
+        let mut bytes = BytesMut::new();
+        StreamType::CONTROL.encode(&mut bytes);
+        Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut bytes);
+        control.write_all(&bytes).await.unwrap();
+        let (_send, mut recv) = connection.accept_bi().await.unwrap();
+        recv.stop(http3_quinn::VarInt::from_u64(STOP_CODE).unwrap())
+            .unwrap();
+        let (_send, mut recv) = connection.accept_bi().await.unwrap();
+        recv.read_to_end(usize::MAX).await.unwrap();
+        let _ = connection.closed().await;
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(client_fut, peer);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn poll_send_api_round_trip_with_trailers_and_split() {
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+    let client_fut = async {
+        let (mut driver, mut client) = client::new(pair.client().await).await.unwrap();
+        let requests = async {
+            for _ in 0..2 {
+                let stream = client
+                    .send_request(Request::post("https://localhost/").body(()).unwrap())
+                    .await
+                    .unwrap();
+                let (mut send, mut recv) = stream.split();
+                future::poll_fn(|cx| send.poll_ready(cx)).await.unwrap();
+                send.start_send_data(Bytes::from(vec![42; 128 * 1024]))
+                    .unwrap();
+                assert_matches!(
+                    send.start_send_data(Bytes::new()),
+                    Err(StreamError::InvalidStreamState { .. })
+                );
+                future::poll_fn(|cx| send.poll_ready(cx)).await.unwrap();
+                let mut trailers = HeaderMap::new();
+                trailers.insert("x-trailer", "request".parse().unwrap());
+                send.start_send_trailers(trailers).unwrap();
+                future::poll_fn(|cx| send.poll_finish(cx)).await.unwrap();
+                assert_eq!(recv.recv_response().await.unwrap().status(), StatusCode::OK);
+                let mut body = Vec::new();
+                while let Some(mut data) = recv.recv_data().await.unwrap() {
+                    body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+                }
+                assert_eq!(body, vec![24; 128 * 1024]);
+                assert_eq!(
+                    recv.recv_trailers().await.unwrap().unwrap()["x-trailer"],
+                    "response"
+                );
+                assert_eq!(
+                    future::poll_fn(|cx| send.poll_stopped(cx)).await.unwrap(),
+                    None
+                );
+            }
+        };
+        tokio::select! {
+            biased;
+            () = requests => (),
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("connection failed: {error:?}"),
+        }
+    };
+    let server_fut = async {
+        let mut driver = server::Connection::new(server.next().await).await.unwrap();
+        for _ in 0..2 {
+            let (_, mut stream) = get_stream_blocking(&mut driver).await.unwrap();
+            let mut body = Vec::new();
+            while let Some(mut data) = stream.recv_data().await.unwrap() {
+                body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+            }
+            assert_eq!(body, vec![42; 128 * 1024]);
+            assert_eq!(
+                stream.recv_trailers().await.unwrap().unwrap()["x-trailer"],
+                "request"
+            );
+            stream.send_response(Response::new(())).await.unwrap();
+            let mut send = stream;
+            future::poll_fn(|cx| send.poll_ready(cx)).await.unwrap();
+            send.start_send_data(Bytes::from(vec![24; 128 * 1024]))
+                .unwrap();
+            // Mix poll and async operations on the server, too.
+            let mut trailers = HeaderMap::new();
+            trailers.insert("x-trailer", "response".parse().unwrap());
+            send.send_trailers(trailers).await.unwrap();
+            future::poll_fn(|cx| send.poll_finish(cx)).await.unwrap();
+        }
+        let _ = driver.accept().await;
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn poll_response_resumes_or_cancels_blocked_headers_after_split() {
+    for cancel in [false, true] {
+        let mut pair = Pair::default();
+        let server = pair.server_inner();
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let client = async {
+            let (mut driver, mut sender) = client::builder()
+                .qpack_max_table_capacity(64)
+                .qpack_blocked_streams(1)
+                .build::<_, _, Bytes>(pair.client().await)
+                .await
+                .unwrap();
+            let mut stream = sender
+                .send_request(Request::get("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap();
+            stream.finish().await.unwrap();
+            {
+                let mut response = std::pin::pin!(stream.recv_response());
+                future::poll_fn(|cx| {
+                    assert!(driver.poll_close(cx).is_pending());
+                    assert!(response.as_mut().poll(cx).is_pending());
+                    if driver.inner.qpack_blocked_stream_count() == 1 {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+            }
+            // Drop the waiting async future, then transfer the partially decoded
+            // HEADERS to the receive half. Neither step abandons the field section.
+            let (_send, mut recv) = stream.split();
+            assert_eq!(driver.inner.qpack_blocked_stream_count(), 1);
+            if cancel {
+                drop(recv);
+                // Cancellation is queued to the connection's QPACK driver.
+                future::poll_fn(|cx| {
+                    assert!(driver.poll_close(cx).is_pending());
+                    if driver.inner.qpack_blocked_stream_count() == 0 {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+                blocked_tx.send(()).unwrap();
+                tokio::select! {
+                    result = done_rx => result.unwrap(),
+                    error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("driver failed: {error:?}"),
+                }
+            } else {
+                blocked_tx.send(()).unwrap();
+                let response = async {
+                    let headers = future::poll_fn(|cx| recv.poll_recv_response(cx))
+                        .await
+                        .unwrap();
+                    assert_eq!(headers.status(), 103);
+                    // A completed informational section must not be delivered twice.
+                    assert_eq!(recv.recv_response().await.unwrap().status(), 200);
+                    assert!(recv.recv_data().await.unwrap().is_none());
+                    assert!(recv.recv_trailers().await.unwrap().is_none());
+                };
+                tokio::select! {
+                    () = response => (),
+                    error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("driver failed: {error:?}"),
+                }
+                assert_eq!(driver.inner.qpack_blocked_stream_count(), 0);
+                drop(driver);
+                done_rx.await.unwrap();
+            }
+        };
+        let peer = async {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            let mut control_stream = connection.open_uni().await.unwrap();
+            let mut control = BytesMut::new();
+            StreamType::CONTROL.encode(&mut control);
+            Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut control);
+            control_stream.write_all(&control).await.unwrap();
+            let mut encoder_stream = connection.open_uni().await.unwrap();
+            let mut encoder = BytesMut::new();
+            StreamType::ENCODER.encode(&mut encoder);
+            encoder_stream.write_all(&encoder).await.unwrap();
+            let (mut send, _recv) = connection.accept_bi().await.unwrap();
+            let mut bytes = BytesMut::new();
+            // RIC 1 and relative index 0 wait for the first dynamic insertion.
+            Frame::headers(vec![0x02, 0x00, 0x80]).encode_with_payload(&mut bytes);
+            send.write_all(&bytes).await.unwrap();
+            blocked_rx.await.unwrap();
+            if cancel {
+                assert_eq!(
+                    send.stopped().await.unwrap().unwrap().into_inner(),
+                    Code::H3_REQUEST_CANCELLED.value(),
+                );
+                // Keep the peer alive until the client observes the cancellation
+                // acknowledgment; a peer close must not race its select branch.
+                done_tx.send(()).unwrap();
+                connection.closed().await;
+            } else {
+                let mut instructions = BytesMut::new();
+                qpack::DynamicTableSizeUpdate(64).encode(&mut instructions);
+                qpack::InsertWithoutNameRef::new(":status", "103")
+                    .encode(&mut instructions)
+                    .unwrap();
+                encoder_stream.write_all(&instructions).await.unwrap();
+                let mut final_head = BytesMut::new();
+                Frame::headers(vec![0x00, 0x00, 0xd9]).encode_with_payload(&mut final_head);
+                send.write_all(&final_head).await.unwrap();
+                send.finish().unwrap();
+                connection.closed().await;
+                done_tx.send(()).unwrap();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(client, peer);
+        })
+        .await
+        .expect("blocked response did not resume or cancel");
     }
 }
