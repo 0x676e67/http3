@@ -1,7 +1,7 @@
 name: Benchmark
 
 on:
-  pull_request:
+  # Run the full matrix after merges; manual runs remain available for diagnostics.
   push:
     branches:
       - main
