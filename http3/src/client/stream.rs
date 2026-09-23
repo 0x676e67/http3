@@ -268,38 +268,35 @@ where
             }
         };
 
-        let qpack::Decoded { fields, .. } = match inner.poll_decode_field_section(cx, &mut encoded)
-        {
+        let fields = match inner.poll_decode_field_section(cx, &mut encoded) {
             Poll::Pending => {
                 *response = Some(encoded);
                 return Poll::Pending;
             }
-            Poll::Ready(decoded) => match decoded {
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
-                //# An HTTP/3 implementation MAY impose a limit on the maximum size of
-                //# the message header it will accept on an individual HTTP message.
-                Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
-                    inner.stop_sending(Code::H3_REQUEST_CANCELLED);
-                    return Poll::Ready(Err(StreamError::HeaderTooBig {
-                        actual_size: cancel_size,
-                        max_size: inner.max_field_section_size,
-                    }));
-                }
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    let code = if error.is_internal() {
-                        Code::H3_INTERNAL_ERROR
-                    } else {
-                        Code::QPACK_DECOMPRESSION_FAILED
-                    };
-                    return Poll::Ready(Err(inner.handle_connection_error_on_stream(
-                        InternalConnectionError::new(
-                            code,
-                            format!("failed to decode response headers: {error}"),
-                        ),
-                    )));
-                }
-            },
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+            //# An HTTP/3 implementation MAY impose a limit on the maximum size of
+            //# the message header it will accept on an individual HTTP message.
+            Poll::Ready(Err(qpack::DecoderError::HeaderTooLong(cancel_size))) => {
+                inner.stop_sending(Code::H3_REQUEST_CANCELLED);
+                return Poll::Ready(Err(StreamError::HeaderTooBig {
+                    actual_size: cancel_size,
+                    max_size: inner.max_field_section_size,
+                }));
+            }
+            Poll::Ready(Ok(qpack::Decoded { fields, .. })) => fields,
+            Poll::Ready(Err(error)) => {
+                let code = if error.is_internal() {
+                    Code::H3_INTERNAL_ERROR
+                } else {
+                    Code::QPACK_DECOMPRESSION_FAILED
+                };
+                return Poll::Ready(Err(inner.handle_connection_error_on_stream(
+                    InternalConnectionError::new(
+                        code,
+                        format!("failed to decode response headers: {error}"),
+                    ),
+                )));
+            }
         };
 
         let (status, headers, pseudo_sensitivity) = Header::try_from(fields)
