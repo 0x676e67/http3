@@ -20,11 +20,10 @@ use crate::{
         Code, StreamError, connection_error_creators::CloseStream,
         internal_error::InternalConnectionError,
     },
-    proto::{frame::Frame, headers::Header},
+    proto::headers::Header,
     qpack,
     quic::{self, SendStream as _},
     shared_state::{ConnectionState, SharedState},
-    stream::{self},
 };
 
 /// Manage request and response transfer for an incoming request
