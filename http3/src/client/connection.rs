@@ -845,6 +845,9 @@ mod integration_tests {
                 6 => poll_fn(|cx| stream.poll_stopped(cx)).await.map(|_| ()),
                 7 => poll_fn(|cx| stream.poll_ready(cx)).await,
                 8 => poll_fn(|cx| stream.poll_finish(cx)).await,
+                9 => poll_fn(|cx| stream.poll_recv_response(cx))
+                    .await
+                    .map(|_| ()),
                 _ => unreachable!(),
             }
         })
@@ -905,7 +908,7 @@ mod integration_tests {
     #[test]
     fn goaway_rejects_returned_request_operations_on_next_poll_and_cancels_directions() {
         for terminal_error in [false, true] {
-            for operation in 0..9 {
+            for operation in 0..10 {
                 let state = Arc::new(State::default());
                 let mut sender = sender(&state, false);
                 let mut stream = returned(&mut sender);
@@ -956,7 +959,7 @@ mod integration_tests {
     #[test]
     fn goaway_rejects_both_split_halves_independently() {
         for send_operation in 3..7 {
-            for recv_operation in 0..3 {
+            for recv_operation in [0, 1, 2, 9] {
                 let state = Arc::new(State::default());
                 let mut sender = sender(&state, false);
                 let (mut send, mut recv) = returned(&mut sender).split();
