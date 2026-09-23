@@ -2867,7 +2867,10 @@ async fn server_requires_response_headers_before_body_or_trailers() {
                 .await
                 .unwrap();
             stream.finish().await.unwrap();
-            assert_eq!(stream.recv_response().await.unwrap().status(), StatusCode::OK);
+            assert_eq!(
+                stream.recv_response().await.unwrap().status(),
+                StatusCode::OK
+            );
             let mut body = Vec::new();
             while let Some(mut chunk) = stream.recv_data().await.unwrap() {
                 body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
