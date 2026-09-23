@@ -84,6 +84,39 @@ async fn cancelled_write_flushes_before_next_frame() {
 }
 
 #[tokio::test]
+async fn quic_finish_flushes_buffered_frame() {
+    let mut pair = Pair::default();
+    let server = pair.server_inner();
+    let client = async {
+        let mut connection = pair.client().await;
+        let mut stream = future::poll_fn(|cx| {
+            <http3_quinn::Connection as quic::OpenStreams<Bytes>>::poll_open_bidi(
+                &mut connection,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+        stream
+            .send_data(Frame::Data(Bytes::from_static(b"payload")))
+            .unwrap();
+        future::poll_fn(|cx| stream.poll_finish(cx)).await.unwrap();
+        (connection, stream)
+    };
+    let peer = async {
+        let connection = server.accept().await.unwrap().await.unwrap();
+        let (_send, mut recv) = connection.accept_bi().await.unwrap();
+        recv.read_to_end(128).await.unwrap()
+    };
+
+    let (received, _client) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(peer, client) })
+            .await
+            .unwrap();
+    assert_eq!(received, b"\x00\x07payload");
+}
+
+#[tokio::test]
 async fn connect() {
     let mut pair = Pair::default();
     let mut server = pair.server();

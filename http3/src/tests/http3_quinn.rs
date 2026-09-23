@@ -488,10 +488,8 @@ where
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    fn poll_finish(
-        &mut self,
-        _cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), StreamErrorIncoming>> {
+    fn poll_finish(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+        ready!(self.poll_ready(cx))?;
         Poll::Ready(
             self.stream
                 .finish()

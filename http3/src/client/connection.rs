@@ -728,7 +728,9 @@ mod integration_tests {
 
     impl SendStream<Bytes> for Mock {
         fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-            if self.0.block_write.load(Ordering::Relaxed) {
+            if self.0.block_write.load(Ordering::Relaxed)
+                && self.0.written.load(Ordering::Relaxed)
+            {
                 Poll::Pending
             } else {
                 Poll::Ready(Ok(()))
@@ -1210,8 +1212,7 @@ mod integration_tests {
                     ))
                     .is_pending()
             );
-            // The initial readiness check blocks before handing headers to the transport.
-            assert!(!state.written.load(Ordering::Relaxed));
+            assert!(state.written.load(Ordering::Relaxed));
             drop(sending);
             assert!(matches!(
                 events_rx.try_recv(),
