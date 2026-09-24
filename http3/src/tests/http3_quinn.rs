@@ -105,14 +105,18 @@ fn convert_connection_error(e: quinn::ConnectionError) -> http3::quic::Connectio
                 error_code: application_close.error_code.into(),
             }
         }
+        quinn::ConnectionError::ConnectionClosed(connection_close) => {
+            ConnectionErrorIncoming::ConnectionClosed {
+                error_code: connection_close.error_code.into(),
+            }
+        }
         quinn::ConnectionError::TimedOut => ConnectionErrorIncoming::Timeout,
 
         error @ quinn::ConnectionError::VersionMismatch
         | error @ quinn::ConnectionError::Reset
         | error @ quinn::ConnectionError::LocallyClosed
         | error @ quinn::ConnectionError::CidsExhausted
-        | error @ quinn::ConnectionError::TransportError(_)
-        | error @ quinn::ConnectionError::ConnectionClosed(_) => {
+        | error @ quinn::ConnectionError::TransportError(_) => {
             ConnectionErrorIncoming::Undefined(Arc::new(error))
         }
     }
