@@ -69,7 +69,11 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: ${{ env.toolchain_msrv }}
-      - run: cargo check -p http3
+      - name: Resolve dependencies for the MSRV
+        run: cargo +stable generate-lockfile
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+      - run: cargo check --locked -p http3
 
   msrv_http3_quic:
     name: Check MSRV of `http3-quic`
@@ -81,7 +85,11 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: ${{ env.toolchain_msrv }}
-      - run: cargo check -p http3-quic
+      - name: Resolve dependencies for the MSRV
+        run: cargo +stable generate-lockfile
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+      - run: cargo check --locked -p http3-quic
 
   test:
     name: Test ${{ matrix.toolchain }} ${{ matrix.os }} ${{ matrix.target }}
@@ -143,7 +151,7 @@ jobs:
         with:
           toolchain: ${{ env.toolchain_fuzz }}
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --version 0.13.2 --locked
+        run: cargo +stable install cargo-fuzz --version 0.13.2 --locked
       - run: cargo fuzz run fuzz_varint -- -runs=1
 
   # Compliance reporting is temporarily disabled because its publishing workflow is not stable.
