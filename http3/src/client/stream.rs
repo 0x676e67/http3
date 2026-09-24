@@ -299,6 +299,12 @@ where
             }
         };
 
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+        //# Malformed requests or responses that are
+        //# detected MUST be treated as a stream error of type H3_MESSAGE_ERROR.
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+        //# Clients MUST NOT
+        //# accept a malformed response.
         let (status, headers, pseudo_sensitivity) = Header::try_from(fields)
             .and_then(Header::into_response_parts)
             .map_err(|error| {
