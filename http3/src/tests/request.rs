@@ -2925,3 +2925,87 @@ async fn cancelled_send_response_rejects_data_until_headers_flush() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn server_requires_final_response_headers_once_before_body_trailers_or_fin() {
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+    let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+    let client_fut = async {
+        let (mut driver, mut sender) = client::new(pair.client().await).await.unwrap();
+        let request = async move {
+            let mut stream = sender
+                .send_request(Request::get("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap();
+            stream.finish().await.unwrap();
+            assert_eq!(stream.recv_response().await.unwrap().status(), 103);
+            assert_eq!(
+                stream.recv_response().await.unwrap().status(),
+                StatusCode::OK
+            );
+            let mut body = Vec::new();
+            while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+                body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+            }
+            assert_eq!(body, b"body");
+            assert!(stream.recv_trailers().await.unwrap().is_none());
+            read_tx.send(()).unwrap();
+        };
+        tokio::select! {
+            () = request => (),
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("connection failed: {error:?}"),
+        }
+    };
+    let server_fut = async {
+        let mut driver = server::Connection::new(server.next().await).await.unwrap();
+        let (_, mut stream) = get_stream_blocking(&mut driver).await.unwrap();
+        future::poll_fn(|cx| stream.poll_ready(cx)).await.unwrap();
+        assert_matches!(
+            stream.start_send_data(Bytes::from_static(b"early")),
+            Err(StreamError::InvalidStreamState { .. })
+        );
+        assert_matches!(
+            stream.start_send_trailers(HeaderMap::new()),
+            Err(StreamError::InvalidStreamState { .. })
+        );
+        assert_matches!(
+            stream.send_data(Bytes::from_static(b"early")).await,
+            Err(StreamError::InvalidStreamState { .. })
+        );
+        assert_matches!(
+            stream.send_trailers(HeaderMap::new()).await,
+            Err(StreamError::InvalidStreamState { .. })
+        );
+        let finish_rejected = |stream: &mut server::RequestStream<_, Bytes>| {
+            let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+            assert_matches!(
+                stream.poll_finish(&mut cx),
+                std::task::Poll::Ready(Err(StreamError::InvalidStreamState { .. }))
+            );
+        };
+        finish_rejected(&mut stream);
+        // An informational response does not open the body.
+        let early_hints = Response::builder().status(103).body(()).unwrap();
+        stream.send_response(early_hints).await.unwrap();
+        assert_matches!(
+            stream.start_send_data(Bytes::from_static(b"early")),
+            Err(StreamError::InvalidStreamState { .. })
+        );
+        finish_rejected(&mut stream);
+        stream.send_response(Response::new(())).await.unwrap();
+        stream.send_data(Bytes::from_static(b"body")).await.unwrap();
+        // More HEADERS would be read as trailers.
+        assert_matches!(
+            stream.send_response(Response::new(())).await,
+            Err(StreamError::InvalidStreamState { .. })
+        );
+        stream.finish().await.unwrap();
+        read_rx.await.unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .unwrap();
+}

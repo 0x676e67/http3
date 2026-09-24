@@ -1628,6 +1628,10 @@ enum SendState {
     Finishing,
     Finished,
     Reset,
+    // A server response has not queued its final HEADERS; 1xx HEADERS may still be sent.
+    Head,
+    // A 1xx HEADERS frame is queued; flushing it returns to Head.
+    Interim,
 }
 
 impl<S, B> RequestStream<S, B>
@@ -1668,6 +1672,9 @@ where
         }
     }
 
+    /// Creates a server request with both cancellation callbacks disarmed.
+    /// Sending awaits the final response HEADERS before DATA, trailers, or FIN.
+    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1>.
     pub(crate) fn with_decode_state(
         stream: FrameStream<S, B>,
         max_field_section_size: u64,
@@ -1681,7 +1688,7 @@ where
             max_field_section_size,
             trailers: None,
             send_grease_frame: grease,
-            send_state: SendState::Ready,
+            send_state: SendState::Head,
             decode_state,
         }
     }
@@ -2061,6 +2068,9 @@ where
         if self.send_state == SendState::Data {
             self.send_state = SendState::Ready;
         }
+        if self.send_state == SendState::Interim {
+            self.send_state = SendState::Head;
+        }
         Poll::Ready(Ok(()))
     }
 
@@ -2120,6 +2130,7 @@ where
     }
 
     /// Flushes all queued frames, emits GREASE once, then submits FIN.
+    /// A server response must queue its final HEADERS first.
     pub fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
         if self.send_state == SendState::Reset {
             return Poll::Ready(Err(StreamError::InvalidStreamState {
@@ -2128,6 +2139,13 @@ where
         }
         if self.send_state == SendState::Finished {
             return Poll::Ready(Ok(()));
+        }
+        if matches!(self.send_state, SendState::Head | SendState::Interim) {
+            // A response without final HEADERS is malformed.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
+            return Poll::Ready(Err(StreamError::InvalidStreamState {
+                reason: "send the final response HEADERS before finishing".into(),
+            }));
         }
         self.send_state = SendState::Finishing;
         ready!(self.poll_ready(cx))?;
@@ -2148,6 +2166,13 @@ where
     }
 
     fn check_send_ready(&self) -> Result<(), StreamError> {
+        if matches!(self.send_state, SendState::Head | SendState::Interim) {
+            // A response starts with HEADERS, not DATA or trailers.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
+            return Err(StreamError::InvalidStreamState {
+                reason: "send the final response HEADERS before DATA or trailers".into(),
+            });
+        }
         if self.send_state != SendState::Ready {
             return Err(StreamError::InvalidStreamState {
                 reason: "flush the pending frame before sending; no content is allowed after trailers, finish, or reset".into(),
@@ -2157,12 +2182,39 @@ where
     }
 
     /// Queues response HEADERS until the next successful `poll_ready` flush.
-    pub(crate) fn start_send_headers(&mut self, block: Bytes) -> Result<(), StreamError> {
-        self.check_send_ready()?;
+    /// Informational HEADERS keep the response open for its final HEADERS.
+    pub(crate) fn start_send_headers(
+        &mut self,
+        block: Bytes,
+        informational: bool,
+    ) -> Result<(), StreamError> {
+        // Leave Head in the same step that queues the final HEADERS, so a
+        // cancelled flush cannot unlock early DATA. HEADERS after the final
+        // response would be read as trailers.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
+        let reason = match self.send_state {
+            SendState::Head => None,
+            SendState::Interim => Some("flush the pending informational response first"),
+            SendState::Finishing | SendState::Finished | SendState::Reset => {
+                Some("no response HEADERS are allowed after finish or reset")
+            }
+            SendState::Ready | SendState::Data | SendState::Trailers => {
+                Some("the final response HEADERS were already sent")
+            }
+        };
+        if let Some(reason) = reason {
+            return Err(StreamError::InvalidStreamState {
+                reason: reason.into(),
+            });
+        }
         self.stream
             .send_data(Frame::Headers(block))
             .map_err(|e| self.handle_quic_stream_error(e))?;
-        self.send_state = SendState::Data;
+        self.send_state = if informational {
+            SendState::Interim
+        } else {
+            SendState::Data
+        };
         Ok(())
     }
 }

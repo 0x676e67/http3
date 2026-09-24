@@ -124,11 +124,12 @@ where
     S: quic::SendStream<B>,
     B: Buf,
 {
-    /// Send the HTTP/3 response
+    /// Sends response HEADERS; 1xx responses may precede the final one.
     ///
-    /// This should be called before trying to send any data with
-    /// [`RequestStream::send_data`].
+    /// The final response must be sent before DATA, trailers, or finish, and
+    /// only once. See [RFC 9114, Section 4.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1).
     pub async fn send_response(&mut self, resp: Response<()>) -> Result<(), StreamError> {
+        let informational = resp.status().is_informational();
         let (parts, _) = resp.into_parts();
         let response::Parts {
             status,
@@ -168,7 +169,8 @@ where
         }
 
         future::poll_fn(|cx| self.inner.poll_ready(cx)).await?;
-        self.inner.start_send_headers(block.freeze())?;
+        self.inner
+            .start_send_headers(block.freeze(), informational)?;
         future::poll_fn(|cx| self.inner.poll_ready(cx)).await
     }
 
