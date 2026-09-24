@@ -136,6 +136,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(release-plz)* verify publishable crates before publishing
 
 ## [unreleased]
+## [0.2.1](https://github.com/0x676e67/http3/compare/v0.2.0..v0.2.1) - 2026-09-24
+
+### Bug Fixes
+
+- Flush buffered data before next write and finish ([#119](https://github.com/0x676e67/http3/issues/119)) - ([b7fd1eb](https://github.com/0x676e67/http3/commit/b7fd1eb48c44c11923e560de817767f3fa0c42a9))
+
+## [0.2.1](https://github.com/0x676e67/http3/compare/v0.2.0..v0.2.1) - 2026-09-24
+
+## [0.2.1](https://github.com/0x676e67/http3/compare/v0.2.0..v0.2.1) - 2026-09-24
+
+### Bug Fixes
+
+- *(server)* Consume GREASE flag when creating resolvers ([#125](https://github.com/0x676e67/http3/issues/125)) - ([63a7fdf](https://github.com/0x676e67/http3/commit/63a7fdf294ad11fa91bf6d39532f47c4f73b7bcc))
+- Require response headers before server body frames ([#121](https://github.com/0x676e67/http3/issues/121)) - ([88f9761](https://github.com/0x676e67/http3/commit/88f97610ba8abfd9e667e84ed48c7091baef536d))
+- Keep pending response headers in send state ([#120](https://github.com/0x676e67/http3/issues/120)) - ([db2b99c](https://github.com/0x676e67/http3/commit/db2b99c0659735e144a2ce9c92a648c6c4f4d142))
+- Flush buffered data before next write and finish ([#119](https://github.com/0x676e67/http3/issues/119)) - ([b7fd1eb](https://github.com/0x676e67/http3/commit/b7fd1eb48c44c11923e560de817767f3fa0c42a9))
+
 ## [0.2.0](https://github.com/0x676e67/http3/compare/v0.1.1..v0.2.0) - 2026-09-23
 
 ### Features
