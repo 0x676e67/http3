@@ -108,14 +108,18 @@ fn convert_connection_error(e: quic::ConnectionError) -> http3::quic::Connection
                 error_code: application_close.error_code.into(),
             }
         }
+        quic::ConnectionError::ConnectionClosed(connection_close) => {
+            ConnectionErrorIncoming::ConnectionClosed {
+                error_code: connection_close.error_code.into(),
+            }
+        }
         quic::ConnectionError::TimedOut => ConnectionErrorIncoming::Timeout,
 
         error @ quic::ConnectionError::VersionMismatch
         | error @ quic::ConnectionError::Reset
         | error @ quic::ConnectionError::LocallyClosed
         | error @ quic::ConnectionError::CidsExhausted
-        | error @ quic::ConnectionError::TransportError(_)
-        | error @ quic::ConnectionError::ConnectionClosed(_) => {
+        | error @ quic::ConnectionError::TransportError(_) => {
             ConnectionErrorIncoming::Undefined(Arc::new(error))
         }
     }
@@ -577,5 +581,27 @@ where
             }
             Err(err) => Poll::Ready(Err(convert_write_error_to_stream_error(err))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http3::quic::ConnectionErrorIncoming;
+    use quic::{ConnectionClose, ConnectionError, TransportErrorCode};
+
+    use super::convert_connection_error;
+
+    #[test]
+    fn connection_closed_is_mapped_to_structured_variant() {
+        let error = ConnectionError::ConnectionClosed(ConnectionClose {
+            error_code: TransportErrorCode::NO_ERROR,
+            frame_type: None,
+            reason: Default::default(),
+        });
+
+        assert!(matches!(
+            convert_connection_error(error),
+            ConnectionErrorIncoming::ConnectionClosed { error_code: 0 }
+        ));
     }
 }

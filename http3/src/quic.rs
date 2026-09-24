@@ -17,6 +17,11 @@ pub use crate::{
     stream::WriteBuf,
 };
 
+/// QUIC transport close code indicating that no error is being signaled.
+///
+/// See <https://www.rfc-editor.org/rfc/rfc9000.html#section-20.1>.
+pub const QUIC_NO_ERROR: u64 = 0;
+
 /// Error type to communicate that the quic connection was closed
 ///
 /// This is used by to implement the quic abstraction traits
@@ -25,6 +30,11 @@ pub enum ConnectionErrorIncoming {
     /// Error from the http3 layer
     ApplicationClose {
         /// http3 error code
+        error_code: u64,
+    },
+    /// The peer closed the connection with a QUIC transport error code.
+    ConnectionClosed {
+        /// QUIC transport error code, not an HTTP/3 application error code.
         error_code: u64,
     },
     /// Quic connection timeout
@@ -45,6 +55,9 @@ impl Debug for ConnectionErrorIncoming {
             Self::ApplicationClose { error_code } => {
                 let error_code = Code::from(*error_code);
                 write!(f, "ApplicationClose({})", error_code)
+            }
+            Self::ConnectionClosed { error_code } => {
+                write!(f, "ConnectionClosed({:#x})", error_code)
             }
             Self::Timeout => write!(f, "Timeout"),
             Self::InternalError(arg0) => f.debug_tuple("InternalError").field(arg0).finish(),
@@ -107,6 +120,9 @@ impl Display for ConnectionErrorIncoming {
             ConnectionErrorIncoming::ApplicationClose { error_code } => {
                 let error_code = Code::from(*error_code);
                 write!(f, "ApplicationClose: {}", error_code)
+            }
+            ConnectionErrorIncoming::ConnectionClosed { error_code } => {
+                write!(f, "ConnectionClosed: {:#x}", error_code)
             }
             ConnectionErrorIncoming::Timeout => write!(f, "Timeout"),
             ConnectionErrorIncoming::InternalError(error) => {

@@ -1,6 +1,6 @@
 //! Public error types for the `http3` crate.
 use super::{codes::Code, internal_error::InternalConnectionError};
-use crate::quic::{ConnectionErrorIncoming, StreamId};
+use crate::quic::{ConnectionErrorIncoming, QUIC_NO_ERROR, StreamId};
 
 /// This enum represents the closure of a connection because of an a closed quic connection
 /// This can be either from this endpoint because of a violation of the protocol or from the remote
@@ -27,7 +27,9 @@ pub enum ConnectionError {
 }
 
 impl ConnectionError {
-    /// Returns if the error is H3_NO_ERROR local or remote
+    /// Returns whether this is local or remote H3_NO_ERROR, or remote QUIC NO_ERROR.
+    ///
+    /// This does not guarantee that outstanding requests completed successfully.
     pub fn is_h3_no_error(&self) -> bool {
         match self {
             ConnectionError::Local {
@@ -39,6 +41,11 @@ impl ConnectionError {
             } => true,
             ConnectionError::Remote(ConnectionErrorIncoming::ApplicationClose { error_code })
                 if *error_code == Code::H3_NO_ERROR.value() =>
+            {
+                true
+            }
+            ConnectionError::Remote(ConnectionErrorIncoming::ConnectionClosed { error_code })
+                if *error_code == QUIC_NO_ERROR =>
             {
                 true
             }
@@ -134,7 +141,9 @@ pub enum StreamError {
 }
 
 impl StreamError {
-    /// Returns if the error is H3_NO_ERROR
+    /// Returns whether this is H3_NO_ERROR or a connection closed with QUIC NO_ERROR.
+    ///
+    /// This does not guarantee that the request completed successfully.
     pub fn is_h3_no_error(&self) -> bool {
         match self {
             StreamError::StreamError {
