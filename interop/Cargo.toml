@@ -39,7 +39,7 @@ tempfile = "3"
 tokio = { workspace = true, features = ["full"] }
 
 # QUIC/HTTP3 Server backends
-tokio-quiche = { version = "0.19.1", default-features = false }
+tokio-quiche = { version = "0.20.0", default-features = false }
 tquic = "1.6"
 ngtcp2 = { workspace = true }
 tokio-ngtcp2 = { workspace = true }
