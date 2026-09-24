@@ -100,7 +100,10 @@ where
 {
     #[cfg(feature = "unstable")]
     /// Create a [`RequestResolver`] to handle an incoming request.
-    pub fn create_resolver(&self, stream: FrameStream<C::BidiStream, B>) -> RequestResolver<C, B> {
+    pub fn create_resolver(
+        &mut self,
+        stream: FrameStream<C::BidiStream, B>,
+    ) -> RequestResolver<C, B> {
         self.create_resolver_internal(stream)
     }
 
@@ -145,16 +148,16 @@ where
 
         let resolver = self.create_resolver_internal(stream);
 
-        // send the grease frame only once
-        self.inner.send_grease_frame = false;
-
         Ok(Some(resolver))
     }
 
     fn create_resolver_internal(
-        &self,
+        &mut self,
         mut stream: FrameStream<C::BidiStream, B>,
     ) -> RequestResolver<C, B> {
+        let send_grease_frame = self.inner.send_grease_frame;
+        // send the grease frame only once per connection
+        self.inner.send_grease_frame = false;
         stream.set_max_field_section_size(self.max_qpack_decode_buffer_size);
         let decode_state = RequestDecodeState::new(
             stream.id(),
@@ -168,7 +171,7 @@ where
                 stream_id: stream.id(),
             }),
             frame_stream: stream,
-            send_grease_frame: self.inner.send_grease_frame,
+            send_grease_frame,
             max_field_section_size: self.max_field_section_size,
             shared: self.inner.shared.clone(),
             decode_state,
