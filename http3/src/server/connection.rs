@@ -369,9 +369,10 @@ pub(super) struct RequestEnd {
 
 #[cfg(test)]
 mod cancellation_tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::tests::Pair;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn cancelled_request_resolver_releases_ongoing_stream() {
