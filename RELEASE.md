@@ -136,6 +136,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(release-plz)* verify publishable crates before publishing
 
 ## [unreleased]
+## [0.2.0](https://github.com/0x676e67/http3/compare/v0.1.1..v0.2.0) - 2026-09-23
+
+### Features
+
+- *(quic)* Add SendStream::poll_stopped - ([faee62d](https://github.com/0x676e67/http3/commit/faee62d471abe8fd0c0ce47f6f2ed2459c3e2fdf))
+
+### Bug Fixes
+
+- Preserve Sync for boxed transport futures and streams - ([7fea381](https://github.com/0x676e67/http3/commit/7fea381d5b87cb3a56aa00321fe5df39ddbda106))
+
+### Styling
+
+- Fmt code - ([7550063](https://github.com/0x676e67/http3/commit/7550063d63d1e9862d3b4fee9ec938f77fa29801))
+
+## [0.2.0](https://github.com/0x676e67/http3/compare/v0.1.1..v0.2.0) - 2026-09-23
+
+## [0.2.0](https://github.com/0x676e67/http3/compare/v0.1.1..v0.2.0) - 2026-09-23
+
+### Features
+
+- *(client)* Add `poll_recv_response` ([#114](https://github.com/0x676e67/http3/issues/114)) - ([4b10fbf](https://github.com/0x676e67/http3/commit/4b10fbf592d8663831771f34938a9fa898b60f91))
+- *(quic)* Add SendStream::poll_stopped - ([faee62d](https://github.com/0x676e67/http3/commit/faee62d471abe8fd0c0ce47f6f2ed2459c3e2fdf))
+- *(stream)* Add poll-based request body sending ([#113](https://github.com/0x676e67/http3/issues/113)) - ([ac47c7b](https://github.com/0x676e67/http3/commit/ac47c7bf037c3cc6517b9d7638646bdb53bfae0a))
+
+### Bug Fixes
+
+- *(client)* [**breaking**] Clarify driver-owned connection shutdown - ([761f521](https://github.com/0x676e67/http3/commit/761f521ff5dffea2a41772a619f233a055483d17))
+- *(client)* Tie connection lifetime to the driver - ([b097d96](https://github.com/0x676e67/http3/commit/b097d96c38ba0da3eb26fd51ffbbcc89b62f3a49))
+- *(qpack)* Preserve absolute Base after dynamic table eviction ([#104](https://github.com/0x676e67/http3/issues/104)) - ([087a340](https://github.com/0x676e67/http3/commit/087a3404c80e31dac4616a0fb1c8a424ffa51b60))
+- *(server)* Publish connection closure on driver drop ([#112](https://github.com/0x676e67/http3/issues/112)) - ([ae17821](https://github.com/0x676e67/http3/commit/ae178215734ab9152487c7d6c1820e41d34ae909))
+- Preserve Sync for boxed transport futures and streams - ([7fea381](https://github.com/0x676e67/http3/commit/7fea381d5b87cb3a56aa00321fe5df39ddbda106))
+- Simplify frame polling and address review feedback - ([3c80fa6](https://github.com/0x676e67/http3/commit/3c80fa615e9831425cad773754f56964c49b2def))
+
+### Refactor
+
+- *(client)* Simplify response header decoding ([#118](https://github.com/0x676e67/http3/issues/118)) - ([91587c2](https://github.com/0x676e67/http3/commit/91587c2095927b0453d827685598b237fed84e44))
+- *(client)* Check GOAWAY rejection on poll instead of waking waiters ([#110](https://github.com/0x676e67/http3/issues/110)) - ([ebb7181](https://github.com/0x676e67/http3/commit/ebb7181fb3c14ad23ce94268708e831ee4ff1c78))
+- *(error)* [**breaking**] Rename RemoteClosing to ConnectionClosing - ([7df8ad7](https://github.com/0x676e67/http3/commit/7df8ad7941b784a7d046386a0e066bf1373f336f))
+
+### Documentation
+
+- *(client)* Fix shutdown example reference links - ([07ab243](https://github.com/0x676e67/http3/commit/07ab243585dc1f92917bf0dc91d8df1af54c0f8f))
+- *(client)* Clarify closing and buffered receive errors - ([8b9f34d](https://github.com/0x676e67/http3/commit/8b9f34d7e1f1ff5358d1b1fa6d72a78c14f1ad7c))
+
+### Performance
+
+- *(headers)* Drop the diagnostic clone of decoded header values ([#109](https://github.com/0x676e67/http3/issues/109)) - ([7f35cd8](https://github.com/0x676e67/http3/commit/7f35cd862d313cca22d44dc480f0d37c8f2b8c6b))
+
+### Styling
+
+- Fmt code - ([7550063](https://github.com/0x676e67/http3/commit/7550063d63d1e9862d3b4fee9ec938f77fa29801))
+
 
 ### 🚀 Features
 

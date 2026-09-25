@@ -7,6 +7,7 @@ use std::{
     future::poll_fn,
     option::Option,
     result::Result,
+    sync::Arc,
     task::{Context, Poll, ready},
 };
 
@@ -99,7 +100,10 @@ where
 {
     #[cfg(feature = "unstable")]
     /// Create a [`RequestResolver`] to handle an incoming request.
-    pub fn create_resolver(&self, stream: FrameStream<C::BidiStream, B>) -> RequestResolver<C, B> {
+    pub fn create_resolver(
+        &mut self,
+        stream: FrameStream<C::BidiStream, B>,
+    ) -> RequestResolver<C, B> {
         self.create_resolver_internal(stream)
     }
 
@@ -144,16 +148,16 @@ where
 
         let resolver = self.create_resolver_internal(stream);
 
-        // send the grease frame only once
-        self.inner.send_grease_frame = false;
-
         Ok(Some(resolver))
     }
 
     fn create_resolver_internal(
-        &self,
+        &mut self,
         mut stream: FrameStream<C::BidiStream, B>,
     ) -> RequestResolver<C, B> {
+        let send_grease_frame = self.inner.send_grease_frame;
+        // send the grease frame only once per connection
+        self.inner.send_grease_frame = false;
         stream.set_max_field_section_size(self.max_qpack_decode_buffer_size);
         let decode_state = RequestDecodeState::new(
             stream.id(),
@@ -162,9 +166,12 @@ where
             self.inner.dynamic_qpack_decoder(),
         );
         RequestResolver {
+            request_end: Arc::new(RequestEnd {
+                request_end: self.request_end_send.clone(),
+                stream_id: stream.id(),
+            }),
             frame_stream: stream,
-            request_end_send: self.request_end_send.clone(),
-            send_grease_frame: self.inner.send_grease_frame,
+            send_grease_frame,
             max_field_section_size: self.max_field_section_size,
             shared: self.inner.shared.clone(),
             decode_state,
@@ -361,4 +368,81 @@ where
 pub(super) struct RequestEnd {
     pub(super) request_end: mpsc::UnboundedSender<StreamId>,
     pub(super) stream_id: StreamId,
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::tests::Pair;
+
+    #[tokio::test]
+    async fn cancelled_request_resolver_releases_ongoing_stream() {
+        check_resolver_cleanup(ResolverExit::Cancelled).await;
+    }
+
+    #[tokio::test]
+    async fn dropped_request_resolver_releases_ongoing_stream() {
+        check_resolver_cleanup(ResolverExit::Dropped).await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_request_resolver_releases_ongoing_stream() {
+        check_resolver_cleanup(ResolverExit::Incomplete).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum ResolverExit {
+        Cancelled,
+        Dropped,
+        Incomplete,
+    }
+
+    async fn check_resolver_cleanup(exit: ResolverExit) {
+        let mut pair = Pair::default();
+        let mut server = pair.server();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let client = async {
+            let connection = pair.client_inner().await;
+            let mut control = connection.open_uni().await.unwrap();
+            control.write_all(&[0, 4, 0]).await.unwrap(); // Control stream, empty SETTINGS.
+            let (mut send, _recv) = connection.open_bi().await.unwrap();
+            send.write_all(&[1, 0x40]).await.unwrap(); // HEADERS with incomplete length.
+            if matches!(exit, ResolverExit::Incomplete) {
+                send.finish().unwrap();
+            }
+            let _ = done_rx.await;
+        };
+        let server = async {
+            let mut incoming: Connection<_, bytes::Bytes> =
+                Connection::new(server.next().await).await.unwrap();
+            let resolver = incoming.accept().await.unwrap().unwrap();
+            assert_eq!(incoming.ongoing_streams.len(), 1);
+            match exit {
+                ResolverExit::Cancelled => assert!(
+                    tokio::time::timeout(Duration::from_millis(50), resolver.resolve_request())
+                        .await
+                        .is_err()
+                ),
+                ResolverExit::Dropped => drop(resolver),
+                ResolverExit::Incomplete => assert!(resolver.resolve_request().await.is_err()),
+            }
+            std::future::poll_fn(|cx| {
+                let _ = incoming.poll_requests_completion(cx);
+                Poll::Ready(())
+            })
+            .await;
+            assert!(
+                incoming.ongoing_streams.is_empty(),
+                "finished resolver retained in ongoing_streams"
+            );
+            let _ = done_tx.send(());
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(client, server);
+        })
+        .await
+        .unwrap();
+    }
 }

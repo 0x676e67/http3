@@ -123,6 +123,8 @@ where
 
     /// Receives response body data.
     ///
+    /// This returns a chunk of the response body, or `None` if the response body is finished.
+    ///
     /// Published request errors take precedence over buffered data; see
     /// [`RequestStream`]'s error handling contract.
     // TODO what if called before recv_response ?
@@ -137,6 +139,8 @@ where
 
     /// Polls for response body data with the same error precedence as
     /// [`Self::recv_data`].
+    ///
+    /// This returns a chunk of the response body, or `None` if the response body is finished.
     pub fn poll_recv_data(
         &mut self,
         cx: &mut Context<'_>,
@@ -215,6 +219,12 @@ where
     ) -> Poll<Result<Response<()>, StreamError>> {
         let qpack::Decoded { fields, .. } = ready!(inner.poll_recv_response_headers(cx))?;
 
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+        //# Malformed requests or responses that are
+        //# detected MUST be treated as a stream error of type H3_MESSAGE_ERROR.
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+        //# Clients MUST NOT
+        //# accept a malformed response.
         let (status, headers, pseudo_sensitivity) = Header::try_from(fields)
             .and_then(Header::into_response_parts)
             .map_err(|error| {

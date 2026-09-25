@@ -34,6 +34,9 @@ where
     D: Into<WriteBuf<B>>,
     B: Buf,
 {
+    // A cancelled write can leave the previous frame in the transport. Flush it
+    // before handing over another frame, or send_data may close the connection.
+    future::poll_fn(|cx| stream.poll_ready(cx)).await?;
     stream.send_data(data)?;
     future::poll_fn(|cx| stream.poll_ready(cx)).await?;
 

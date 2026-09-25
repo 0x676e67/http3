@@ -476,6 +476,10 @@ impl FrameDecoder {
 
         match unknown {
             Ok(Some((_ty, len))) => {
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+                //# Frames of unknown types (Section 9), including reserved frames
+                //# (Section 7.2.8) MAY be sent on a request or push stream before,
+                //# after, or interleaved with other frames described in this section.
                 // Keep only the number of bytes still to discard. This mirrors
                 // the frame-state approach used for DATA and HEADERS payloads,
                 // so an unknown frame never has to be buffered in full.
