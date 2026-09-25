@@ -136,6 +136,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(release-plz)* verify publishable crates before publishing
 
 ## [unreleased]
+## [0.3.0](https://github.com/0x676e67/http3/compare/v0.2.0..v0.3.0) - 2026-09-25
+
+### Bug Fixes
+
+- Flush buffered data before next write and finish ([#119](https://github.com/0x676e67/http3/issues/119)) - ([b7fd1eb](https://github.com/0x676e67/http3/commit/b7fd1eb48c44c11923e560de817767f3fa0c42a9))
+
+### Miscellaneous Tasks
+
+- Remove newly added license files - ([7436e7c](https://github.com/0x676e67/http3/commit/7436e7c8c000256204b6fcfaa3b9bc38cbb2645b))
+
+## [0.3.0](https://github.com/0x676e67/http3/compare/v0.2.0..v0.3.0) - 2026-09-25
+
+## [0.3.0](https://github.com/0x676e67/http3/compare/v0.2.0..v0.3.0) - 2026-09-25
+
+### Bug Fixes
+
+- *(server)* Consume GREASE flag when creating resolvers - ([200e6fd](https://github.com/0x676e67/http3/commit/200e6fdd81d4853ec06b95214790a354c1bc8d74))
+- Require response headers before server body frames ([#121](https://github.com/0x676e67/http3/issues/121)) - ([88f9761](https://github.com/0x676e67/http3/commit/88f97610ba8abfd9e667e84ed48c7091baef536d))
+- Keep pending response headers in send state ([#120](https://github.com/0x676e67/http3/issues/120)) - ([db2b99c](https://github.com/0x676e67/http3/commit/db2b99c0659735e144a2ce9c92a648c6c4f4d142))
+- Flush buffered data before next write and finish ([#119](https://github.com/0x676e67/http3/issues/119)) - ([b7fd1eb](https://github.com/0x676e67/http3/commit/b7fd1eb48c44c11923e560de817767f3fa0c42a9))
+
+### Documentation
+
+- Clarify recv_data and poll_recv_data results - ([82c2f52](https://github.com/0x676e67/http3/commit/82c2f5254ed6269424b78647e6d3332a81243e17))
+- Complete pseudo-header compliance backport - ([b390da2](https://github.com/0x676e67/http3/commit/b390da229da02439c36b15f037ad0100c7591567))
+- Backport applicable Duvet compliance annotations - ([6684ac6](https://github.com/0x676e67/http3/commit/6684ac627c2a23433094cdad5b430a39f2890b1c))
+
+### Miscellaneous Tasks
+
+- Remove newly added license files - ([7436e7c](https://github.com/0x676e67/http3/commit/7436e7c8c000256204b6fcfaa3b9bc38cbb2645b))
+- Keep GREASE backport scoped to upstream fix - ([ba4f366](https://github.com/0x676e67/http3/commit/ba4f366d5ac9f2c7dcf2e4deb6e8d7269c0bb096))
+
 ## [0.2.0](https://github.com/0x676e67/http3/compare/v0.1.1..v0.2.0) - 2026-09-23
 
 ### Features
