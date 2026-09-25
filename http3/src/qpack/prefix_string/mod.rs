@@ -235,6 +235,14 @@ mod tests {
         ];
         for (encoded, expected) in cases {
             for split in 0..=encoded.len() {
+                let mut chained = encoded[..split].chain(&encoded[split..]);
+                assert_eq!(
+                    decode(8, &mut chained).as_deref(),
+                    expected.as_ref().copied()
+                );
+                assert_eq!(chained.remaining(), 1);
+                assert_eq!(chained.get_u8(), 0xaa);
+
                 let mut input = crate::buf::BufList::new();
                 for part in [&encoded[..split], &encoded[split..]] {
                     if !part.is_empty() {

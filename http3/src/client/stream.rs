@@ -5,7 +5,7 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-use bytes::{Buf, Bytes};
+use bytes::Buf;
 use http::{HeaderMap, Response};
 use quic::StreamId;
 #[cfg(feature = "tracing")]
@@ -13,11 +13,8 @@ use tracing::instrument;
 
 use crate::{
     connection::{self},
-    error::{
-        Code, StreamError, connection_error_creators::CloseStream,
-        internal_error::InternalConnectionError,
-    },
-    proto::{frame::Frame, headers::Header},
+    error::{Code, StreamError, connection_error_creators::CloseStream},
+    proto::headers::Header,
     qpack,
     quic::{self},
     shared_state::{ConnectionState, SharedState},
@@ -98,8 +95,6 @@ use crate::{
 pub struct RequestStream<S, B> {
     pub(super) inner: connection::RequestStream<S, B>,
     rejection: RequestRejection,
-    // Retained while QPACK waits for encoder instructions.
-    response: Option<Bytes>,
 }
 
 impl<S, B> ConnectionState for RequestStream<S, B> {
@@ -191,7 +186,6 @@ where
     /// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_sending(&mut self, error_code: Code) {
-        self.response = None;
         self.inner.stop_sending(error_code)
     }
 
@@ -213,95 +207,17 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Response<()>, StreamError>> {
-        let result = self.rejection.poll(cx, |cx| {
-            Self::poll_recv_response_inner(&mut self.inner, &mut self.response, cx)
-        });
-        result.map(|result| {
-            self.response = None;
-            self.handle_result(result)
-        })
+        let result = self
+            .rejection
+            .poll(cx, |cx| Self::poll_recv_response_inner(&mut self.inner, cx));
+        result.map(|result| self.handle_result(result))
     }
 
     fn poll_recv_response_inner(
         inner: &mut connection::RequestStream<S, B>,
-        response: &mut Option<Bytes>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Response<()>, StreamError>> {
-        let mut encoded = match response.take() {
-            Some(encoded) => encoded,
-            None => {
-                let frame = ready!(inner.stream.poll_next(cx))
-                    .map_err(|e| inner.handle_receive_stream_error(e))?
-                    .ok_or_else(|| {
-                        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-                        //# Receipt of an invalid sequence of frames MUST be treated as a
-                        //# connection error of type H3_FRAME_UNEXPECTED.
-                        inner.handle_connection_error_on_stream(InternalConnectionError::new(
-                            Code::H3_FRAME_UNEXPECTED,
-                            "Stream finished without receiving response headers".to_string(),
-                        ))
-                    })?;
-
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
-                //= type=TODO
-                //# A client MUST treat
-                //# receipt of a PUSH_PROMISE frame that contains a larger push ID than
-                //# the client has advertised as a connection error of H3_ID_ERROR.
-
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
-                //= type=TODO
-                //# If a client
-                //# receives a push ID that has already been promised and detects a
-                //# mismatch, it MUST respond with a connection error of type
-                //# H3_GENERAL_PROTOCOL_ERROR.
-
-                match frame {
-                    Frame::Headers(encoded) => encoded,
-                    _ => {
-                        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-                        //# Receipt of an invalid sequence of frames MUST be treated as a
-                        //# connection error of type H3_FRAME_UNEXPECTED.
-                        return Poll::Ready(Err(inner.handle_connection_error_on_stream(
-                            InternalConnectionError::new(
-                                Code::H3_FRAME_UNEXPECTED,
-                                "First response frame is not headers".to_string(),
-                            ),
-                        )));
-                    }
-                }
-            }
-        };
-
-        let fields = match inner.poll_decode_field_section(cx, &mut encoded) {
-            Poll::Pending => {
-                *response = Some(encoded);
-                return Poll::Pending;
-            }
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
-            //# An HTTP/3 implementation MAY impose a limit on the maximum size of
-            //# the message header it will accept on an individual HTTP message.
-            Poll::Ready(Err(qpack::DecoderError::HeaderTooLong(cancel_size))) => {
-                inner.stop_sending(Code::H3_REQUEST_CANCELLED);
-                return Poll::Ready(Err(StreamError::HeaderTooBig {
-                    actual_size: cancel_size,
-                    max_size: inner.max_field_section_size,
-                }));
-            }
-            Poll::Ready(Ok(qpack::Decoded { fields, .. })) => fields,
-            Poll::Ready(Err(error)) => {
-                let code = if error.is_internal() {
-                    Code::H3_INTERNAL_ERROR
-                } else {
-                    Code::QPACK_DECOMPRESSION_FAILED
-                };
-                return Poll::Ready(Err(inner.handle_connection_error_on_stream(
-                    InternalConnectionError::new(
-                        code,
-                        format!("failed to decode response headers: {error}"),
-                    ),
-                )));
-            }
-        };
+        let qpack::Decoded { fields, .. } = ready!(inner.poll_recv_response_headers(cx))?;
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
         //# Malformed requests or responses that are
@@ -472,22 +388,16 @@ where
         RequestStream<S::SendStream, B>,
         RequestStream<S::RecvStream, B>,
     ) {
-        let Self {
-            inner,
-            rejection,
-            response,
-        } = self;
+        let Self { inner, rejection } = self;
         let (send, recv) = inner.split();
         (
             RequestStream {
                 inner: send,
                 rejection: RequestRejection::new(rejection.state.clone(), rejection.stream_id),
-                response: None,
             },
             RequestStream {
                 inner: recv,
                 rejection,
-                response,
             },
         )
     }
@@ -500,11 +410,7 @@ where
 {
     pub(super) fn new(inner: connection::RequestStream<S, B>) -> Self {
         let rejection = RequestRejection::new(inner.conn_state.clone(), inner.stream.id());
-        Self {
-            inner,
-            rejection,
-            response: None,
-        }
+        Self { inner, rejection }
     }
 }
 
