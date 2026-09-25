@@ -15,7 +15,7 @@ A [Tokio][tokio] aware, HTTP/3 implementation for Rust.
 - Works with different QUIC transport implementations.
 - Passes HTTP/3 interoperability tests.
 - Focus on performance, interoperability, and correctness.
-- Carries forward [h3]'s implementation.
+- Continues the [h3](https://github.com/hyperium/h3) codebase, tracking upstream changes.
 
 ## Usage
 
