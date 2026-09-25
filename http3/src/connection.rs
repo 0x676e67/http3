@@ -1733,7 +1733,7 @@ where
         self.handle_frame_stream_error_on_request_stream(error)
     }
 
-    /// Receive some of the request body.
+    /// Receive some of the request/response body.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_recv_data(
         &mut self,

@@ -128,6 +128,8 @@ where
 
     /// Receives response body data.
     ///
+    /// This returns a chunk of the response body, or `None` if the response body is finished.
+    ///
     /// Published request errors take precedence over buffered data; see
     /// [`RequestStream`]'s error handling contract.
     // TODO what if called before recv_response ?
@@ -142,6 +144,8 @@ where
 
     /// Polls for response body data with the same error precedence as
     /// [`Self::recv_data`].
+    ///
+    /// This returns a chunk of the response body, or `None` if the response body is finished.
     pub fn poll_recv_data(
         &mut self,
         cx: &mut Context<'_>,
