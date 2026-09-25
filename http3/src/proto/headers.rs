@@ -398,6 +398,10 @@ impl TryFrom<Vec<HeaderField<'static>>> for Header {
                 // A HeaderMap cannot retain wire order or duplicate pseudo
                 // fields. Validate before inserting either kind of field.
                 // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+                //# Any request or response that contains a
+                //# pseudo-header field that appears in a header section after a regular
+                //# header field MUST be treated as malformed.
                 if !fields.is_empty() {
                     return Err(HeaderError::PseudoAfterField);
                 }
@@ -541,6 +545,9 @@ impl Field {
                     .map_err(|_| HeaderError::invalid_value(name, value))?,
             ),
             b":protocol" => Field::Protocol(try_value(name, value)?),
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+            //# Endpoints MUST treat a request or response that contains
+            //# undefined or invalid pseudo-header fields as malformed.
             _ => return Err(HeaderError::invalid_name(name)),
         })
     }
@@ -812,6 +819,11 @@ mod tests {
 
     #[test]
     fn received_pseudo_fields_reject_duplicates_and_late_placement() {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+        //= type=test
+        //# Any request or response that contains a
+        //# pseudo-header field that appears in a header section after a regular
+        //# header field MUST be treated as malformed.
         for (name, value) in [
             (":method", "GET"),
             (":scheme", "https"),
@@ -834,6 +846,10 @@ mod tests {
 
     #[test]
     fn received_pseudo_fields_require_their_message_context() {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+        //= type=test
+        //# Endpoints MUST treat a request or response that contains
+        //# undefined or invalid pseudo-header fields as malformed.
         for (name, value) in [
             (":method", "GET"),
             (":scheme", "https"),

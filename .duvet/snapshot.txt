@@ -223,13 +223,13 @@ SPECIFICATION: https://www.rfc-editor.org/rfc/rfc9114
     TEXT[!MUST,implication]:    appear in requests.
     TEXT[!MUST,implementation]: Pseudo-header fields MUST NOT appear in trailer
     TEXT[!MUST,implementation]:    sections.
-    TEXT[!MUST,todo]: Endpoints MUST treat a request or response that contains
-    TEXT[!MUST,todo]:    undefined or invalid pseudo-header fields as malformed.
+    TEXT[!MUST,implementation,test]: Endpoints MUST treat a request or response that contains
+    TEXT[!MUST,implementation,test]:    undefined or invalid pseudo-header fields as malformed.
     TEXT[!MUST,implementation]:    All pseudo-header fields MUST appear in the header section before
     TEXT[!MUST,implementation]:    regular header fields.
-    TEXT[!MUST,todo]: Any request or response that contains a
-    TEXT[!MUST,todo]:    pseudo-header field that appears in a header section after a regular
-    TEXT[!MUST,todo]:    header field MUST be treated as malformed.
+    TEXT[!MUST,implementation,test]: Any request or response that contains a
+    TEXT[!MUST,implementation,test]:    pseudo-header field that appears in a header section after a regular
+    TEXT[!MUST,implementation,test]:    header field MUST be treated as malformed.
 
   SECTION: [Request Pseudo-Header Fields](#section-4.3.1)
     TEXT[!MUST,todo]: The authority MUST NOT include the
