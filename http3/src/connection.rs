@@ -1806,9 +1806,9 @@ where
 
     /// Poll receive trailers.
     ///
-    /// Call this once [`Self::poll_recv_data`] returned `None`. While the body
-    /// has not ended, this returns [`StreamError::InvalidStreamState`] and the
-    /// body remains readable.
+    /// Call this once [`Self::poll_recv_data`] returned `None`. Calling it while
+    /// body data remains returns [`StreamError::InvalidStreamState`] and leaves
+    /// that data readable.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_recv_trailers(
         &mut self,

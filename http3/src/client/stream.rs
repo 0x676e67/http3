@@ -156,8 +156,9 @@ where
 
     /// Receive an optional set of trailers for the response.
     ///
-    /// Call this once [`recv_data()`] returned `None`; earlier calls return
-    /// [`StreamError::InvalidStreamState`] and leave the body readable.
+    /// Call this once [`recv_data()`] returned `None`. Calling it while body
+    /// data remains returns [`StreamError::InvalidStreamState`] and leaves that
+    /// data readable.
     ///
     /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
