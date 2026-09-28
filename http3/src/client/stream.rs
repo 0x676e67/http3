@@ -109,6 +109,8 @@ enum ResponseHead {
     Decoding(Bytes),
     /// The final response was returned; the body may be read.
     Received,
+    /// Receiving the response failed; nothing more is read.
+    Failed,
 }
 
 impl ResponseHead {
@@ -118,6 +120,13 @@ impl ResponseHead {
             Self::Pending | Self::Decoding(_) => Err(StreamError::InvalidStreamState {
                 reason: "receive the final response before its body".into(),
             }),
+            Self::Failed => Err(Self::failed()),
+        }
+    }
+
+    fn failed() -> StreamError {
+        StreamError::InvalidStreamState {
+            reason: "receiving the response failed".into(),
         }
     }
 }
@@ -241,16 +250,13 @@ where
             Self::poll_recv_response_inner(&mut self.inner, &mut self.head, cx)
         });
         result.map(|result| {
-            if let Ok(response) = &result {
-                self.head = if response.status().is_informational() {
-                    ResponseHead::Pending
-                } else {
-                    ResponseHead::Received
-                };
-            } else if !matches!(self.head, ResponseHead::Received) {
-                // Drop HEADERS retained by an earlier poll.
-                self.head = ResponseHead::Pending;
-            }
+            self.head = match &result {
+                Ok(response) if response.status().is_informational() => ResponseHead::Pending,
+                Ok(_) => ResponseHead::Received,
+                // A call after the final response does not change what was read.
+                Err(_) if matches!(self.head, ResponseHead::Received) => ResponseHead::Received,
+                Err(_) => ResponseHead::Failed,
+            };
             self.handle_result(result)
         })
     }
@@ -266,6 +272,7 @@ where
                     reason: "the final response was already received".into(),
                 }));
             }
+            ResponseHead::Failed => return Poll::Ready(Err(ResponseHead::failed())),
             ResponseHead::Decoding(encoded) => std::mem::take(encoded),
             ResponseHead::Pending => {
                 let frame = ready!(inner.stream.poll_next(cx))

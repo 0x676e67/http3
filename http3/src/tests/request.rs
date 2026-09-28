@@ -47,6 +47,11 @@ async fn rejected_response_fields(
                 stream.recv_response().await.unwrap_err()
             };
             assert_matches!(error, StreamError::StreamError { code: actual, .. } if actual == code);
+            // The failed response is not read again.
+            assert_matches!(
+                stream.recv_response().await,
+                Err(StreamError::InvalidStreamState { .. })
+            );
             // A field-section rejection must leave the connection usable.
             let mut next = client
                 .send_request(Request::get("https://localhost/").body(()).unwrap())
