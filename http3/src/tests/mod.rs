@@ -23,7 +23,7 @@ use http3_quinn::{Connection, quinn::TransportConfig};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-use crate::quic;
+use crate::{quic, shared_state::ConnectionState};
 
 pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -45,6 +45,16 @@ where
     let request_resolver = incoming.accept().await.ok()??;
     let (request, stream) = request_resolver.resolve_request().await.ok()?;
     Some((request, stream))
+}
+
+/// Yields until the client driver published a GOAWAY at or below `boundary`.
+async fn goaway_published<T: ConnectionState>(state: &T, boundary: u64) {
+    while state
+        .peer_goaway()
+        .is_none_or(|id| id.into_inner() > boundary)
+    {
+        tokio::task::yield_now().await;
+    }
 }
 
 pub struct Pair {
