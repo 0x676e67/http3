@@ -214,7 +214,8 @@ where
     /// Stops receiving the response with `error_code` and releases its QPACK state.
     ///
     /// Before the final response, later receive calls then return
-    /// [`StreamError::InvalidStreamState`]; a received body stays readable.
+    /// [`StreamError::InvalidStreamState`]. After the final response, body reads
+    /// remain allowed, but unread data may be discarded by the transport.
     /// The request's send direction remains open. Dropping the stream afterwards
     /// does not replace this receive-side code with `H3_REQUEST_CANCELLED`.
     /// Clients must not use `H3_REQUEST_REJECTED` unless the server requested
