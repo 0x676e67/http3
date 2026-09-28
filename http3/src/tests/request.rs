@@ -324,6 +324,15 @@ async fn out_of_order_receives_are_local_errors() {
                 .await
                 .unwrap();
             stream.finish().await.unwrap();
+            // The body is not open before the final response.
+            assert_matches!(
+                stream.recv_data().await.map(|_| ()),
+                Err(StreamError::InvalidStreamState { .. })
+            );
+            assert_matches!(
+                stream.recv_trailers().await,
+                Err(StreamError::InvalidStreamState { .. })
+            );
             assert_eq!(
                 stream.recv_response().await.unwrap().status(),
                 StatusCode::OK

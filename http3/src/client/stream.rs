@@ -1,6 +1,6 @@
 use std::{
     convert::TryFrom,
-    future::{Future, poll_fn},
+    future::poll_fn,
     sync::Arc,
     task::{Context, Poll, ready},
 };
@@ -111,6 +111,17 @@ enum ResponseHead {
     Received,
 }
 
+impl ResponseHead {
+    fn require_received(&self) -> Result<(), StreamError> {
+        match self {
+            Self::Received => Ok(()),
+            Self::Pending | Self::Decoding(_) => Err(StreamError::InvalidStreamState {
+                reason: "receive the final response before its body".into(),
+            }),
+        }
+    }
+}
+
 impl<S, B> ConnectionState for RequestStream<S, B> {
     fn shared_state(&self) -> &SharedState {
         &self.inner.conn_state
@@ -138,17 +149,14 @@ where
     /// Receives response body data.
     ///
     /// This returns a chunk of the response body, or `None` if the response body is finished.
+    /// Before the final response was received it returns
+    /// [`StreamError::InvalidStreamState`].
     ///
     /// Published request errors take precedence over buffered data; see
     /// [`RequestStream`]'s error handling contract.
-    // TODO what if called before recv_response ?
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_data(&mut self) -> Result<Option<impl Buf + use<S, B>>, StreamError> {
-        let result = self
-            .rejection
-            .run(poll_fn(|cx| self.inner.poll_recv_data(cx)))
-            .await;
-        self.handle_result(result)
+        poll_fn(|cx| self.poll_recv_data(cx)).await
     }
 
     /// Polls for response body data with the same error precedence as
@@ -159,27 +167,23 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
-        let result = self.rejection.poll(cx, |cx| self.inner.poll_recv_data(cx));
+        let result = self.rejection.poll(cx, |cx| {
+            self.head.require_received()?;
+            self.inner.poll_recv_data(cx)
+        });
         result.map(|result| self.handle_result(result))
     }
 
     /// Receive an optional set of trailers for the response.
     ///
-    /// Call this once [`recv_data()`] returned `None`. Calling it while body
-    /// data remains returns [`StreamError::InvalidStreamState`] and leaves that
-    /// data readable.
+    /// Call this once [`recv_data()`] returned `None`. Calling it before the
+    /// final response, or while body data remains, returns
+    /// [`StreamError::InvalidStreamState`] and leaves that data readable.
     ///
     /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, StreamError> {
-        let result = self
-            .rejection
-            .run(poll_fn(|cx| self.inner.poll_recv_trailers(cx)))
-            .await;
-        if let Err(StreamError::HeaderTooBig { .. }) = &result {
-            self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
-        }
-        self.handle_result(result)
+        poll_fn(|cx| self.poll_recv_trailers(cx)).await
     }
 
     /// Poll receive an optional set of trailers for the response.
@@ -188,9 +192,10 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
-        let res = self
-            .rejection
-            .poll(cx, |cx| self.inner.poll_recv_trailers(cx));
+        let res = self.rejection.poll(cx, |cx| {
+            self.head.require_received()?;
+            self.inner.poll_recv_trailers(cx)
+        });
         if let Poll::Ready(Err(StreamError::HeaderTooBig { .. })) = &res {
             self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
         }
@@ -569,14 +574,6 @@ impl RequestRejection {
             }
         }
         result
-    }
-
-    async fn run<T>(
-        &self,
-        operation: impl Future<Output = Result<T, StreamError>>,
-    ) -> Result<T, StreamError> {
-        let mut operation = std::pin::pin!(operation);
-        poll_fn(|cx| self.poll(cx, |cx| operation.as_mut().poll(cx))).await
     }
 }
 
