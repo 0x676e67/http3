@@ -16,7 +16,8 @@ use crate::{
     error::{Code, ConnectionError, LocalError, StreamError},
     proto::{
         coding::{Decode as _, Encode as _},
-        frame::{Frame, Settings},
+        frame::{self, Frame, Settings},
+        headers::Header,
         push::PushId,
         stream::StreamType,
         varint::VarInt,
@@ -1261,6 +1262,124 @@ async fn graceful_shutdown_server_rejects() {
     };
 
     tokio::join!(server_fut, client_fut);
+}
+
+#[tokio::test]
+async fn graceful_shutdown_goaway_identifies_first_unprocessed_request() {
+    init_tracing();
+    // Accepting stream 0 before `shutdown(0)`, or allowing one request with
+    // `shutdown(1)` before any arrives, must both advertise GOAWAY(4):
+    // stream 0 is processed and stream 4 is rejected.
+    for accept_before_shutdown in [true, false] {
+        let mut pair = Pair::default();
+        let mut server = pair.server();
+        let (goaway_tx, goaway_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+
+        let server_fut = async {
+            let mut incoming = server::Connection::new(server.next().await).await.unwrap();
+            let stream = if accept_before_shutdown {
+                let (_, stream) = get_stream_blocking(&mut incoming).await.unwrap();
+                incoming.shutdown(0).await.unwrap();
+                goaway_tx.send(()).unwrap();
+                stream
+            } else {
+                incoming.shutdown(1).await.unwrap();
+                goaway_tx.send(()).unwrap();
+                get_stream_blocking(&mut incoming).await.unwrap().1
+            };
+            response(stream).await;
+            assert!(incoming.accept().await.unwrap().is_none());
+            // Keep the connection open until the peer observed the reset.
+            let _ = done_rx.await;
+        };
+
+        let peer = async {
+            let connection = pair.client_inner().await;
+            let mut control = connection.open_uni().await.unwrap();
+            let mut buf = BytesMut::new();
+            StreamType::CONTROL.encode(&mut buf);
+            Frame::<Bytes>::Settings(Settings::default()).encode(&mut buf);
+            control.write_all(&buf).await.unwrap();
+
+            let mut request = BytesMut::new();
+            let mut block = BytesMut::new();
+            qpack::encode_stateless(
+                &mut block,
+                &Header::request(
+                    http::Method::GET,
+                    "https://localhost/".parse().unwrap(),
+                    http::HeaderMap::new(),
+                    http::Extensions::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            Frame::headers(block.to_vec()).encode_with_payload(&mut request);
+
+            let open_request = async || {
+                let (mut send, recv) = connection.open_bi().await.unwrap();
+                send.write_all(&request).await.unwrap();
+                send.finish().unwrap();
+                recv
+            };
+            let mut processed = if accept_before_shutdown {
+                let recv = open_request().await;
+                goaway_rx.await.unwrap();
+                recv
+            } else {
+                goaway_rx.await.unwrap();
+                open_request().await
+            };
+            let mut rejected = open_request().await;
+
+            assert_eq!(server_goaway(&connection).await, 4);
+            assert!(!processed.read_to_end(1024).await.unwrap().is_empty());
+            assert_matches!(
+                rejected.read_to_end(1024).await,
+                Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code)))
+                    if code.into_inner() == Code::H3_REQUEST_REJECTED.value()
+            );
+            done_tx.send(()).unwrap();
+        };
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(server_fut, peer);
+        })
+        .await
+        .unwrap();
+    }
+}
+
+/// Reads the server's control stream until its first GOAWAY frame.
+async fn server_goaway(connection: &quinn::Connection) -> u64 {
+    loop {
+        let mut recv = connection.accept_uni().await.unwrap();
+        let mut buf = BytesMut::new();
+        let Some(chunk) = recv.read_chunk(usize::MAX, true).await.unwrap() else {
+            continue;
+        };
+        buf.extend_from_slice(&chunk.bytes);
+        if StreamType::decode(&mut buf.clone()).ok() != Some(StreamType::CONTROL) {
+            continue;
+        }
+        StreamType::decode(&mut buf).unwrap();
+        loop {
+            let mut cursor = std::io::Cursor::new(&buf[..]);
+            match Frame::decode(&mut cursor) {
+                Ok(Frame::Goaway(id)) => return id.into_inner(),
+                Ok(_) | Err(frame::FrameError::UnknownFrame(_)) => {
+                    let consumed = cursor.position() as usize;
+                    buf.advance(consumed);
+                }
+                Err(frame::FrameError::Incomplete(_)) => {
+                    let chunk = recv.read_chunk(usize::MAX, true).await.unwrap().unwrap();
+                    buf.extend_from_slice(&chunk.bytes);
+                }
+                Err(error) => panic!("invalid server control frame: {error}"),
+            }
+        }
+    }
 }
 
 #[tokio::test]

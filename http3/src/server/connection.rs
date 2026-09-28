@@ -57,7 +57,7 @@ where
     // Let the streams tell us when they are no longer running.
     pub(super) request_end_recv: mpsc::UnboundedReceiver<StreamId>,
     pub(super) request_end_send: mpsc::UnboundedSender<StreamId>,
-    // Has a GOAWAY frame been sent? If so, this StreamId is the last we are willing to accept.
+    // Has a GOAWAY frame been sent? If so, this is the first StreamId we will not accept.
     pub(super) sent_closing: Option<StreamId>,
     // Has a GOAWAY frame been received? If so, this is PushId the last the remote will accept.
     pub(super) recv_closing: Option<PushId>,
@@ -180,15 +180,21 @@ where
 
     /// Initiate a graceful shutdown, accepting `max_request` potentially still in-flight
     ///
+    /// The GOAWAY identifies the first request stream that will not be processed:
+    /// the stream after the last accepted one, advanced by `max_requests`.
+    ///
     /// See [connection shutdown](https://www.rfc-editor.org/rfc/rfc9114.html#connection-shutdown) for more information.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn shutdown(&mut self, max_requests: usize) -> Result<(), ConnectionError> {
-        let max_id = self
+        // Requests at or above the GOAWAY identifier are rejected.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-5.2
+        let next_request = self
             .last_accepted_stream
-            .map(|id| id + max_requests)
-            .unwrap_or(StreamId::FIRST_REQUEST);
+            .map_or(StreamId::FIRST_REQUEST, |id| id + 1);
 
-        self.inner.shutdown(&mut self.sent_closing, max_id).await
+        self.inner
+            .shutdown(&mut self.sent_closing, next_request + max_requests)
+            .await
     }
 
     /// Accepts an incoming bidirectional stream.
@@ -227,8 +233,8 @@ where
                     // When the connection is in a graceful shutdown procedure, reject all
                     // incoming requests not belonging to the grace interval. It's possible that
                     // some acceptable request streams arrive after rejected requests.
-                    if let Some(max_id) = self.sent_closing
-                        && s.send_id() > max_id
+                    if let Some(goaway_id) = self.sent_closing
+                        && s.send_id() >= goaway_id
                     {
                         s.stop_sending(Code::H3_REQUEST_REJECTED.value());
                         s.reset(Code::H3_REQUEST_REJECTED.value());
