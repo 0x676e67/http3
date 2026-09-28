@@ -563,7 +563,10 @@ where
                     self.inner.shared.set_peer_goaway(StreamId::from(id));
 
                     #[cfg(feature = "tracing")]
-                    info!("Server initiated graceful shutdown, last: StreamId({})", id);
+                    info!(
+                        "Server initiated graceful shutdown, first rejected: StreamId({})",
+                        id
+                    );
                 }
 
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5

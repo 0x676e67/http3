@@ -1333,7 +1333,8 @@ async fn graceful_shutdown_goaway_identifies_first_unprocessed_request() {
             };
             let mut rejected = open_request().await;
 
-            assert_eq!(server_goaway(&connection).await, 4);
+            let (goaway, _server_streams) = server_goaway(&connection).await;
+            assert_eq!(goaway, 4);
             assert!(!processed.read_to_end(1024).await.unwrap().is_empty());
             assert_matches!(
                 rejected.read_to_end(1024).await,
@@ -1352,22 +1353,29 @@ async fn graceful_shutdown_goaway_identifies_first_unprocessed_request() {
 }
 
 /// Reads the server's control stream until its first GOAWAY frame.
-async fn server_goaway(connection: &quinn::Connection) -> u64 {
+///
+/// Returns every server stream it accepted as well: dropping a quinn receive stream sends
+/// STOP_SENDING, which the server treats as closing a critical stream.
+async fn server_goaway(connection: &quinn::Connection) -> (u64, Vec<quinn::RecvStream>) {
+    let mut streams = Vec::new();
     loop {
         let mut recv = connection.accept_uni().await.unwrap();
         let mut buf = BytesMut::new();
-        let Some(chunk) = recv.read_chunk(usize::MAX, true).await.unwrap() else {
-            continue;
-        };
-        buf.extend_from_slice(&chunk.bytes);
+        if let Some(chunk) = recv.read_chunk(usize::MAX, true).await.unwrap() {
+            buf.extend_from_slice(&chunk.bytes);
+        }
         if StreamType::decode(&mut buf.clone()).ok() != Some(StreamType::CONTROL) {
+            streams.push(recv);
             continue;
         }
         StreamType::decode(&mut buf).unwrap();
         loop {
             let mut cursor = std::io::Cursor::new(&buf[..]);
             match Frame::decode(&mut cursor) {
-                Ok(Frame::Goaway(id)) => return id.into_inner(),
+                Ok(Frame::Goaway(id)) => {
+                    streams.push(recv);
+                    return (id.into_inner(), streams);
+                }
                 Ok(_) | Err(frame::FrameError::UnknownFrame(_)) => {
                     let consumed = cursor.position() as usize;
                     buf.advance(consumed);

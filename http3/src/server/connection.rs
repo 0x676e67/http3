@@ -178,7 +178,7 @@ where
         }
     }
 
-    /// Initiate a graceful shutdown, accepting `max_request` potentially still in-flight
+    /// Initiate a graceful shutdown, accepting `max_requests` potentially still in-flight
     ///
     /// The GOAWAY identifies the first request stream that will not be processed:
     /// the stream after the last accepted one, advanced by `max_requests`.
