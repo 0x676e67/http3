@@ -155,6 +155,11 @@ where
     }
 
     /// Receive an optional set of trailers for the response.
+    ///
+    /// Call this once [`recv_data()`] returned `None`; earlier calls return
+    /// [`StreamError::InvalidStreamState`] and leave the body readable.
+    ///
+    /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, StreamError> {
         let result = self
@@ -230,6 +235,11 @@ where
         let mut encoded = match response.take() {
             Some(encoded) => encoded,
             None => {
+                if inner.stream.has_data() {
+                    return Poll::Ready(Err(StreamError::InvalidStreamState {
+                        reason: "the response head was already received".into(),
+                    }));
+                }
                 let frame = ready!(inner.stream.poll_next(cx))
                     .map_err(|e| inner.handle_receive_stream_error(e))?
                     .ok_or_else(|| {

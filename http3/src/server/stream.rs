@@ -75,6 +75,11 @@ where
     }
 
     /// Receive an optional set of trailers for the request
+    ///
+    /// Call this once [`recv_data()`] returned `None`; earlier calls return
+    /// [`StreamError::InvalidStreamState`] and leave the body readable.
+    ///
+    /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, StreamError> {
         future::poll_fn(|cx| self.poll_recv_trailers(cx)).await

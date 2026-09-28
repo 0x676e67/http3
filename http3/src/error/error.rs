@@ -75,8 +75,8 @@ pub enum LocalError {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum StreamError {
-    /// A send operation is not valid in the current local stream state.
-    /// No frame is queued and the connection remains usable.
+    /// An operation is not valid in the current local stream state.
+    /// Nothing is sent or discarded and the connection remains usable.
     #[cfg_attr(not(feature = "unstable"), non_exhaustive)]
     InvalidStreamState {
         /// Why the operation cannot be performed.

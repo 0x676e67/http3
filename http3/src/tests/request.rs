@@ -238,6 +238,161 @@ async fn empty_data_frames_preserve_request_and_response_body() {
     }
 }
 
+/// Reads a body whose peer splits the first DATA frame at `resume`, calling
+/// `recv_trailers` inside that frame and at its boundary before a second one.
+macro_rules! recv_trailers_before_body_end {
+    ($stream:expr, $resume:expr) => {{
+        let mut body = BytesMut::new();
+        let mut chunk = $stream.recv_data().await.unwrap().unwrap();
+        body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+        assert!(body.len() < 10, "the first DATA frame is still incomplete");
+        assert_matches!(
+            $stream.recv_trailers().await,
+            Err(StreamError::InvalidStreamState { .. })
+        );
+        $resume.send(()).unwrap();
+        while body.len() < 10 {
+            let mut chunk = $stream.recv_data().await.unwrap().unwrap();
+            body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+        }
+        // The body continues with a second DATA frame at this boundary.
+        assert_matches!(
+            $stream.recv_trailers().await,
+            Err(StreamError::InvalidStreamState { .. })
+        );
+        while let Some(mut chunk) = $stream.recv_data().await.unwrap() {
+            body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+        }
+        assert_eq!(&body[..], b"0123456789abc");
+        assert_eq!(
+            $stream.recv_trailers().await.unwrap().unwrap()["trailer"],
+            "value"
+        );
+    }};
+}
+
+/// Writes `head`, a DATA frame split at `resume`, a second DATA frame, trailers,
+/// and FIN, then keeps the peer's streams open until `done`.
+async fn write_split_body(
+    send: &mut quinn::SendStream,
+    head: &[u8],
+    resume: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut wire = BytesMut::from(head);
+    Frame::Data(Bytes::from_static(b"0123456789")).encode_with_payload(&mut wire);
+    let split = wire.len() - 5;
+    send.write_all(&wire[..split]).await.unwrap();
+    resume.await.unwrap();
+
+    let mut wire = BytesMut::from(&wire[split..]);
+    Frame::Data(Bytes::from_static(b"abc")).encode_with_payload(&mut wire);
+    let mut trailers = HeaderMap::new();
+    trailers.insert("trailer", "value".parse().unwrap());
+    let mut block = BytesMut::new();
+    qpack::encode_stateless(&mut block, &Header::trailer(trailers)).unwrap();
+    Frame::headers(block.to_vec()).encode_with_payload(&mut wire);
+    send.write_all(&wire).await.unwrap();
+    send.finish().unwrap();
+}
+
+fn control_stream_prefix() -> BytesMut {
+    let mut wire = BytesMut::new();
+    StreamType::CONTROL.encode(&mut wire);
+    Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut wire);
+    wire
+}
+
+#[tokio::test]
+async fn recv_trailers_before_body_end_is_a_local_error() {
+    // Client role: a raw server splits the response body.
+    let mut pair = Pair::default();
+    let endpoint = pair.server_inner();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let client = async {
+        let (mut driver, mut sender) = client::new(pair.client().await).await.unwrap();
+        let request = async {
+            let mut stream = sender
+                .send_request(Request::get("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap();
+            stream.finish().await.unwrap();
+            assert_eq!(
+                stream.recv_response().await.unwrap().status(),
+                StatusCode::OK
+            );
+            recv_trailers_before_body_end!(stream, resume_tx);
+            assert!(sender.get_conn_error().is_none());
+            done_tx.send(()).unwrap();
+        };
+        tokio::select! { biased; _ = request => (), error = driver.wait_idle() => panic!("connection failed: {error}") }
+    };
+    let peer = async {
+        let connection = endpoint.accept().await.unwrap().await.unwrap();
+        let mut control = connection.open_uni().await.unwrap();
+        control.write_all(&control_stream_prefix()).await.unwrap();
+        let (mut send, _recv) = connection.accept_bi().await.unwrap();
+        let mut head = BytesMut::new();
+        let mut block = BytesMut::new();
+        qpack::encode_stateless(
+            &mut block,
+            &Header::response(StatusCode::OK, HeaderMap::new(), http::Extensions::new()),
+        )
+        .unwrap();
+        Frame::headers(block.to_vec()).encode_with_payload(&mut head);
+        write_split_body(&mut send, &head, resume_rx).await;
+        done_rx.await.unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(client, peer);
+    })
+    .await
+    .unwrap();
+
+    // Server role: a raw client splits the request body.
+    let mut pair = Pair::default();
+    let mut endpoint = pair.server();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = async {
+        let mut incoming = server::Connection::new(endpoint.next().await)
+            .await
+            .unwrap();
+        let resolver = incoming.accept().await.unwrap().unwrap();
+        let (_, mut stream) = resolver.resolve_request().await.unwrap();
+        recv_trailers_before_body_end!(stream, resume_tx);
+        assert!(incoming.get_conn_error().is_none());
+        done_tx.send(()).unwrap();
+    };
+    let peer = async {
+        let connection = pair.client_inner().await;
+        let mut control = connection.open_uni().await.unwrap();
+        control.write_all(&control_stream_prefix()).await.unwrap();
+        let (mut send, _recv) = connection.open_bi().await.unwrap();
+        let mut head = BytesMut::new();
+        let mut block = BytesMut::new();
+        qpack::encode_stateless(
+            &mut block,
+            &Header::request(
+                http::Method::GET,
+                "https://localhost/".parse().unwrap(),
+                HeaderMap::new(),
+                http::Extensions::new(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        Frame::headers(block.to_vec()).encode_with_payload(&mut head);
+        write_split_body(&mut send, &head, resume_rx).await;
+        done_rx.await.unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(server, peer);
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn server_goaway_reaches_response_operations_at_each_boundary() {
     for reject_lower in [false, true] {

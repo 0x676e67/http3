@@ -1805,6 +1805,10 @@ where
     }
 
     /// Poll receive trailers.
+    ///
+    /// Call this once [`Self::poll_recv_data`] returned `None`. While the body
+    /// has not ended, this returns [`StreamError::InvalidStreamState`] and the
+    /// body remains readable.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_recv_trailers(
         &mut self,
@@ -1813,6 +1817,11 @@ where
         let mut trailers = if let Some(encoded) = self.trailers.take() {
             encoded
         } else {
+            if self.stream.has_data() {
+                return Poll::Ready(Err(StreamError::InvalidStreamState {
+                    reason: "read the remaining body data before the trailers".into(),
+                }));
+            }
             match ready!(self.stream.poll_next(cx)) {
                 Err(frame_stream_error) => {
                     return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
@@ -1822,6 +1831,13 @@ where
                     return Poll::Ready(Ok(None));
                 }
                 Ok(Some(Frame::Headers(encoded))) => encoded,
+                // DATA may follow DATA, so only the local call order is wrong.
+                // The frame's payload stays readable through `poll_recv_data`.
+                Ok(Some(Frame::Data { .. })) => {
+                    return Poll::Ready(Err(StreamError::InvalidStreamState {
+                        reason: "the body has not ended".into(),
+                    }));
+                }
                 Ok(Some(other_frame)) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                     //# Receipt of an invalid sequence of frames MUST be treated as a
