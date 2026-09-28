@@ -22,7 +22,7 @@ use crate::{
     quic::ConnectionErrorIncoming,
     server,
     shared_state::ConnectionState,
-    tests::get_stream_blocking,
+    tests::{get_stream_blocking, goaway_published},
 };
 
 async fn rejected_response_fields(
@@ -325,16 +325,6 @@ async fn server_goaway_reaches_response_operations_at_each_boundary() {
         })
         .await
         .unwrap();
-    }
-}
-
-/// Yields until the client driver published a GOAWAY at or below `boundary`.
-async fn goaway_published<T: ConnectionState>(state: &T, boundary: u64) {
-    while state
-        .peer_goaway()
-        .is_none_or(|id| id.into_inner() > boundary)
-    {
-        tokio::task::yield_now().await;
     }
 }
 
