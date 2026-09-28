@@ -47,6 +47,11 @@ async fn rejected_response_fields(
                 stream.recv_response().await.unwrap_err()
             };
             assert_matches!(error, StreamError::StreamError { code: actual, .. } if actual == code);
+            // The failed response is not read again.
+            assert_matches!(
+                stream.recv_response().await,
+                Err(StreamError::InvalidStreamState { .. })
+            );
             // A field-section rejection must leave the connection usable.
             let mut next = client
                 .send_request(Request::get("https://localhost/").body(()).unwrap())
@@ -324,6 +329,15 @@ async fn out_of_order_receives_are_local_errors() {
                 .await
                 .unwrap();
             stream.finish().await.unwrap();
+            // The body is not open before the final response.
+            assert_matches!(
+                stream.recv_data().await.map(|_| ()),
+                Err(StreamError::InvalidStreamState { .. })
+            );
+            assert_matches!(
+                stream.recv_trailers().await,
+                Err(StreamError::InvalidStreamState { .. })
+            );
             assert_eq!(
                 stream.recv_response().await.unwrap().status(),
                 StatusCode::OK
@@ -2932,7 +2946,7 @@ async fn poll_response_resumes_or_cancels_blocked_headers_after_split() {
             let (_send, mut recv) = stream.split();
             assert_eq!(driver.inner.qpack_blocked_stream_count(), 1);
             if cancel {
-                drop(recv);
+                recv.stop_sending(Code::H3_REQUEST_CANCELLED);
                 // Cancellation is queued to the connection's QPACK driver.
                 future::poll_fn(|cx| {
                     assert!(driver.poll_close(cx).is_pending());
@@ -2943,6 +2957,13 @@ async fn poll_response_resumes_or_cancels_blocked_headers_after_split() {
                     }
                 })
                 .await;
+                // The buffered DATA after the abandoned head is not read as one.
+                assert_matches!(
+                    recv.recv_response().await,
+                    Err(StreamError::InvalidStreamState { .. })
+                );
+                assert!(sender.get_conn_error().is_none());
+                drop(recv);
                 blocked_tx.send(()).unwrap();
                 tokio::select! {
                     result = done_rx => result.unwrap(),
@@ -2984,6 +3005,9 @@ async fn poll_response_resumes_or_cancels_blocked_headers_after_split() {
             let mut bytes = BytesMut::new();
             // RIC 1 and relative index 0 wait for the first dynamic insertion.
             Frame::headers(vec![0x02, 0x00, 0x80]).encode_with_payload(&mut bytes);
+            if cancel {
+                Frame::Data(Bytes::from_static(b"body")).encode_with_payload(&mut bytes);
+            }
             send.write_all(&bytes).await.unwrap();
             blocked_rx.await.unwrap();
             if cancel {
