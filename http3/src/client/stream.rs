@@ -98,8 +98,17 @@ use crate::{
 pub struct RequestStream<S, B> {
     pub(super) inner: connection::RequestStream<S, B>,
     rejection: RequestRejection,
-    // Retained while QPACK waits for encoder instructions.
-    response: Option<Bytes>,
+    head: ResponseHead,
+}
+
+/// Progress of the response head, which gates the body operations.
+enum ResponseHead {
+    /// Only informational responses, if any, were received.
+    Pending,
+    /// HEADERS retained while QPACK waits for encoder instructions.
+    Decoding(Bytes),
+    /// The final response was returned; the body may be read.
+    Received,
 }
 
 impl<S, B> ConnectionState for RequestStream<S, B> {
@@ -197,7 +206,9 @@ where
     /// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_sending(&mut self, error_code: Code) {
-        self.response = None;
+        if matches!(self.head, ResponseHead::Decoding(_)) {
+            self.head = ResponseHead::Pending;
+        }
         self.inner.stop_sending(error_code)
     }
 
@@ -213,6 +224,8 @@ where
     /// continue polling this method or [`Self::recv_response`] to resume.
     /// Dropping a waiting future does not cancel reception; use
     /// [`Self::stop_sending`] or drop the stream to abandon it.
+    /// Once the final response was returned, this returns
+    /// [`StreamError::InvalidStreamState`].
     ///
     /// Uses the same validation and error precedence as [`Self::recv_response`].
     pub fn poll_recv_response(
@@ -220,27 +233,36 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Response<()>, StreamError>> {
         let result = self.rejection.poll(cx, |cx| {
-            Self::poll_recv_response_inner(&mut self.inner, &mut self.response, cx)
+            Self::poll_recv_response_inner(&mut self.inner, &mut self.head, cx)
         });
         result.map(|result| {
-            self.response = None;
+            if let Ok(response) = &result {
+                self.head = if response.status().is_informational() {
+                    ResponseHead::Pending
+                } else {
+                    ResponseHead::Received
+                };
+            } else if !matches!(self.head, ResponseHead::Received) {
+                // Drop HEADERS retained by an earlier poll.
+                self.head = ResponseHead::Pending;
+            }
             self.handle_result(result)
         })
     }
 
     fn poll_recv_response_inner(
         inner: &mut connection::RequestStream<S, B>,
-        response: &mut Option<Bytes>,
+        head: &mut ResponseHead,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Response<()>, StreamError>> {
-        let mut encoded = match response.take() {
-            Some(encoded) => encoded,
-            None => {
-                if inner.stream.has_data() {
-                    return Poll::Ready(Err(StreamError::InvalidStreamState {
-                        reason: "the response head was already received".into(),
-                    }));
-                }
+        let mut encoded = match head {
+            ResponseHead::Received => {
+                return Poll::Ready(Err(StreamError::InvalidStreamState {
+                    reason: "the final response was already received".into(),
+                }));
+            }
+            ResponseHead::Decoding(encoded) => std::mem::take(encoded),
+            ResponseHead::Pending => {
                 let frame = ready!(inner.stream.poll_next(cx))
                     .map_err(|e| inner.handle_receive_stream_error(e))?
                     .ok_or_else(|| {
@@ -285,7 +307,7 @@ where
 
         let fields = match inner.poll_decode_field_section(cx, &mut encoded) {
             Poll::Pending => {
-                *response = Some(encoded);
+                *head = ResponseHead::Decoding(encoded);
                 return Poll::Pending;
             }
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
@@ -486,19 +508,19 @@ where
         let Self {
             inner,
             rejection,
-            response,
+            head,
         } = self;
         let (send, recv) = inner.split();
         (
             RequestStream {
                 inner: send,
                 rejection: RequestRejection::new(rejection.state.clone(), rejection.stream_id),
-                response: None,
+                head: ResponseHead::Pending,
             },
             RequestStream {
                 inner: recv,
                 rejection,
-                response,
+                head,
             },
         )
     }
@@ -514,7 +536,7 @@ where
         Self {
             inner,
             rejection,
-            response: None,
+            head: ResponseHead::Pending,
         }
     }
 }

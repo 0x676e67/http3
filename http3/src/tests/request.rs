@@ -240,8 +240,9 @@ async fn empty_data_frames_preserve_request_and_response_body() {
 
 /// Reads a body whose peer splits the first DATA frame at `resume`, calling
 /// `recv_trailers` inside that frame and at its boundary before a second one.
+/// `$again` runs once the body is fully read and again once it has ended.
 macro_rules! recv_trailers_before_body_end {
-    ($stream:expr, $resume:expr) => {{
+    ($stream:expr, $resume:expr, $again:block) => {{
         let mut body = BytesMut::new();
         let mut chunk = $stream.recv_data().await.unwrap().unwrap();
         body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
@@ -260,10 +261,16 @@ macro_rules! recv_trailers_before_body_end {
             $stream.recv_trailers().await,
             Err(StreamError::InvalidStreamState { .. })
         );
-        while let Some(mut chunk) = $stream.recv_data().await.unwrap() {
+        while body.len() < 13 {
+            let mut chunk = $stream.recv_data().await.unwrap().unwrap();
             body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
         }
         assert_eq!(&body[..], b"0123456789abc");
+        // The trailers HEADERS is next, not yet read.
+        $again
+        assert!($stream.recv_data().await.unwrap().is_none());
+        // The trailers are buffered.
+        $again
         assert_eq!(
             $stream.recv_trailers().await.unwrap().unwrap()["trailer"],
             "value"
@@ -303,7 +310,7 @@ fn control_stream_prefix() -> BytesMut {
 }
 
 #[tokio::test]
-async fn recv_trailers_before_body_end_is_a_local_error() {
+async fn out_of_order_receives_are_local_errors() {
     // Client role: a raw server splits the response body.
     let mut pair = Pair::default();
     let endpoint = pair.server_inner();
@@ -321,7 +328,17 @@ async fn recv_trailers_before_body_end_is_a_local_error() {
                 stream.recv_response().await.unwrap().status(),
                 StatusCode::OK
             );
-            recv_trailers_before_body_end!(stream, resume_tx);
+            // A second head is not read at any later position.
+            let no_second_head = async |stream: &mut client::RequestStream<_, Bytes>| {
+                assert_matches!(
+                    stream.recv_response().await,
+                    Err(StreamError::InvalidStreamState { .. })
+                );
+            };
+            no_second_head(&mut stream).await;
+            recv_trailers_before_body_end!(stream, resume_tx, {
+                no_second_head(&mut stream).await;
+            });
             assert!(sender.get_conn_error().is_none());
             done_tx.send(()).unwrap();
         };
@@ -360,7 +377,7 @@ async fn recv_trailers_before_body_end_is_a_local_error() {
             .unwrap();
         let resolver = incoming.accept().await.unwrap().unwrap();
         let (_, mut stream) = resolver.resolve_request().await.unwrap();
-        recv_trailers_before_body_end!(stream, resume_tx);
+        recv_trailers_before_body_end!(stream, resume_tx, {});
         assert!(incoming.get_conn_error().is_none());
         done_tx.send(()).unwrap();
     };
