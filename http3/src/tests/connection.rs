@@ -26,7 +26,7 @@ use crate::{
     quic::{self, ConnectionErrorIncoming, SendStream},
     server,
     shared_state::ConnectionState,
-    tests::get_stream_blocking,
+    tests::{get_stream_blocking, goaway_published},
 };
 
 #[tokio::test]
@@ -1228,26 +1228,27 @@ async fn graceful_shutdown_server_rejects() {
     let mut server = pair.server();
 
     let client_fut = async {
-        let (_driver, mut send_request) = client::new(pair.client().await).await.unwrap();
-
-        let mut first = send_request
-            .send_request(Request::get("http://no.way").body(()).unwrap())
-            .await
-            .unwrap();
-        let mut rejected = send_request
-            .send_request(Request::get("http://no.way").body(()).unwrap())
-            .await
-            .unwrap();
-        let first = first.recv_response().await;
-        let rejected = rejected.recv_response().await;
-
-        assert_matches!(first, Ok(_));
-        assert_matches!(
-            rejected.unwrap_err(),
-            StreamError::RemoteTerminate {
-                code: Code::H3_REQUEST_REJECTED
-            }
-        );
+        let (mut driver, mut send_request) = client::new(pair.client().await).await.unwrap();
+        let requests = async {
+            let mut first = send_request
+                .send_request(Request::get("http://no.way").body(()).unwrap())
+                .await
+                .unwrap();
+            let mut rejected = send_request
+                .send_request(Request::get("http://no.way").body(()).unwrap())
+                .await
+                .unwrap();
+            // The server accepts `first` before shutting down, so its GOAWAY
+            // names `rejected`, which must not be reported as retryable.
+            goaway_published(&send_request, 4).await;
+            assert_matches!(first.recv_response().await, Ok(_));
+            assert_matches!(
+                rejected.recv_response().await,
+                Err(StreamError::GoawayRejected { stream_id, boundary })
+                    if stream_id.into_inner() == 4 && boundary.into_inner() == 4
+            );
+        };
+        tokio::select! { biased; _ = requests => (), error = driver.wait_idle() => panic!("connection failed: {error}") }
     };
 
     let server_fut = async {
@@ -1255,8 +1256,8 @@ async fn graceful_shutdown_server_rejects() {
         let mut incoming = server::Connection::new(conn).await.unwrap();
         let request_resolver = incoming.accept().await.unwrap().unwrap();
         let (_, stream) = request_resolver.resolve_request().await.unwrap();
-        response(stream).await;
         incoming.shutdown(0).await.unwrap();
+        response(stream).await;
         assert_matches!(incoming.accept().await.map(|x| x.map(|_| ())), Ok(None));
         server.endpoint.wait_idle().await;
     };
