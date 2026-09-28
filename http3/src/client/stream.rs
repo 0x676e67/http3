@@ -109,8 +109,8 @@ enum ResponseHead {
     Decoding(Bytes),
     /// The final response was returned; the body may be read.
     Received,
-    /// Receiving the response failed; nothing more is read.
-    Failed,
+    /// The response head failed or was abandoned; nothing more is read.
+    Closed,
 }
 
 impl ResponseHead {
@@ -120,13 +120,13 @@ impl ResponseHead {
             Self::Pending | Self::Decoding(_) => Err(StreamError::InvalidStreamState {
                 reason: "receive the final response before its body".into(),
             }),
-            Self::Failed => Err(Self::failed()),
+            Self::Closed => Err(Self::closed()),
         }
     }
 
-    fn failed() -> StreamError {
+    fn closed() -> StreamError {
         StreamError::InvalidStreamState {
-            reason: "receiving the response failed".into(),
+            reason: "the response is no longer read".into(),
         }
     }
 }
@@ -213,6 +213,8 @@ where
 
     /// Stops receiving the response with `error_code` and releases its QPACK state.
     ///
+    /// Before the final response, later receive calls then return
+    /// [`StreamError::InvalidStreamState`]; a received body stays readable.
     /// The request's send direction remains open. Dropping the stream afterwards
     /// does not replace this receive-side code with `H3_REQUEST_CANCELLED`.
     /// Clients must not use `H3_REQUEST_REJECTED` unless the server requested
@@ -220,8 +222,9 @@ where
     /// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_sending(&mut self, error_code: Code) {
-        if matches!(self.head, ResponseHead::Decoding(_)) {
-            self.head = ResponseHead::Pending;
+        // Buffered frames of an abandoned head must not be read as a response.
+        if !matches!(self.head, ResponseHead::Received) {
+            self.head = ResponseHead::Closed;
         }
         self.inner.stop_sending(error_code)
     }
@@ -238,8 +241,8 @@ where
     /// continue polling this method or [`Self::recv_response`] to resume.
     /// Dropping a waiting future does not cancel reception; use
     /// [`Self::stop_sending`] or drop the stream to abandon it.
-    /// Once the final response was returned, this returns
-    /// [`StreamError::InvalidStreamState`].
+    /// Once the final response was returned, after an error, or after
+    /// [`Self::stop_sending`], this returns [`StreamError::InvalidStreamState`].
     ///
     /// Uses the same validation and error precedence as [`Self::recv_response`].
     pub fn poll_recv_response(
@@ -255,7 +258,7 @@ where
                 Ok(_) => ResponseHead::Received,
                 // A call after the final response does not change what was read.
                 Err(_) if matches!(self.head, ResponseHead::Received) => ResponseHead::Received,
-                Err(_) => ResponseHead::Failed,
+                Err(_) => ResponseHead::Closed,
             };
             self.handle_result(result)
         })
@@ -272,7 +275,7 @@ where
                     reason: "the final response was already received".into(),
                 }));
             }
-            ResponseHead::Failed => return Poll::Ready(Err(ResponseHead::failed())),
+            ResponseHead::Closed => return Poll::Ready(Err(ResponseHead::closed())),
             ResponseHead::Decoding(encoded) => std::mem::take(encoded),
             ResponseHead::Pending => {
                 let frame = ready!(inner.stream.poll_next(cx))
