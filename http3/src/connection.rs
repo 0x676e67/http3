@@ -1114,7 +1114,29 @@ where
             return Poll::Pending;
         };
 
-        let res = match ready!(recv.poll_next(cx)) {
+        let polled = recv.poll_next(cx);
+        // The decoder skips unknown frames, so check whether one came first,
+        // even while the next frame is still pending.
+        if !self.got_peer_settings && recv.skipped_unknown_frame() {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-9
+            //# However, where a known frame type is required to be in
+            //# a specific location, such as the SETTINGS frame as the first frame of
+            //# the control stream (see Section 6.2.1), an unknown frame type does
+            //# not satisfy that requirement and SHOULD be treated as an error.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+            //# If the first frame of the control stream is any other frame
+            //# type, this MUST be treated as a connection error of type
+            //# H3_MISSING_SETTINGS.
+            return Poll::Ready(Err(self.handle_connection_error(
+                InternalConnectionError::new(
+                    Code::H3_MISSING_SETTINGS,
+                    "received a frame of unknown type before settings".to_string(),
+                ),
+            )));
+        }
+
+        let res = match ready!(polled) {
             Err(FrameStreamError::Quic(StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error,
             })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),

@@ -16,7 +16,7 @@ use crate::{
     error::{Code, ConnectionError, LocalError, StreamError},
     proto::{
         coding::{Decode as _, Encode as _},
-        frame::{self, Frame, Settings},
+        frame::{self, Frame, FrameType, Settings},
         headers::Header,
         push::PushId,
         stream::StreamType,
@@ -1097,6 +1097,122 @@ async fn missing_settings() {
     };
 
     tokio::select! { _ = server_fut => (), _ = client_fut => panic!("client resolved first") };
+}
+
+#[tokio::test]
+async fn unknown_frame_before_settings_is_missing_settings() {
+    init_tracing();
+    let reserved = {
+        let mut buf = BytesMut::new();
+        FrameType::RESERVED.encode(&mut buf);
+        VarInt(0).encode(&mut buf);
+        buf
+    };
+    let settings = {
+        let mut buf = BytesMut::new();
+        Frame::<Bytes>::Settings(Settings::default()).encode(&mut buf);
+        buf
+    };
+    let control = |frames: &[&BytesMut]| {
+        let mut buf = BytesMut::new();
+        StreamType::CONTROL.encode(&mut buf);
+        frames.iter().for_each(|frame| buf.extend_from_slice(frame));
+        buf
+    };
+    let missing_settings = |error: ConnectionError| {
+        assert_matches!(
+            error,
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_MISSING_SETTINGS,
+                    ..
+                }
+            }
+        );
+    };
+
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-9
+    //= type=test
+    //# However, where a known frame type is required to be in
+    //# a specific location, such as the SETTINGS frame as the first frame of
+    //# the control stream (see Section 6.2.1), an unknown frame type does
+    //# not satisfy that requirement and SHOULD be treated as an error.
+
+    // Server role. An unknown frame cannot stand in for SETTINGS, whether
+    // SETTINGS follows it or nothing does. After SETTINGS it is ignored.
+    for (frames, valid) in [
+        (vec![&reserved, &settings], false),
+        (vec![&reserved], false),
+        (vec![&settings, &reserved], true),
+    ] {
+        let control = control(&frames);
+        let mut pair = Pair::default();
+        let mut server = pair.server();
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let client_fut = async {
+            let connection = pair.client_inner().await;
+            let mut control_stream = connection.open_uni().await.unwrap();
+            control_stream.write_all(&control).await.unwrap();
+            if valid {
+                let mut block = BytesMut::new();
+                qpack::encode_stateless(
+                    &mut block,
+                    &Header::request(
+                        http::Method::GET,
+                        "https://localhost/".parse().unwrap(),
+                        http::HeaderMap::new(),
+                        http::Extensions::new(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let mut request = BytesMut::new();
+                Frame::headers(block.to_vec()).encode_with_payload(&mut request);
+                let (mut send, mut recv) = connection.open_bi().await.unwrap();
+                send.write_all(&request).await.unwrap();
+                send.finish().unwrap();
+                assert!(!recv.read_to_end(1024).await.unwrap().is_empty());
+                done_tx.send(()).unwrap();
+            }
+            connection.closed().await;
+        };
+        let server_fut = async {
+            let mut incoming = server::Connection::new(server.next().await).await.unwrap();
+            if valid {
+                let (_, stream) = get_stream_blocking(&mut incoming).await.unwrap();
+                response(stream).await;
+                done_rx.await.unwrap();
+                assert!(incoming.get_conn_error().is_none());
+            } else {
+                missing_settings(incoming.accept().await.map(|_| ()).unwrap_err());
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! { biased; () = server_fut => (), () = client_fut => panic!("client closed first") }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("server did not handle {control:x?}"));
+    }
+
+    // Client role, through the connection driver.
+    let control = control(&[&reserved]);
+    let mut pair = Pair::default();
+    let server = pair.server_inner();
+    let client_fut = async {
+        let (mut driver, _send) = client::new(pair.client().await).await.unwrap();
+        missing_settings(future::poll_fn(|cx| driver.poll_close(cx)).await);
+    };
+    let server_fut = async {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let mut control_stream = conn.open_uni().await.unwrap();
+        control_stream.write_all(&control).await.unwrap();
+        conn.closed().await;
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("client did not reject an unknown first frame");
 }
 
 #[tokio::test]
