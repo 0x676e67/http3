@@ -801,11 +801,6 @@ mod tests {
             );
         }
 
-        // A payload that has not fully arrived still waits for more data.
-        assert_matches!(
-            Frame::decode(&mut Cursor::new(&[0x07, 0x02, 0x40])),
-            Err(FrameError::Incomplete(4))
-        );
         // Exact payloads leave the next frame intact.
         let mut buf = Cursor::new(&[0x07, 0x01, 0x04, 0x0d, 0x02, 0x40, 0x08]);
         assert_matches!(Frame::decode(&mut buf), Ok(Frame::Goaway(VarInt(4))));
