@@ -1168,6 +1168,89 @@ async fn timeout_on_control_frame_read() {
     tokio::join!(server_fut, client_fut);
 }
 
+/// Control frames whose payload ends early or carries extra bytes, each preceded
+/// by whatever the control stream needs to reach it.
+/// https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+fn malformed_control_streams(frames: &[&[u8]]) -> Vec<BytesMut> {
+    frames
+        .iter()
+        .map(|frame| {
+            let mut buf = BytesMut::new();
+            StreamType::CONTROL.encode(&mut buf);
+            // A truncated SETTINGS frame is itself the first frame.
+            if frame[0] != 0x04 {
+                Frame::<Bytes>::Settings(Settings::default()).encode(&mut buf);
+            }
+            buf.extend_from_slice(frame);
+            buf
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn control_frame_payload_must_hold_exactly_its_fields() {
+    init_tracing();
+    let frame_error = |error: ConnectionError| {
+        assert_matches!(
+            error,
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_FRAME_ERROR,
+                    ..
+                }
+            }
+        );
+    };
+
+    // Client role: the server's control stream carries the malformed frame.
+    for control in malformed_control_streams(&[
+        &[0x07, 0x00],             // GOAWAY without an identifier
+        &[0x07, 0x02, 0x04, 0x00], // GOAWAY with a trailing byte
+        &[0x04, 0x01, 0x01],       // SETTINGS with a lone identifier
+    ]) {
+        let mut pair = Pair::default();
+        let server = pair.server_inner();
+        let client_fut = async {
+            let (mut driver, _send) = client::new(pair.client().await).await.unwrap();
+            frame_error(future::poll_fn(|cx| driver.poll_close(cx)).await);
+        };
+        let server_fut = async {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let mut control_stream = conn.open_uni().await.unwrap();
+            control_stream.write_all(&control).await.unwrap();
+            conn.closed().await;
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(client_fut, server_fut);
+        })
+        .await
+        .unwrap_or_else(|_| panic!("client did not reject {control:x?}"));
+    }
+
+    // Server role: the client's control stream carries the malformed frame.
+    for control in malformed_control_streams(&[
+        &[0x0d, 0x00], // MAX_PUSH_ID without a push ID
+    ]) {
+        let mut pair = Pair::default();
+        let mut server = pair.server();
+        let client_fut = async {
+            let connection = pair.client_inner().await;
+            let mut control_stream = connection.open_uni().await.unwrap();
+            control_stream.write_all(&control).await.unwrap();
+            connection.closed().await;
+        };
+        let server_fut = async {
+            let mut incoming = server::Connection::new(server.next().await).await.unwrap();
+            frame_error(incoming.accept().await.map(|_| ()).unwrap_err());
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(client_fut, server_fut);
+        })
+        .await
+        .unwrap_or_else(|_| panic!("server did not reject {control:x?}"));
+    }
+}
+
 #[tokio::test]
 async fn goaway_from_server_not_request_id() {
     init_tracing();

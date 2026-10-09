@@ -3,7 +3,7 @@ use std::{
     fmt::{self, Debug},
 };
 
-use bytes::{Buf, BufMut, Bytes};
+use bytes::{Buf, BufMut, Bytes, buf::Take};
 #[cfg(feature = "tracing")]
 use tracing::trace;
 
@@ -160,18 +160,31 @@ impl Frame<PayloadLen> {
             return Err(FrameError::Incomplete(frame_len));
         }
 
-        let mut payload = buf.take(len);
-
         #[cfg(feature = "tracing")]
         trace!("frame ty: {:?}", ty);
 
         let frame = match ty {
-            FrameType::HEADERS => Ok(Frame::Headers(payload.copy_to_bytes(len))),
-            FrameType::SETTINGS => Ok(Frame::Settings(Settings::decode(&mut payload)?)),
-            FrameType::CANCEL_PUSH => Ok(Frame::CancelPush(payload.get_var()?.try_into()?)),
-            FrameType::PUSH_PROMISE => Ok(Frame::PushPromise(PushPromise::decode(&mut payload)?)),
-            FrameType::GOAWAY => Ok(Frame::Goaway(VarInt::decode(&mut payload)?)),
-            FrameType::MAX_PUSH_ID => Ok(Frame::MaxPushId(payload.get_var()?.try_into()?)),
+            FrameType::HEADERS => Ok(Frame::Headers(buf.copy_to_bytes(len))),
+            FrameType::SETTINGS => decode_payload(buf, len, |payload| {
+                Settings::decode(payload)
+                    .map(Frame::Settings)
+                    .map_err(|error| match error {
+                        SettingsError::Malformed => FrameError::Malformed,
+                        error => FrameError::Settings(error),
+                    })
+            }),
+            FrameType::CANCEL_PUSH => decode_payload(buf, len, |payload| {
+                Ok(Frame::CancelPush(payload.get_var()?.try_into()?))
+            }),
+            FrameType::PUSH_PROMISE => decode_payload(buf, len, |payload| {
+                Ok(Frame::PushPromise(PushPromise::decode(payload)?))
+            }),
+            FrameType::GOAWAY => decode_payload(buf, len, |payload| {
+                Ok(Frame::Goaway(VarInt::decode(payload)?))
+            }),
+            FrameType::MAX_PUSH_ID => decode_payload(buf, len, |payload| {
+                Ok(Frame::MaxPushId(payload.get_var()?.try_into()?))
+            }),
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
             //# These frame
             //# types MUST NOT be sent, and their receipt MUST be treated as a
@@ -201,6 +214,28 @@ impl Frame<PayloadLen> {
         }
         frame
     }
+}
+
+/// Decodes the fields of a frame whose `len`-byte payload is fully buffered.
+///
+/// The payload must hold exactly these fields: running out of bytes or leaving
+/// some unread is a connection error of type H3_FRAME_ERROR, never a request
+/// for more stream data.
+/// https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+fn decode_payload<B: Buf, F>(
+    buf: &mut B,
+    len: usize,
+    decode: impl FnOnce(&mut Take<&mut B>) -> Result<F, FrameError>,
+) -> Result<F, FrameError> {
+    let mut payload = buf.take(len);
+    let fields = decode(&mut payload).map_err(|error| match error {
+        FrameError::Incomplete(_) => FrameError::Malformed,
+        error => error,
+    })?;
+    if payload.has_remaining() {
+        return Err(FrameError::Malformed);
+    }
+    Ok(fields)
 }
 
 fn payload_len(encoded_len: u64, max_addressable: u64) -> Result<usize, FrameError> {
@@ -740,6 +775,37 @@ mod tests {
         let mut buf = Cursor::new(&[4, 4, 0, 255, 128]);
         let decoded = Frame::decode(&mut buf);
         assert_matches!(decoded, Err(FrameError::Incomplete(6)));
+    }
+
+    #[test]
+    fn buffered_payload_must_hold_exactly_its_fields() {
+        // A payload that ends before its fields or carries extra bytes is a
+        // frame error, not a request for more stream data.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+        for wire in [
+            &[0x07, 0x00][..],         // GOAWAY without an identifier
+            &[0x07, 0x01, 0x40],       // GOAWAY with a truncated identifier
+            &[0x07, 0x02, 0x04, 0x00], // GOAWAY with a trailing byte
+            &[0x03, 0x00],             // CANCEL_PUSH without a push ID
+            &[0x03, 0x02, 0x00, 0x00], // CANCEL_PUSH with a trailing byte
+            &[0x0d, 0x00],             // MAX_PUSH_ID without a push ID
+            &[0x0d, 0x02, 0x00, 0x00], // MAX_PUSH_ID with a trailing byte
+            &[0x05, 0x00],             // PUSH_PROMISE without a push ID
+            &[0x04, 0x01, 0x01],       // SETTINGS with a lone identifier
+            &[0x04, 0x02, 0x01, 0x40], // SETTINGS with a truncated value
+        ] {
+            assert_matches!(
+                Frame::decode(&mut Cursor::new(wire)),
+                Err(FrameError::Malformed),
+                "{wire:x?}"
+            );
+        }
+
+        // Exact payloads leave the next frame intact.
+        let mut buf = Cursor::new(&[0x07, 0x01, 0x04, 0x0d, 0x02, 0x40, 0x08]);
+        assert_matches!(Frame::decode(&mut buf), Ok(Frame::Goaway(VarInt(4))));
+        assert_matches!(Frame::decode(&mut buf), Ok(Frame::MaxPushId(PushId(8))));
+        assert!(!buf.has_remaining());
     }
 
     #[test]
