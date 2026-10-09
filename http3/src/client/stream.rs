@@ -1,6 +1,6 @@
 use std::{
     convert::TryFrom,
-    future::{Future, poll_fn},
+    future::poll_fn,
     sync::Arc,
     task::{Context, Poll, ready},
 };
@@ -109,6 +109,26 @@ enum ResponseHead {
     Decoding(Bytes),
     /// The final response was returned; the body may be read.
     Received,
+    /// The response head failed or was abandoned; nothing more is read.
+    Closed,
+}
+
+impl ResponseHead {
+    fn require_received(&self) -> Result<(), StreamError> {
+        match self {
+            Self::Received => Ok(()),
+            Self::Pending | Self::Decoding(_) => Err(StreamError::InvalidStreamState {
+                reason: "receive the final response before its body".into(),
+            }),
+            Self::Closed => Err(Self::closed()),
+        }
+    }
+
+    fn closed() -> StreamError {
+        StreamError::InvalidStreamState {
+            reason: "the response is no longer read".into(),
+        }
+    }
 }
 
 impl<S, B> ConnectionState for RequestStream<S, B> {
@@ -138,17 +158,14 @@ where
     /// Receives response body data.
     ///
     /// This returns a chunk of the response body, or `None` if the response body is finished.
+    /// Before the final response was received it returns
+    /// [`StreamError::InvalidStreamState`].
     ///
     /// Published request errors take precedence over buffered data; see
     /// [`RequestStream`]'s error handling contract.
-    // TODO what if called before recv_response ?
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_data(&mut self) -> Result<Option<impl Buf + use<S, B>>, StreamError> {
-        let result = self
-            .rejection
-            .run(poll_fn(|cx| self.inner.poll_recv_data(cx)))
-            .await;
-        self.handle_result(result)
+        poll_fn(|cx| self.poll_recv_data(cx)).await
     }
 
     /// Polls for response body data with the same error precedence as
@@ -159,27 +176,23 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
-        let result = self.rejection.poll(cx, |cx| self.inner.poll_recv_data(cx));
+        let result = self.rejection.poll(cx, |cx| {
+            self.head.require_received()?;
+            self.inner.poll_recv_data(cx)
+        });
         result.map(|result| self.handle_result(result))
     }
 
     /// Receive an optional set of trailers for the response.
     ///
-    /// Call this once [`recv_data()`] returned `None`. Calling it while body
-    /// data remains returns [`StreamError::InvalidStreamState`] and leaves that
-    /// data readable.
+    /// Call this once [`recv_data()`] returned `None`. Calling it before the
+    /// final response, or while body data remains, returns
+    /// [`StreamError::InvalidStreamState`] and leaves that data readable.
     ///
     /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, StreamError> {
-        let result = self
-            .rejection
-            .run(poll_fn(|cx| self.inner.poll_recv_trailers(cx)))
-            .await;
-        if let Err(StreamError::HeaderTooBig { .. }) = &result {
-            self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
-        }
-        self.handle_result(result)
+        poll_fn(|cx| self.poll_recv_trailers(cx)).await
     }
 
     /// Poll receive an optional set of trailers for the response.
@@ -188,9 +201,10 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
-        let res = self
-            .rejection
-            .poll(cx, |cx| self.inner.poll_recv_trailers(cx));
+        let res = self.rejection.poll(cx, |cx| {
+            self.head.require_received()?;
+            self.inner.poll_recv_trailers(cx)
+        });
         if let Poll::Ready(Err(StreamError::HeaderTooBig { .. })) = &res {
             self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
         }
@@ -199,6 +213,9 @@ where
 
     /// Stops receiving the response with `error_code` and releases its QPACK state.
     ///
+    /// Before the final response, later receive calls then return
+    /// [`StreamError::InvalidStreamState`]. After the final response, body reads
+    /// remain allowed, but unread data may be discarded by the transport.
     /// The request's send direction remains open. Dropping the stream afterwards
     /// does not replace this receive-side code with `H3_REQUEST_CANCELLED`.
     /// Clients must not use `H3_REQUEST_REJECTED` unless the server requested
@@ -206,8 +223,9 @@ where
     /// See [RFC 9114, Section 4.1.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1).
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_sending(&mut self, error_code: Code) {
-        if matches!(self.head, ResponseHead::Decoding(_)) {
-            self.head = ResponseHead::Pending;
+        // Buffered frames of an abandoned head must not be read as a response.
+        if !matches!(self.head, ResponseHead::Received) {
+            self.head = ResponseHead::Closed;
         }
         self.inner.stop_sending(error_code)
     }
@@ -224,8 +242,8 @@ where
     /// continue polling this method or [`Self::recv_response`] to resume.
     /// Dropping a waiting future does not cancel reception; use
     /// [`Self::stop_sending`] or drop the stream to abandon it.
-    /// Once the final response was returned, this returns
-    /// [`StreamError::InvalidStreamState`].
+    /// Once the final response was returned, after an error, or after
+    /// [`Self::stop_sending`], this returns [`StreamError::InvalidStreamState`].
     ///
     /// Uses the same validation and error precedence as [`Self::recv_response`].
     pub fn poll_recv_response(
@@ -236,16 +254,13 @@ where
             Self::poll_recv_response_inner(&mut self.inner, &mut self.head, cx)
         });
         result.map(|result| {
-            if let Ok(response) = &result {
-                self.head = if response.status().is_informational() {
-                    ResponseHead::Pending
-                } else {
-                    ResponseHead::Received
-                };
-            } else if !matches!(self.head, ResponseHead::Received) {
-                // Drop HEADERS retained by an earlier poll.
-                self.head = ResponseHead::Pending;
-            }
+            self.head = match &result {
+                Ok(response) if response.status().is_informational() => ResponseHead::Pending,
+                Ok(_) => ResponseHead::Received,
+                // A call after the final response does not change what was read.
+                Err(_) if matches!(self.head, ResponseHead::Received) => ResponseHead::Received,
+                Err(_) => ResponseHead::Closed,
+            };
             self.handle_result(result)
         })
     }
@@ -261,6 +276,7 @@ where
                     reason: "the final response was already received".into(),
                 }));
             }
+            ResponseHead::Closed => return Poll::Ready(Err(ResponseHead::closed())),
             ResponseHead::Decoding(encoded) => std::mem::take(encoded),
             ResponseHead::Pending => {
                 let frame = ready!(inner.stream.poll_next(cx))
@@ -569,14 +585,6 @@ impl RequestRejection {
             }
         }
         result
-    }
-
-    async fn run<T>(
-        &self,
-        operation: impl Future<Output = Result<T, StreamError>>,
-    ) -> Result<T, StreamError> {
-        let mut operation = std::pin::pin!(operation);
-        poll_fn(|cx| self.poll(cx, |cx| operation.as_mut().poll(cx))).await
     }
 }
 
