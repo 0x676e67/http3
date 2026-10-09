@@ -127,7 +127,13 @@ pub fn run_from_args<A: Adapter>(mut args: impl Iterator<Item = String>) -> Resu
             ))
         }
         "no-steal-local" | "no-steal-split" => {
-            let runtime = pingora_runtime::NoStealRuntime::new(threads, "http3-no-steal");
+            // Default options keep the plain current-thread workers of pingora-runtime 0.8.
+            let runtime = pingora_runtime::NoStealRuntime::new(
+                threads,
+                "http3-no-steal",
+                pingora_runtime::BlockingPoolOpts::default(),
+                pingora_runtime::RuntimeOpts::default(),
+            );
             let request_runtimes = if scheduling == "no-steal-split" {
                 (0..threads)
                     .map(|index| runtime.get_runtime_at(index).clone())
