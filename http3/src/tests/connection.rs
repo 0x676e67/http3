@@ -1113,6 +1113,11 @@ async fn unknown_frame_before_settings_is_missing_settings() {
         Frame::<Bytes>::Settings(Settings::default()).encode(&mut buf);
         buf
     };
+    let goaway = {
+        let mut buf = BytesMut::new();
+        Frame::<Bytes>::Goaway(VarInt(0)).encode(&mut buf);
+        buf
+    };
     let control = |frames: &[&BytesMut]| {
         let mut buf = BytesMut::new();
         StreamType::CONTROL.encode(&mut buf);
@@ -1139,52 +1144,29 @@ async fn unknown_frame_before_settings_is_missing_settings() {
     //# not satisfy that requirement and SHOULD be treated as an error.
 
     // Server role. An unknown frame cannot stand in for SETTINGS, whether
-    // SETTINGS follows it or nothing does. After SETTINGS it is ignored.
-    for (frames, valid) in [
-        (vec![&reserved, &settings], false),
-        (vec![&reserved], false),
-        (vec![&settings, &reserved], true),
+    // SETTINGS follows it or nothing does. After SETTINGS it is ignored: the
+    // GOAWAY behind it on the same stream ends accept() only once it was read.
+    for (frames, rejected) in [
+        (vec![&reserved, &settings], true),
+        (vec![&reserved], true),
+        (vec![&settings, &reserved, &goaway], false),
     ] {
         let control = control(&frames);
         let mut pair = Pair::default();
         let mut server = pair.server();
-        let (done_tx, done_rx) = oneshot::channel::<()>();
         let client_fut = async {
             let connection = pair.client_inner().await;
             let mut control_stream = connection.open_uni().await.unwrap();
             control_stream.write_all(&control).await.unwrap();
-            if valid {
-                let mut block = BytesMut::new();
-                qpack::encode_stateless(
-                    &mut block,
-                    &Header::request(
-                        http::Method::GET,
-                        "https://localhost/".parse().unwrap(),
-                        http::HeaderMap::new(),
-                        http::Extensions::new(),
-                    )
-                    .unwrap(),
-                )
-                .unwrap();
-                let mut request = BytesMut::new();
-                Frame::headers(block.to_vec()).encode_with_payload(&mut request);
-                let (mut send, mut recv) = connection.open_bi().await.unwrap();
-                send.write_all(&request).await.unwrap();
-                send.finish().unwrap();
-                assert!(!recv.read_to_end(1024).await.unwrap().is_empty());
-                done_tx.send(()).unwrap();
-            }
             connection.closed().await;
         };
         let server_fut = async {
             let mut incoming = server::Connection::new(server.next().await).await.unwrap();
-            if valid {
-                let (_, stream) = get_stream_blocking(&mut incoming).await.unwrap();
-                response(stream).await;
-                done_rx.await.unwrap();
-                assert!(incoming.get_conn_error().is_none());
+            let accepted = incoming.accept().await.map(|request| request.is_some());
+            if rejected {
+                missing_settings(accepted.unwrap_err());
             } else {
-                missing_settings(incoming.accept().await.map(|_| ()).unwrap_err());
+                assert_matches!(accepted, Ok(false));
             }
         };
         tokio::time::timeout(Duration::from_secs(5), async {
