@@ -136,6 +136,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(release-plz)* verify publishable crates before publishing
 
 ## [unreleased]
+## [0.3.0](https://github.com/0x676e67/http3/compare/v0.2.0..v0.3.0) - 2026-10-09
+
+### Bug Fixes
+
+- Flush buffered data before next write and finish ([#119](https://github.com/0x676e67/http3/issues/119)) - ([b7fd1eb](https://github.com/0x676e67/http3/commit/b7fd1eb48c44c11923e560de817767f3fa0c42a9))
+
+### Miscellaneous Tasks
+
+- Remove newly added license files - ([7436e7c](https://github.com/0x676e67/http3/commit/7436e7c8c000256204b6fcfaa3b9bc38cbb2645b))
+
+## [0.3.0](https://github.com/0x676e67/http3/compare/v0.2.0..v0.3.0) - 2026-10-09
+
+## [0.3.0](https://github.com/0x676e67/http3/compare/v0.2.0..v0.3.0) - 2026-10-09
+
+### Bug Fixes
+
+- *(client)* Reject body reads before the final response ([#135](https://github.com/0x676e67/http3/issues/135)) - ([ed8ea91](https://github.com/0x676e67/http3/commit/ed8ea919f9a7031d2d7de648110efeece85a9666))
+- *(server)* Advertise the first unprocessed request in GOAWAY ([#133](https://github.com/0x676e67/http3/issues/133)) - ([de6ced7](https://github.com/0x676e67/http3/commit/de6ced7bd745fa060ad9e7c1093b59f442f777de))
+- *(server)* Consume GREASE flag when creating resolvers - ([200e6fd](https://github.com/0x676e67/http3/commit/200e6fdd81d4853ec06b95214790a354c1bc8d74))
+- Reject control frame payloads that do not match their fields ([#143](https://github.com/0x676e67/http3/issues/143)) - ([7ab9979](https://github.com/0x676e67/http3/commit/7ab9979e8f18f9e94113fe6805f1b220a3fbfcb5))
+- Reject trailers read before the body ends without a panic ([#134](https://github.com/0x676e67/http3/issues/134)) - ([7857a59](https://github.com/0x676e67/http3/commit/7857a59125f4e700c15da517a408c616f9ede998))
+- Release request tracking when resolver ends early - ([ee1d5ca](https://github.com/0x676e67/http3/commit/ee1d5ca52845dc624a2f1657ef3e905069e7be1f))
+- Require response headers before server body frames ([#121](https://github.com/0x676e67/http3/issues/121)) - ([88f9761](https://github.com/0x676e67/http3/commit/88f97610ba8abfd9e667e84ed48c7091baef536d))
+- Keep pending response headers in send state ([#120](https://github.com/0x676e67/http3/issues/120)) - ([db2b99c](https://github.com/0x676e67/http3/commit/db2b99c0659735e144a2ce9c92a648c6c4f4d142))
+- Flush buffered data before next write and finish ([#119](https://github.com/0x676e67/http3/issues/119)) - ([b7fd1eb](https://github.com/0x676e67/http3/commit/b7fd1eb48c44c11923e560de817767f3fa0c42a9))
+
+### Documentation
+
+- Clarify recv_data and poll_recv_data results - ([82c2f52](https://github.com/0x676e67/http3/commit/82c2f5254ed6269424b78647e6d3332a81243e17))
+- Complete pseudo-header compliance backport - ([b390da2](https://github.com/0x676e67/http3/commit/b390da229da02439c36b15f037ad0100c7591567))
+- Backport applicable Duvet compliance annotations - ([6684ac6](https://github.com/0x676e67/http3/commit/6684ac627c2a23433094cdad5b430a39f2890b1c))
+
+### Styling
+
+- Format request resolver regression tests - ([6cf6adb](https://github.com/0x676e67/http3/commit/6cf6adb1378ab70b2071d76d3b3183cd6f61dec1))
+
+### Miscellaneous Tasks
+
+- Remove newly added license files - ([7436e7c](https://github.com/0x676e67/http3/commit/7436e7c8c000256204b6fcfaa3b9bc38cbb2645b))
+- Keep GREASE backport scoped to upstream fix - ([ba4f366](https://github.com/0x676e67/http3/commit/ba4f366d5ac9f2c7dcf2e4deb6e8d7269c0bb096))
+
 ## [0.2.0](https://github.com/0x676e67/http3/compare/v0.1.1..v0.2.0) - 2026-09-23
 
 ### Features
