@@ -325,7 +325,7 @@ impl Header {
 
     /// Sets the pseudo-header field order for this header block.
     pub fn set_pseudo_order(&mut self, order: PseudoOrder) {
-        self.pseudo.pseudo_order = Some(order);
+        self.pseudo.order = Some(order);
     }
 
     #[cfg(test)]
@@ -364,7 +364,7 @@ impl<'a> Iterator for HeaderIter<'a> {
             self.pseudo_order_index += 1;
             let id = self
                 .pseudo
-                .pseudo_order
+                .order
                 .as_ref()
                 .map_or(PseudoId::DEFAULT_IDS[index], |order| order.ids[index]);
             if let Some(field) = self.pseudo.field_ref(id) {
@@ -592,7 +592,7 @@ struct Pseudo {
     protocol: Option<Protocol>,
 
     // Pseudo-header field order
-    pseudo_order: Option<PseudoOrder>,
+    order: Option<PseudoOrder>,
 
     // QPACK never-indexed bits for pseudo-header fields. Regular fields carry
     // the same metadata through `HeaderValue::is_sensitive`.
@@ -670,7 +670,7 @@ impl Pseudo {
             path,
             status: None,
             protocol,
-            pseudo_order: None,
+            order: None,
             sensitive,
             len,
         }
@@ -689,7 +689,7 @@ impl Pseudo {
             path: None,
             status: Some(status),
             protocol: None,
-            pseudo_order: None,
+            order: None,
             sensitive: ext
                 .get::<PseudoHeaderSensitivity>()
                 .copied()
