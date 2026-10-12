@@ -47,6 +47,8 @@ define_enum_with_values! {
 ///
 /// Typically, a `PseudoOrder` is constructed using the [`PseudoOrderBuilder`] to enforce uniqueness
 /// and correct ordering.
+/// Apply it with [`crate::client::Builder::pseudo_order`] to configure all requests
+/// on a connection. Storing this value in request extensions has no effect.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct PseudoOrder {
     ids: [PseudoId; PseudoId::DEFAULT_STACK_SIZE],
@@ -323,7 +325,7 @@ impl Header {
 
     /// Sets the pseudo-header field order for this header block.
     pub fn set_pseudo_order(&mut self, order: PseudoOrder) {
-        self.pseudo.order = Some(order);
+        self.pseudo.pseudo_order = Some(order);
     }
 
     #[cfg(test)]
@@ -362,7 +364,7 @@ impl<'a> Iterator for HeaderIter<'a> {
             self.pseudo_order_index += 1;
             let id = self
                 .pseudo
-                .order
+                .pseudo_order
                 .as_ref()
                 .map_or(PseudoId::DEFAULT_IDS[index], |order| order.ids[index]);
             if let Some(field) = self.pseudo.field_ref(id) {
@@ -590,7 +592,7 @@ struct Pseudo {
     protocol: Option<Protocol>,
 
     // Pseudo-header field order
-    order: Option<PseudoOrder>,
+    pseudo_order: Option<PseudoOrder>,
 
     // QPACK never-indexed bits for pseudo-header fields. Regular fields carry
     // the same metadata through `HeaderValue::is_sensitive`.
@@ -655,8 +657,6 @@ impl Pseudo {
         //# All HTTP/3 requests MUST include exactly one value for the :method,
         //# :scheme, and :path pseudo-header fields, unless the request is a
         //# CONNECT request; see Section 4.4.
-        // Extract pseudo-header order from extensions, if provided.
-        let order = ext.get::<PseudoOrder>().cloned();
         let sensitive = ext
             .get::<PseudoHeaderSensitivity>()
             .copied()
@@ -670,7 +670,7 @@ impl Pseudo {
             path,
             status: None,
             protocol,
-            order,
+            pseudo_order: None,
             sensitive,
             len,
         }
@@ -689,7 +689,7 @@ impl Pseudo {
             path: None,
             status: Some(status),
             protocol: None,
-            order: None,
+            pseudo_order: None,
             sensitive: ext
                 .get::<PseudoHeaderSensitivity>()
                 .copied()
