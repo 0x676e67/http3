@@ -677,123 +677,57 @@ async fn get() {
 }
 
 #[tokio::test]
-async fn client_pseudo_order_is_connection_configuration() {
-    for custom in [false, true] {
-        let mut pair = Pair::default();
-        let mut transport_server = pair.server();
-
-        let client_fut = async {
-            let mut builder = client::builder();
-            builder.send_grease(false);
-            if custom {
-                builder.pseudo_order(
-                    PseudoOrder::builder()
-                        .extend([PseudoId::Path, PseudoId::Authority, PseudoId::Method])
-                        .build(),
-                );
-            }
-            let (mut driver, mut send) = builder
-                .build::<_, _, Bytes>(pair.client().await)
-                .await
-                .unwrap();
-            let mut cloned = send.clone();
-
-            let requests = async {
-                for request_index in 0..3 {
-                    let request = if request_index == 2 {
-                        Request::connect("localhost:443")
-                    } else {
-                        Request::get("https://localhost/order")
-                    };
-                    let mut request = request.header("x-order-test", "present").body(()).unwrap();
-                    if request_index > 0 {
-                        request.extensions_mut().insert(
-                            PseudoOrder::builder()
-                                .extend([PseudoId::Scheme, PseudoId::Method])
-                                .build(),
-                        );
-                    }
-                    let sender = if request_index == 0 {
-                        &mut send
-                    } else {
-                        &mut cloned
-                    };
-                    let mut stream = sender.send_request(request).await.unwrap();
-                    stream.finish().await.unwrap();
-                    assert_eq!(
-                        stream.recv_response().await.unwrap().status(),
-                        StatusCode::OK
-                    );
-                }
-            };
-            tokio::select! {
-                biased;
-                _ = requests => (),
-                error = future::poll_fn(|cx| driver.poll_close(cx)) => {
-                    panic!("connection closed during pseudo-order requests: {error:?}");
-                }
-            }
+async fn client_builder_sets_pseudo_order() {
+    let mut pair = Pair::default();
+    let mut transport_server = pair.server();
+    let client_fut = async {
+        let (driver, send) = client::builder()
+            .send_grease(false)
+            .pseudo_order(PseudoOrder::builder().push(PseudoId::Path).build())
+            .build::<_, _, Bytes>(pair.client().await)
+            .await
+            .unwrap();
+        let stream = send
+            .clone()
+            .send_request(
+                Request::get("https://localhost/order")
+                    .header("x-order-test", "present")
+                    .extension(PseudoOrder::default())
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The join retains these until the peer has read the field section.
+        (driver, stream)
+    };
+    let server_fut = async {
+        let mut incoming = server::Connection::<_, Bytes>::new(transport_server.next().await)
+            .await
+            .unwrap();
+        let mut resolver = incoming.accept().await.unwrap().unwrap();
+        let frame = future::poll_fn(|cx| resolver.frame_stream.poll_next(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        let Frame::Headers(mut encoded) = frame else {
+            panic!("request did not start with HEADERS");
         };
-
-        let server_fut = async {
-            let mut incoming = server::builder()
-                .send_grease(false)
-                .build(transport_server.next().await)
-                .await
-                .unwrap();
-            let decoder = qpack::Decoder::new(0, 0).unwrap();
-
-            for request_index in 0..3 {
-                // Inspect the field section before HeaderMap discards its wire order.
-                let mut resolver = incoming.accept().await.unwrap().unwrap();
-                let frame = future::poll_fn(|cx| resolver.frame_stream.poll_next(cx))
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let Frame::Headers(encoded) = &frame else {
-                    panic!("request did not start with HEADERS");
-                };
-                let decoded = decoder.decode_header(&mut encoded.clone()).unwrap();
-                assert!(!decoded.dyn_ref);
-                let names = decoded
-                    .fields
-                    .iter()
-                    .map(|field| std::str::from_utf8(field.name.as_ref()).unwrap())
-                    .collect::<Vec<_>>();
-                let expected = match (custom, request_index == 2) {
-                    (false, false) => {
-                        vec![":method", ":scheme", ":authority", ":path", "x-order-test"]
-                    }
-                    (true, false) => {
-                        vec![":path", ":authority", ":method", ":scheme", "x-order-test"]
-                    }
-                    (false, true) => vec![":method", ":authority", "x-order-test"],
-                    (true, true) => vec![":authority", ":method", "x-order-test"],
-                };
-                assert_eq!(names, expected);
-
-                let (_, mut stream) = resolver
-                    .accept_with_frame(Ok(Some(frame)))
-                    .unwrap()
-                    .resolve()
-                    .await
-                    .unwrap();
-                stream.send_response(Response::new(())).await.unwrap();
-                stream.finish().await.unwrap();
-            }
-            let error = match incoming.accept().await {
-                Err(error) => error,
-                Ok(_) => panic!("server accepted another request"),
-            };
-            assert!(error.is_h3_no_error(), "{error:?}");
-        };
-
-        tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(server_fut, client_fut);
-        })
-        .await
-        .expect("pseudo-order requests timed out");
-    }
+        qpack::Decoder::new(0, 0)
+            .unwrap()
+            .decode_header(&mut encoded)
+            .unwrap()
+            .fields
+    };
+    let (_, fields) =
+        tokio::time::timeout(Duration::from_secs(5), future::join(client_fut, server_fut))
+            .await
+            .unwrap();
+    let names: Vec<_> = fields.iter().map(|field| field.name.as_ref()).collect();
+    assert_eq!(
+        names,
+        [":path", ":method", ":scheme", ":authority", "x-order-test"].map(str::as_bytes)
+    );
 }
 
 #[tokio::test]
@@ -808,12 +742,7 @@ async fn client_dynamic_qpack_request_round_trip() {
         let mut builder = client::builder();
         builder
             .qpack_encoder_table_capacity(TABLE_CAPACITY as usize)
-            .send_grease(false)
-            .pseudo_order(
-                PseudoOrder::builder()
-                    .extend([PseudoId::Path, PseudoId::Authority, PseudoId::Method])
-                    .build(),
-            );
+            .send_grease(false);
         let (mut driver, mut send) = builder
             .build::<_, _, Bytes>(pair.client().await)
             .await
@@ -835,7 +764,6 @@ async fn client_dynamic_qpack_request_round_trip() {
         })
         .await;
 
-        let mut cloned = send.clone();
         for request_index in 0..2 {
             if request_index == 1 {
                 future::poll_fn(|cx| {
@@ -852,21 +780,15 @@ async fn client_dynamic_qpack_request_round_trip() {
             }
 
             let mut request = Box::pin(async {
-                let mut request = Request::get("http://localhost/dynamic")
-                    .header("x-repeated", "stable-value")
-                    .body(())
-                    .unwrap();
-                request.extensions_mut().insert(
-                    PseudoOrder::builder()
-                        .extend([PseudoId::Scheme, PseudoId::Method])
-                        .build(),
-                );
-                let sender = if request_index == 0 {
-                    &mut send
-                } else {
-                    &mut cloned
-                };
-                let mut stream = sender.send_request(request).await.expect("send request");
+                let mut stream = send
+                    .send_request(
+                        Request::get("http://localhost/dynamic")
+                            .header("x-repeated", "stable-value")
+                            .body(())
+                            .unwrap(),
+                    )
+                    .await
+                    .expect("send request");
                 stream.finish().await.expect("finish request");
                 let response = stream.recv_response().await.expect("receive response");
                 assert_eq!(response.status(), StatusCode::OK);
@@ -883,7 +805,7 @@ async fn client_dynamic_qpack_request_round_trip() {
             .await;
         }
 
-        drop((send, cloned));
+        drop(send);
         driver.inner.handle_connection_error(
             crate::error::internal_error::InternalConnectionError::new(
                 Code::H3_NO_ERROR,
@@ -902,42 +824,11 @@ async fn client_dynamic_qpack_request_round_trip() {
             .await
             .expect("server init");
 
-        let decoder = incoming.inner.dynamic_qpack_decoder().unwrap();
-        for request_index in 0..2 {
-            let mut resolver = incoming
-                .accept()
-                .await
-                .expect("accept dynamic request")
-                .expect("request stream");
-            let frame = future::poll_fn(|cx| resolver.frame_stream.poll_next(cx))
-                .await
-                .unwrap()
-                .unwrap();
-            let Frame::Headers(encoded) = &frame else {
-                panic!("request did not start with HEADERS");
-            };
-            let mut encoded = encoded.clone();
-            let mut prefix = None;
-            let decoded = future::poll_fn(|cx| {
-                decoder.poll_decode_field_section(cx, &mut encoded, u64::MAX, &mut prefix)
-            })
-            .await
-            .unwrap();
-            assert_eq!(decoded.dyn_ref, request_index == 1);
-            let names = decoded
-                .fields
-                .iter()
-                .map(|field| std::str::from_utf8(field.name.as_ref()).unwrap())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                names,
-                vec![":path", ":authority", ":method", ":scheme", "x-repeated"]
-            );
-
+        for _ in 0..2 {
+            let resolver = incoming.accept().await.expect("accept dynamic request");
             let (request, mut stream) = resolver
-                .accept_with_frame(Ok(Some(frame)))
-                .unwrap()
-                .resolve()
+                .expect("request stream")
+                .resolve_request()
                 .await
                 .expect("decode dynamic request");
             assert_eq!(request.headers()["x-repeated"], "stable-value");
