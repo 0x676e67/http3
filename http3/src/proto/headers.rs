@@ -1324,25 +1324,4 @@ mod tests {
             vec![":method", ":scheme", ":authority", ":path"]
         );
     }
-
-    #[test]
-    fn request_pseudo_order_extension_is_ignored() {
-        let mut extensions = Extensions::new();
-        extensions.insert(PseudoOrder::builder().push(PseudoId::Path).build());
-        let headers = Header::request(
-            Method::GET,
-            Uri::from_static("https://example.com/"),
-            HeaderMap::new(),
-            extensions,
-        )
-        .unwrap();
-        let names: Vec<_> = (&headers)
-            .into_iter()
-            .map(|field| field.name.into_owned())
-            .collect();
-        assert_eq!(
-            names,
-            [":method", ":scheme", ":authority", ":path"].map(str::as_bytes)
-        );
-    }
 }

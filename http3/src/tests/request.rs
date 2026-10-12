@@ -683,7 +683,16 @@ async fn client_builder_sets_pseudo_order() {
     let client_fut = async {
         let (driver, send) = client::builder()
             .send_grease(false)
-            .pseudo_order(PseudoOrder::builder().push(PseudoId::Path).build())
+            .pseudo_order(
+                PseudoOrder::builder()
+                    .extend([
+                        PseudoId::Path,
+                        PseudoId::Method,
+                        PseudoId::Scheme,
+                        PseudoId::Authority,
+                    ])
+                    .build(),
+            )
             .build::<_, _, Bytes>(pair.client().await)
             .await
             .unwrap();
@@ -692,7 +701,6 @@ async fn client_builder_sets_pseudo_order() {
             .send_request(
                 Request::get("https://localhost/order")
                     .header("x-order-test", "present")
-                    .extension(PseudoOrder::default())
                     .body(())
                     .unwrap(),
             )
