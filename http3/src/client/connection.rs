@@ -15,6 +15,7 @@ use tracing::{info, instrument, trace};
 
 use super::stream::RequestStream;
 use crate::{
+    PseudoOrder,
     connection::{self, ConnectionInner},
     error::{
         Code, ConnectionError, StreamError, connection_error_creators::CloseStream,
@@ -139,6 +140,7 @@ where
     pub(super) _buf: PhantomData<fn(B)>,
     pub(super) send_grease_frame: bool,
     pub(super) qpack_encode_buffer: BytesMut,
+    pub(super) pseudo_order: Option<PseudoOrder>,
 }
 
 impl<T, B> ConnectionState for SendRequest<T, B>
@@ -181,11 +183,14 @@ where
             extensions,
             ..
         } = parts;
-        let headers = Header::request(method, uri, headers, extensions).map_err(|error| {
+        let mut headers = Header::request(method, uri, headers, extensions).map_err(|error| {
             StreamError::InvalidRequest {
                 reason: error.to_string().into_boxed_str(),
             }
         })?;
+        if let Some(order) = &self.pseudo_order {
+            headers.set_pseudo_order(order.clone());
+        }
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
         //= type=TODO
@@ -372,6 +377,7 @@ where
             // Encoding buffers are worker-local mutable state. Sharing their
             // allocation would add synchronization to the request hot path.
             qpack_encode_buffer: BytesMut::new(),
+            pseudo_order: self.pseudo_order.clone(),
         }
     }
 }
@@ -818,6 +824,7 @@ mod integration_tests {
             _buf: PhantomData,
             send_grease_frame: false,
             qpack_encode_buffer: BytesMut::new(),
+            pseudo_order: None,
         }
     }
 

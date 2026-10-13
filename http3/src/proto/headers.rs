@@ -47,6 +47,8 @@ define_enum_with_values! {
 ///
 /// Typically, a `PseudoOrder` is constructed using the [`PseudoOrderBuilder`] to enforce uniqueness
 /// and correct ordering.
+/// Apply it with [`crate::client::Builder::pseudo_order`] to configure all requests
+/// on a connection. Storing this value in request extensions has no effect.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct PseudoOrder {
     ids: [PseudoId; PseudoId::DEFAULT_STACK_SIZE],
@@ -655,8 +657,6 @@ impl Pseudo {
         //# All HTTP/3 requests MUST include exactly one value for the :method,
         //# :scheme, and :path pseudo-header fields, unless the request is a
         //# CONNECT request; see Section 4.4.
-        // Extract pseudo-header order from extensions, if provided.
-        let order = ext.get::<PseudoOrder>().cloned();
         let sensitive = ext
             .get::<PseudoHeaderSensitivity>()
             .copied()
@@ -670,7 +670,7 @@ impl Pseudo {
             path,
             status: None,
             protocol,
-            order,
+            order: None,
             sensitive,
             len,
         }

@@ -13,7 +13,7 @@ use crate::{
     proto::{
         coding::Encode,
         frame::{self, Frame, FrameType},
-        headers::Header,
+        headers::{Header, PseudoId, PseudoOrder},
         push::PushId,
         stream::StreamType,
         varint::VarInt,
@@ -674,6 +674,68 @@ async fn get() {
     };
 
     tokio::join!(server_fut, client_fut);
+}
+
+#[tokio::test]
+async fn client_builder_sets_pseudo_order() {
+    let mut pair = Pair::default();
+    let mut transport_server = pair.server();
+    let client_fut = async {
+        let (driver, send) = client::builder()
+            .send_grease(false)
+            .pseudo_order(
+                PseudoOrder::builder()
+                    .extend([
+                        PseudoId::Path,
+                        PseudoId::Method,
+                        PseudoId::Scheme,
+                        PseudoId::Authority,
+                    ])
+                    .build(),
+            )
+            .build::<_, _, Bytes>(pair.client().await)
+            .await
+            .unwrap();
+        let stream = send
+            .clone()
+            .send_request(
+                Request::get("https://localhost/order")
+                    .header("x-order-test", "present")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The join retains these until the peer has read the field section.
+        (driver, stream)
+    };
+    let server_fut = async {
+        let mut incoming = server::Connection::<_, Bytes>::new(transport_server.next().await)
+            .await
+            .unwrap();
+        let mut resolver = incoming.accept().await.unwrap().unwrap();
+        let frame = future::poll_fn(|cx| resolver.frame_stream.poll_next(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        let Frame::Headers(mut encoded) = frame else {
+            panic!("request did not start with HEADERS");
+        };
+        qpack::Decoder::new(0, 0)
+            .unwrap()
+            .decode_header(&mut encoded)
+            .unwrap()
+            .fields
+    };
+    let (_, fields) =
+        tokio::time::timeout(Duration::from_secs(5), future::join(client_fut, server_fut))
+            .await
+            .unwrap();
+    let names: Vec<_> = fields.iter().map(|field| field.name.as_ref()).collect();
+    assert_eq!(
+        names,
+        [":path", ":method", ":scheme", ":authority", "x-order-test"].map(str::as_bytes)
+    );
 }
 
 #[tokio::test]

@@ -6,6 +6,7 @@ use bytes::{Buf, Bytes, BytesMut};
 
 use super::connection::{Connection, SendRequest};
 use crate::{
+    PseudoOrder,
     config::Config,
     connection::ConnectionInner,
     error::ConnectionError,
@@ -57,12 +58,14 @@ where
 /// ```
 pub struct Builder {
     config: Config,
+    pseudo_order: Option<PseudoOrder>,
 }
 
 impl Builder {
     pub(super) fn new() -> Self {
         Builder {
             config: Default::default(),
+            pseudo_order: None,
         }
     }
 
@@ -218,6 +221,7 @@ impl Builder {
             max_qpack_decode_buffer_size: self.config.qpack_decode_buffer_size,
             send_grease_frame: self.config.send_grease,
             qpack_encode_buffer: BytesMut::new(),
+            pseudo_order: self.pseudo_order.clone(),
             _buf: PhantomData,
         };
 
@@ -229,5 +233,33 @@ impl Builder {
             },
             send_request,
         ))
+    }
+
+    /// Sets the pseudo-header order for every request on connections built by this builder.
+    ///
+    /// Without this setting, requests use [`PseudoOrder::default`]: `:method`,
+    /// `:scheme`, `:authority`, `:path`, then `:protocol`. Fields absent from a
+    /// request are skipped. All pseudo-headers precede regular fields, as
+    /// required by [RFC 9114 Section 4.3].
+    ///
+    /// This is a local encoding preference, not an HTTP/3 SETTINGS parameter.
+    /// A `PseudoOrder` in request extensions is ignored; configure it here instead.
+    /// Changing this builder does not affect connections already built from it.
+    ///
+    /// [RFC 9114 Section 4.3]: https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3
+    ///
+    /// ```
+    /// use http3::{PseudoId, PseudoOrder, client};
+    ///
+    /// let mut builder = client::builder();
+    /// builder.pseudo_order(
+    ///     PseudoOrder::builder()
+    ///         .extend([PseudoId::Method, PseudoId::Authority, PseudoId::Scheme, PseudoId::Path])
+    ///         .build(),
+    /// );
+    /// ```
+    pub fn pseudo_order(&mut self, order: PseudoOrder) -> &mut Self {
+        self.pseudo_order = Some(order);
+        self
     }
 }
