@@ -12,7 +12,7 @@ build = "build.rs"
 [dependencies]
 anyhow = { workspace = true }
 # Match the AWS-LC versions used by the published ngtcp2 0.2.0 bindings.
-aws-lc-rs = "=1.18.1"
+aws-lc-rs = "=1.18.2"
 aws-lc-sys = { version = "=0.43.0", features = ["ssl"] }
 bytesize = "2.7.0"
 bytes = { workspace = true }
