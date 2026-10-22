@@ -619,6 +619,18 @@ impl Settings {
             return Err(SettingsError::InvalidSettingValue(id, value));
         }
 
+        // These settings only take 0 or 1; a peer sending anything else gets H3_SETTINGS_ERROR.
+        // https://www.rfc-editor.org/rfc/rfc9297.html#section-2.1.1
+        // https://www.rfc-editor.org/rfc/rfc8441.html#section-3, reused by
+        // https://www.rfc-editor.org/rfc/rfc9220.html#section-3
+        let boolean = matches!(
+            id,
+            SettingId::H3_DATAGRAM | SettingId::ENABLE_CONNECT_PROTOCOL
+        );
+        if boolean && value > 1 {
+            return Err(SettingsError::InvalidSettingValue(id, value));
+        }
+
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
         //# The same setting identifier MUST NOT occur more than once in the
         //# SETTINGS frame.
