@@ -1557,7 +1557,7 @@ dependencies = [
 
 [[package]]
 name = "http3"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "assert_matches",
  "bytes",
@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "http3-datagram"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "http3",
@@ -1588,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "http3-quic"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "futures-util",
