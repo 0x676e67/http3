@@ -64,11 +64,6 @@ const PUBLIC_SERVER_TARGETS: &[PublicServerTarget] = &[
         concurrency: CONCURRENCY_1_5_10,
     },
     PublicServerTarget {
-        name: "impersonate",
-        uri: "https://fp.impersonate.pro/api/http3",
-        concurrency: CONCURRENCY_1_5_10,
-    },
-    PublicServerTarget {
         name: "cloudflare",
         uri: "https://cloudflare-quic.com",
         concurrency: CONCURRENCY_1_5_10,
