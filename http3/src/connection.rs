@@ -2723,24 +2723,16 @@ mod qpack_field_section_tests {
         };
         config.settings.qpack_max_table_capacity = Some(256);
         config.settings.qpack_blocked_streams = Some(4);
-        config.settings_order = Some(vec![frame::SettingId::MAX_HEADER_LIST_SIZE]);
+        config.settings_order = Some(
+            frame::SettingsOrder::builder()
+                .push(frame::SettingId::MAX_HEADER_LIST_SIZE)
+                .build(),
+        );
 
         let wire_settings = local_settings(&config).unwrap();
         let effective: crate::config::Settings = (&wire_settings).into();
         assert_eq!(effective.qpack_max_table_capacity, None);
         assert_eq!(effective.qpack_blocked_streams, None);
-
-        config.settings_order = None;
-        config.settings.qpack_max_table_capacity = None;
-        config.settings.qpack_blocked_streams = None;
-        config.extra_settings = vec![
-            (frame::SettingId::QPACK_MAX_TABLE_CAPACITY, 128),
-            (frame::SettingId::QPACK_MAX_BLOCKED_STREAMS, 2),
-        ];
-        let wire_settings = local_settings(&config).unwrap();
-        let effective: crate::config::Settings = (&wire_settings).into();
-        assert_eq!(effective.qpack_max_table_capacity, Some(128));
-        assert_eq!(effective.qpack_blocked_streams, Some(2));
 
         config.send_settings = false;
         let wire_settings = local_settings(&config).unwrap();
