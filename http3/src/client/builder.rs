@@ -5,12 +5,14 @@ use std::marker::PhantomData;
 use bytes::{Buf, Bytes, BytesMut};
 
 use super::connection::{Connection, SendRequest};
+#[cfg(feature = "unstable")]
+use crate::proto::frame::ExperimentalSettings;
 use crate::{
     PseudoOrder,
     config::Config,
     connection::ConnectionInner,
     error::ConnectionError,
-    proto::frame::SettingId,
+    proto::frame::SettingsOrder,
     quic::{self},
 };
 
@@ -178,25 +180,67 @@ impl Builder {
         self
     }
 
-    /// Set the exact order of settings in the SETTINGS frame.
+    /// Sets the exact order of the SETTINGS frame sent by this client.
     ///
-    /// Each `SettingId` in the list will be encoded in that order. Values are
-    /// resolved from known config settings (e.g. `max_field_section_size`) or
-    /// from entries added via [`extra_setting`](Self::extra_setting).
+    /// Only identifiers in `order` are sent, in that order. Values come from the
+    /// typed builder methods (e.g. [`max_field_section_size`](Self::max_field_section_size))
+    /// or from experimental settings (`unstable` feature); identifiers without a
+    /// value are skipped. Without an order, known settings use the default order
+    /// and experimental settings follow them.
     ///
     /// When `send_grease` is enabled (the default), a GREASE entry is always
-    /// appended after all ordered settings — do not include it in this list.
-    pub fn settings_order(&mut self, order: Vec<SettingId>) -> &mut Self {
+    /// appended after the ordered settings — do not include it in `order`.
+    ///
+    /// ```
+    /// use http3::{SettingId, SettingsOrder, client};
+    ///
+    /// let mut builder = client::builder();
+    /// builder.settings_order(
+    ///     SettingsOrder::builder()
+    ///         .extend([
+    ///             SettingId::QPACK_MAX_TABLE_CAPACITY,
+    ///             SettingId::MAX_HEADER_LIST_SIZE,
+    ///             SettingId::QPACK_MAX_BLOCKED_STREAMS,
+    ///             SettingId::H3_DATAGRAM,
+    ///         ])
+    ///         .build(),
+    /// );
+    /// ```
+    pub fn settings_order(&mut self, order: SettingsOrder) -> &mut Self {
         self.config.settings_order = Some(order);
         self
     }
 
-    /// Add an arbitrary (id, value) setting entry.
+    /// Sets extension settings not covered by the typed builder methods.
     ///
-    /// Used for browser-specific unknown settings, controlled GREASE, or any
-    /// setting ID not covered by the typed builder methods.
-    pub fn extra_setting(&mut self, id: SettingId, value: u64) -> &mut Self {
-        self.config.extra_settings.push((id, value));
+    /// Used for browser-specific settings or controlled GREASE. Replaces any
+    /// experimental settings set before. Identifiers and values must fit a QUIC
+    /// variable-length integer, or connection setup fails.
+    ///
+    /// With a [`settings_order`](Self::settings_order), an experimental setting
+    /// is sent only when its identifier is listed:
+    ///
+    /// ```
+    /// use http3::{ExperimentalSettings, SettingId, SettingsOrder, client};
+    ///
+    /// let datagram = SettingId::H3_SETTING_ENABLE_DATAGRAM_CHROME_SPECIFIC;
+    /// let mut builder = client::builder();
+    /// builder
+    ///     .experimental_settings(ExperimentalSettings::builder().push(datagram, 1).build())
+    ///     .settings_order(
+    ///         SettingsOrder::builder()
+    ///             .extend([SettingId::MAX_HEADER_LIST_SIZE, datagram])
+    ///             .build(),
+    ///     );
+    /// ```
+    //
+    // - Experimental feature – subject to removal without notice
+    #[cfg(feature = "unstable")]
+    pub fn experimental_settings(
+        &mut self,
+        experimental_settings: ExperimentalSettings,
+    ) -> &mut Self {
+        self.config.experimental_settings = experimental_settings;
         self
     }
 

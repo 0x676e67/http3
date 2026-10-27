@@ -4,6 +4,7 @@ use std::{
 };
 
 use bytes::{Buf, BufMut, Bytes, buf::Take};
+use smallvec::SmallVec;
 #[cfg(feature = "tracing")]
 use tracing::trace;
 
@@ -513,6 +514,17 @@ pub struct SettingId(pub u64);
 impl SettingId {
     const NONE: SettingId = SettingId(0);
 
+    /// Known identifiers in the order sent when no [`SettingsOrder`] is configured.
+    pub(crate) const DEFAULT_IDS: [SettingId; 7] = [
+        SettingId::MAX_HEADER_LIST_SIZE,
+        SettingId::ENABLE_CONNECT_PROTOCOL,
+        SettingId::ENABLE_WEBTRANSPORT,
+        SettingId::H3_DATAGRAM,
+        SettingId::WEBTRANSPORT_MAX_SESSIONS,
+        SettingId::QPACK_MAX_TABLE_CAPACITY,
+        SettingId::QPACK_MAX_BLOCKED_STREAMS,
+    ];
+
     /// Returns a SettingId with a random number of the `0x1f * N + 0x21`
     /// format. The multiplier N is bounded to a u32, matching Chromium's
     /// GREASE setting ID generation.
@@ -588,6 +600,142 @@ setting_identifiers! {
     H3_SETTING_ENABLE_DATAGRAM_CHROME_SPECIFIC = 0xFFD277,
     /// <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-8.2>
     WEBTRANSPORT_MAX_SESSIONS = 0x2b603743,
+}
+
+/// Represents the order of identifiers in the SETTINGS frame sent by a client.
+///
+/// The order is exact: identifiers that are not listed are not sent, so known
+/// settings advertised by default can be left out to match a specific client.
+/// Apply it with [`crate::client::Builder::settings_order`].
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct SettingsOrder {
+    ids: SmallVec<[SettingId; SettingId::DEFAULT_IDS.len()]>,
+}
+
+/// A builder for constructing a [`SettingsOrder`].
+#[derive(Debug)]
+pub struct SettingsOrderBuilder {
+    ids: SmallVec<[SettingId; SettingId::DEFAULT_IDS.len()]>,
+}
+
+/// Extension settings sent in the SETTINGS frame of a client.
+///
+/// Holds identifiers without a typed builder method, such as browser-specific
+/// settings or controlled GREASE. Known identifiers are configured through their
+/// builder methods, and reserved HTTP/2 identifiers must never be sent, so both
+/// are ignored. Apply it with [`crate::client::Builder::experimental_settings`].
+#[cfg(feature = "unstable")]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct ExperimentalSettings {
+    settings: SmallVec<[(SettingId, u64); SettingId::DEFAULT_IDS.len()]>,
+}
+
+/// A builder for constructing [`ExperimentalSettings`].
+#[cfg(feature = "unstable")]
+#[derive(Debug)]
+pub struct ExperimentalSettingsBuilder {
+    settings: SmallVec<[(SettingId, u64); SettingId::DEFAULT_IDS.len()]>,
+}
+
+impl SettingsOrder {
+    /// Creates a new [`SettingsOrderBuilder`].
+    #[inline]
+    pub fn builder() -> SettingsOrderBuilder {
+        SettingsOrderBuilder {
+            ids: SmallVec::new(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a SettingsOrder {
+    type Item = &'a SettingId;
+    type IntoIter = std::slice::Iter<'a, SettingId>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.ids.iter()
+    }
+}
+
+impl SettingsOrderBuilder {
+    /// Pushes a setting ID to the order, ignoring duplicates.
+    pub fn push(mut self, id: SettingId) -> Self {
+        if !self.ids.contains(&id) {
+            self.ids.push(id);
+        }
+        self
+    }
+
+    /// Extends the order with multiple setting IDs.
+    pub fn extend(mut self, iter: impl IntoIterator<Item = SettingId>) -> Self {
+        for id in iter {
+            self = self.push(id);
+        }
+        self
+    }
+
+    /// Builds the [`SettingsOrder`].
+    pub fn build(self) -> SettingsOrder {
+        SettingsOrder { ids: self.ids }
+    }
+}
+
+#[cfg(feature = "unstable")]
+impl ExperimentalSettings {
+    /// Creates a new [`ExperimentalSettingsBuilder`].
+    #[inline]
+    pub fn builder() -> ExperimentalSettingsBuilder {
+        ExperimentalSettingsBuilder {
+            settings: SmallVec::new(),
+        }
+    }
+
+    pub(crate) fn get(&self, id: SettingId) -> Option<u64> {
+        self.settings
+            .iter()
+            .find(|(entry_id, _)| *entry_id == id)
+            .map(|(_, value)| *value)
+    }
+}
+
+#[cfg(feature = "unstable")]
+impl<'a> IntoIterator for &'a ExperimentalSettings {
+    type Item = &'a (SettingId, u64);
+    type IntoIter = std::slice::Iter<'a, (SettingId, u64)>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.settings.iter()
+    }
+}
+
+#[cfg(feature = "unstable")]
+impl ExperimentalSettingsBuilder {
+    /// Pushes a setting, ignoring known, reserved, and duplicate identifiers.
+    pub fn push(mut self, id: SettingId, value: u64) -> Self {
+        let ignored = id.is_supported()
+            || id.is_forbidden()
+            || self.settings.iter().any(|(entry_id, _)| *entry_id == id);
+        if !ignored {
+            self.settings.push((id, value));
+        }
+        self
+    }
+
+    /// Extends the settings with multiple `(id, value)` pairs.
+    pub fn extend(mut self, iter: impl IntoIterator<Item = (SettingId, u64)>) -> Self {
+        for (id, value) in iter {
+            self = self.push(id, value);
+        }
+        self
+    }
+
+    /// Builds the [`ExperimentalSettings`].
+    pub fn build(self) -> ExperimentalSettings {
+        ExperimentalSettings {
+            settings: self.settings,
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq)]

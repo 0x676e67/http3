@@ -17,17 +17,14 @@ pub struct Config {
     #[cfg(test)]
     pub(crate) send_settings: bool,
 
-    /// When set, controls the exact order of settings in the SETTINGS frame.
-    /// Each entry in the list specifies a SettingId whose value will be resolved
-    /// from known settings fields or `extra_settings`. When `None`, the default
-    /// insertion order is used.
-    pub(crate) settings_order: Option<Vec<frame::SettingId>>,
+    /// Exact order of the local SETTINGS frame. When `None`, known settings use
+    /// `SettingId::DEFAULT_IDS` and experimental settings follow them.
+    pub(crate) settings_order: Option<frame::SettingsOrder>,
 
-    /// Arbitrary (id, value) setting entries for browser-specific unknown settings
-    /// or controlled GREASE. These are used when `settings_order` references IDs
-    /// not covered by the known `Settings` fields, or appended at the end in
-    /// default mode.
-    pub(crate) extra_settings: Vec<(frame::SettingId, u64)>,
+    /// Extension settings without a typed field, such as browser-specific
+    /// settings or controlled GREASE.
+    #[cfg(feature = "unstable")]
+    pub(crate) experimental_settings: frame::ExperimentalSettings,
 
     /// Maximum compressed QPACK input retained while decoding one field
     /// section or encoder-stream string.
@@ -116,7 +113,7 @@ impl From<&frame::Settings> for Settings {
 
 impl Config {
     /// Resolve the value for a given setting ID from known settings fields
-    /// or extra_settings.
+    /// or experimental settings.
     fn resolve_setting_value(&self, id: &frame::SettingId) -> Option<u64> {
         match *id {
             frame::SettingId::MAX_HEADER_LIST_SIZE => Some(self.settings.max_field_section_size),
@@ -130,11 +127,10 @@ impl Config {
             }
             frame::SettingId::QPACK_MAX_TABLE_CAPACITY => self.settings.qpack_max_table_capacity,
             frame::SettingId::QPACK_MAX_BLOCKED_STREAMS => self.settings.qpack_blocked_streams,
-            _ => self
-                .extra_settings
-                .iter()
-                .find(|(sid, _)| sid == id)
-                .map(|(_, v)| *v),
+            #[cfg(feature = "unstable")]
+            _ => self.experimental_settings.get(*id),
+            #[cfg(not(feature = "unstable"))]
+            _ => None,
         }
     }
 }
@@ -144,44 +140,20 @@ impl TryFrom<Config> for frame::Settings {
     fn try_from(value: Config) -> Result<Self, Self::Error> {
         let mut settings = frame::Settings::default();
 
-        if let Some(ref order) = value.settings_order {
-            // Impersonation mode: insert settings in the exact specified order.
-            for id in order {
-                if let Some(val) = value.resolve_setting_value(id) {
-                    settings.insert(*id, val)?;
-                }
+        let ids = match &value.settings_order {
+            Some(order) => order.into_iter(),
+            None => frame::SettingId::DEFAULT_IDS.iter(),
+        };
+        for id in ids {
+            if let Some(val) = value.resolve_setting_value(id) {
+                settings.insert(*id, val)?;
             }
-        } else {
-            // Default mode: existing behavior.
-            settings.insert(
-                frame::SettingId::MAX_HEADER_LIST_SIZE,
-                value.settings.max_field_section_size,
-            )?;
-            settings.insert(
-                frame::SettingId::ENABLE_CONNECT_PROTOCOL,
-                value.settings.enable_extended_connect as u64,
-            )?;
-            settings.insert(
-                frame::SettingId::ENABLE_WEBTRANSPORT,
-                value.settings.enable_webtransport as u64,
-            )?;
-            settings.insert(
-                frame::SettingId::H3_DATAGRAM,
-                value.settings.enable_datagram as u64,
-            )?;
-            settings.insert(
-                frame::SettingId::WEBTRANSPORT_MAX_SESSIONS,
-                value.settings.max_webtransport_sessions,
-            )?;
-            if let Some(value) = value.settings.qpack_max_table_capacity {
-                settings.insert(frame::SettingId::QPACK_MAX_TABLE_CAPACITY, value)?;
-            }
-            if let Some(value) = value.settings.qpack_blocked_streams {
-                settings.insert(frame::SettingId::QPACK_MAX_BLOCKED_STREAMS, value)?;
-            }
+        }
 
-            // Append extra settings at the end in default mode
-            for (id, val) in &value.extra_settings {
+        // Without an explicit order, experimental settings follow the known ones.
+        #[cfg(feature = "unstable")]
+        if value.settings_order.is_none() {
+            for (id, val) in &value.experimental_settings {
                 settings.insert(*id, *val)?;
             }
         }
@@ -264,10 +236,98 @@ impl Default for Config {
             #[cfg(test)]
             send_settings: true,
             settings_order: None,
-            extra_settings: Vec::new(),
+            #[cfg(feature = "unstable")]
+            experimental_settings: Default::default(),
             qpack_decode_buffer_size: DEFAULT_QPACK_DECODE_BUFFER_SIZE,
             qpack_encoder_table_capacity: 0,
             settings: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::frame::SettingId;
+
+    fn settings(entries: &[(SettingId, u64)]) -> frame::Settings {
+        let mut settings = frame::Settings::default();
+        for &(id, value) in entries {
+            settings.insert(id, value).unwrap();
+        }
+        settings
+    }
+
+    #[test]
+    fn settings_frame_follows_configured_order() {
+        let mut config = Config {
+            send_grease: false,
+            ..Config::default()
+        };
+        config.settings.qpack_max_table_capacity = Some(64);
+
+        assert_eq!(
+            frame::Settings::try_from(config.clone()).unwrap(),
+            settings(&[
+                (SettingId::MAX_HEADER_LIST_SIZE, VarInt::MAX.0),
+                (SettingId::ENABLE_CONNECT_PROTOCOL, 0),
+                (SettingId::ENABLE_WEBTRANSPORT, 0),
+                (SettingId::H3_DATAGRAM, 0),
+                (SettingId::WEBTRANSPORT_MAX_SESSIONS, 0),
+                (SettingId::QPACK_MAX_TABLE_CAPACITY, 64),
+            ])
+        );
+
+        // Only listed settings with a value are sent, each once.
+        config.settings_order = Some(
+            frame::SettingsOrder::builder()
+                .extend([
+                    SettingId::QPACK_MAX_TABLE_CAPACITY,
+                    SettingId::QPACK_MAX_BLOCKED_STREAMS,
+                    SettingId::MAX_HEADER_LIST_SIZE,
+                    SettingId::QPACK_MAX_TABLE_CAPACITY,
+                ])
+                .build(),
+        );
+        assert_eq!(
+            frame::Settings::try_from(config).unwrap(),
+            settings(&[
+                (SettingId::QPACK_MAX_TABLE_CAPACITY, 64),
+                (SettingId::MAX_HEADER_LIST_SIZE, VarInt::MAX.0),
+            ])
+        );
+    }
+
+    #[cfg(feature = "unstable")]
+    #[test]
+    fn experimental_settings_skip_known_reserved_and_duplicate_ids() {
+        let chrome_datagram = SettingId::H3_SETTING_ENABLE_DATAGRAM_CHROME_SPECIFIC;
+        let mut config = Config {
+            send_grease: false,
+            experimental_settings: frame::ExperimentalSettings::builder()
+                .push(chrome_datagram, 1)
+                .push(chrome_datagram, 2)
+                .push(SettingId::QPACK_MAX_BLOCKED_STREAMS, 9)
+                .push(SettingId(0x02), 1)
+                .build(),
+            ..Config::default()
+        };
+
+        let wire = frame::Settings::try_from(config.clone()).unwrap();
+        assert_eq!(wire.get(chrome_datagram), Some(1));
+        assert_eq!(wire.get(SettingId::QPACK_MAX_BLOCKED_STREAMS), None);
+
+        config.settings_order = Some(
+            frame::SettingsOrder::builder()
+                .extend([chrome_datagram, SettingId::MAX_HEADER_LIST_SIZE])
+                .build(),
+        );
+        assert_eq!(
+            frame::Settings::try_from(config).unwrap(),
+            settings(&[
+                (chrome_datagram, 1),
+                (SettingId::MAX_HEADER_LIST_SIZE, VarInt::MAX.0),
+            ])
+        );
     }
 }

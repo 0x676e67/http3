@@ -55,8 +55,10 @@ mod stream;
 #[cfg(not(feature = "unstable"))]
 mod webtransport;
 
+#[cfg(feature = "unstable")]
+pub use proto::frame::{ExperimentalSettings, ExperimentalSettingsBuilder};
 pub use proto::{
-    frame::SettingId,
+    frame::{SettingId, SettingsOrder, SettingsOrderBuilder},
     headers::{PseudoHeaderSensitivity, PseudoId, PseudoOrder, PseudoOrderBuilder},
 };
 
