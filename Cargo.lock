@@ -2148,8 +2148,6 @@ dependencies = [
 [[package]]
 name = "nghttp3-sys"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e9412a5b9f3ad9e170e085ee9e511986a8e83425bebd48987a518a3204a3eef"
 dependencies = [
  "bindgen",
  "cmake",
@@ -2159,8 +2157,6 @@ dependencies = [
 [[package]]
 name = "ngtcp2"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26c4d99b3a4ab6b958a5958fdd1f241ddb0334dcc6e8853e6222d0b329739685"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys 0.43.0",
@@ -2173,8 +2169,6 @@ dependencies = [
 [[package]]
 name = "ngtcp2-sys"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf62d961ed1802863baa278374a3293e748f27eb2b88a245ceb8f950a2ace287"
 dependencies = [
  "aws-lc-sys 0.43.0",
  "bindgen",
@@ -3878,8 +3872,6 @@ dependencies = [
 [[package]]
 name = "tokio-ngtcp2"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f259f208721cee4013ce25b08399df1823f048a3afe8a1491bd4d1980d34d03"
 dependencies = [
  "ngtcp2",
  "tokio",

@@ -15,7 +15,7 @@ use crate::{
     frame::FrameStream,
     proto::{
         coding::Encode,
-        frame::{Frame, FrameHeader, Settings},
+        frame::{Frame, FrameHeader, RequestPriorityUpdate, Settings},
         stream::StreamType,
         varint::VarInt,
     },
@@ -271,6 +271,26 @@ impl Encode for BidiStreamHeader {
                 StreamType::WEBTRANSPORT_BIDI.encode(buf);
                 session_id.encode(buf);
             }
+        }
+    }
+}
+
+impl<B> From<RequestPriorityUpdate> for WriteBuf<B>
+where
+    B: Buf,
+{
+    fn from(update: RequestPriorityUpdate) -> Self {
+        // Type and Length take at most two varints; either way the frame is one chunk, so it
+        // reaches the QUIC layer as a single write.
+        let max_len = update
+            .len()
+            .saturating_add(VarInt::MAX_SIZE.saturating_mul(2));
+        if max_len <= WRITE_BUF_ENCODE_SIZE {
+            let mut this = Self::inline(None);
+            this.encode_value(&update);
+            this
+        } else {
+            Self::heap(Self::encode_heap(&update, max_len), None)
         }
     }
 }
@@ -937,6 +957,8 @@ mod tests {
                 | Frame::PushPromise(_)
                 | Frame::Goaway(_)
                 | Frame::MaxPushId(_)
+                | Frame::PriorityUpdateRequest(_)
+                | Frame::PriorityUpdatePush(_)
                 | Frame::WebTransportStream(_)
                 | Frame::Grease => {}
             }
