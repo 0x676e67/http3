@@ -245,7 +245,7 @@ where
         //# A
         //# client MUST send only a single request on a given stream.
         let mut stream;
-        if let Some(encoder) = dynamic_encoder {
+        let (mut guard, block) = if let Some(encoder) = dynamic_encoder {
             // Dynamic references are tracked by the actual QUIC request stream
             // ID. Check the peer's limit before mutating the encoder table.
             let mem_size = headers
@@ -266,7 +266,7 @@ where
                 });
             }
             stream = Self::open_request_stream_with_state(&mut self.open, &self.conn_state).await?;
-            let mut guard =
+            let guard =
                 OpeningStream::<_, B>::new(&mut stream, self.decoder.as_ref(), &self.conn_state);
 
             let encoder_instructions_queued = match encoder.encode(
@@ -291,15 +291,7 @@ where
             if encoder_instructions_queued {
                 self.waker().wake();
             }
-
-            if let Some(value) = priority_update {
-                self.send_initial_priority(guard.stream.send_id(), value)?;
-            }
-            // Keep dynamic references tracked once encoding commits. A canceled
-            // write may already be peer-visible and can still produce a Section
-            // Acknowledgment or Stream Cancellation.
-            Self::write_headers(guard.stream, block, &self.conn_state).await?;
-            guard.complete = true;
+            (guard, block)
         } else {
             let mem_size = match qpack::encode_stateless(&mut self.qpack_encode_buffer, &headers) {
                 Ok(mem_size) => mem_size,
@@ -324,14 +316,32 @@ where
                 });
             }
             stream = Self::open_request_stream_with_state(&mut self.open, &self.conn_state).await?;
-            let mut guard =
+            let guard =
                 OpeningStream::<_, B>::new(&mut stream, self.decoder.as_ref(), &self.conn_state);
-            if let Some(value) = priority_update {
-                self.send_initial_priority(guard.stream.send_id(), value)?;
-            }
-            Self::write_headers(guard.stream, block, &self.conn_state).await?;
-            guard.complete = true;
+            (guard, block)
+        };
+
+        // The update goes right before HEADERS, usually in the same QUIC packet; its stream ID
+        // comes from a completed open, so it is within the peer's stream limit.
+        // https://www.rfc-editor.org/rfc/rfc9218.html#section-7.2
+        if let Some(value) = priority_update {
+            let update = RequestPriorityUpdate {
+                stream_id: guard.stream.send_id(),
+                value,
+            };
+            self.control_send.send_now(update).map_err(|error| {
+                let error = self.set_conn_error_and_wake(connection::critical_send_stream_error(
+                    error, "control",
+                ));
+                StreamError::ConnectionError(convert_to_connection_error(error))
+            })?;
         }
+        // Keep dynamic references tracked once encoding commits. A canceled
+        // write may already be peer-visible and can still produce a Section
+        // Acknowledgment or Stream Cancellation.
+        Self::write_headers(guard.stream, block, &self.conn_state).await?;
+        guard.complete = true;
+        drop(guard);
 
         let request_stream = RequestStream::new(connection::RequestStream::new(
             FrameStream::new(BufRecvStream::new(stream)),
@@ -344,25 +354,6 @@ where
         // send the grease frame only once
         self.send_grease_frame = false;
         Ok(request_stream)
-    }
-
-    /// Writes the initial PRIORITY_UPDATE right before the request's HEADERS.
-    ///
-    /// Both writes start in one poll, so they usually share a QUIC packet; http3-quic sends
-    /// the control stream first. The stream ID comes from a completed open, so it is within
-    /// the peer's stream limit.
-    /// See [RFC 9218, Section 7.2](https://www.rfc-editor.org/rfc/rfc9218.html#section-7.2).
-    fn send_initial_priority(
-        &self,
-        stream_id: StreamId,
-        value: ext::PriorityUpdate,
-    ) -> Result<(), StreamError> {
-        let update = RequestPriorityUpdate { stream_id, value };
-        self.control_send.send_now(update).map_err(|error| {
-            let error = self
-                .set_conn_error_and_wake(connection::critical_send_stream_error(error, "control"));
-            StreamError::ConnectionError(convert_to_connection_error(error))
-        })
     }
 
     async fn write_headers(
