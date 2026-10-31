@@ -63,6 +63,14 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3", default-features = false }
 tracing-tree = "0.4"
 
+# Build the ngtcp2 bindings from interop/crates. A patch keeps them out of the
+# workspace members, and the -sys crates' `links` keys tie all four together.
+[patch.crates-io]
+ngtcp2-sys = { path = "interop/crates/ngtcp2-sys" }
+nghttp3-sys = { path = "interop/crates/nghttp3-sys" }
+ngtcp2 = { path = "interop/crates/ngtcp2" }
+tokio-ngtcp2 = { path = "interop/crates/tokio-ngtcp2" }
+
 [profile.bench]
 opt-level = 3
 codegen-units = 1

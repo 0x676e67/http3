@@ -11,10 +11,10 @@ use tracing::trace;
 use super::{
     coding::{Decode, Encode},
     push::{InvalidPushId, PushId},
-    stream::InvalidStreamId,
+    stream::{InvalidStreamId, StreamId},
     varint::{BufExt, BufMutExt, UnexpectedEnd, VarInt},
 };
-use crate::webtransport::SessionId;
+use crate::{ext, webtransport::SessionId};
 
 #[derive(Debug, PartialEq)]
 pub enum FrameError {
@@ -60,6 +60,10 @@ pub enum Frame<B> {
     PushPromise(PushPromise),
     Goaway(VarInt),
     MaxPushId(PushId),
+    /// An RFC 9218 request-stream priority update; only its target ID is kept.
+    PriorityUpdateRequest(StreamId),
+    /// An RFC 9218 promised-push priority update; only its target ID is kept.
+    PriorityUpdatePush(PushId),
     /// Describes the header for a webtransport stream.
     ///
     /// The payload is sent streaming until the stream is closed
@@ -186,6 +190,16 @@ impl Frame<PayloadLen> {
             FrameType::MAX_PUSH_ID => decode_payload(buf, len, |payload| {
                 Ok(Frame::MaxPushId(payload.get_var()?.try_into()?))
             }),
+            FrameType::PRIORITY_UPDATE_REQUEST => decode_payload(buf, len, |payload| {
+                let id = payload.get_var()?.try_into()?;
+                payload.advance(payload.remaining());
+                Ok(Frame::PriorityUpdateRequest(id))
+            }),
+            FrameType::PRIORITY_UPDATE_PUSH => decode_payload(buf, len, |payload| {
+                let id = payload.get_var()?.try_into()?;
+                payload.advance(payload.remaining());
+                Ok(Frame::PriorityUpdatePush(id))
+            }),
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
             //# These frame
             //# types MUST NOT be sent, and their receipt MUST be treated as a
@@ -285,6 +299,12 @@ where
             Frame::CancelPush(id) => simple_frame_encode(FrameType::CANCEL_PUSH, (*id).into(), buf),
             Frame::Goaway(id) => simple_frame_encode(FrameType::GOAWAY, *id, buf),
             Frame::MaxPushId(id) => simple_frame_encode(FrameType::MAX_PUSH_ID, (*id).into(), buf),
+            Frame::PriorityUpdateRequest(id) => {
+                simple_frame_encode(FrameType::PRIORITY_UPDATE_REQUEST, (*id).into(), buf)
+            }
+            Frame::PriorityUpdatePush(id) => {
+                simple_frame_encode(FrameType::PRIORITY_UPDATE_PUSH, (*id).into(), buf)
+            }
             Frame::Grease => {
                 FrameType::grease().encode(buf);
                 buf.write_var(6);
@@ -341,6 +361,30 @@ where
     }
 }
 
+/// An outgoing request-stream PRIORITY_UPDATE.
+///
+/// See [RFC 9218, Section 7.2](https://www.rfc-editor.org/rfc/rfc9218.html#section-7.2).
+#[derive(Debug)]
+pub(crate) struct RequestPriorityUpdate {
+    pub(crate) stream_id: StreamId,
+    pub(crate) value: ext::PriorityUpdate,
+}
+
+impl FrameHeader for RequestPriorityUpdate {
+    const TYPE: FrameType = FrameType::PRIORITY_UPDATE_REQUEST;
+    fn len(&self) -> usize {
+        VarInt::from(self.stream_id).size() + self.value.as_bytes().len()
+    }
+}
+
+impl Encode for RequestPriorityUpdate {
+    fn encode<B: BufMut>(&self, buf: &mut B) {
+        self.encode_header(buf);
+        VarInt::from(self.stream_id).encode(buf);
+        buf.put_slice(self.value.as_bytes());
+    }
+}
+
 impl fmt::Debug for Frame<PayloadLen> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -351,6 +395,8 @@ impl fmt::Debug for Frame<PayloadLen> {
             Frame::PushPromise(frame) => write!(f, "PushPromise({})", frame.id),
             Frame::Goaway(id) => write!(f, "GoAway({})", id),
             Frame::MaxPushId(id) => write!(f, "MaxPushId({})", id),
+            Frame::PriorityUpdateRequest(id) => write!(f, "PriorityUpdateRequest({})", id),
+            Frame::PriorityUpdatePush(id) => write!(f, "PriorityUpdatePush({})", id),
             Frame::Grease => write!(f, "Grease()"),
             Frame::WebTransportStream(session) => write!(f, "WebTransportStream({:?})", session),
         }
@@ -370,6 +416,8 @@ where
             Frame::PushPromise(frame) => write!(f, "PushPromise({})", frame.id),
             Frame::Goaway(id) => write!(f, "GoAway({})", id),
             Frame::MaxPushId(id) => write!(f, "MaxPushId({})", id),
+            Frame::PriorityUpdateRequest(id) => write!(f, "PriorityUpdateRequest({})", id),
+            Frame::PriorityUpdatePush(id) => write!(f, "PriorityUpdatePush({})", id),
             Frame::Grease => write!(f, "Grease()"),
             Frame::WebTransportStream(_) => write!(f, "WebTransportStream()"),
         }
@@ -390,6 +438,12 @@ impl<T, U> PartialEq<Frame<T>> for Frame<U> {
             Frame::PushPromise(x) => matches!(other, Frame::PushPromise(y) if x == y),
             Frame::Goaway(x) => matches!(other, Frame::Goaway(y) if x == y),
             Frame::MaxPushId(x) => matches!(other, Frame::MaxPushId(y) if x == y),
+            Frame::PriorityUpdateRequest(x) => {
+                matches!(other, Frame::PriorityUpdateRequest(y) if x == y)
+            }
+            Frame::PriorityUpdatePush(x) => {
+                matches!(other, Frame::PriorityUpdatePush(y) if x == y)
+            }
             Frame::Grease => matches!(other, Frame::Grease),
             Frame::WebTransportStream(x) => {
                 matches!(other, Frame::WebTransportStream(y) if x == y)
@@ -425,6 +479,8 @@ frame_types! {
     H2_WINDOW_UPDATE = 0x8,
     H2_CONTINUATION = 0x9,
     MAX_PUSH_ID = 0xD,
+    PRIORITY_UPDATE_REQUEST = 0xF0700,
+    PRIORITY_UPDATE_PUSH = 0xF0701,
     // Reserved frame types
     WEBTRANSPORT_BI_STREAM = 0x41,
 }
@@ -1197,6 +1253,33 @@ mod tests {
             Frame::MaxPushId(PushId(2)),
             &[13, 1, 2],
             Frame::MaxPushId(PushId(2)),
+        );
+    }
+
+    #[test]
+    fn priority_update_wire_keeps_the_value_and_decodes_only_the_target() {
+        // An 8-byte stream ID and a 52-byte value take 65 bytes, one past the inline prefix.
+        let value = "u=0, i, x=\"".to_string() + &"a".repeat(40) + "\"";
+        let update = RequestPriorityUpdate {
+            stream_id: StreamId::try_from(1 << 30).unwrap(),
+            value: ext::PriorityUpdate::new(http::HeaderValue::from_str(&value).unwrap()),
+        };
+        let mut buf = WriteBuf::<Bytes>::from(update);
+        let wire = buf.copy_to_bytes(buf.remaining());
+        let mut expected = b"\x80\x0f\x07\x00\x3c\xc0\x00\x00\x00\x40\x00\x00\x00".to_vec();
+        expected.extend_from_slice(value.as_bytes());
+        assert_eq!(wire, expected);
+        let mut buf = &wire[..];
+        assert_eq!(
+            Frame::decode(&mut buf),
+            Ok(Frame::PriorityUpdateRequest(
+                StreamId::try_from(1 << 30).unwrap()
+            ))
+        );
+        let mut buf = &b"\x80\x0f\x07\x01\x04\x01u=2"[..];
+        assert_eq!(
+            Frame::decode(&mut buf),
+            Ok(Frame::PriorityUpdatePush(PushId(1)))
         );
     }
 

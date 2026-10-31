@@ -16,12 +16,13 @@ use tracing::{instrument, warn};
 
 use crate::{
     config::Config,
+    control::ControlSend,
     error::{
         Code, ConnectionError, StreamError,
         connection_error_creators::{
             CloseRawQuicConnection, CloseStream, HandleFrameStreamErrorOnRequestStream,
         },
-        internal_error::InternalConnectionError,
+        internal_error::{ErrorOrigin, InternalConnectionError},
     },
     frame::{FrameStream, FrameStreamError},
     proto::{
@@ -138,6 +139,30 @@ where
     }
 }
 
+/// Maps a failed write on a control or QPACK stream to the connection error it causes.
+/// See [RFC 9114, Section 6.2.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1)
+/// and [RFC 9204, Section 4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2).
+pub(crate) fn critical_send_stream_error(
+    error: StreamErrorIncoming,
+    stream_name: &str,
+) -> ErrorOrigin {
+    match error {
+        StreamErrorIncoming::ConnectionErrorIncoming { connection_error } => {
+            connection_error.into()
+        }
+        StreamErrorIncoming::StreamTerminated { error_code } => InternalConnectionError::new(
+            Code::H3_CLOSED_CRITICAL_STREAM,
+            format!("{stream_name} stream was terminated with error code {error_code}"),
+        )
+        .into(),
+        StreamErrorIncoming::Unknown(error) => InternalConnectionError::new(
+            Code::H3_CLOSED_CRITICAL_STREAM,
+            format!("failed to write {stream_name} stream: {error}"),
+        )
+        .into(),
+    }
+}
+
 fn wake_qpack_waiters_on_connection_error(
     blocked_streams: &mut qpack::BlockedStreamRegistry,
     decoder_events_recv: &mut mpsc::UnboundedReceiver<QpackEvent>,
@@ -171,7 +196,7 @@ where
     /// TODO: breaking encapsulation just to see if we can get this to work, will fix before
     /// merging
     pub conn: C,
-    control_send: C::SendStream,
+    control_send: Arc<ControlSend<C::SendStream>>,
     control_recv: Option<FrameStream<C::RecvStream, B>>,
     pub(crate) qpack_streams: QpackStreams<C, B>,
     /// Buffers incoming uni/recv streams which have yet to be claimed.
@@ -243,23 +268,9 @@ where
         result: Result<(), StreamErrorIncoming>,
         stream_name: &str,
     ) -> Result<(), ConnectionError> {
-        match result {
-            Ok(()) => Ok(()),
-            Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
-                Err(self.handle_connection_error(connection_error))
-            }
-            Err(StreamErrorIncoming::StreamTerminated { error_code }) => Err(self
-                .handle_connection_error(InternalConnectionError::new(
-                    Code::H3_CLOSED_CRITICAL_STREAM,
-                    format!("{stream_name} stream was terminated with error code {error_code}"),
-                ))),
-            Err(StreamErrorIncoming::Unknown(error)) => {
-                Err(self.handle_connection_error(InternalConnectionError::new(
-                    Code::H3_CLOSED_CRITICAL_STREAM,
-                    format!("failed to write {stream_name} stream header: {error}"),
-                )))
-            }
-        }
+        result.map_err(|error| {
+            self.handle_connection_error(critical_send_stream_error(error, stream_name))
+        })
     }
 
     /// Wakes every request task waiting for QPACK progress.
@@ -330,11 +341,10 @@ where
         //# MUST initiate, at most, one encoder stream and, at most, one decoder
         //# stream.
 
-        let control = stream::write(
-            &mut self.control_send,
-            WriteBuf::from(UniStreamHeader::Control(settings)),
-        )
-        .await;
+        let control = self
+            .control_send
+            .write(WriteBuf::from(UniStreamHeader::Control(settings)))
+            .await;
         self.handle_critical_send_stream_result(control, "control")?;
 
         // QPACK encoder and decoder streams are critical streams. A peer must
@@ -424,8 +434,10 @@ where
             encoder_recv: None,
         };
 
+        let shared = Arc::new(SharedState::default());
+        let control_send = Arc::new(ControlSend::new(control_send, shared.clone()));
         let mut conn_inner = Self {
-            shared: Arc::new(SharedState::default()),
+            shared,
             conn,
             control_send,
             control_recv: None,
@@ -474,30 +486,8 @@ where
         //# (Section 5.2) so that both endpoints can reliably determine whether
         //# previously sent frames have been processed and gracefully complete or
         //# terminate any necessary remaining tasks.
-        match stream::write(&mut self.control_send, Frame::Goaway(max_id.into())).await {
-            Ok(()) => Ok(()),
-            Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
-                Err(self.handle_connection_error(connection_error))
-            }
-            Err(StreamErrorIncoming::StreamTerminated { error_code: err }) => Err(self
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
-                //# If either control
-                //# stream is closed at any point, this MUST be treated as a connection
-                //# error of type H3_CLOSED_CRITICAL_STREAM.
-                .handle_connection_error(InternalConnectionError::new(
-                    Code::H3_CLOSED_CRITICAL_STREAM,
-                    format!(
-                        "control stream was requested to stop sending with error code {}",
-                        err
-                    ),
-                ))),
-            Err(StreamErrorIncoming::Unknown(error)) => {
-                Err(self.handle_connection_error(InternalConnectionError::new(
-                    Code::H3_CLOSED_CRITICAL_STREAM,
-                    format!("an error occurred on the control stream {}", error),
-                )))
-            }
-        }
+        let result = self.control_send.write(Frame::Goaway(max_id.into())).await;
+        self.handle_critical_send_stream_result(result, "control")
     }
 
     #[allow(missing_docs)]
@@ -1224,7 +1214,9 @@ where
             Ok(Some(
                 frame @ Frame::Goaway(_)
                 | frame @ Frame::CancelPush(_)
-                | frame @ Frame::MaxPushId(_),
+                | frame @ Frame::MaxPushId(_)
+                | frame @ Frame::PriorityUpdateRequest(_)
+                | frame @ Frame::PriorityUpdatePush(_),
             )) => {
                 // handle these frames in client/server imples
                 frame
@@ -1479,6 +1471,23 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Returns the control stream writer shared with request senders.
+    // The projection lets client builders name it through their opener type.
+    pub(crate) fn control_send(
+        &self,
+    ) -> Arc<ControlSend<<C::OpenStreams as quic::OpenStreams<B>>::SendStream>> {
+        self.control_send.clone()
+    }
+
+    /// Finishes leftover control-stream bytes and writes queued PRIORITY_UPDATE frames.
+    pub(crate) fn poll_control_flush(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectionError>> {
+        let result = ready!(self.control_send.poll_flush(cx));
+        Poll::Ready(self.handle_critical_send_stream_result(result, "control"))
     }
 }
 

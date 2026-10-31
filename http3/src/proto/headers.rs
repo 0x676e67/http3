@@ -175,7 +175,7 @@ impl Header {
         method: Method,
         uri: Uri,
         fields: HeaderMap,
-        ext: Extensions,
+        ext: &Extensions,
     ) -> Result<Self, HeaderError> {
         match (uri.authority(), fields.get(header::HOST)) {
             (None, None) => Err(HeaderError::MissingAuthority),
@@ -187,7 +187,7 @@ impl Header {
         }
     }
 
-    pub fn response(status: StatusCode, fields: HeaderMap, ext: Extensions) -> Self {
+    pub fn response(status: StatusCode, fields: HeaderMap, ext: &Extensions) -> Self {
         Self {
             pseudo: Pseudo::response(status, ext),
             fields,
@@ -603,7 +603,7 @@ struct Pseudo {
 
 #[allow(clippy::len_without_is_empty)]
 impl Pseudo {
-    fn request(method: Method, uri: Uri, ext: Extensions) -> Self {
+    fn request(method: Method, uri: Uri, ext: &Extensions) -> Self {
         let Parts {
             scheme,
             authority,
@@ -676,7 +676,7 @@ impl Pseudo {
         }
     }
 
-    fn response(status: StatusCode, ext: Extensions) -> Self {
+    fn response(status: StatusCode, ext: &Extensions) -> Self {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
         //= type=implication
         //# Pseudo-header fields defined for requests MUST NOT appear
@@ -1189,7 +1189,7 @@ mod tests {
 
         let mut extensions = Extensions::new();
         extensions.insert(sensitivity);
-        let forwarded = Header::request(method, uri, fields, extensions).unwrap();
+        let forwarded = Header::request(method, uri, fields, &extensions).unwrap();
         let method = (&forwarded)
             .into_iter()
             .find(|field| field.name.as_ref() == b":method")
@@ -1210,7 +1210,7 @@ mod tests {
 
         let mut extensions = Extensions::new();
         extensions.insert(sensitivity);
-        let forwarded = Header::response(status, fields, extensions);
+        let forwarded = Header::response(status, fields, &extensions);
         let status = (&forwarded)
             .into_iter()
             .find(|field| field.name.as_ref() == b":status")
@@ -1254,7 +1254,7 @@ mod tests {
             Method::GET,
             Uri::from_static("https://example.com/test"),
             HeaderMap::new(),
-            Extensions::default(),
+            &Extensions::default(),
         )
         .unwrap();
         headers.set_pseudo_order(order);
@@ -1285,7 +1285,7 @@ mod tests {
             Method::GET,
             Uri::from_static("https://example.com/test"),
             HeaderMap::new(),
-            Extensions::default(),
+            &Extensions::default(),
         )
         .unwrap();
         headers.set_pseudo_order(order);
@@ -1309,7 +1309,7 @@ mod tests {
             Method::GET,
             Uri::from_static("https://example.com/test"),
             HeaderMap::new(),
-            Extensions::default(),
+            &Extensions::default(),
         )
         .unwrap();
 

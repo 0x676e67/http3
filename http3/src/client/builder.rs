@@ -266,6 +266,7 @@ impl Builder {
             send_grease_frame: self.config.send_grease,
             qpack_encode_buffer: BytesMut::new(),
             pseudo_order: self.pseudo_order.clone(),
+            control_send: inner.control_send(),
             _buf: PhantomData,
         };
 

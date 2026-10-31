@@ -308,7 +308,7 @@ async fn run_request_worker<A: Adapter>(
         // This counter hands out request slots, not data from another worker.
         // A failed decrement leaves zero intact, even when every worker exits.
         if remaining_requests
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_err()

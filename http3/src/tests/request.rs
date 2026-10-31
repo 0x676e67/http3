@@ -15,7 +15,7 @@ use crate::{
         frame::{self, Frame, FrameType},
         headers::{Header, PseudoId, PseudoOrder},
         push::PushId,
-        stream::StreamType,
+        stream::{StreamId, StreamType},
         varint::VarInt,
     },
     qpack,
@@ -367,7 +367,7 @@ async fn out_of_order_receives_are_local_errors() {
         let mut block = BytesMut::new();
         qpack::encode_stateless(
             &mut block,
-            &Header::response(StatusCode::OK, HeaderMap::new(), http::Extensions::new()),
+            &Header::response(StatusCode::OK, HeaderMap::new(), &http::Extensions::new()),
         )
         .unwrap();
         Frame::headers(block.to_vec()).encode_with_payload(&mut head);
@@ -408,7 +408,7 @@ async fn out_of_order_receives_are_local_errors() {
                 http::Method::GET,
                 "https://localhost/".parse().unwrap(),
                 HeaderMap::new(),
-                http::Extensions::new(),
+                &http::Extensions::new(),
             )
             .unwrap(),
         )
@@ -554,7 +554,7 @@ async fn rejected_request_fields(
                 http::Method::GET,
                 "https://localhost/".parse().unwrap(),
                 HeaderMap::new(),
-                http::Extensions::new(),
+                &http::Extensions::new(),
             )
             .unwrap(),
         )
@@ -2404,6 +2404,8 @@ fn invalid_request_frames() -> Vec<Frame<Bytes>> {
         Frame::Settings(frame::Settings::default()),
         Frame::Goaway(VarInt(1)),
         Frame::MaxPushId(PushId(1)),
+        Frame::PriorityUpdateRequest(StreamId(0)),
+        Frame::PriorityUpdatePush(PushId(0)),
     ]
 }
 
@@ -2431,6 +2433,10 @@ async fn request_invalid_frame_first() {
     //# The MAX_PUSH_ID frame is always sent on the control stream.  Receipt
     //# of a MAX_PUSH_ID frame on any other stream MUST be treated as a
     //# connection error of type H3_FRAME_UNEXPECTED.
+
+    // A PRIORITY_UPDATE on a stream other than the client control stream is
+    // H3_FRAME_UNEXPECTED.
+    // https://www.rfc-editor.org/rfc/rfc9218.html#section-7.2
     for frame in invalid_request_frames() {
         request_sequence_unexpected(|mut buf| frame.encode(&mut buf)).await;
     }
@@ -2602,7 +2608,7 @@ fn request_encode<B: BufMut>(buf: &mut B, req: http::Request<()>) {
         extensions,
         ..
     } = parts;
-    let headers = Header::request(method, uri, headers, extensions).unwrap();
+    let headers = Header::request(method, uri, headers, &extensions).unwrap();
     let mut block = BytesMut::new();
     qpack::encode_stateless(&mut block, &headers).unwrap();
     Frame::headers(block).encode_with_payload(buf);
