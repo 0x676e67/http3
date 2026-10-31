@@ -1500,7 +1500,7 @@ async fn graceful_shutdown_goaway_identifies_first_unprocessed_request() {
                     http::Method::GET,
                     "https://localhost/".parse().unwrap(),
                     http::HeaderMap::new(),
-                    http::Extensions::new(),
+                    &http::Extensions::new(),
                 )
                 .unwrap(),
             )

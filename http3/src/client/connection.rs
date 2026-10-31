@@ -194,8 +194,8 @@ where
             mut extensions,
             ..
         } = parts;
-        let priority_update = extensions.remove::<ext::PriorityUpdate>();
-        let mut headers = Header::request(method, uri, headers, extensions).map_err(|error| {
+
+        let mut headers = Header::request(method, uri, headers, &extensions).map_err(|error| {
             StreamError::InvalidRequest {
                 reason: error.to_string().into_boxed_str(),
             }
@@ -324,7 +324,7 @@ where
         // The update goes right before HEADERS, usually in the same QUIC packet; its stream ID
         // comes from a completed open, so it is within the peer's stream limit.
         // https://www.rfc-editor.org/rfc/rfc9218.html#section-7.2
-        if let Some(value) = priority_update {
+        if let Some(value) = extensions.remove::<ext::PriorityUpdate>() {
             let update = RequestPriorityUpdate {
                 stream_id: guard.stream.send_id(),
                 value,
@@ -706,7 +706,10 @@ impl<S: quic::SendStream<B> + quic::RecvStream, B: Buf> Drop for OpeningStream<'
 mod integration_tests {
     use std::{
         future::{Future, poll_fn},
-        sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        sync::{
+            Mutex, OnceLock,
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        },
     };
 
     use futures_util::task::{ArcWake, waker};
@@ -722,8 +725,8 @@ mod integration_tests {
         block_open: AtomicBool,
         block_write: AtomicBool,
         block_finish: AtomicBool,
-        read: std::sync::Mutex<Option<Bytes>>,
-        reject_on_read: std::sync::OnceLock<Arc<SharedState>>,
+        read: Mutex<Option<Bytes>>,
+        reject_on_read: OnceLock<Arc<SharedState>>,
         opened: AtomicUsize,
         written: AtomicBool,
         reset: AtomicU64,
@@ -731,11 +734,11 @@ mod integration_tests {
         reset_calls: AtomicUsize,
         stop_calls: AtomicUsize,
         wakes: AtomicUsize,
-        close_on_open: std::sync::OnceLock<Arc<SharedState>>,
+        close_on_open: OnceLock<Arc<SharedState>>,
         /// Bytes given to `send_data`, reaching `sent` on the next ready poll as in http3-quic.
-        pending: std::sync::Mutex<std::collections::HashMap<u64, Bytes>>,
-        sent: std::sync::Mutex<Vec<Bytes>>,
-        blocked_writer: std::sync::Mutex<Option<std::task::Waker>>,
+        pending: Mutex<std::collections::HashMap<u64, Bytes>>,
+        sent: Mutex<Vec<Bytes>>,
+        blocked_writer: Mutex<Option<std::task::Waker>>,
     }
 
     impl ArcWake for State {

@@ -147,8 +147,8 @@ where
             extensions,
             ..
         } = parts;
-        let headers = Header::response(status, headers, extensions);
 
+        let headers = Header::response(status, headers, &extensions);
         let mut block = BytesMut::new();
         let mem_size = qpack::encode_stateless(&mut block, &headers).map_err(|_e| {
             self.handle_connection_error_on_stream(InternalConnectionError {
