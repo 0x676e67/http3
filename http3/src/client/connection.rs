@@ -19,8 +19,7 @@ use crate::{
     connection::{self, ConnectionInner},
     control::ControlSend,
     error::{
-        Code, ConnectionError, StreamError,
-        connection_error_creators::{CloseStream, convert_to_connection_error},
+        Code, ConnectionError, StreamError, connection_error_creators::CloseStream,
         internal_error::InternalConnectionError,
     },
     ext,
@@ -330,10 +329,9 @@ where
                 value,
             };
             self.control_send.send_now(update).map_err(|error| {
-                let error = self.set_conn_error_and_wake(connection::critical_send_stream_error(
+                self.handle_connection_error_on_stream(connection::critical_send_stream_error(
                     error, "control",
-                ));
-                StreamError::ConnectionError(convert_to_connection_error(error))
+                ))
             })?;
         }
         // Keep dynamic references tracked once encoding commits. A canceled
@@ -615,6 +613,10 @@ where
                 //# A client MUST treat the
                 //# receipt of a MAX_PUSH_ID frame as a connection error of type
                 //# H3_FRAME_UNEXPECTED.
+
+                // A server MUST NOT send PRIORITY_UPDATE, and a client treats one as
+                // H3_FRAME_UNEXPECTED.
+                // https://www.rfc-editor.org/rfc/rfc9218.html#section-7.2
                 Ok(frame) => {
                     return Poll::Ready(self.inner.handle_connection_error(
                         InternalConnectionError::new(
@@ -967,11 +969,13 @@ mod integration_tests {
             value: ext::PriorityUpdate::new(http::HeaderValue::from_static("u=1")),
         };
 
-        // Queueing wakes the driver.
+        // Queueing leaves the wake to the stream, whose writable wake reaches the driver.
         shared.waker().register(&waker(driver.clone()));
         for index in 0..256 {
             control.send_now::<Bytes>(update(index * 4)).unwrap();
         }
+        assert_eq!(driver.wakes.load(Ordering::Relaxed), 0);
+        state.blocked_writer.lock().unwrap().take().unwrap().wake();
         assert_eq!(driver.wakes.load(Ordering::Relaxed), 1);
 
         // The stream's writable wake reaches both the driver and a blocked GOAWAY write,

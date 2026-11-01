@@ -124,12 +124,18 @@ impl<S> ControlSend<S> {
                     return Err(error);
                 }
             }
+            // The pending poll registered the composite waker, so the driver drains the queue
+            // once the stream is writable again.
             Poll::Pending if inner.queue.len() < MAX_QUEUED_PRIORITY_UPDATES => {
                 inner.queue.push_back(update);
-                drop(inner);
-                self.wake.shared.waker().wake();
             }
-            Poll::Pending => {}
+            Poll::Pending => {
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    "control stream busy, dropped PRIORITY_UPDATE for {}",
+                    update.stream_id
+                );
+            }
         }
         Ok(())
     }
