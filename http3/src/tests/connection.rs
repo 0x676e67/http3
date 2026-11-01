@@ -1286,7 +1286,8 @@ async fn blocked_grease_stream_does_not_hold_back_control_frames() {
     init_tracing();
     let mut pair = Pair::default();
     // Room for the client's three critical streams only, the minimum RFC 9114
-    // Section 6.2 requires, so its GREASE stream cannot open yet.
+    // requires, so its GREASE stream cannot open yet.
+    // https://www.rfc-editor.org/rfc/rfc9114#section-6.2
     std::sync::Arc::get_mut(&mut pair.config)
         .unwrap()
         .max_concurrent_uni_streams(quinn::VarInt::from_u32(3));
@@ -1295,14 +1296,14 @@ async fn blocked_grease_stream_does_not_hold_back_control_frames() {
 
     let client_fut = async {
         let (mut driver, send_request) = client::new(pair.client().await).await.unwrap();
-        let goaway = async {
-            goaway_published(&send_request, 4).await;
-            goaway_tx.send(()).unwrap();
-        };
-        let (error, ()) = tokio::join!(driver.wait_idle(), goaway);
+        tokio::select! {
+            biased;
+            () = goaway_published(&send_request, 4) => goaway_tx.send(()).unwrap(),
+            error = driver.wait_idle() => panic!("connection failed: {error}"),
+        }
         // A larger GOAWAY is rejected only because the first one was read.
         assert_matches!(
-            error,
+            driver.wait_idle().await,
             ConnectionError::Local {
                 error: LocalError::Application {
                     code: Code::H3_ID_ERROR,
