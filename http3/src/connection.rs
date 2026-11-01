@@ -1110,6 +1110,16 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Frame<PayloadLen>, ConnectionError>> {
+        if self.send_grease_stream_flag {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.3
+            //# They MAY also be
+            //# sent on connections where no data is currently being transferred.
+            // Best effort: the peer may grant only the three critical
+            // unidirectional streams (RFC 9114 Section 6.2), so a pending GREASE
+            // stream must not hold back control frames.
+            let _ = self.poll_grease_stream(cx);
+        }
+
         let Some(recv) = &mut self.control_recv else {
             return Poll::Pending;
         };
@@ -1253,13 +1263,6 @@ where
                 )));
             }
         };
-
-        if self.send_grease_stream_flag {
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.3
-            //# They MAY also be
-            //# sent on connections where no data is currently being transferred.
-            ready!(self.poll_grease_stream(cx));
-        }
 
         Poll::Ready(Ok(res))
     }

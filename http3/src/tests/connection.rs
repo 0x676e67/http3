@@ -1282,6 +1282,74 @@ async fn client_rejects_control_stream(control: &[u8], code: Code) {
 }
 
 #[tokio::test]
+async fn blocked_grease_stream_does_not_hold_back_control_frames() {
+    init_tracing();
+    let mut pair = Pair::default();
+    // Room for the client's three critical streams only, the minimum RFC 9114
+    // Section 6.2 requires, so its GREASE stream cannot open yet.
+    std::sync::Arc::get_mut(&mut pair.config)
+        .unwrap()
+        .max_concurrent_uni_streams(quinn::VarInt::from_u32(3));
+    let server = pair.server_inner();
+    let (goaway_tx, goaway_rx) = oneshot::channel();
+
+    let client_fut = async {
+        let (mut driver, send_request) = client::new(pair.client().await).await.unwrap();
+        let goaway = async {
+            goaway_published(&send_request, 4).await;
+            goaway_tx.send(()).unwrap();
+        };
+        let (error, ()) = tokio::join!(driver.wait_idle(), goaway);
+        // A larger GOAWAY is rejected only because the first one was read.
+        assert_matches!(
+            error,
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_ID_ERROR,
+                    ..
+                }
+            }
+        );
+    };
+    let server_fut = async {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let mut control_stream = conn.open_uni().await.unwrap();
+        let mut buf = BytesMut::new();
+        StreamType::CONTROL.encode(&mut buf);
+        Frame::<Bytes>::Settings(Settings::default()).encode(&mut buf);
+        Frame::<Bytes>::Goaway(VarInt(4)).encode(&mut buf);
+        control_stream.write_all(&buf).await.unwrap();
+
+        // The GOAWAY took effect while the GREASE stream was blocked, and a
+        // fourth stream still lets the GREASE stream out.
+        goaway_rx.await.unwrap();
+        let mut critical_streams = Vec::new();
+        for _ in 0..3 {
+            critical_streams.push(conn.accept_uni().await.unwrap());
+        }
+        conn.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(4));
+        let mut grease = conn.accept_uni().await.unwrap();
+        let grease = grease.read_to_end(64).await.unwrap();
+        let stream_type = StreamType::decode(&mut &grease[..]).unwrap().value();
+        assert_eq!(
+            stream_type.checked_sub(0x21).map(|n| n % 0x1f),
+            Some(0),
+            "{stream_type:#x}"
+        );
+
+        let mut buf = BytesMut::new();
+        Frame::<Bytes>::Goaway(VarInt(8)).encode(&mut buf);
+        control_stream.write_all(&buf).await.unwrap();
+        conn.closed().await;
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("the client stalled behind its blocked GREASE stream");
+}
+
+#[tokio::test]
 async fn goaway_from_server_not_request_id() {
     init_tracing();
     let mut pair = Pair::default();
