@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, TryLockError},
+    sync::{
+        Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, TryLockError,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll, Waker},
 };
 
@@ -11,7 +14,9 @@ use tokio::sync::mpsc;
 #[cfg(feature = "unstable")]
 pub use self::decoder::decode_stateless;
 #[cfg(test)]
-pub(crate) use self::stream::{DynamicTableSizeUpdate, InsertCountIncrement, InsertWithoutNameRef};
+pub(crate) use self::stream::{
+    DynamicTableSizeUpdate, HeaderAck, InsertCountIncrement, InsertWithoutNameRef, StreamCancel,
+};
 pub use self::{
     decoder::{Decoded, Decoder, DecoderError, ack_header, stream_canceled},
     encoder::{EncoderError, encode_stateless},
@@ -418,12 +423,27 @@ impl BlockedStreamRegistry {
     }
 }
 
+// Bound decoder instructions that requests queue before the connection driver
+// writes them. A driver that is not polled for a while would otherwise write
+// the whole backlog at once, and peers may limit such bursts: nghttp3 rejects
+// more than 4 KiB of decoder-stream input between two of its own field-section
+// encodes. Each decoded dynamic field section (a request head, an interim or
+// final response head, or trailers) queues one Section Acknowledgment of at
+// most 4 bytes for stream IDs below 2^21, so the backlog stays near 1 KiB.
+// Requests decoding concurrently with the check, and requests abandoned
+// meanwhile (one Stream Cancellation each), can exceed the bound by their
+// number.
+// https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
+pub(crate) const MAX_QUEUED_DECODER_INSTRUCTIONS: usize = 256;
+
 struct QpackDecoderInner {
     decoder: RwLock<Decoder>,
     decoder_dynamic_table: bool,
     allows_blocking: bool,
     max_encoded_string_size: usize,
     decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
+    /// Section Acknowledgments and Stream Cancellations not yet written by the driver.
+    queued_instructions: AtomicUsize,
     /// Connection-driver waker used while a request holds a read guard.
     write_waker: AtomicWaker,
 }
@@ -432,7 +452,8 @@ struct QpackDecoderInner {
 ///
 /// Request tasks use read guards to decode field sections. The connection driver
 /// takes a write guard for dynamic table updates and resumes when active readers
-/// release their guards.
+/// release their guards. Requests stop decoding while too many decoder
+/// instructions wait for the driver to write them.
 #[derive(Clone)]
 pub(crate) struct QpackDecoder(Arc<QpackDecoderInner>);
 
@@ -452,6 +473,7 @@ impl QpackDecoder {
             max_encoded_string_size: decoder.max_encoded_string_size(),
             decoder: RwLock::new(decoder),
             decoder_events_send,
+            queued_instructions: AtomicUsize::new(0),
             write_waker: AtomicWaker::new(),
         }))
     }
@@ -543,10 +565,11 @@ impl QpackDecoder {
         &self,
         stream_id: StreamId,
     ) -> Result<(), DecoderError> {
-        self.0
-            .decoder_events_send
-            .send(QpackEvent::HeaderAck(stream_id))
-            .map_err(|_| DecoderError::Internal("QPACK decoder event channel is closed"))?;
+        if !self.queue_instruction(QpackEvent::HeaderAck(stream_id)) {
+            return Err(DecoderError::Internal(
+                "QPACK decoder event channel is closed",
+            ));
+        }
         #[cfg(feature = "tracing")]
         tracing::debug!(
             stream_id = ?stream_id,
@@ -563,11 +586,7 @@ impl QpackDecoder {
     ///
     /// See [RFC 9204, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
     pub(crate) fn queue_stream_cancellation(&self, stream_id: StreamId) -> bool {
-        let queued = self
-            .0
-            .decoder_events_send
-            .send(QpackEvent::StreamCancel(stream_id))
-            .is_ok();
+        let queued = self.queue_instruction(QpackEvent::StreamCancel(stream_id));
         #[cfg(feature = "tracing")]
         if queued {
             tracing::debug!(
@@ -576,6 +595,56 @@ impl QpackDecoder {
             );
         }
         queued
+    }
+
+    /// Writes a queued Section Acknowledgment to the decoder stream buffer.
+    ///
+    /// Only the connection driver calls this, in queue order. Writing releases
+    /// the instruction from the bound that pauses field-section decoding.
+    pub(crate) fn write_section_acknowledgment<W: BufMut>(
+        &self,
+        stream_id: StreamId,
+        write: &mut W,
+    ) {
+        ack_header(stream_id.into_inner(), write);
+        self.release_instruction();
+    }
+
+    /// Writes a queued Stream Cancellation to the decoder stream buffer.
+    ///
+    /// Like [`Self::write_section_acknowledgment`], this releases the instruction.
+    pub(crate) fn write_stream_cancellation<W: BufMut>(&self, stream_id: StreamId, write: &mut W) {
+        stream_canceled(stream_id.into_inner(), write);
+        self.release_instruction();
+    }
+
+    /// Sends a decoder instruction and counts it until the driver writes it.
+    fn queue_instruction(&self, event: QpackEvent) -> bool {
+        // Count first: the driver can write the instruction before `send` returns.
+        self.0.queued_instructions.fetch_add(1, Ordering::Relaxed);
+        let queued = self.0.decoder_events_send.send(event).is_ok();
+        if !queued {
+            self.release_instruction();
+        }
+        queued
+    }
+
+    fn release_instruction(&self) {
+        // Every released instruction was counted first. Saturate anyway, so a
+        // mismatch cannot pause decoding for the rest of the connection.
+        let _ = self.0.queued_instructions.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |count| count.checked_sub(1),
+        );
+    }
+
+    /// Queues a request waker that the driver wakes when it reaches this event.
+    fn queue_decoder_waiter(&self, cx: &mut Context<'_>) -> Result<(), DecoderError> {
+        self.0
+            .decoder_events_send
+            .send(QpackEvent::DecoderAccessWaker(cx.waker().clone()))
+            .map_err(|_| DecoderError::Internal("QPACK decoder event channel is closed"))
     }
 
     /// Applies instructions received on the peer QPACK encoder stream.
@@ -631,7 +700,8 @@ impl QpackDecoder {
     ///
     /// [`DecoderError::MissingRefs`] contains the Required Insert Count used to
     /// register the request with the connection driver. A direct [`Poll::Pending`]
-    /// means that the driver currently holds the write lock.
+    /// means that the driver currently holds the write lock or has not yet written
+    /// enough queued decoder instructions; the driver wakes the request in both cases.
     ///
     /// See [RFC 9204, Section 2.2.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1).
     pub(crate) fn poll_decode_field_section<T: Buf>(
@@ -649,6 +719,19 @@ impl QpackDecoder {
             ));
         }
 
+        // Every decoded dynamic field section needs its own Section
+        // Acknowledgment, so a stalled driver must not let decoding run far
+        // ahead of it. The driver wakes this request after writing every
+        // instruction queued before it; a stale count only costs another
+        // waiter round trip.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.2.1
+        if self.0.queued_instructions.load(Ordering::Relaxed) >= MAX_QUEUED_DECODER_INSTRUCTIONS {
+            self.queue_decoder_waiter(cx)?;
+            #[cfg(feature = "tracing")]
+            tracing::debug!("queued QPACK decoder waiter for decoder instructions");
+            return Poll::Pending;
+        }
+
         match self.0.decoder.try_read() {
             Ok(decoder) => {
                 let decoded =
@@ -664,16 +747,7 @@ impl QpackDecoder {
         }
 
         // Register before retrying; the writer drains this queue after its update.
-        if self
-            .0
-            .decoder_events_send
-            .send(QpackEvent::DecoderAccessWaker(cx.waker().clone()))
-            .is_err()
-        {
-            return Poll::Ready(Err(DecoderError::Internal(
-                "QPACK decoder event channel is closed",
-            )));
-        }
+        self.queue_decoder_waiter(cx)?;
         #[cfg(feature = "tracing")]
         tracing::debug!("queued QPACK decoder waiter for decoder write lock");
 

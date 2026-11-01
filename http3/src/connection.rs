@@ -1432,14 +1432,16 @@ where
     fn poll_qpack_decoder_events(&mut self, cx: &mut Context<'_>) -> Result<(), ConnectionError> {
         while let Poll::Ready(Some(event)) = self.qpack_streams.decoder_events_recv.poll_recv(cx) {
             match event {
-                QpackEvent::HeaderAck(stream_id) => qpack::ack_header(
-                    stream_id.into_inner(),
-                    &mut self.qpack_streams.decoder_send_buf,
-                ),
-                QpackEvent::StreamCancel(stream_id) => qpack::stream_canceled(
-                    stream_id.into_inner(),
-                    &mut self.qpack_streams.decoder_send_buf,
-                ),
+                QpackEvent::HeaderAck(stream_id) => {
+                    self.qpack_streams.decoder.write_section_acknowledgment(
+                        stream_id,
+                        &mut self.qpack_streams.decoder_send_buf,
+                    )
+                }
+                QpackEvent::StreamCancel(stream_id) => self
+                    .qpack_streams
+                    .decoder
+                    .write_stream_cancellation(stream_id, &mut self.qpack_streams.decoder_send_buf),
                 QpackEvent::RegisterBlocked {
                     stream_id,
                     required_ref,
@@ -1473,8 +1475,9 @@ where
                     .blocked_streams
                     .release(stream_id, required_ref),
                 // Missing references use `RegisterBlocked`. This event only
-                // waits for a write guard scoped to `poll_on_recv_encoder`, which
-                // has been released before the driver can consume the event.
+                // waits for a write guard scoped to `poll_on_recv_encoder`, or
+                // for the decoder instructions queued before it. Both are done
+                // before the driver can consume the event.
                 QpackEvent::DecoderAccessWaker(waker) => waker.wake(),
             }
         }
@@ -1486,6 +1489,8 @@ pub(crate) struct DecoderGuard {
     stream_id: StreamId,
     shared: Arc<SharedState>,
     cancel_on_drop: bool,
+    // A Stream Cancellation was queued, so no later field section is decoded.
+    cancelled: bool,
     blocked: Option<usize>,
     decoder: QpackDecoder,
     prefix: Option<qpack::FieldSectionPrefix>,
@@ -1555,10 +1560,11 @@ impl DecoderGuard {
     /// See [RFC 9204, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
     fn cancel_reading(&mut self) {
         self.unblock();
-        if std::mem::take(&mut self.cancel_on_drop)
-            && self.decoder.queue_stream_cancellation(self.stream_id)
-        {
-            self.shared.waker().wake();
+        if std::mem::take(&mut self.cancel_on_drop) {
+            self.cancelled = true;
+            if self.decoder.queue_stream_cancellation(self.stream_id) {
+                self.shared.waker().wake();
+            }
         }
     }
 }
@@ -1589,6 +1595,7 @@ impl RequestDecodeState {
                 // Dropping before end of stream abandons any remaining field section
                 // and requires Stream Cancellation.
                 cancel_on_drop: true,
+                cancelled: false,
                 blocked: None,
                 decoder,
                 prefix: None,
@@ -1609,6 +1616,10 @@ impl RequestDecodeState {
         if let Self::Dynamic(state) = self {
             state.finish_reading();
         }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Dynamic(state) if state.cancelled)
     }
 }
 
@@ -1870,6 +1881,15 @@ where
                 }
             }
         };
+
+        // After Stream Cancellation the peer expects no Section Acknowledgment for
+        // this stream and may evict the entries these trailers reference.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.2.2
+        if self.decode_state.is_cancelled() {
+            return Poll::Ready(Err(StreamError::InvalidStreamState {
+                reason: "the trailers are no longer read".into(),
+            }));
+        }
 
         if !self.stream.is_eos() {
             // Get the trailing frame. After trailers no known frame is allowed.
@@ -2498,6 +2518,7 @@ mod qpack_field_section_tests {
                 stream_id: StreamId(0),
                 shared,
                 cancel_on_drop: true,
+                cancelled: false,
                 blocked: None,
                 decoder,
                 prefix: None,
@@ -3058,6 +3079,54 @@ mod request_drop_tests {
                 ("stop", Code::H3_REQUEST_CANCELLED.value()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn stopped_receive_side_does_not_decode_dynamic_trailers() {
+        // HEADERS with Required Insert Count 1, Base 1 and dynamic entry 0.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1
+        let (mut stream, _probe) = stream_with_probe(Probe {
+            incoming: Some(Bytes::from_static(&[0x01, 0x03, 0x02, 0x00, 0x80])),
+            ..Probe::default()
+        });
+        let (events_send, mut events) = mpsc::unbounded_channel();
+        let decoder = QpackDecoder::new(qpack::Decoder::new(1024, 1).unwrap(), events_send);
+        let mut encoder_stream = BytesMut::new();
+        qpack::DynamicTableSizeUpdate(1024).encode(&mut encoder_stream);
+        qpack::InsertWithoutNameRef::new("foo", "bar")
+            .encode(&mut encoder_stream)
+            .unwrap();
+        assert_eq!(
+            decoder.poll_on_recv_encoder(
+                &mut Context::from_waker(futures_util::task::noop_waker_ref()),
+                &mut std::io::Cursor::new(encoder_stream),
+                &mut Vec::new(),
+            ),
+            Poll::Ready(Ok(1))
+        );
+        stream.decode_state =
+            RequestDecodeState::new(StreamId(0), &stream.conn_state, 1024, Some(decoder));
+
+        // The trailers are buffered before reading stops.
+        assert!(
+            future::poll_fn(|cx| stream.poll_recv_data(cx))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+        assert!(matches!(
+            future::poll_fn(|cx| stream.poll_recv_trailers(cx)).await,
+            Err(StreamError::InvalidStreamState { .. })
+        ));
+
+        // The peer rejects a Section Acknowledgment after Stream Cancellation.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QpackEvent::StreamCancel(StreamId(0)))
+        ));
+        assert!(events.try_recv().is_err());
     }
 
     #[test]

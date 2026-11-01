@@ -10,7 +10,8 @@ use std::{
 use crate::{
     proto::headers::Header,
     qpack::{
-        BlockedStreamRegistry, Decoded, DecoderError, HeaderField, QpackDecoder, QpackEvent,
+        BlockedStreamRegistry, Decoded, DecoderError, HeaderField, MAX_QUEUED_DECODER_INSTRUCTIONS,
+        QpackDecoder, QpackEvent,
         block::{HeaderPrefix, Indexed, Literal, LiteralWithNameRef, LiteralWithPostBaseNameRef},
         decoder::{Decoder, decode_stateless},
         dynamic::{DynamicTable, Error as DynamicTableError},
@@ -298,6 +299,78 @@ fn decoder_update_releases_blocked_stream_budget_before_request_repoll() {
             .register(StreamId(4), 2, cx.waker().clone())
             .is_ok()
     );
+}
+
+#[test]
+fn unwritten_decoder_instructions_pause_decoding() {
+    let mut encoder_table = DynamicTable::new();
+    encoder_table.set_max_blocked(1).unwrap();
+    let mut encoder_stream = Vec::new();
+    set_dynamic_table_size(&mut encoder_table, &mut encoder_stream, TABLE_SIZE).unwrap();
+    let mut field_section = Vec::new();
+    assert_eq!(
+        Encoder::from(encoder_table).encode(
+            0,
+            &mut field_section,
+            &mut encoder_stream,
+            &[HeaderField::new("foo", "bar")],
+        ),
+        Ok(1)
+    );
+
+    let (events_send, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let decoder = QpackDecoder::new(Decoder::new(TABLE_SIZE as u64, 1).unwrap(), events_send);
+    let wake_count = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    let waker = futures_util::task::waker(wake_count.clone());
+    let mut cx = Context::from_waker(&waker);
+    assert_eq!(
+        decoder.poll_on_recv_encoder(&mut cx, &mut Cursor::new(encoder_stream), &mut Vec::new()),
+        Poll::Ready(Ok(1))
+    );
+    let decode = |cx: &mut Context<'_>| {
+        decoder.poll_decode_field_section(cx, &mut Cursor::new(&field_section), u64::MAX, &mut None)
+    };
+
+    // Section Acknowledgments and Stream Cancellations share one bound until the
+    // connection driver writes them.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4
+    let decode_until_paused = |cx: &mut Context<'_>, requests: std::ops::Range<u64>| {
+        for request in requests {
+            assert!(matches!(
+                decode(cx),
+                Poll::Ready(Ok(Decoded { dyn_ref: true, .. }))
+            ));
+            if request % 2 == 0 {
+                decoder
+                    .queue_section_acknowledgment(StreamId(4 * request))
+                    .unwrap();
+            } else {
+                assert!(decoder.queue_stream_cancellation(StreamId(4 * request)));
+            }
+        }
+        assert!(decode(cx).is_pending());
+    };
+    let bound = MAX_QUEUED_DECODER_INSTRUCTIONS as u64;
+    decode_until_paused(&mut cx, 0..bound);
+
+    // The driver writes the backlog in queue order, then wakes the request.
+    let mut decoder_stream = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            QpackEvent::HeaderAck(stream_id) => {
+                decoder.write_section_acknowledgment(stream_id, &mut decoder_stream)
+            }
+            QpackEvent::StreamCancel(stream_id) => {
+                decoder.write_stream_cancellation(stream_id, &mut decoder_stream)
+            }
+            QpackEvent::DecoderAccessWaker(waker) => waker.wake(),
+            event => panic!("unexpected QPACK event: {event:?}"),
+        }
+    }
+    assert_eq!(wake_count.0.load(Ordering::Relaxed), 1);
+
+    // Writing released every instruction, whether or not it reached the peer.
+    decode_until_paused(&mut cx, bound..2 * bound);
 }
 
 #[test]
