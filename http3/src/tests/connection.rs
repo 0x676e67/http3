@@ -1324,6 +1324,7 @@ async fn blocked_grease_stream_does_not_hold_back_control_frames() {
         // The GOAWAY took effect while the GREASE stream was blocked, and a
         // fourth stream still lets the GREASE stream out.
         goaway_rx.await.unwrap();
+        // Hold the critical streams: closing one would return its credit.
         let mut critical_streams = Vec::new();
         for _ in 0..3 {
             critical_streams.push(conn.accept_uni().await.unwrap());

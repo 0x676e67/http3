@@ -1078,6 +1078,9 @@ where
     }
 
     /// Waits for the control stream to be received and reads subsequent frames.
+    ///
+    /// Each call also drives the optional GREASE stream, which never delays
+    /// control frames.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_control(
         &mut self,
@@ -1096,7 +1099,8 @@ where
     /// Keeping that accept pass outside the control-frame loop avoids polling
     /// the same incoming-stream queue again for each buffered frame.
     /// Returns a decoded frame, waits for the stream or its data, or reports the
-    /// same connection errors as `poll_control`.
+    /// same connection errors as `poll_control`. Like `poll_control`, it also
+    /// drives the GREASE stream.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub(crate) fn poll_accepted_control(
         &mut self,
