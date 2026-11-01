@@ -63,6 +63,11 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3", default-features = false }
 tracing-tree = "0.4"
 
+# quic 0.12.2 lacks the fixes for GHSA-53rm-773f-4q8c and GHSA-wppq-2f6r-wfvm.
+[patch.crates-io]
+quic = { git = "https://github.com/0x676e67/quic", rev = "daca87d87be17f56b7112fd117bec1a3378e7228" }
+quic-proto = { git = "https://github.com/0x676e67/quic", rev = "daca87d87be17f56b7112fd117bec1a3378e7228" }
+
 [profile.bench]
 opt-level = 3
 codegen-units = 1
