@@ -4,7 +4,7 @@ use std::{
     option::Option,
     result::Result,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use bytes::{Buf, BytesMut};
@@ -31,6 +31,9 @@ use crate::{
 /// The [`RequestStream`] struct is used to send and/or receive
 /// information from the client.
 /// After sending the final response, call [`RequestStream::finish`] to close the stream.
+/// Dropping it before [`RequestStream::finish`] cancels both directions with
+/// [`Code::H3_REQUEST_CANCELLED`]; afterwards, an unread request body is stopped
+/// with [`Code::H3_NO_ERROR`].
 pub struct RequestStream<S, B> {
     pub(super) inner: crate::connection::RequestStream<S, B>,
     pub(super) request_end: Arc<RequestEnd>,
@@ -209,7 +212,7 @@ where
     ///
     /// [`RequestStream::finish`] must be called to finalize a request.
     pub async fn finish(&mut self) -> Result<(), StreamError> {
-        self.inner.finish().await
+        future::poll_fn(|cx| self.poll_finish(cx)).await
     }
 
     /// Polls for the client stopping or acknowledging the response's send direction.
@@ -223,14 +226,6 @@ where
     ) -> Poll<Result<Option<Code>, StreamError>> {
         self.inner.poll_stopped(cx)
     }
-
-    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
-    //= type=TODO
-    //# Implementations SHOULD cancel requests by abruptly terminating any
-    //# directions of a stream that are still open.  To do so, an
-    //# implementation resets the sending parts of streams and aborts reading
-    //# on the receiving parts of streams; see Section 2.4 of
-    //# [QUIC-TRANSPORT].
 
     /// Returns the underlying stream id
     pub fn send_id(&self) -> StreamId {
@@ -274,7 +269,14 @@ where
     /// Success is repeatable and does not wait for FIN acknowledgment; use
     /// [`Self::poll_stopped`] for that. Receiving is unaffected.
     pub fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
-        self.inner.poll_finish(cx)
+        let result = ready!(self.inner.poll_finish(cx));
+        if result.is_ok() {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+            //# The error code H3_NO_ERROR SHOULD be used when requesting that the
+            //# client stop sending on the request stream.
+            self.inner.stream.set_cancel_code(Code::H3_NO_ERROR);
+        }
+        Poll::Ready(result)
     }
 }
 
@@ -285,6 +287,9 @@ where
 {
     /// Splits the Request-Stream into send and receive.
     /// This can be used the send and receive data on different tasks.
+    ///
+    /// Unless the response was finished before splitting, dropping the receive half
+    /// before the request body ends stops it with [`Code::H3_REQUEST_CANCELLED`].
     pub fn split(
         self,
     ) -> (

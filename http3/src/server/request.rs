@@ -7,13 +7,13 @@ use tracing::instrument;
 
 use super::{connection::RequestEnd, stream::RequestStream};
 use crate::{
-    connection::{self, RequestDecodeState},
+    connection::{self, RequestDecodeState, StreamGuard},
     error::{
         Code, StreamError,
         connection_error_creators::{CloseStream, HandleFrameStreamErrorOnRequestStream},
         internal_error::InternalConnectionError,
     },
-    frame::{FrameStream, FrameStreamError},
+    frame::FrameStreamError,
     proto::{
         frame::{Frame, PayloadLen},
         headers::Header,
@@ -24,15 +24,16 @@ use crate::{
 };
 
 /// Helper struct to await the request headers and return a `Request` object
+///
+/// Dropping it before the request is resolved rejects the request with
+/// [`Code::H3_REQUEST_REJECTED`].
 pub struct RequestResolver<C, B>
 where
     C: quic::Connection<B>,
     C::BidiStream: quic::SendStream<B>,
     B: Buf,
 {
-    #[doc(hidden)]
-    // TODO: make this private
-    pub frame_stream: FrameStream<C::BidiStream, B>,
+    pub(crate) frame_stream: StreamGuard<C::BidiStream, B>,
     pub(super) request_end: Arc<RequestEnd>,
     pub(super) send_grease_frame: bool,
     pub(super) max_field_section_size: u64,
@@ -65,8 +66,8 @@ where
     /// Returns a future to await the request headers and return a `Request` object
     ///
     /// This does not impose a header read deadline. Callers can use their runtime's
-    /// timeout mechanism. Dropping the resolver or cancelling this future releases
-    /// its entry in the connection's ongoing request tracking.
+    /// timeout mechanism. Dropping the resolver or cancelling this future rejects
+    /// the request and releases its entry in the connection's ongoing request tracking.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     #[allow(clippy::type_complexity)]
     pub async fn resolve_request(
@@ -96,6 +97,7 @@ where
             //# complete response, the server SHOULD abort its response stream with
             //# the error code H3_REQUEST_INCOMPLETE.
             Ok(None) => {
+                self.frame_stream.finish_reading();
                 self.frame_stream.reset(Code::H3_REQUEST_INCOMPLETE.value());
                 return Err(StreamError::StreamError {
                     code: Code::H3_REQUEST_INCOMPLETE,
@@ -198,6 +200,7 @@ where
                             .expect("header too big response"),
                     )
                     .await?;
+                self.request_stream.finish().await?;
 
                 return Err(StreamError::HeaderTooBig {
                     actual_size: cancel_size,
@@ -262,6 +265,14 @@ where
         #[cfg(feature = "tracing")]
         tracing::trace!("replying with: {:?}", req);
 
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+        //# When a server abandons a
+        //# response after partial processing, it SHOULD abort its response
+        //# stream with the error code H3_REQUEST_CANCELLED.
+        self.request_stream
+            .inner
+            .stream
+            .set_cancel_code(Code::H3_REQUEST_CANCELLED);
         Ok((req, self.request_stream))
     }
 }
