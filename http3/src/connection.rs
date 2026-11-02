@@ -1078,6 +1078,9 @@ where
     }
 
     /// Waits for the control stream to be received and reads subsequent frames.
+    ///
+    /// Each call also drives the optional GREASE stream, which never delays
+    /// control frames.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_control(
         &mut self,
@@ -1096,7 +1099,8 @@ where
     /// Keeping that accept pass outside the control-frame loop avoids polling
     /// the same incoming-stream queue again for each buffered frame.
     /// Returns a decoded frame, waits for the stream or its data, or reports the
-    /// same connection errors as `poll_control`.
+    /// same connection errors as `poll_control`. Like `poll_control`, it also
+    /// drives the GREASE stream.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub(crate) fn poll_accepted_control(
         &mut self,
@@ -1110,6 +1114,17 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Frame<PayloadLen>, ConnectionError>> {
+        if self.send_grease_stream_flag {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.3
+            //# They MAY also be
+            //# sent on connections where no data is currently being transferred.
+            // Best effort: the peer may grant only the three critical
+            // unidirectional streams, so a pending GREASE stream must not hold
+            // back control frames.
+            // https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+            let _ = self.poll_grease_stream(cx);
+        }
+
         let Some(recv) = &mut self.control_recv else {
             return Poll::Pending;
         };
@@ -1253,13 +1268,6 @@ where
                 )));
             }
         };
-
-        if self.send_grease_stream_flag {
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.3
-            //# They MAY also be
-            //# sent on connections where no data is currently being transferred.
-            ready!(self.poll_grease_stream(cx));
-        }
 
         Poll::Ready(Ok(res))
     }
