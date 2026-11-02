@@ -8,7 +8,7 @@ use crate::{
     buf::BufList,
     error::Code,
     proto::{
-        frame::{self, Frame, PayloadLen, SettingsError},
+        frame::{self, Frame, PayloadLen, SettingsError, StreamFrame},
         push::InvalidPushId,
         stream::StreamId,
     },
@@ -39,6 +39,14 @@ impl<S, B> FrameStream<S, B> {
     /// partially received/read frames.
     pub fn into_inner(self) -> BufRecvStream<S, B> {
         self.stream
+    }
+
+    /// Creates a decoder for a peer control stream, where HEADERS and
+    /// PUSH_PROMISE are rejected at their frame header.
+    pub(crate) fn control(stream: BufRecvStream<S, B>) -> Self {
+        let mut frames = Self::new(stream);
+        frames.decoder.control_stream = true;
+        frames
     }
 
     pub(crate) fn set_max_field_section_size(&mut self, max: usize) {
@@ -91,7 +99,7 @@ where
                     Poll::Ready(false) => continue,
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(true) => {
-                        if self.stream.buf_mut().has_remaining() {
+                        if self.stream.buf_mut().has_remaining() || self.decoder.skip != 0 {
                             // Reached the end of receive stream, but there is still some data:
                             // The frame is incomplete.
                             Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
@@ -161,7 +169,7 @@ where
     }
 
     pub(crate) fn is_eos(&self) -> bool {
-        self.stream.is_eos() && !self.stream.buf().has_remaining()
+        self.stream.is_eos() && !self.stream.buf().has_remaining() && self.decoder.skip == 0
     }
 
     fn try_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool, FrameStreamError>> {
@@ -240,7 +248,10 @@ where
 pub struct FrameDecoder {
     expected: Option<usize>,
     max_field_section_size: usize,
+    control_stream: bool,
     skipped_unknown: bool,
+    /// Payload bytes of an unknown frame still to discard.
+    skip: u64,
 }
 
 impl Default for FrameDecoder {
@@ -248,7 +259,9 @@ impl Default for FrameDecoder {
         Self {
             expected: None,
             max_field_section_size: usize::MAX,
+            control_stream: false,
             skipped_unknown: false,
+            skip: 0,
         }
     }
 }
@@ -261,6 +274,18 @@ impl FrameDecoder {
         // Decode in a loop since we ignore unknown frames, and there may be
         // other frames already in our BufList.
         loop {
+            // Discard an unknown frame's payload as it arrives, so its declared
+            // length, which may exceed the address space, is never buffered.
+            if self.skip != 0 {
+                let available = u64::try_from(src.remaining()).unwrap_or(u64::MAX);
+                let discard = self.skip.min(available);
+                src.advance(usize::try_from(discard).unwrap_or(src.remaining()));
+                self.skip -= discard;
+                if self.skip != 0 {
+                    return Ok(None);
+                }
+            }
+
             if !src.has_remaining() {
                 return Ok(None);
             }
@@ -273,15 +298,16 @@ impl FrameDecoder {
 
             let (pos, decoded) = {
                 let mut cur = src.cursor();
-                let decoded = Frame::decode_with_max_field_section_size(
+                let decoded = Frame::decode_stream(
                     &mut cur,
                     self.max_field_section_size,
+                    self.control_stream,
                 );
                 (cur.position(), decoded)
             };
 
             match decoded {
-                Err(frame::FrameError::UnknownFrame(_ty)) => {
+                Ok(StreamFrame::Unknown { ty: _ty, len }) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                     //# Frames of unknown types (Section 9), including reserved frames
                     //# (Section 7.2.8) MAY be sent on a request or push stream before,
@@ -295,13 +321,14 @@ impl FrameDecoder {
                     src.advance(pos);
                     self.expected = None;
                     self.skipped_unknown = true;
+                    self.skip = len;
                     continue;
                 }
                 Err(frame::FrameError::Incomplete(min)) => {
                     self.expected = Some(min);
                     return Ok(None);
                 }
-                Ok(frame) => {
+                Ok(StreamFrame::Known(frame)) => {
                     src.advance(pos);
                     self.expected = None;
                     return Ok(Some(frame));
@@ -336,7 +363,8 @@ impl FrameDecoder {
                         limit,
                     }));
                 }
-                Err(frame::FrameError::Malformed) => {
+                // `decode_stream` returns unknown frames as `StreamFrame::Unknown`.
+                Err(frame::FrameError::Malformed | frame::FrameError::UnknownFrame(_)) => {
                     return Err(FrameStreamError::Proto(FrameProtocolError::Malformed));
                 }
             }
@@ -462,6 +490,45 @@ mod tests {
                 Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
             );
         }
+    }
+
+    #[test]
+    fn unknown_frame_payload_is_discarded_as_it_arrives() {
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        let header = |len| {
+            let mut wire = BytesMut::new();
+            FrameType::grease().encode(&mut wire);
+            VarInt(len).encode(&mut wire);
+            wire.freeze()
+        };
+        let payload = Bytes::from(vec![0; 16 * 1024]);
+
+        // A frame of maximum length keeps nothing buffered, and its header alone
+        // already shows that an unknown frame came first.
+        let mut recv = FakeRecv::default();
+        recv.chunk(header(VarInt::MAX.0));
+        for _ in 0..64 {
+            recv.chunk(payload.clone());
+        }
+        recv.pending_when_empty();
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+        assert!(stream.poll_next(&mut cx).is_pending());
+        assert!(!stream.stream.buf().has_remaining());
+        assert!(stream.skipped_unknown_frame());
+
+        // The next frame decodes once the payload has passed.
+        let mut goaway = BytesMut::new();
+        Frame::<Bytes>::Goaway(VarInt(4)).encode(&mut goaway);
+        let mut recv = FakeRecv::default();
+        recv.chunk(header(2 * 16 * 1024))
+            .chunk(payload.clone())
+            .chunk(payload)
+            .chunk(goaway.freeze());
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+        assert_matches!(
+            stream.poll_next(&mut cx),
+            Poll::Ready(Ok(Some(Frame::Goaway(VarInt(4)))))
+        );
     }
 
     #[test]

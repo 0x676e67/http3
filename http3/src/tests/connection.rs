@@ -1655,6 +1655,31 @@ async fn boolean_settings_must_be_zero_or_one() {
     }
 }
 
+#[tokio::test]
+async fn control_frames_are_rejected_at_their_header() {
+    init_tracing();
+    // Only the frame header is sent and the stream stays open, so each frame
+    // must be rejected before its payload would be buffered.
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-10.5
+    for (frame, code) in [
+        // HEADERS of 2^30 - 1 bytes on the control stream.
+        (
+            &[0x01, 0xbf, 0xff, 0xff, 0xff][..],
+            Code::H3_FRAME_UNEXPECTED,
+        ),
+        // HTTP/2 PING of 2^30 - 1 bytes.
+        (&[0x06, 0xbf, 0xff, 0xff, 0xff], Code::H3_FRAME_UNEXPECTED),
+        // GOAWAY longer than one variable-length integer.
+        (&[0x07, 0x09], Code::H3_FRAME_ERROR),
+        // SETTINGS of 64 KiB + 1 bytes.
+        (&[0x04, 0x80, 0x01, 0x00, 0x01], Code::H3_EXCESSIVE_LOAD),
+    ] {
+        for control in malformed_control_streams(&[frame]) {
+            client_rejects_control_stream(&control, code).await;
+        }
+    }
+}
+
 /// Opens `control` as the server's control stream and expects the client to
 /// close the connection with `code`.
 async fn client_rejects_control_stream(control: &[u8], code: Code) {
