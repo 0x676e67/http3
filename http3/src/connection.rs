@@ -1263,21 +1263,9 @@ where
                 frame
             }
             Ok(Some(frame)) => {
-                // All other frames are not allowed on the control stream
-                // Unknown frames are not covered by the Frame enum and poll_next will just ignore
-                // them
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.1
-                //= type=implication
-                //# DATA frames MUST be associated with an HTTP request or response.
-
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.1
-                //# If
-                //# a DATA frame is received on a control stream, the recipient MUST
-                //# respond with a connection error of type H3_FRAME_UNEXPECTED.
-
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.2
-                //# If a HEADERS frame is received on a control stream, the recipient
-                //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
+                // All other frames are not allowed on the control stream. DATA,
+                // HEADERS and PUSH_PROMISE are rejected at their frame header, and
+                // unknown frames are skipped by poll_next.
                 return Poll::Ready(Err(self.handle_connection_error(
                     InternalConnectionError::new(
                         Code::H3_FRAME_UNEXPECTED,
@@ -1826,26 +1814,7 @@ where
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                     //# Receipt of an invalid sequence of frames MUST be treated as a
                     //# connection error of type H3_FRAME_UNEXPECTED.
-
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
-                    //# Receiving a
-                    //# CANCEL_PUSH frame on a stream other than the control stream MUST be
-                    //# treated as a connection error of type H3_FRAME_UNEXPECTED.
-
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
-                    //# If an endpoint receives a SETTINGS frame on a different
-                    //# stream, the endpoint MUST respond with a connection error of type
-                    //# H3_FRAME_UNEXPECTED.
-
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.6
-                    //# A client MUST treat a GOAWAY frame on a stream other than
-                    //# the control stream as a connection error of type H3_FRAME_UNEXPECTED.
-
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
-                    //# The MAX_PUSH_ID frame is always sent on the control stream.  Receipt
-                    //# of a MAX_PUSH_ID frame on any other stream MUST be treated as a
-                    //# connection error of type H3_FRAME_UNEXPECTED.
-
+                    // Control frames are rejected at their frame header.
                     return Poll::Ready(Err(self.handle_connection_error_on_stream(
                         InternalConnectionError::new(
                             Code::H3_FRAME_UNEXPECTED,
@@ -1899,25 +1868,7 @@ where
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                     //# Receipt of an invalid sequence of frames MUST be treated as a
                     //# connection error of type H3_FRAME_UNEXPECTED.
-
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
-                    //# Receiving a
-                    //# CANCEL_PUSH frame on a stream other than the control stream MUST be
-                    //# treated as a connection error of type H3_FRAME_UNEXPECTED.
-
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
-                    //# If an endpoint receives a SETTINGS frame on a different
-                    //# stream, the endpoint MUST respond with a connection error of type
-                    //# H3_FRAME_UNEXPECTED.
-
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.6
-                    //# A client MUST treat a GOAWAY frame on a stream other than
-                    //# the control stream as a connection error of type H3_FRAME_UNEXPECTED.
-
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
-                    //# The MAX_PUSH_ID frame is always sent on the control stream.  Receipt
-                    //# of a MAX_PUSH_ID frame on any other stream MUST be treated as a
-                    //# connection error of type H3_FRAME_UNEXPECTED.
+                    // Control frames are rejected at their frame header.
                     return Poll::Ready(Err(self.handle_connection_error_on_stream(
                         InternalConnectionError::new(
                             Code::H3_FRAME_UNEXPECTED,

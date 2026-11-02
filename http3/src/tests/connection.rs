@@ -1731,6 +1731,114 @@ async fn server_rejects_control_stream(control: &[u8], code: Code) {
     .unwrap_or_else(|_| panic!("server did not reject {control:x?}"));
 }
 
+#[tokio::test]
+async fn control_frames_are_rejected_at_their_header() {
+    init_tracing();
+    // Only the frame header is sent and the stream stays open, so each frame
+    // must be rejected before its payload would be buffered.
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-10.5
+    for (frame, code) in [
+        // HEADERS of 2^30 - 1 bytes on the control stream.
+        (
+            &[0x01, 0xbf, 0xff, 0xff, 0xff][..],
+            Code::H3_FRAME_UNEXPECTED,
+        ),
+        // HTTP/2 PING of 2^30 - 1 bytes.
+        (&[0x06, 0xbf, 0xff, 0xff, 0xff], Code::H3_FRAME_UNEXPECTED),
+        // GOAWAY of 2^30 bytes, as sent by h3spec.
+        (
+            &[0x07, 0xc0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00],
+            Code::H3_EXCESSIVE_LOAD,
+        ),
+        // SETTINGS of 64 KiB + 1 bytes.
+        (&[0x04, 0x80, 0x01, 0x00, 0x01], Code::H3_EXCESSIVE_LOAD),
+    ] {
+        for control in malformed_control_streams(&[frame]) {
+            client_rejects_control_stream(&control, code).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn control_frames_on_request_streams_are_unexpected() {
+    init_tracing();
+    // Empty payloads would be frame errors; the type alone is unexpected here.
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.3
+    // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.6
+    let unexpected = |error: quinn::ConnectionError| {
+        assert_matches!(
+            error,
+            quinn::ConnectionError::ApplicationClosed(close)
+                if close.error_code.into_inner() == Code::H3_FRAME_UNEXPECTED.value()
+        );
+    };
+
+    // Server role: CANCEL_PUSH opens a request stream.
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+    let client_fut = async {
+        let connection = pair.client_inner().await;
+        let (mut send, _recv) = connection.open_bi().await.unwrap();
+        send.write_all(&[0x03, 0x00]).await.unwrap();
+        unexpected(connection.closed().await);
+    };
+    let server_fut = async {
+        let mut incoming = server::Connection::new(server.next().await).await.unwrap();
+        let resolver = incoming.accept().await.unwrap().unwrap();
+        assert_matches!(
+            resolver.resolve_request().await.map(|_| ()),
+            Err(StreamError::ConnectionError(ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_FRAME_UNEXPECTED,
+                    ..
+                }
+            }))
+        );
+        // Keep driving until the connection error is sent.
+        let _ = incoming.accept().await;
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("server did not reject CANCEL_PUSH on a request stream");
+
+    // Client role: GOAWAY on the response stream.
+    let mut pair = Pair::default();
+    let server = pair.server_inner();
+    let client_fut = async {
+        let (mut driver, mut send_request) = client::new(pair.client().await).await.unwrap();
+        let request = async {
+            let mut stream = send_request
+                .send_request(Request::get("http://no.way").body(()).unwrap())
+                .await
+                .unwrap();
+            assert!(stream.recv_response().await.is_err());
+        };
+        let (_, error) = tokio::join!(request, driver.wait_idle());
+        assert_matches!(
+            error,
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_FRAME_UNEXPECTED,
+                    ..
+                }
+            }
+        );
+    };
+    let server_fut = async {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let (mut send, _recv) = conn.accept_bi().await.unwrap();
+        send.write_all(&[0x07, 0x00]).await.unwrap();
+        unexpected(conn.closed().await);
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("client did not reject GOAWAY on a response stream");
+}
+
 /// Opens `control` as the server's control stream and expects the client to
 /// close the connection with `code`.
 async fn client_rejects_control_stream(control: &[u8], code: Code) {
