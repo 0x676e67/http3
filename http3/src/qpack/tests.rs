@@ -319,7 +319,10 @@ fn unwritten_decoder_instructions_pause_decoding() {
     );
 
     let (events_send, mut events) = tokio::sync::mpsc::unbounded_channel();
-    let decoder = QpackDecoder::new(Decoder::new(TABLE_SIZE as u64, 1).unwrap(), events_send);
+    let decoder = QpackDecoder::with_instruction_bound(
+        Decoder::new(TABLE_SIZE as u64, 1).unwrap(),
+        events_send,
+    );
     let wake_count = Arc::new(WakeCounter(AtomicUsize::new(0)));
     let waker = futures_util::task::waker(wake_count.clone());
     let mut cx = Context::from_waker(&waker);
@@ -352,6 +355,16 @@ fn unwritten_decoder_instructions_pause_decoding() {
     };
     let bound = MAX_QUEUED_DECODER_INSTRUCTIONS as u64;
     decode_until_paused(&mut cx, 0..bound);
+    // A section without dynamic references queues nothing, so it still decodes.
+    assert!(matches!(
+        decoder.poll_decode_field_section(
+            &mut cx,
+            &mut Cursor::new([0x00, 0x00, 0xd9]),
+            u64::MAX,
+            &mut None
+        ),
+        Poll::Ready(Ok(Decoded { dyn_ref: false, .. }))
+    ));
 
     // The driver writes the backlog in queue order, then wakes the request.
     let mut decoder_stream = Vec::new();

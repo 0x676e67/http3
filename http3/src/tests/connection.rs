@@ -1183,6 +1183,14 @@ async fn abandoned_requests_release_their_stream_cancellations() {
             .build::<_, _, Bytes>(pair.client().await)
             .await
             .expect("client init");
+        // Clients pause dynamic decoding at the bound; servers never do.
+        assert!(
+            connection
+                .inner
+                .dynamic_qpack_decoder()
+                .unwrap()
+                .instruction_bound()
+        );
 
         // Each dropped request queues a Stream Cancellation; once the driver
         // writes them, the next dynamic response still decodes.
@@ -1227,6 +1235,66 @@ async fn abandoned_requests_release_their_stream_cancellations() {
     })
     .await
     .expect("Stream Cancellations kept decoding paused");
+}
+
+#[tokio::test]
+async fn idle_server_driver_does_not_pause_request_decoding() {
+    // `GET https://localhost/` plus `foo: bar` as dynamic entry 0: Required
+    // Insert Count 1 (encoded as 2), Base 1, static :method, :scheme and :path,
+    // a literal :authority, then the dynamic entry.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5
+    const REQUEST: &[u8] = b"\x01\x11\x02\x00\xd1\xd7\xc1\x50\x09localhost\x80";
+    const REQUESTS: usize = qpack::MAX_QUEUED_DECODER_INSTRUCTIONS + 1;
+
+    init_tracing();
+    let mut pair = Pair::default();
+    std::sync::Arc::get_mut(&mut pair.config)
+        .unwrap()
+        .max_concurrent_bidi_streams(quinn::VarInt::from_u32(REQUESTS as u32));
+    let mut server = pair.server();
+    let (resolved_send, resolved_recv) = oneshot::channel();
+
+    let client_fut = async {
+        let connection = pair.client_inner().await;
+        let peer = DynamicTablePeer::new(&connection).await;
+        let mut streams = Vec::new();
+        for _ in 0..REQUESTS {
+            let (mut send, recv) = connection.open_bi().await.unwrap();
+            send.write_all(REQUEST).await.unwrap();
+            send.finish().unwrap();
+            streams.push((send, recv));
+        }
+        resolved_recv.await.unwrap();
+        (connection, peer, streams)
+    };
+
+    let server_fut = async {
+        let mut incoming = server::builder()
+            .qpack_max_table_capacity(128)
+            .build(server.next().await)
+            .await
+            .unwrap();
+        let mut resolvers = Vec::new();
+        for _ in 0..REQUESTS {
+            resolvers.push(incoming.accept().await.unwrap().unwrap());
+        }
+        // An application may stop polling accept(), the server driver, while it
+        // handles requests; their Section Acknowledgments must not stall it.
+        let mut streams = Vec::new();
+        for resolver in resolvers {
+            let (request, stream) = resolver.resolve_request().await.unwrap();
+            assert_eq!(request.headers()["foo"], "bar");
+            streams.push(stream);
+        }
+        resolved_send.send(()).unwrap();
+        (incoming, streams)
+    };
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("request decoding waited for the server driver");
 }
 
 #[tokio::test]

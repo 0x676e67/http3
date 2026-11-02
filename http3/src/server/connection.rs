@@ -132,9 +132,8 @@ where
     /// all requests have been completed.
     ///
     /// Polling this method also drives the connection's control and QPACK streams. With a
-    /// QPACK dynamic table ([`Builder::qpack_max_table_capacity`]), keep polling it while
-    /// requests resolve or read trailers: decoding pauses while too many decoder
-    /// instructions wait for this driver to write them.
+    /// QPACK dynamic table ([`Builder::qpack_max_table_capacity`]), field sections that
+    /// reference entries not yet received wait until it is polled again.
     ///
     /// [`Builder::qpack_max_table_capacity`]: crate::server::Builder::qpack_max_table_capacity
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]

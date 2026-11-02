@@ -421,12 +421,20 @@ impl BlockedStreamRegistry {
     }
 }
 
-// Caps decoder instructions waiting for the connection driver, so an idle
-// driver does not flush them in one burst: nghttp3 rejects more than 4 KiB of
-// decoder-stream input between its own field-section encodes. 256 instructions
-// of a few bytes stay near 1 KiB; concurrent requests may overshoot slightly.
+// Caps decoder instructions waiting for the client driver, so an idle driver
+// does not flush them in one burst: nghttp3 rejects more than 4 KiB of
+// decoder-stream input between its own field-section encodes. 256 short
+// instructions stay near 1 KiB. Written bytes held back by flow control are not
+// counted: response decoding must not wait for send credit.
 // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
 pub(crate) const MAX_QUEUED_DECODER_INSTRUCTIONS: usize = 256;
+
+/// Returns whether an encoded field section declares a nonzero Required Insert
+/// Count. The count is the first 8-bit prefixed integer, so zero is a zero byte.
+/// https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
+pub(crate) fn references_dynamic_table<T: Buf>(field_section: &T) -> bool {
+    field_section.chunk().first().is_some_and(|&byte| byte != 0)
+}
 
 struct QpackDecoderInner {
     decoder: RwLock<Decoder>,
@@ -436,6 +444,8 @@ struct QpackDecoderInner {
     decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
     /// Section Acknowledgments and Stream Cancellations not yet written by the driver.
     queued_instructions: AtomicUsize,
+    /// Whether decoding pauses at [`MAX_QUEUED_DECODER_INSTRUCTIONS`].
+    instruction_bound: bool,
     /// Connection-driver waker used while a request holds a read guard.
     write_waker: AtomicWaker,
 }
@@ -444,8 +454,8 @@ struct QpackDecoderInner {
 ///
 /// Request tasks use read guards to decode field sections. The connection driver
 /// takes a write guard for dynamic table updates and resumes when active readers
-/// release their guards. Requests stop decoding while too many decoder
-/// instructions wait for the driver to write them.
+/// release their guards. With the instruction bound, requests stop decoding
+/// while too many decoder instructions wait for the driver to write them.
 #[derive(Clone)]
 pub(crate) struct QpackDecoder(Arc<QpackDecoderInner>);
 
@@ -459,6 +469,23 @@ impl QpackDecoder {
         decoder: Decoder,
         decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
     ) -> Self {
+        Self::build(decoder, decoder_events_send, false)
+    }
+
+    /// Like [`Self::new`], but dynamic field sections pause while
+    /// [`MAX_QUEUED_DECODER_INSTRUCTIONS`] instructions are queued for the driver.
+    pub(crate) fn with_instruction_bound(
+        decoder: Decoder,
+        decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
+    ) -> Self {
+        Self::build(decoder, decoder_events_send, true)
+    }
+
+    fn build(
+        decoder: Decoder,
+        decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
+        instruction_bound: bool,
+    ) -> Self {
         QpackDecoder(Arc::new(QpackDecoderInner {
             decoder_dynamic_table: decoder.dynamic_table_enabled(),
             allows_blocking: decoder.max_blocked_streams() != 0,
@@ -466,6 +493,7 @@ impl QpackDecoder {
             decoder: RwLock::new(decoder),
             decoder_events_send,
             queued_instructions: AtomicUsize::new(0),
+            instruction_bound,
             write_waker: AtomicWaker::new(),
         }))
     }
@@ -587,6 +615,11 @@ impl QpackDecoder {
             );
         }
         queued
+    }
+
+    #[cfg(test)]
+    pub(crate) fn instruction_bound(&self) -> bool {
+        self.0.instruction_bound
     }
 
     /// Writes a queued Section Acknowledgment to the decoder stream buffer.
@@ -712,13 +745,17 @@ impl QpackDecoder {
             ));
         }
 
-        // Every decoded dynamic field section needs its own Section
-        // Acknowledgment, so a stalled driver must not let decoding run far
-        // ahead of it. The driver wakes this request after writing every
-        // instruction queued before it; a stale count only costs another
-        // waiter round trip.
+        // Only sections with dynamic references queue a Section Acknowledgment.
+        // The driver wakes this request after writing the instructions before it.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.2.1
-        if self.0.queued_instructions.load(Ordering::Relaxed) >= MAX_QUEUED_DECODER_INSTRUCTIONS {
+        let references_dynamic_table = match prefix {
+            Some(prefix) => prefix.references_dynamic_table(),
+            None => references_dynamic_table(field_section),
+        };
+        if self.0.instruction_bound
+            && references_dynamic_table
+            && self.0.queued_instructions.load(Ordering::Relaxed) >= MAX_QUEUED_DECODER_INSTRUCTIONS
+        {
             self.queue_decoder_waiter(cx)?;
             #[cfg(feature = "tracing")]
             tracing::debug!("queued QPACK decoder waiter for decoder instructions");
