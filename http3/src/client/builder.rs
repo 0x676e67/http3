@@ -255,7 +255,11 @@ impl Builder {
         B: Buf,
     {
         let open = quic.opener();
-        let inner = ConnectionInner::new(quic, self.config.clone()).await?;
+        let config = Config {
+            bound_decoder_instructions: true,
+            ..self.config.clone()
+        };
+        let inner = ConnectionInner::new(quic, config).await?;
         let send_request = SendRequest {
             open,
             conn_state: inner.shared.clone(),
