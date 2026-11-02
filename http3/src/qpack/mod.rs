@@ -423,16 +423,10 @@ impl BlockedStreamRegistry {
     }
 }
 
-// Bound decoder instructions that requests queue before the connection driver
-// writes them. A driver that is not polled for a while would otherwise write
-// the whole backlog at once, and peers may limit such bursts: nghttp3 rejects
-// more than 4 KiB of decoder-stream input between two of its own field-section
-// encodes. Each decoded dynamic field section (a request head, an interim or
-// final response head, or trailers) queues one Section Acknowledgment of at
-// most 4 bytes for stream IDs below 2^21, so the backlog stays near 1 KiB.
-// Requests decoding concurrently with the check, and requests abandoned
-// meanwhile (one Stream Cancellation each), can exceed the bound by their
-// number.
+// Caps decoder instructions waiting for the connection driver, so an idle
+// driver does not flush them in one burst: nghttp3 rejects more than 4 KiB of
+// decoder-stream input between its own field-section encodes. 256 instructions
+// of a few bytes stay near 1 KiB; concurrent requests may overshoot slightly.
 // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
 pub(crate) const MAX_QUEUED_DECODER_INSTRUCTIONS: usize = 256;
 
