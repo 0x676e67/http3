@@ -36,6 +36,11 @@ pub struct Config {
     /// also limited by the peer's `SETTINGS_QPACK_MAX_TABLE_CAPACITY` value.
     pub(crate) qpack_encoder_table_capacity: usize,
 
+    /// Pauses field-section decoding while too many decoder instructions wait
+    /// for the connection driver. Only clients enable it, because the server
+    /// driver is `accept()`, which applications may stop polling.
+    pub(crate) bound_decoder_instructions: bool,
+
     /// HTTP/3 Settings
     pub settings: Settings,
 }
@@ -240,6 +245,7 @@ impl Default for Config {
             experimental_settings: Default::default(),
             qpack_decode_buffer_size: DEFAULT_QPACK_DECODE_BUFFER_SIZE,
             qpack_encoder_table_capacity: 0,
+            bound_decoder_instructions: false,
             settings: Default::default(),
         }
     }

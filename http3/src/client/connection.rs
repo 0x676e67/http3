@@ -419,7 +419,9 @@ where
 /// required transfers and transport acknowledgments first. See
 /// [RFC 9114 Section 5.3](https://www.rfc-editor.org/rfc/rfc9114.html#section-5.3).
 ///
-/// It needs to be polled continuously via [`poll_close()`]. On connection closure,
+/// It needs to be polled continuously via [`poll_close()`]. With a QPACK dynamic
+/// table, response decoding also pauses while too many decoder instructions are
+/// queued for this driver to write. On connection closure,
 /// this returns a [`ConnectionError`]; use [`ConnectionError::is_h3_no_error()`]
 /// to distinguish a normal close from an error.
 ///

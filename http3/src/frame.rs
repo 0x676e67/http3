@@ -155,6 +155,11 @@ where
         self.remaining_data != 0
     }
 
+    /// Returns whether a frame of unknown type was skipped on this stream.
+    pub(crate) fn skipped_unknown_frame(&self) -> bool {
+        self.decoder.skipped_unknown
+    }
+
     pub(crate) fn is_eos(&self) -> bool {
         self.stream.is_eos() && !self.stream.buf().has_remaining()
     }
@@ -235,6 +240,7 @@ where
 pub struct FrameDecoder {
     expected: Option<usize>,
     max_field_section_size: usize,
+    skipped_unknown: bool,
 }
 
 impl Default for FrameDecoder {
@@ -242,6 +248,7 @@ impl Default for FrameDecoder {
         Self {
             expected: None,
             max_field_section_size: usize::MAX,
+            skipped_unknown: false,
         }
     }
 }
@@ -287,6 +294,7 @@ impl FrameDecoder {
 
                     src.advance(pos);
                     self.expected = None;
+                    self.skipped_unknown = true;
                     continue;
                 }
                 Err(frame::FrameError::Incomplete(min)) => {

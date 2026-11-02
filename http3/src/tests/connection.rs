@@ -16,7 +16,7 @@ use crate::{
     error::{Code, ConnectionError, LocalError, StreamError},
     proto::{
         coding::{Decode as _, Encode as _},
-        frame::{self, Frame, Settings},
+        frame::{self, Frame, FrameType, Settings},
         headers::Header,
         push::PushId,
         stream::StreamType,
@@ -994,6 +994,309 @@ async fn client_flushes_insert_count_increment_without_a_blocked_request() {
     .expect("Insert Count Increment was not received");
 }
 
+/// Raw server-side QPACK streams after the client acknowledged `foo: bar`.
+struct DynamicTablePeer {
+    client_decoder: quinn::RecvStream,
+    // Closing a critical stream is a connection error.
+    _critical_streams: (Vec<quinn::SendStream>, Vec<quinn::RecvStream>),
+}
+
+impl DynamicTablePeer {
+    // `:status: 200` and `foo: bar`: Required Insert Count 1 (encoded as 2 for
+    // 4 entries), Base 1, static index 25 and dynamic entry 0.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1
+    const RESPONSE: [u8; 6] = [0x01, 0x04, 0x02, 0x00, 0xd9, 0x80];
+
+    /// Inserts the entry into a 128-byte table and waits for the client's
+    /// Insert Count Increment, so responses using it never block.
+    async fn new(connection: &quinn::Connection) -> Self {
+        let mut control_stream = connection.open_uni().await.unwrap();
+        let mut control = BytesMut::new();
+        StreamType::CONTROL.encode(&mut control);
+        Frame::<Bytes>::Settings(Settings::default()).encode(&mut control);
+        control_stream.write_all(&control).await.unwrap();
+
+        let mut decoder_stream = connection.open_uni().await.unwrap();
+        let mut stream_type = BytesMut::new();
+        StreamType::DECODER.encode(&mut stream_type);
+        decoder_stream.write_all(&stream_type).await.unwrap();
+
+        let mut encoder_stream = connection.open_uni().await.unwrap();
+        let mut instructions = BytesMut::new();
+        StreamType::ENCODER.encode(&mut instructions);
+        qpack::DynamicTableSizeUpdate(128).encode(&mut instructions);
+        qpack::InsertWithoutNameRef::new("foo", "bar")
+            .encode(&mut instructions)
+            .unwrap();
+        encoder_stream.write_all(&instructions).await.unwrap();
+
+        let mut other_streams = Vec::new();
+        let (mut client_decoder, mut received) = loop {
+            let mut stream = connection.accept_uni().await.unwrap();
+            let mut received = BytesMut::new();
+            while received.is_empty() {
+                let chunk = stream.read_chunk(usize::MAX, true).await.unwrap().unwrap();
+                received.extend_from_slice(&chunk.bytes);
+            }
+            if StreamType::decode(&mut received).unwrap() == StreamType::DECODER {
+                break (stream, received);
+            }
+            other_streams.push(stream);
+        };
+        while received.is_empty() {
+            let chunk = client_decoder
+                .read_chunk(usize::MAX, true)
+                .await
+                .unwrap()
+                .unwrap();
+            received.extend_from_slice(&chunk.bytes);
+        }
+        assert_eq!(
+            qpack::InsertCountIncrement::decode(&mut received),
+            Ok(Some(qpack::InsertCountIncrement(1)))
+        );
+        assert!(received.is_empty());
+
+        Self {
+            client_decoder,
+            _critical_streams: (
+                vec![control_stream, decoder_stream, encoder_stream],
+                other_streams,
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn unread_uploads_do_not_stop_response_decoding() {
+    const REQUESTS: usize = 300;
+    const BODY_LEN: usize = 512;
+
+    init_tracing();
+    let mut pair = Pair::default();
+    // Request heads fit the server's connection window; the bodies do not.
+    std::sync::Arc::get_mut(&mut pair.config)
+        .unwrap()
+        .receive_window(quinn::VarInt::from_u32(48 * 1024))
+        .max_concurrent_bidi_streams(quinn::VarInt::from_u32(REQUESTS as u32));
+    let server = pair.server();
+    let (ready_send, ready_recv) = oneshot::channel();
+
+    let client_fut = async {
+        let mut builder = client::builder();
+        builder.qpack_max_table_capacity(128);
+        builder.send_grease(false);
+        let (mut connection, send_request) = builder
+            .build::<_, _, Bytes>(pair.client().await)
+            .await
+            .expect("client init");
+
+        // The uploads exhaust connection-level send credit, which the decoder
+        // stream shares; decoding must not wait for its Section Acknowledgments
+        // to be sent.
+        let requests = async {
+            ready_recv.await.unwrap();
+            let streams = future::join_all((0..REQUESTS).map(|_| {
+                let mut send_request = send_request.clone();
+                async move {
+                    let request = Request::post("https://localhost/").body(()).unwrap();
+                    send_request.send_request(request).await.unwrap()
+                }
+            }))
+            .await;
+            let (sends, recvs): (Vec<_>, Vec<_>) =
+                streams.into_iter().map(|stream| stream.split()).unzip();
+            let uploads = future::join_all(sends.into_iter().map(|mut send| async move {
+                let _ = send.send_data(Bytes::from(vec![0; BODY_LEN])).await;
+                std::future::pending::<()>().await;
+            }));
+            let responses = future::join_all(recvs.into_iter().map(|mut recv| async move {
+                let response = recv.recv_response().await.unwrap();
+                assert_eq!(response.headers()["foo"], "bar");
+                // Keep reading open, so no Stream Cancellation is queued.
+                recv
+            }));
+            future::select(std::pin::pin!(responses), std::pin::pin!(uploads)).await;
+        };
+        let drive = future::poll_fn(|cx| connection.poll_close(cx));
+        if let future::Either::Right((error, _)) =
+            future::select(std::pin::pin!(requests), std::pin::pin!(drive)).await
+        {
+            panic!("connection closed early: {error:?}");
+        }
+    };
+
+    let server_fut = async {
+        let connection = server.endpoint.accept().await.unwrap().await.unwrap();
+        let mut peer = DynamicTablePeer::new(&connection).await;
+        ready_send.send(()).unwrap();
+
+        // The peer reads its decoder stream but none of the request bodies.
+        let read_decoder = async {
+            while let Some(_chunk) = peer
+                .client_decoder
+                .read_chunk(usize::MAX, true)
+                .await
+                .unwrap()
+            {}
+        };
+        let respond = async {
+            let mut streams = Vec::new();
+            for _ in 0..REQUESTS {
+                let (mut send, recv) = connection.accept_bi().await.unwrap();
+                send.write_all(&DynamicTablePeer::RESPONSE).await.unwrap();
+                send.finish().unwrap();
+                streams.push((send, recv));
+            }
+            std::future::pending::<()>().await;
+        };
+        future::join(read_decoder, respond).await;
+    };
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            () = client_fut => {}
+            _ = server_fut => unreachable!("the server keeps its streams open"),
+        }
+    })
+    .await
+    .expect("response decoding waited for connection-level send credit");
+}
+
+#[tokio::test]
+async fn abandoned_requests_release_their_stream_cancellations() {
+    const REQUESTS: usize = 2 * qpack::MAX_QUEUED_DECODER_INSTRUCTIONS;
+
+    init_tracing();
+    let mut pair = Pair::default();
+    std::sync::Arc::get_mut(&mut pair.config)
+        .unwrap()
+        .max_concurrent_bidi_streams(quinn::VarInt::from_u32(REQUESTS as u32 + 1));
+    let server = pair.server();
+    let (ready_send, ready_recv) = oneshot::channel();
+
+    let client_fut = async {
+        let mut builder = client::builder();
+        builder.qpack_max_table_capacity(128);
+        builder.send_grease(false);
+        let (mut connection, mut send_request) = builder
+            .build::<_, _, Bytes>(pair.client().await)
+            .await
+            .expect("client init");
+        // Clients pause dynamic decoding at the bound; servers never do.
+        assert!(
+            connection
+                .inner
+                .dynamic_qpack_decoder()
+                .unwrap()
+                .instruction_bound()
+        );
+
+        // Each dropped request queues a Stream Cancellation; once the driver
+        // writes them, the next dynamic response still decodes.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2
+        let requests = async {
+            ready_recv.await.unwrap();
+            for _ in 0..REQUESTS {
+                let request = Request::get("https://localhost/").body(()).unwrap();
+                let mut stream = send_request.send_request(request).await.unwrap();
+                stream.finish().await.unwrap();
+            }
+            let request = Request::get("https://localhost/").body(()).unwrap();
+            let mut stream = send_request.send_request(request).await.unwrap();
+            stream.finish().await.unwrap();
+            let response = stream.recv_response().await.unwrap();
+            assert_eq!(response.headers()["foo"], "bar");
+        };
+        let drive = future::poll_fn(|cx| connection.poll_close(cx));
+        if let future::Either::Right((error, _)) =
+            future::select(std::pin::pin!(requests), std::pin::pin!(drive)).await
+        {
+            panic!("connection closed early: {error:?}");
+        }
+    };
+
+    let server_fut = async {
+        let connection = server.endpoint.accept().await.unwrap().await.unwrap();
+        let peer = DynamicTablePeer::new(&connection).await;
+        ready_send.send(()).unwrap();
+        let mut streams = Vec::new();
+        for _ in 0..REQUESTS {
+            streams.push(connection.accept_bi().await.unwrap());
+        }
+        let (mut send, recv) = connection.accept_bi().await.unwrap();
+        send.write_all(&DynamicTablePeer::RESPONSE).await.unwrap();
+        send.finish().unwrap();
+        (connection, peer, streams, send, recv)
+    };
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("Stream Cancellations kept decoding paused");
+}
+
+#[tokio::test]
+async fn idle_server_driver_does_not_pause_request_decoding() {
+    // `GET https://localhost/` plus `foo: bar` as dynamic entry 0: Required
+    // Insert Count 1 (encoded as 2), Base 1, static :method, :scheme and :path,
+    // a literal :authority, then the dynamic entry.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5
+    const REQUEST: &[u8] = b"\x01\x11\x02\x00\xd1\xd7\xc1\x50\x09localhost\x80";
+    const REQUESTS: usize = qpack::MAX_QUEUED_DECODER_INSTRUCTIONS + 1;
+
+    init_tracing();
+    let mut pair = Pair::default();
+    std::sync::Arc::get_mut(&mut pair.config)
+        .unwrap()
+        .max_concurrent_bidi_streams(quinn::VarInt::from_u32(REQUESTS as u32));
+    let mut server = pair.server();
+    let (resolved_send, resolved_recv) = oneshot::channel();
+
+    let client_fut = async {
+        let connection = pair.client_inner().await;
+        let peer = DynamicTablePeer::new(&connection).await;
+        let mut streams = Vec::new();
+        for _ in 0..REQUESTS {
+            let (mut send, recv) = connection.open_bi().await.unwrap();
+            send.write_all(REQUEST).await.unwrap();
+            send.finish().unwrap();
+            streams.push((send, recv));
+        }
+        resolved_recv.await.unwrap();
+        (connection, peer, streams)
+    };
+
+    let server_fut = async {
+        let mut incoming = server::builder()
+            .qpack_max_table_capacity(128)
+            .build(server.next().await)
+            .await
+            .unwrap();
+        let mut resolvers = Vec::new();
+        for _ in 0..REQUESTS {
+            resolvers.push(incoming.accept().await.unwrap().unwrap());
+        }
+        // An application may stop polling accept(), the server driver, while it
+        // handles requests; their Section Acknowledgments must not stall it.
+        let mut streams = Vec::new();
+        for resolver in resolvers {
+            let (request, stream) = resolver.resolve_request().await.unwrap();
+            assert_eq!(request.headers()["foo"], "bar");
+            streams.push(stream);
+        }
+        resolved_send.send(()).unwrap();
+        (incoming, streams)
+    };
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("request decoding waited for the server driver");
+}
+
 #[tokio::test]
 async fn control_close_send_error() {
     init_tracing();
@@ -1103,6 +1406,104 @@ async fn missing_settings() {
     };
 
     tokio::select! { _ = server_fut => (), _ = client_fut => panic!("client resolved first") };
+}
+
+#[tokio::test]
+async fn unknown_frame_before_settings_is_missing_settings() {
+    init_tracing();
+    let reserved = {
+        let mut buf = BytesMut::new();
+        FrameType::RESERVED.encode(&mut buf);
+        VarInt(0).encode(&mut buf);
+        buf
+    };
+    let settings = {
+        let mut buf = BytesMut::new();
+        Frame::<Bytes>::Settings(Settings::default()).encode(&mut buf);
+        buf
+    };
+    let goaway = {
+        let mut buf = BytesMut::new();
+        Frame::<Bytes>::Goaway(VarInt(0)).encode(&mut buf);
+        buf
+    };
+    let control = |frames: &[&BytesMut]| {
+        let mut buf = BytesMut::new();
+        StreamType::CONTROL.encode(&mut buf);
+        frames.iter().for_each(|frame| buf.extend_from_slice(frame));
+        buf
+    };
+    let missing_settings = |error: ConnectionError| {
+        assert_matches!(
+            error,
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_MISSING_SETTINGS,
+                    ..
+                }
+            }
+        );
+    };
+
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-9
+    //= type=test
+    //# However, where a known frame type is required to be in
+    //# a specific location, such as the SETTINGS frame as the first frame of
+    //# the control stream (see Section 6.2.1), an unknown frame type does
+    //# not satisfy that requirement and SHOULD be treated as an error.
+
+    // Server role. An unknown frame cannot stand in for SETTINGS, whether
+    // SETTINGS follows it or nothing does. After SETTINGS it is ignored: the
+    // GOAWAY behind it on the same stream ends accept() only once it was read.
+    for (frames, rejected) in [
+        (vec![&reserved, &settings], true),
+        (vec![&reserved], true),
+        (vec![&settings, &reserved, &goaway], false),
+    ] {
+        let control = control(&frames);
+        let mut pair = Pair::default();
+        let mut server = pair.server();
+        let client_fut = async {
+            let connection = pair.client_inner().await;
+            let mut control_stream = connection.open_uni().await.unwrap();
+            control_stream.write_all(&control).await.unwrap();
+            connection.closed().await;
+        };
+        let server_fut = async {
+            let mut incoming = server::Connection::new(server.next().await).await.unwrap();
+            let accepted = incoming.accept().await.map(|request| request.is_some());
+            if rejected {
+                missing_settings(accepted.unwrap_err());
+            } else {
+                assert_matches!(accepted, Ok(false));
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! { biased; () = server_fut => (), () = client_fut => panic!("client closed first") }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("server did not handle {control:x?}"));
+    }
+
+    // Client role, through the connection driver.
+    let control = control(&[&reserved]);
+    let mut pair = Pair::default();
+    let server = pair.server_inner();
+    let client_fut = async {
+        let (mut driver, _send) = client::new(pair.client().await).await.unwrap();
+        missing_settings(future::poll_fn(|cx| driver.poll_close(cx)).await);
+    };
+    let server_fut = async {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let mut control_stream = conn.open_uni().await.unwrap();
+        control_stream.write_all(&control).await.unwrap();
+        conn.closed().await;
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("client did not reject an unknown first frame");
 }
 
 #[tokio::test]
@@ -1355,6 +1756,76 @@ async fn client_rejects_control_stream(control: &[u8], code: Code) {
     })
     .await
     .unwrap_or_else(|_| panic!("client did not reject {control:x?}"));
+}
+
+#[tokio::test]
+async fn blocked_grease_stream_does_not_hold_back_control_frames() {
+    init_tracing();
+    let mut pair = Pair::default();
+    // Room for the client's three critical streams only, the minimum RFC 9114
+    // requires, so its GREASE stream cannot open yet.
+    // https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+    std::sync::Arc::get_mut(&mut pair.config)
+        .unwrap()
+        .max_concurrent_uni_streams(quinn::VarInt::from_u32(3));
+    let server = pair.server_inner();
+    let (goaway_tx, goaway_rx) = oneshot::channel();
+
+    let client_fut = async {
+        let (mut driver, send_request) = client::new(pair.client().await).await.unwrap();
+        tokio::select! {
+            biased;
+            () = goaway_published(&send_request, 4) => goaway_tx.send(()).unwrap(),
+            error = driver.wait_idle() => panic!("connection failed: {error}"),
+        }
+        // A larger GOAWAY is rejected only because the first one was read.
+        assert_matches!(
+            driver.wait_idle().await,
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_ID_ERROR,
+                    ..
+                }
+            }
+        );
+    };
+    let server_fut = async {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let mut control_stream = conn.open_uni().await.unwrap();
+        let mut buf = BytesMut::new();
+        StreamType::CONTROL.encode(&mut buf);
+        Frame::<Bytes>::Settings(Settings::default()).encode(&mut buf);
+        Frame::<Bytes>::Goaway(VarInt(4)).encode(&mut buf);
+        control_stream.write_all(&buf).await.unwrap();
+
+        // The GOAWAY took effect while the GREASE stream was blocked, and a
+        // fourth stream still lets the GREASE stream out.
+        goaway_rx.await.unwrap();
+        // Hold the critical streams: closing one would return its credit.
+        let mut critical_streams = Vec::new();
+        for _ in 0..3 {
+            critical_streams.push(conn.accept_uni().await.unwrap());
+        }
+        conn.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(4));
+        let mut grease = conn.accept_uni().await.unwrap();
+        let grease = grease.read_to_end(64).await.unwrap();
+        let stream_type = StreamType::decode(&mut &grease[..]).unwrap().value();
+        assert_eq!(
+            stream_type.checked_sub(0x21).map(|n| n % 0x1f),
+            Some(0),
+            "{stream_type:#x}"
+        );
+
+        let mut buf = BytesMut::new();
+        Frame::<Bytes>::Goaway(VarInt(8)).encode(&mut buf);
+        control_stream.write_all(&buf).await.unwrap();
+        conn.closed().await;
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("the client stalled behind its blocked GREASE stream");
 }
 
 #[tokio::test]

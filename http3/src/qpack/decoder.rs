@@ -130,6 +130,12 @@ pub(crate) struct FieldSectionPrefix {
     base: usize,
 }
 
+impl FieldSectionPrefix {
+    pub(crate) fn references_dynamic_table(&self) -> bool {
+        self.required_ref != 0
+    }
+}
+
 pub struct Decoder {
     table: DynamicTable,
     // SETTINGS_QPACK_MAX_TABLE_CAPACITY is a fixed decoding limit. The table's
