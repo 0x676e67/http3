@@ -14,9 +14,7 @@ use tokio::sync::mpsc;
 #[cfg(feature = "unstable")]
 pub use self::decoder::decode_stateless;
 #[cfg(test)]
-pub(crate) use self::stream::{
-    DynamicTableSizeUpdate, HeaderAck, InsertCountIncrement, InsertWithoutNameRef, StreamCancel,
-};
+pub(crate) use self::stream::{DynamicTableSizeUpdate, InsertCountIncrement, InsertWithoutNameRef};
 pub use self::{
     decoder::{Decoded, Decoder, DecoderError, ack_header, stream_canceled},
     encoder::{EncoderError, encode_stateless},

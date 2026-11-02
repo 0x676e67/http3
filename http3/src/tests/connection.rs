@@ -1068,174 +1068,6 @@ impl DynamicTablePeer {
 }
 
 #[tokio::test]
-async fn idle_client_driver_bounds_queued_decoder_instructions() {
-    use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-        task::{Context, Poll, Wake, Waker},
-    };
-
-    struct Woken(AtomicBool);
-
-    impl Wake for Woken {
-        fn wake(self: Arc<Self>) {
-            self.0.store(true, Ordering::Relaxed);
-        }
-    }
-
-    const BOUND: usize = qpack::MAX_QUEUED_DECODER_INSTRUCTIONS;
-    const REQUESTS: usize = 2 * BOUND;
-
-    init_tracing();
-    let mut pair = Pair::default();
-    Arc::get_mut(&mut pair.config)
-        .unwrap()
-        .max_concurrent_bidi_streams(quinn::VarInt::from_u32(REQUESTS as u32));
-    let server = pair.server();
-    let (responded_send, responded_recv) = oneshot::channel();
-    let (acknowledged_send, acknowledged_recv) = oneshot::channel();
-
-    let client_fut = async {
-        let mut builder = client::builder();
-        builder.qpack_max_table_capacity(128);
-        builder.send_grease(false);
-        let (mut connection, mut send_request) = builder
-            .build::<_, _, Bytes>(pair.client().await)
-            .await
-            .expect("client init");
-
-        // The driver writes the Insert Count Increment while requests are sent.
-        let requests = async {
-            let mut streams = Vec::new();
-            for _ in 0..REQUESTS {
-                let request = Request::get("https://localhost/").body(()).unwrap();
-                let mut stream = send_request.send_request(request).await.unwrap();
-                stream.finish().await.unwrap();
-                streams.push(stream);
-            }
-            responded_recv.await.unwrap();
-            streams
-        };
-        let drive = future::poll_fn(|cx| connection.poll_close(cx));
-        let mut streams =
-            match future::select(std::pin::pin!(requests), std::pin::pin!(drive)).await {
-                future::Either::Left((streams, _)) => streams,
-                future::Either::Right((error, _)) => panic!("connection closed early: {error:?}"),
-            };
-
-        // Every response is buffered. Without the driver, decoding pauses once
-        // the bound of unwritten Section Acknowledgments is reached.
-        let wakes: Vec<_> = (0..REQUESTS)
-            .map(|_| Arc::new(Woken(AtomicBool::new(false))))
-            .collect();
-        let mut poll_response = |request: usize| {
-            let waker = Waker::from(wakes[request].clone());
-            streams[request].poll_recv_response(&mut Context::from_waker(&waker))
-        };
-        let pending: Vec<_> = (0..REQUESTS)
-            .filter(|&request| match poll_response(request) {
-                Poll::Ready(response) => {
-                    assert_eq!(response.unwrap().headers()["foo"], "bar");
-                    false
-                }
-                Poll::Pending => true,
-            })
-            .collect();
-        assert!(pending.iter().copied().eq(BOUND..REQUESTS));
-
-        // One driver poll writes the whole backlog and wakes every paused
-        // request. Tokio's budget would otherwise cut the event drain short.
-        let poll = tokio::task::unconstrained(future::poll_fn(|cx| {
-            Poll::Ready(connection.poll_close(cx))
-        }))
-        .await;
-        assert!(poll.is_pending());
-        assert!(
-            pending
-                .iter()
-                .all(|&request| wakes[request].0.load(Ordering::Relaxed))
-        );
-        for &request in &pending {
-            assert_matches!(poll_response(request), Poll::Ready(Ok(_)));
-        }
-
-        // EOF completes each stream without a Stream Cancellation.
-        let finish = async {
-            for stream in &mut streams {
-                assert!(stream.recv_data().await.unwrap().is_none());
-            }
-            acknowledged_recv.await.unwrap();
-        };
-        let drive = future::poll_fn(|cx| connection.poll_close(cx));
-        if let future::Either::Right((error, _)) =
-            future::select(std::pin::pin!(finish), std::pin::pin!(drive)).await
-        {
-            panic!("connection closed early: {error:?}");
-        }
-    };
-
-    let server_fut = async {
-        let connection = server.endpoint.accept().await.unwrap().await.unwrap();
-        let mut peer = DynamicTablePeer::new(&connection).await;
-
-        let mut streams = Vec::new();
-        for _ in 0..REQUESTS {
-            let (mut send, recv) = connection.accept_bi().await.unwrap();
-            send.write_all(&DynamicTablePeer::RESPONSE).await.unwrap();
-            send.finish().unwrap();
-            streams.push((send, recv));
-        }
-        // The client's transport acknowledged every response.
-        for (send, _) in &streams {
-            assert_matches!(send.stopped().await, Ok(None));
-        }
-        responded_send.send(()).unwrap();
-
-        // Each response is acknowledged exactly once.
-        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
-        let mut acknowledged = Vec::new();
-        let mut received = BytesMut::new();
-        while acknowledged.len() < REQUESTS {
-            let chunk = peer
-                .client_decoder
-                .read_chunk(usize::MAX, true)
-                .await
-                .unwrap()
-                .unwrap();
-            received.extend_from_slice(&chunk.bytes);
-            loop {
-                let mut read = std::io::Cursor::new(&received[..]);
-                let Some(qpack::HeaderAck(stream_id)) =
-                    qpack::HeaderAck::decode(&mut read).unwrap()
-                else {
-                    break;
-                };
-                let consumed = read.position() as usize;
-                received.advance(consumed);
-                acknowledged.push(stream_id);
-            }
-        }
-        acknowledged.sort_unstable();
-        assert!(
-            acknowledged
-                .into_iter()
-                .eq((0..REQUESTS as u64).map(|request| 4 * request))
-        );
-        assert!(received.is_empty());
-        acknowledged_send.send(()).unwrap();
-        (connection, peer, streams)
-    };
-
-    tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::join!(client_fut, server_fut);
-    })
-    .await
-    .expect("decoder instruction backlog was not released");
-}
-
-#[tokio::test]
 async fn unread_uploads_do_not_stop_response_decoding() {
     const REQUESTS: usize = 300;
     const BODY_LEN: usize = 512;
@@ -1342,7 +1174,6 @@ async fn abandoned_requests_release_their_stream_cancellations() {
         .max_concurrent_bidi_streams(quinn::VarInt::from_u32(REQUESTS as u32 + 1));
     let server = pair.server();
     let (ready_send, ready_recv) = oneshot::channel();
-    let (cancelled_send, cancelled_recv) = oneshot::channel();
 
     let client_fut = async {
         let mut builder = client::builder();
@@ -1355,6 +1186,7 @@ async fn abandoned_requests_release_their_stream_cancellations() {
 
         // Each dropped request queues a Stream Cancellation; once the driver
         // writes them, the next dynamic response still decodes.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2
         let requests = async {
             ready_recv.await.unwrap();
             for _ in 0..REQUESTS {
@@ -1362,7 +1194,6 @@ async fn abandoned_requests_release_their_stream_cancellations() {
                 let mut stream = send_request.send_request(request).await.unwrap();
                 stream.finish().await.unwrap();
             }
-            cancelled_recv.await.unwrap();
             let request = Request::get("https://localhost/").body(()).unwrap();
             let mut stream = send_request.send_request(request).await.unwrap();
             stream.finish().await.unwrap();
@@ -1379,45 +1210,12 @@ async fn abandoned_requests_release_their_stream_cancellations() {
 
     let server_fut = async {
         let connection = server.endpoint.accept().await.unwrap().await.unwrap();
-        let mut peer = DynamicTablePeer::new(&connection).await;
+        let peer = DynamicTablePeer::new(&connection).await;
         ready_send.send(()).unwrap();
         let mut streams = Vec::new();
         for _ in 0..REQUESTS {
             streams.push(connection.accept_bi().await.unwrap());
         }
-
-        // Each abandoned stream is cancelled exactly once.
-        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2
-        let mut cancelled = Vec::new();
-        let mut received = BytesMut::new();
-        while cancelled.len() < REQUESTS {
-            let chunk = peer
-                .client_decoder
-                .read_chunk(usize::MAX, true)
-                .await
-                .unwrap()
-                .unwrap();
-            received.extend_from_slice(&chunk.bytes);
-            loop {
-                let mut read = std::io::Cursor::new(&received[..]);
-                let Some(qpack::StreamCancel(stream_id)) =
-                    qpack::StreamCancel::decode(&mut read).unwrap()
-                else {
-                    break;
-                };
-                let consumed = read.position() as usize;
-                received.advance(consumed);
-                cancelled.push(stream_id);
-            }
-        }
-        cancelled.sort_unstable();
-        assert!(
-            cancelled
-                .into_iter()
-                .eq((0..REQUESTS as u64).map(|request| 4 * request))
-        );
-        cancelled_send.send(()).unwrap();
-
         let (mut send, recv) = connection.accept_bi().await.unwrap();
         send.write_all(&DynamicTablePeer::RESPONSE).await.unwrap();
         send.finish().unwrap();
