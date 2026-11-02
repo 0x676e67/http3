@@ -215,8 +215,8 @@ where
     ///
     /// Before the final response, later receive calls then return
     /// [`StreamError::InvalidStreamState`]. After the final response, body reads
-    /// remain allowed, but unread data may be discarded by the transport. With a
-    /// QPACK dynamic table, trailers are no longer decoded.
+    /// remain allowed, but unread data may be discarded by the transport.
+    /// Trailers that reference the QPACK dynamic table are no longer decoded.
     /// The request's send direction remains open. Dropping the stream afterwards
     /// does not replace this receive-side code with `H3_REQUEST_CANCELLED`.
     /// Clients must not use `H3_REQUEST_REJECTED` unless the server requested

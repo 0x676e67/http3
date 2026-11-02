@@ -97,7 +97,7 @@ where
 
     /// Tell the peer to stop sending into the underlying QUIC stream
     ///
-    /// With a QPACK dynamic table, trailers are no longer decoded afterwards.
+    /// Trailers that reference the QPACK dynamic table are no longer decoded afterwards.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_sending(&mut self, error_code: Code) {
         self.inner.stop_sending(error_code)

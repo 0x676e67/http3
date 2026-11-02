@@ -429,11 +429,19 @@ impl BlockedStreamRegistry {
 // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
 pub(crate) const MAX_QUEUED_DECODER_INSTRUCTIONS: usize = 256;
 
-/// Returns whether an encoded field section declares a nonzero Required Insert
-/// Count. The count is the first 8-bit prefixed integer, so zero is a zero byte.
-/// https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
-pub(crate) fn references_dynamic_table<T: Buf>(field_section: &T) -> bool {
-    field_section.chunk().first().is_some_and(|&byte| byte != 0)
+/// Returns whether a field section declares a nonzero Required Insert Count.
+///
+/// A blocked section keeps its parsed `prefix` and no longer holds the prefix
+/// bytes. Otherwise the count is the first 8-bit prefixed integer, so zero is a
+/// zero byte. https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
+pub(crate) fn references_dynamic_table<T: Buf>(
+    prefix: Option<&FieldSectionPrefix>,
+    field_section: &T,
+) -> bool {
+    match prefix {
+        Some(prefix) => prefix.references_dynamic_table(),
+        None => field_section.chunk().first().is_some_and(|&byte| byte != 0),
+    }
 }
 
 struct QpackDecoderInner {
@@ -748,12 +756,8 @@ impl QpackDecoder {
         // Only sections with dynamic references queue a Section Acknowledgment.
         // The driver wakes this request after writing the instructions before it.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.2.1
-        let references_dynamic_table = match prefix {
-            Some(prefix) => prefix.references_dynamic_table(),
-            None => references_dynamic_table(field_section),
-        };
         if self.0.instruction_bound
-            && references_dynamic_table
+            && references_dynamic_table(prefix.as_ref(), field_section)
             && self.0.queued_instructions.load(Ordering::Relaxed) >= MAX_QUEUED_DECODER_INSTRUCTIONS
         {
             self.queue_decoder_waiter(cx)?;

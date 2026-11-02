@@ -1630,8 +1630,11 @@ impl RequestDecodeState {
         }
     }
 
-    fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Dynamic(state) if state.cancelled)
+    /// Whether reading was cancelled and `field_section` references the dynamic table.
+    fn refuses_after_cancellation<T: Buf>(&self, field_section: &T) -> bool {
+        matches!(self, Self::Dynamic(state)
+            if state.cancelled
+                && qpack::references_dynamic_table(state.prefix.as_ref(), field_section))
     }
 }
 
@@ -1897,7 +1900,7 @@ where
         // After Stream Cancellation the peer expects no Section Acknowledgment for
         // this stream and may evict the entries dynamic trailers reference.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.2.2
-        if self.decode_state.is_cancelled() && qpack::references_dynamic_table(&trailers) {
+        if self.decode_state.refuses_after_cancellation(&trailers) {
             return Poll::Ready(Err(StreamError::InvalidStreamState {
                 reason: "the trailers are no longer read".into(),
             }));
@@ -3095,12 +3098,20 @@ mod request_drop_tests {
 
     #[tokio::test]
     async fn stopped_receive_side_decodes_only_static_trailers() {
-        // HEADERS with Required Insert Count 1, Base 1 and dynamic entry 0, and
-        // HEADERS with Required Insert Count 0 and static `age: 0`.
-        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1
-        for (trailers, dynamic) in [
-            (&[0x01, 0x03, 0x02, 0x00, 0x80], true),
-            (&[0x01, 0x03, 0x00, 0x00, 0xc2], false),
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5
+        // Required Insert Count 1, Base 1 and dynamic entry 0.
+        const DYNAMIC: &[u8] = &[0x01, 0x03, 0x02, 0x00, 0x80];
+        // Required Insert Count 0 and static `age: 0`.
+        const STATIC: &[u8] = &[0x01, 0x03, 0x00, 0x00, 0xc2];
+        // Required Insert Count 1, Base 0, then `foo: baz` whose post-base name
+        // reference starts the field lines with a zero byte.
+        const BLOCKED: &[u8] = b"\x01\x07\x02\x80\x00\x03baz";
+
+        // The blocked trailers are cancelled before their entry arrives.
+        for (trailers, blocked, decodes) in [
+            (DYNAMIC, false, false),
+            (STATIC, false, true),
+            (BLOCKED, true, false),
         ] {
             let (mut stream, _probe) = stream_with_probe(Probe {
                 incoming: Some(Bytes::from_static(trailers)),
@@ -3108,21 +3119,30 @@ mod request_drop_tests {
             });
             let (events_send, mut events) = mpsc::unbounded_channel();
             let decoder = QpackDecoder::new(qpack::Decoder::new(1024, 1).unwrap(), events_send);
-            let mut encoder_stream = BytesMut::new();
-            qpack::DynamicTableSizeUpdate(1024).encode(&mut encoder_stream);
-            qpack::InsertWithoutNameRef::new("foo", "bar")
-                .encode(&mut encoder_stream)
-                .unwrap();
-            assert_eq!(
-                decoder.poll_on_recv_encoder(
-                    &mut Context::from_waker(futures_util::task::noop_waker_ref()),
-                    &mut std::io::Cursor::new(encoder_stream),
-                    &mut Vec::new(),
-                ),
-                Poll::Ready(Ok(1))
+            let insert = || {
+                let mut encoder_stream = BytesMut::new();
+                qpack::DynamicTableSizeUpdate(1024).encode(&mut encoder_stream);
+                qpack::InsertWithoutNameRef::new("foo", "bar")
+                    .encode(&mut encoder_stream)
+                    .unwrap();
+                assert_eq!(
+                    decoder.poll_on_recv_encoder(
+                        &mut Context::from_waker(futures_util::task::noop_waker_ref()),
+                        &mut std::io::Cursor::new(encoder_stream),
+                        &mut Vec::new(),
+                    ),
+                    Poll::Ready(Ok(1))
+                );
+            };
+            if !blocked {
+                insert();
+            }
+            stream.decode_state = RequestDecodeState::new(
+                StreamId(0),
+                &stream.conn_state,
+                1024,
+                Some(decoder.clone()),
             );
-            stream.decode_state =
-                RequestDecodeState::new(StreamId(0), &stream.conn_state, 1024, Some(decoder));
 
             // The trailers are buffered before reading stops.
             assert!(
@@ -3131,24 +3151,38 @@ mod request_drop_tests {
                     .unwrap()
                     .is_none()
             );
+            if blocked {
+                let poll = future::poll_fn(|cx| Poll::Ready(stream.poll_recv_trailers(cx))).await;
+                assert!(poll.is_pending());
+            }
             stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+            if blocked {
+                insert();
+            }
             let received = future::poll_fn(|cx| stream.poll_recv_trailers(cx)).await;
-            if dynamic {
+            if decodes {
+                assert_eq!(received.unwrap().unwrap()["age"], "0");
+            } else {
                 assert!(matches!(
                     received,
                     Err(StreamError::InvalidStreamState { .. })
                 ));
-            } else {
-                assert_eq!(received.unwrap().unwrap()["age"], "0");
             }
 
             // The peer rejects a Section Acknowledgment after Stream Cancellation.
             // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
+            let instructions: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+                .filter(|event| {
+                    matches!(
+                        event,
+                        QpackEvent::HeaderAck(_) | QpackEvent::StreamCancel(_)
+                    )
+                })
+                .collect();
             assert!(matches!(
-                events.try_recv(),
-                Ok(QpackEvent::StreamCancel(StreamId(0)))
+                instructions[..],
+                [QpackEvent::StreamCancel(StreamId(0))]
             ));
-            assert!(events.try_recv().is_err());
         }
     }
 
