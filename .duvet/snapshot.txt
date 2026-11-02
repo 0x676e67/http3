@@ -743,10 +743,10 @@ SPECIFICATION: https://www.rfc-editor.org/rfc/rfc9114
     TEXT[!MUST,implementation]: Implementations MUST discard data or
     TEXT[!MUST,implementation]:    abort reading on unidirectional streams that have unknown or
     TEXT[!MUST,implementation]:    unsupported types.
-    TEXT[!SHOULD,todo]: However, where a known frame type is required to be in
-    TEXT[!SHOULD,todo]:    a specific location, such as the SETTINGS frame as the first frame of
-    TEXT[!SHOULD,todo]:    the control stream (see Section 6.2.1), an unknown frame type does
-    TEXT[!SHOULD,todo]:    not satisfy that requirement and SHOULD be treated as an error.
+    TEXT[!SHOULD,implementation,test]: However, where a known frame type is required to be in
+    TEXT[!SHOULD,implementation,test]:    a specific location, such as the SETTINGS frame as the first frame of
+    TEXT[!SHOULD,implementation,test]:    the control stream (see Section 6.2.1), an unknown frame type does
+    TEXT[!SHOULD,implementation,test]:    not satisfy that requirement and SHOULD be treated as an error.
     TEXT[!MUST,exception]:    Extensions that could change the semantics of existing protocol
     TEXT[!MUST,exception]:    components MUST be negotiated before being used.
     TEXT[!MUST,exception]: If a setting is used for extension negotiation, the default
