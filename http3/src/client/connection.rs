@@ -316,7 +316,7 @@ where
         }
 
         let request_stream = RequestStream::new(connection::RequestStream::new(
-            FrameStream::new(BufRecvStream::new(stream)),
+            FrameStream::request(BufRecvStream::new(stream)),
             self.max_field_section_size,
             self.max_qpack_decode_buffer_size,
             self.send_grease_frame,
@@ -576,10 +576,6 @@ where
                         id
                     );
                 }
-
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
-                //# If a PUSH_PROMISE frame is received on the control stream, the client
-                //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
 
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
                 //# A client MUST treat the

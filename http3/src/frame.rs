@@ -8,7 +8,7 @@ use crate::{
     buf::BufList,
     error::Code,
     proto::{
-        frame::{self, Frame, PayloadLen, SettingsError, StreamFrame},
+        frame::{self, Frame, PayloadLen, SettingsError, StreamFrame, StreamKind},
         push::InvalidPushId,
         stream::StreamId,
     },
@@ -36,7 +36,8 @@ impl<S, B> FrameStream<S, B> {
     }
 
     /// Unwraps the Framed streamer and returns the underlying stream **without** data loss for
-    /// partially received/read frames.
+    /// partially received/read frames. The rest of an unknown frame being skipped is already
+    /// discarded, so call this at a frame boundary.
     pub fn into_inner(self) -> BufRecvStream<S, B> {
         self.stream
     }
@@ -44,8 +45,18 @@ impl<S, B> FrameStream<S, B> {
     /// Creates a decoder for a peer control stream, where HEADERS and
     /// PUSH_PROMISE are rejected at their frame header.
     pub(crate) fn control(stream: BufRecvStream<S, B>) -> Self {
+        Self::with_kind(stream, StreamKind::Control)
+    }
+
+    /// Creates a decoder for a request or push stream, where control frames are
+    /// rejected at their frame header.
+    pub(crate) fn request(stream: BufRecvStream<S, B>) -> Self {
+        Self::with_kind(stream, StreamKind::Request)
+    }
+
+    fn with_kind(stream: BufRecvStream<S, B>, kind: StreamKind) -> Self {
         let mut frames = Self::new(stream);
-        frames.decoder.control_stream = true;
+        frames.decoder.kind = kind;
         frames
     }
 
@@ -248,7 +259,7 @@ where
 pub struct FrameDecoder {
     expected: Option<usize>,
     max_field_section_size: usize,
-    control_stream: bool,
+    kind: StreamKind,
     skipped_unknown: bool,
     /// Payload bytes of an unknown frame still to discard.
     skip: u64,
@@ -259,7 +270,7 @@ impl Default for FrameDecoder {
         Self {
             expected: None,
             max_field_section_size: usize::MAX,
-            control_stream: false,
+            kind: StreamKind::Any,
             skipped_unknown: false,
             skip: 0,
         }
@@ -298,11 +309,8 @@ impl FrameDecoder {
 
             let (pos, decoded) = {
                 let mut cur = src.cursor();
-                let decoded = Frame::decode_stream(
-                    &mut cur,
-                    self.max_field_section_size,
-                    self.control_stream,
-                );
+                let decoded =
+                    Frame::decode_stream(&mut cur, self.max_field_section_size, self.kind);
                 (cur.position(), decoded)
             };
 
@@ -489,6 +497,7 @@ mod tests {
                 stream.poll_next(&mut cx),
                 Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
             );
+            assert!(!stream.is_eos());
         }
     }
 

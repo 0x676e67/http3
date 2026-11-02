@@ -1282,10 +1282,7 @@ where
                 //# If
                 //# a DATA frame is received on a control stream, the recipient MUST
                 //# respond with a connection error of type H3_FRAME_UNEXPECTED.
-
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.2
-                //# If a HEADERS frame is received on a control stream, the recipient
-                //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
+                // HEADERS and PUSH_PROMISE are rejected at their frame header.
                 return Poll::Ready(Err(self.handle_connection_error(
                     InternalConnectionError::new(
                         Code::H3_FRAME_UNEXPECTED,

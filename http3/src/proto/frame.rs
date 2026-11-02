@@ -82,12 +82,22 @@ pub(crate) enum StreamFrame {
     },
 }
 
-// Payload limits checked at the frame header, so these payloads are never
-// buffered beyond them: GOAWAY, CANCEL_PUSH and MAX_PUSH_ID carry a single
-// variable-length integer, and SETTINGS from browsers stays under 100 bytes.
+/// The stream a frame arrives on, which decides the frame types rejected at
+/// their header.
+#[derive(Clone, Copy)]
+pub(crate) enum StreamKind {
+    /// No stream-specific rules apply.
+    Any,
+    Control,
+    /// A request or push stream.
+    Request,
+}
+
+// Largest CANCEL_PUSH, SETTINGS, GOAWAY or MAX_PUSH_ID payload buffered before
+// decoding. Valid ones are a few bytes, or well under 100 bytes for browser
+// SETTINGS, so a longer declared length is excessive load.
 // https://www.rfc-editor.org/rfc/rfc9114#section-10.5
-const MAX_ID_PAYLOAD: u64 = VarInt::MAX_SIZE as u64;
-const MAX_SETTINGS_PAYLOAD: u64 = 64 * 1024;
+const MAX_CONTROL_PAYLOAD: u64 = 64 * 1024;
 
 /// Represents the available data len for a `Data` frame on a RecvStream
 ///
@@ -123,16 +133,16 @@ impl Frame<PayloadLen> {
     pub(crate) fn decode_stream<T: Buf>(
         buf: &mut T,
         max_field_section_size: usize,
-        control_stream: bool,
+        kind: StreamKind,
     ) -> Result<StreamFrame, FrameError> {
         let max_addressable = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
-        Self::decode_with_limits(buf, max_addressable, max_field_section_size, control_stream)
+        Self::decode_with_limits(buf, max_addressable, max_field_section_size, kind)
     }
 
     /// Decodes a frame and consumes an unknown frame whole once it is buffered.
     fn decode_whole<T: Buf>(buf: &mut T, max_addressable: u64) -> Result<Self, FrameError> {
         let remaining = buf.remaining();
-        match Self::decode_with_limits(buf, max_addressable, usize::MAX, false)? {
+        match Self::decode_with_limits(buf, max_addressable, usize::MAX, StreamKind::Any)? {
             StreamFrame::Known(frame) => Ok(frame),
             StreamFrame::Unknown {
                 ty,
@@ -156,7 +166,7 @@ impl Frame<PayloadLen> {
         buf: &mut T,
         max_addressable: u64,
         max_field_section_size: usize,
-        control_stream: bool,
+        kind: StreamKind,
     ) -> Result<StreamFrame, FrameError> {
         let remaining = buf.remaining();
         let next_byte = remaining
@@ -190,11 +200,41 @@ impl Frame<PayloadLen> {
             | FrameType::H2_PING
             | FrameType::H2_WINDOW_UPDATE
             | FrameType::H2_CONTINUATION => return Err(FrameError::UnsupportedFrame(ty.0)),
-            // HEADERS and PUSH_PROMISE on the control stream are connection
-            // errors of type H3_FRAME_UNEXPECTED.
-            // https://www.rfc-editor.org/rfc/rfc9114#section-7.2.2
-            // https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
-            FrameType::HEADERS | FrameType::PUSH_PROMISE if control_stream => {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.2
+            //# If a HEADERS frame is received on a control stream, the recipient
+            //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
+            //# If a PUSH_PROMISE frame is received on the control stream, the client
+            //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
+            FrameType::HEADERS | FrameType::PUSH_PROMISE if matches!(kind, StreamKind::Control) => {
+                return Err(FrameError::UnsupportedFrame(ty.0));
+            }
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+            //# Receiving a
+            //# CANCEL_PUSH frame on a stream other than the control stream MUST be
+            //# treated as a connection error of type H3_FRAME_UNEXPECTED.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+            //# If an endpoint receives a SETTINGS frame on a different
+            //# stream, the endpoint MUST respond with a connection error of type
+            //# H3_FRAME_UNEXPECTED.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.6
+            //# A client MUST treat a GOAWAY frame on a stream other than
+            //# the control stream as a connection error of type H3_FRAME_UNEXPECTED.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
+            //# The MAX_PUSH_ID frame is always sent on the control stream.  Receipt
+            //# of a MAX_PUSH_ID frame on any other stream MUST be treated as a
+            //# connection error of type H3_FRAME_UNEXPECTED.
+            FrameType::CANCEL_PUSH
+            | FrameType::SETTINGS
+            | FrameType::GOAWAY
+            | FrameType::MAX_PUSH_ID
+                if matches!(kind, StreamKind::Request) =>
+            {
                 return Err(FrameError::UnsupportedFrame(ty.0));
             }
             FrameType::HEADERS | FrameType::PUSH_PROMISE
@@ -210,17 +250,15 @@ impl Frame<PayloadLen> {
                     limit: max_field_section_size,
                 });
             }
-            // A longer payload has bytes after its identifier.
-            // https://www.rfc-editor.org/rfc/rfc9114#section-7.1
-            FrameType::CANCEL_PUSH | FrameType::GOAWAY | FrameType::MAX_PUSH_ID
-                if encoded_len > MAX_ID_PAYLOAD =>
+            FrameType::CANCEL_PUSH
+            | FrameType::SETTINGS
+            | FrameType::GOAWAY
+            | FrameType::MAX_PUSH_ID
+                if encoded_len > MAX_CONTROL_PAYLOAD =>
             {
-                return Err(FrameError::Malformed);
-            }
-            FrameType::SETTINGS if encoded_len > MAX_SETTINGS_PAYLOAD => {
                 return Err(FrameError::ExcessiveLoad {
                     len: encoded_len,
-                    limit: usize::try_from(MAX_SETTINGS_PAYLOAD).unwrap_or(usize::MAX),
+                    limit: usize::try_from(MAX_CONTROL_PAYLOAD).unwrap_or(usize::MAX),
                 });
             }
             FrameType::DATA
@@ -991,53 +1029,93 @@ mod tests {
 
     #[test]
     fn frame_payload_limits_apply_at_the_header() {
-        let decode = |ty, len, control_stream| {
-            Frame::decode_stream(&mut frame_header(ty, len), usize::MAX, control_stream).err()
+        use StreamKind::{Any, Control, Request};
+        let decode = |ty, len, kind| {
+            Frame::decode_stream(&mut frame_header(ty, len), usize::MAX, kind).err()
         };
-        // At their limits these frames wait for the payload.
-        for (ty, len, control_stream) in [
-            (FrameType::GOAWAY, 8, true),
-            (FrameType::SETTINGS, MAX_SETTINGS_PAYLOAD, true),
-            (FrameType::HEADERS, 1, false),
+        // These frames wait for their payload: within the limit an extra byte
+        // is still a frame error once the payload has arrived.
+        for (ty, len, kind) in [
+            (FrameType::GOAWAY, 9, Control),
+            (FrameType::SETTINGS, MAX_CONTROL_PAYLOAD, Control),
+            (FrameType::GOAWAY, 1, Any),
+            (FrameType::HEADERS, 1, Request),
         ] {
-            assert_matches!(
-                decode(ty, len, control_stream),
-                Some(FrameError::Incomplete(_))
-            );
+            assert_matches!(decode(ty, len, kind), Some(FrameError::Incomplete(_)));
         }
-        for (ty, len, control_stream, error) in [
+        let excessive = || FrameError::ExcessiveLoad {
+            len: MAX_CONTROL_PAYLOAD + 1,
+            limit: 64 * 1024,
+        };
+        for (ty, len, kind, error) in [
             (
                 FrameType::H2_PING,
                 8,
-                false,
+                Any,
                 FrameError::UnsupportedFrame(0x6),
             ),
             (
                 FrameType::HEADERS,
                 1,
-                true,
+                Control,
                 FrameError::UnsupportedFrame(0x1),
             ),
             (
                 FrameType::PUSH_PROMISE,
                 1,
-                true,
+                Control,
                 FrameError::UnsupportedFrame(0x5),
             ),
-            (FrameType::CANCEL_PUSH, 9, true, FrameError::Malformed),
-            (FrameType::GOAWAY, 9, true, FrameError::Malformed),
-            (FrameType::MAX_PUSH_ID, 9, true, FrameError::Malformed),
+            (
+                FrameType::CANCEL_PUSH,
+                0,
+                Request,
+                FrameError::UnsupportedFrame(0x3),
+            ),
             (
                 FrameType::SETTINGS,
-                MAX_SETTINGS_PAYLOAD + 1,
-                true,
-                FrameError::ExcessiveLoad {
-                    len: MAX_SETTINGS_PAYLOAD + 1,
-                    limit: 64 * 1024,
-                },
+                0,
+                Request,
+                FrameError::UnsupportedFrame(0x4),
+            ),
+            (
+                FrameType::GOAWAY,
+                0,
+                Request,
+                FrameError::UnsupportedFrame(0x7),
+            ),
+            (
+                FrameType::MAX_PUSH_ID,
+                0,
+                Request,
+                FrameError::UnsupportedFrame(0xd),
+            ),
+            (
+                FrameType::CANCEL_PUSH,
+                MAX_CONTROL_PAYLOAD + 1,
+                Control,
+                excessive(),
+            ),
+            (
+                FrameType::SETTINGS,
+                MAX_CONTROL_PAYLOAD + 1,
+                Control,
+                excessive(),
+            ),
+            (
+                FrameType::GOAWAY,
+                MAX_CONTROL_PAYLOAD + 1,
+                Control,
+                excessive(),
+            ),
+            (
+                FrameType::MAX_PUSH_ID,
+                MAX_CONTROL_PAYLOAD + 1,
+                Control,
+                excessive(),
             ),
         ] {
-            assert_eq!(decode(ty, len, control_stream), Some(error));
+            assert_eq!(decode(ty, len, kind), Some(error));
         }
     }
 

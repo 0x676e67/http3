@@ -2560,12 +2560,10 @@ async fn request_invalid_data_frame_length_too_large() {
         //# after the identified fields or a frame payload that terminates before
         //# the end of the identified fields MUST be treated as a connection
         //# error of type H3_FRAME_ERROR.
+        // The stream ends inside the payload. Bytes after it would be read as
+        // the rest of the payload and then parsed as the next frame.
         VarInt::from(5u32).encode(&mut buf);
         buf.put_slice(b"fada");
-
-        let mut trailers = HeaderMap::new();
-        trailers.insert("trailer", "value".parse().unwrap());
-        trailers_encode(buf, trailers);
     })
     .await;
 }
