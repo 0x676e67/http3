@@ -42,7 +42,7 @@ impl<S, B> FrameStream<S, B> {
         self.stream
     }
 
-    /// Creates a decoder for a peer control stream, where HEADERS and
+    /// Creates a decoder for a peer control stream, where DATA, HEADERS and
     /// PUSH_PROMISE are rejected at their frame header.
     pub(crate) fn control(stream: BufRecvStream<S, B>) -> Self {
         Self::with_kind(stream, StreamKind::Control)

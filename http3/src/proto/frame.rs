@@ -200,6 +200,15 @@ impl Frame<PayloadLen> {
             | FrameType::H2_PING
             | FrameType::H2_WINDOW_UPDATE
             | FrameType::H2_CONTINUATION => return Err(FrameError::UnsupportedFrame(ty.0)),
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.1
+            //= type=implication
+            //# DATA frames MUST be associated with an HTTP request or response.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.1
+            //# If
+            //# a DATA frame is received on a control stream, the recipient MUST
+            //# respond with a connection error of type H3_FRAME_UNEXPECTED.
+
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.2
             //# If a HEADERS frame is received on a control stream, the recipient
             //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
@@ -207,7 +216,9 @@ impl Frame<PayloadLen> {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
             //# If a PUSH_PROMISE frame is received on the control stream, the client
             //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
-            FrameType::HEADERS | FrameType::PUSH_PROMISE if matches!(kind, StreamKind::Control) => {
+            FrameType::DATA | FrameType::HEADERS | FrameType::PUSH_PROMISE
+                if matches!(kind, StreamKind::Control) =>
+            {
                 return Err(FrameError::UnsupportedFrame(ty.0));
             }
 
@@ -1053,6 +1064,12 @@ mod tests {
                 8,
                 Any,
                 FrameError::UnsupportedFrame(0x6),
+            ),
+            (
+                FrameType::DATA,
+                1,
+                Control,
+                FrameError::UnsupportedFrame(0x0),
             ),
             (
                 FrameType::HEADERS,

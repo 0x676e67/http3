@@ -1708,9 +1708,16 @@ async fn control_frames_on_request_streams_are_unexpected() {
     };
     let server_fut = async {
         let mut incoming = server::Connection::new(server.next().await).await.unwrap();
-        if let Ok(Some(resolver)) = incoming.accept().await {
-            assert!(resolver.resolve_request().await.is_err());
-        }
+        let resolver = incoming.accept().await.unwrap().unwrap();
+        assert_matches!(
+            resolver.resolve_request().await.map(|_| ()),
+            Err(StreamError::ConnectionError(ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_FRAME_UNEXPECTED,
+                    ..
+                }
+            }))
+        );
         // Keep driving until the connection error is sent.
         let _ = incoming.accept().await;
     };
