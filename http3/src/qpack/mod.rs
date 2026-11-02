@@ -632,11 +632,12 @@ impl QpackDecoder {
     fn release_instruction(&self) {
         // Every released instruction was counted first. Saturate anyway, so a
         // mismatch cannot pause decoding for the rest of the connection.
-        let _ = self.0.queued_instructions.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |count| count.checked_sub(1),
-        );
+        let _ =
+            self.0
+                .queued_instructions
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    count.checked_sub(1)
+                });
     }
 
     /// Queues a request waker that the driver wakes when it reaches this event.
