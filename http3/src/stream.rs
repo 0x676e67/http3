@@ -397,8 +397,8 @@ where
 
     pub fn into_stream(self) -> AcceptedRecvStream<S, B> {
         match self.ty.expect("Stream type not resolved yet") {
-            StreamType::CONTROL => AcceptedRecvStream::Control(FrameStream::new(self.stream)),
-            StreamType::PUSH => AcceptedRecvStream::Push(FrameStream::new(self.stream)),
+            StreamType::CONTROL => AcceptedRecvStream::Control(FrameStream::control(self.stream)),
+            StreamType::PUSH => AcceptedRecvStream::Push(FrameStream::request(self.stream)),
             StreamType::ENCODER => AcceptedRecvStream::Encoder(self.stream),
             StreamType::DECODER => AcceptedRecvStream::Decoder(self.stream),
             StreamType::WEBTRANSPORT_UNI => AcceptedRecvStream::WebTransportUni(
