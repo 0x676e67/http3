@@ -191,6 +191,12 @@ where
         {
             Ok(decoded) => decoded,
             Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
+                // The request is still unprocessed, but the rest of it is not needed
+                // once the 431 response is complete.
+                self.request_stream
+                    .inner
+                    .stream
+                    .set_cancel_codes(Code::H3_REQUEST_REJECTED, Code::H3_NO_ERROR);
                 // Send and await the error response
                 self.request_stream
                     .send_response(
@@ -266,13 +272,21 @@ where
         tracing::trace!("replying with: {:?}", req);
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
-        //# When a server abandons a
+        //# Servers MUST NOT use the H3_REQUEST_REJECTED error code for requests
+        //# that were partially or fully processed.  When a server abandons a
         //# response after partial processing, it SHOULD abort its response
         //# stream with the error code H3_REQUEST_CANCELLED.
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+        //# The error code H3_NO_ERROR
+        //# SHOULD be used when requesting that the client stop sending on the
+        //# request stream.
+        // An unfinished response is still reset, so the request body can always
+        // be stopped with H3_NO_ERROR, including on a split receive half.
         self.request_stream
             .inner
             .stream
-            .set_cancel_code(Code::H3_REQUEST_CANCELLED);
+            .set_cancel_codes(Code::H3_REQUEST_CANCELLED, Code::H3_NO_ERROR);
         Ok((req, self.request_stream))
     }
 }

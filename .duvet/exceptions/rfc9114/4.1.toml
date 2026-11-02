@@ -16,9 +16,7 @@ quote = '''
 When the server does
 not need to receive the remainder of the request, it MAY abort
 reading the request stream, send a complete response, and cleanly
-close the sending part of the stream.  The error code H3_NO_ERROR
-SHOULD be used when requesting that the client stop sending on the
-request stream.
+close the sending part of the stream.
 '''
 reason = '''
 This should be initiated by the user, as http3 cannot determine if the

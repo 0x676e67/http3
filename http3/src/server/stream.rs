@@ -4,7 +4,7 @@ use std::{
     option::Option,
     result::Result,
     sync::Arc,
-    task::{Context, Poll, ready},
+    task::{Context, Poll},
 };
 
 use bytes::{Buf, BytesMut};
@@ -31,9 +31,8 @@ use crate::{
 /// The [`RequestStream`] struct is used to send and/or receive
 /// information from the client.
 /// After sending the final response, call [`RequestStream::finish`] to close the stream.
-/// Dropping it before [`RequestStream::finish`] cancels both directions with
-/// [`Code::H3_REQUEST_CANCELLED`]; afterwards, an unread request body is stopped
-/// with [`Code::H3_NO_ERROR`].
+/// Dropping it before then resets the response with [`Code::H3_REQUEST_CANCELLED`].
+/// Dropping it with the request body unread stops the body with [`Code::H3_NO_ERROR`].
 pub struct RequestStream<S, B> {
     pub(super) inner: crate::connection::RequestStream<S, B>,
     pub(super) request_end: Arc<RequestEnd>,
@@ -212,7 +211,7 @@ where
     ///
     /// [`RequestStream::finish`] must be called to finalize a request.
     pub async fn finish(&mut self) -> Result<(), StreamError> {
-        future::poll_fn(|cx| self.poll_finish(cx)).await
+        self.inner.finish().await
     }
 
     /// Polls for the client stopping or acknowledging the response's send direction.
@@ -269,14 +268,7 @@ where
     /// Success is repeatable and does not wait for FIN acknowledgment; use
     /// [`Self::poll_stopped`] for that. Receiving is unaffected.
     pub fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
-        let result = ready!(self.inner.poll_finish(cx));
-        if result.is_ok() {
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-            //# The error code H3_NO_ERROR SHOULD be used when requesting that the
-            //# client stop sending on the request stream.
-            self.inner.stream.set_cancel_code(Code::H3_NO_ERROR);
-        }
-        Poll::Ready(result)
+        self.inner.poll_finish(cx)
     }
 }
 
@@ -287,9 +279,6 @@ where
 {
     /// Splits the Request-Stream into send and receive.
     /// This can be used the send and receive data on different tasks.
-    ///
-    /// Unless the response was finished before splitting, dropping the receive half
-    /// before the request body ends stops it with [`Code::H3_REQUEST_CANCELLED`].
     pub fn split(
         self,
     ) -> (

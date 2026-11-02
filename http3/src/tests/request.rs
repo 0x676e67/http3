@@ -1494,11 +1494,18 @@ async fn header_too_big_response_from_server() {
                 .send_request(Request::get("http://localhost/salut").body(()).unwrap())
                 .await
                 .expect("request");
-            request_stream.finish().await.expect("client finish");
             let response = request_stream.recv_response().await.unwrap();
             assert_eq!(
                 response.status(),
                 StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+            );
+            // The 431 response is complete and the open upload is no longer needed.
+            assert!(request_stream.recv_data().await.unwrap().is_none());
+            assert_eq!(
+                future::poll_fn(|cx| request_stream.poll_stopped(cx))
+                    .await
+                    .unwrap(),
+                Some(Code::H3_NO_ERROR)
             );
         };
         tokio::select! {
@@ -2843,15 +2850,28 @@ async fn request_stream_drop_resets_request_body() {
 async fn server_drop_aborts_request_by_phase() {
     init_tracing();
     let mut pair = Pair::default();
-    let mut server = pair.server();
+    let endpoint = pair.server_inner();
     let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
 
     let client_fut = async {
         let (mut driver, mut client) = client::new(pair.client().await).await.unwrap();
         let requests = async {
             let request = || Request::get("https://localhost/").body(()).unwrap();
-            // Dropped before resolving, then after resolving without a response.
-            for expected in [Code::H3_REQUEST_REJECTED, Code::H3_REQUEST_CANCELLED] {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+            //= type=test
+            //# When the server cancels a request without performing any application
+            //# processing, the request is considered "rejected".  The server SHOULD
+            //# abort its response stream with the error code H3_REQUEST_REJECTED.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+            //= type=test
+            //# When a server abandons a
+            //# response after partial processing, it SHOULD abort its response
+            //# stream with the error code H3_REQUEST_CANCELLED.
+            // Dropped before and after the headers are decoded, then after
+            // the request reached the application without a response.
+            let codes = [Code::H3_REQUEST_REJECTED, Code::H3_REQUEST_REJECTED];
+            for expected in codes.into_iter().chain([Code::H3_REQUEST_CANCELLED]) {
                 let mut stream = client.send_request(request()).await.unwrap();
                 assert_matches!(
                     stream.recv_response().await,
@@ -2859,6 +2879,11 @@ async fn server_drop_aborts_request_by_phase() {
                 );
             }
 
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+            //= type=test
+            //# The error code H3_NO_ERROR
+            //# SHOULD be used when requesting that the client stop sending on the
+            //# request stream.
             // Dropped mid-body: the truncated response must not read as complete.
             let mut stream = client.send_request(request()).await.unwrap();
             stream.recv_response().await.unwrap();
@@ -2869,8 +2894,12 @@ async fn server_drop_aborts_request_by_phase() {
                 stream.recv_data().await.map(|_| ()),
                 Err(StreamError::RemoteTerminate { code }) if code == Code::H3_REQUEST_CANCELLED
             );
+            assert_eq!(
+                future::poll_fn(|cx| stream.poll_stopped(cx)).await.unwrap(),
+                Some(Code::H3_NO_ERROR)
+            );
 
-            // Dropped after finishing: the unread upload is stopped with H3_NO_ERROR.
+            // A split receive half dropped after its send half finished.
             let mut stream = client.send_request(request()).await.unwrap();
             stream.recv_response().await.unwrap();
             assert!(stream.recv_data().await.unwrap().is_none());
@@ -2887,8 +2916,14 @@ async fn server_drop_aborts_request_by_phase() {
     };
 
     let server_fut = async {
-        let mut incoming = server::Connection::new(server.next().await).await.unwrap();
+        let conn = endpoint.accept().await.unwrap().await.unwrap();
+        let mut incoming = server::Connection::new(http3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
         drop(incoming.accept().await.unwrap().unwrap());
+        let mut resolver = incoming.accept().await.unwrap().unwrap();
+        let frame = future::poll_fn(|cx| resolver.frame_stream.poll_next(cx)).await;
+        drop(resolver.accept_with_frame(frame).unwrap());
         drop(get_stream_blocking(&mut incoming).await.unwrap());
 
         let (_, mut stream) = get_stream_blocking(&mut incoming).await.unwrap();
@@ -2900,10 +2935,11 @@ async fn server_drop_aborts_request_by_phase() {
         partial_rx.await.unwrap();
         drop(stream);
 
-        let (_, mut stream) = get_stream_blocking(&mut incoming).await.unwrap();
-        stream.send_response(Response::new(())).await.unwrap();
-        stream.finish().await.unwrap();
-        drop(stream);
+        let (_, stream) = get_stream_blocking(&mut incoming).await.unwrap();
+        let (mut send, recv) = stream.split();
+        send.send_response(Response::new(())).await.unwrap();
+        send.finish().await.unwrap();
+        drop(recv);
         // Keep the connection open until the client is done.
         let _ = incoming.accept().await;
     };

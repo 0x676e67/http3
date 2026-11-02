@@ -1702,6 +1702,9 @@ where
         );
 
         Self {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+            //# Client SHOULD use the error code H3_REQUEST_CANCELLED to cancel
+            //# requests.
             stream: StreamGuard::new(stream, Code::H3_REQUEST_CANCELLED),
             max_field_section_size,
             send_grease_frame: grease,
@@ -2323,13 +2326,14 @@ mod guard {
     ///
     /// Callbacks retain each direction's trait capability after splitting, without
     /// requiring receive-only streams to implement `SendStream` (or vice versa).
-    /// Both callbacks use `code`, which a server changes as the request advances.
+    /// A server changes the codes when it hands the request to the application.
     /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1>.
     pub(crate) struct StreamGuard<S, B> {
         inner: Option<FrameStream<S, B>>,
         reset_on_drop: Option<Cancel<S, B>>,
         stop_sending_on_drop: Option<Cancel<S, B>>,
-        code: Code,
+        reset_code: Code,
+        stop_sending_code: Code,
     }
 
     impl<S, B> StreamGuard<S, B> {
@@ -2340,13 +2344,15 @@ mod guard {
                 inner: Some(stream),
                 reset_on_drop: None,
                 stop_sending_on_drop: None,
-                code: Code::H3_REQUEST_CANCELLED,
+                reset_code: Code::H3_REQUEST_CANCELLED,
+                stop_sending_code: Code::H3_REQUEST_CANCELLED,
             }
         }
 
-        /// Sets the code used by the callbacks still armed.
-        pub(crate) fn set_cancel_code(&mut self, code: Code) {
-            self.code = code;
+        /// Sets the codes used by the callbacks still armed.
+        pub(crate) fn set_cancel_codes(&mut self, reset: Code, stop_sending: Code) {
+            self.reset_code = reset;
+            self.stop_sending_code = stop_sending;
         }
 
         /// Disables receive cancellation after EOF and any buffered trailers are processed.
@@ -2393,7 +2399,8 @@ mod guard {
                 inner: Some(stream),
                 reset_on_drop: Some(|stream, code| stream.reset(code.into())),
                 stop_sending_on_drop: Some(|stream, code| stream.stop_sending(code)),
-                code,
+                reset_code: code,
+                stop_sending_code: code,
             }
         }
     }
@@ -2407,8 +2414,8 @@ mod guard {
             let (send, recv) = self.inner.take().expect("stream is present").split();
             let mut send = StreamGuard::without_cancellation(send);
             let mut recv = StreamGuard::without_cancellation(recv);
-            send.code = self.code;
-            recv.code = self.code;
+            send.set_cancel_codes(self.reset_code, self.stop_sending_code);
+            recv.set_cancel_codes(self.reset_code, self.stop_sending_code);
 
             if self.reset_on_drop.take().is_some() {
                 send.reset_on_drop = Some(|stream, code| stream.reset(code.into()));
@@ -2495,10 +2502,10 @@ mod guard {
             //# on the receiving parts of streams; see Section 2.4 of
             //# [QUIC-TRANSPORT].
             if let Some(reset) = self.reset_on_drop.take() {
-                reset(stream, self.code);
+                reset(stream, self.reset_code);
             }
             if let Some(stop_sending) = self.stop_sending_on_drop.take() {
-                stop_sending(stream, self.code);
+                stop_sending(stream, self.stop_sending_code);
             }
         }
     }
@@ -3260,7 +3267,9 @@ mod request_drop_tests {
         );
 
         let (mut stream, probe) = server_stream_with_probe(Probe::default());
-        stream.stream.set_cancel_code(Code::H3_REQUEST_REJECTED);
+        stream
+            .stream
+            .set_cancel_codes(Code::H3_REQUEST_REJECTED, Code::H3_NO_ERROR);
         let (send, recv) = stream.split();
         drop(send);
         drop(recv);
@@ -3268,7 +3277,7 @@ mod request_drop_tests {
             *probe.events.lock().unwrap(),
             [
                 ("reset", Code::H3_REQUEST_REJECTED.value()),
-                ("stop", Code::H3_REQUEST_REJECTED.value()),
+                ("stop", Code::H3_NO_ERROR.value()),
             ]
         );
     }
