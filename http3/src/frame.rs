@@ -38,6 +38,7 @@ impl<S, B> FrameStream<S, B> {
     /// Unwraps the Framed streamer and returns the underlying stream **without** data loss for
     /// partially received/read frames. The rest of an unknown frame being skipped is already
     /// discarded, so call this at a frame boundary.
+    #[cfg_attr(not(feature = "unstable"), allow(dead_code))]
     pub fn into_inner(self) -> BufRecvStream<S, B> {
         self.stream
     }
@@ -416,6 +417,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        connection::StreamGuard,
         proto::{coding::Encode, frame::FrameType, varint::VarInt},
         webtransport::SessionId,
     };
@@ -921,7 +923,7 @@ mod tests {
                 None,
             );
             let mut stream = crate::connection::RequestStream::<_, Bytes>::with_decode_state(
-                FrameStream::new(BufRecvStream::new(recv)),
+                StreamGuard::without_cancellation(FrameStream::new(BufRecvStream::new(recv))),
                 u64::MAX,
                 shared,
                 false,
@@ -988,7 +990,7 @@ mod tests {
                 Some(QpackDecoder::new(decoder, events_tx)),
             );
             let mut stream = crate::connection::RequestStream::<_, Bytes>::with_decode_state(
-                FrameStream::new(BufRecvStream::new(recv)),
+                StreamGuard::without_cancellation(FrameStream::new(BufRecvStream::new(recv))),
                 u64::MAX,
                 shared,
                 false,
@@ -1038,7 +1040,7 @@ mod tests {
             crate::connection::RequestDecodeState::new(recv.recv_id(), &shared, usize::MAX, None);
         let frames = FrameStream::new(BufRecvStream::new(recv));
         let mut stream = crate::connection::RequestStream::<_, Bytes>::with_decode_state(
-            frames,
+            StreamGuard::without_cancellation(frames),
             u64::MAX,
             shared,
             false,

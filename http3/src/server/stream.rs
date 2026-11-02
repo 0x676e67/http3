@@ -31,6 +31,8 @@ use crate::{
 /// The [`RequestStream`] struct is used to send and/or receive
 /// information from the client.
 /// After sending the final response, call [`RequestStream::finish`] to close the stream.
+/// Dropping it before then resets the response with [`Code::H3_REQUEST_CANCELLED`].
+/// Dropping it with the request body unread stops the body with [`Code::H3_NO_ERROR`].
 pub struct RequestStream<S, B> {
     pub(super) inner: crate::connection::RequestStream<S, B>,
     pub(super) request_end: Arc<RequestEnd>,
@@ -223,14 +225,6 @@ where
     ) -> Poll<Result<Option<Code>, StreamError>> {
         self.inner.poll_stopped(cx)
     }
-
-    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
-    //= type=TODO
-    //# Implementations SHOULD cancel requests by abruptly terminating any
-    //# directions of a stream that are still open.  To do so, an
-    //# implementation resets the sending parts of streams and aborts reading
-    //# on the receiving parts of streams; see Section 2.4 of
-    //# [QUIC-TRANSPORT].
 
     /// Returns the underlying stream id
     pub fn send_id(&self) -> StreamId {

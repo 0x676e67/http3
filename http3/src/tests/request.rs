@@ -1494,11 +1494,18 @@ async fn header_too_big_response_from_server() {
                 .send_request(Request::get("http://localhost/salut").body(()).unwrap())
                 .await
                 .expect("request");
-            request_stream.finish().await.expect("client finish");
             let response = request_stream.recv_response().await.unwrap();
             assert_eq!(
                 response.status(),
                 StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+            );
+            // The 431 response is complete and the open upload is no longer needed.
+            assert!(request_stream.recv_data().await.unwrap().is_none());
+            assert_eq!(
+                future::poll_fn(|cx| request_stream.poll_stopped(cx))
+                    .await
+                    .unwrap(),
+                Some(Code::H3_NO_ERROR)
             );
         };
         tokio::select! {
@@ -2725,6 +2732,8 @@ where
 
             while stream.recv_data().await?.is_some() {}
             stream.recv_trailers().await?;
+            stream.send_response(Response::new(())).await?;
+            stream.finish().await?;
 
             Result::<(), StreamError>::Ok(())
         };
@@ -2737,10 +2746,19 @@ where
     ) = tokio::join!(server_fut, client_fut);
 
     if let Err(err) = client_result_stream {
-        // we have no influence wether the quinn returns the connection error to the stream api
-        // but if it returns an error it needs to be the expected one
-        assert_matches!(err, quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(code))
-            if code.error_code.into_inner() == expected_error_code.expect("If this is a error an error was expected").value());
+        // Quinn may return the connection error to the stream API, or the reset
+        // sent when the server dropped the failed request before closing.
+        let expected = expected_error_code.expect("If this is a error an error was expected");
+        match err {
+            quinn::ReadError::Reset(code) => assert!(
+                [Code::H3_REQUEST_REJECTED, Code::H3_REQUEST_CANCELLED]
+                    .contains(&Code::from(code.into_inner()))
+            ),
+            err => {
+                assert_matches!(err, quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(close))
+                if close.error_code.into_inner() == expected.value())
+            }
+        }
     }
 
     if let Some(expected_error_code) = expected_error_code {
@@ -2823,6 +2841,107 @@ async fn request_stream_drop_resets_request_body() {
         }
 
         let _ = server_done_tx.send(());
+    };
+
+    tokio::join!(server_fut, client_fut);
+}
+
+#[tokio::test]
+async fn server_drop_aborts_request_by_phase() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let endpoint = pair.server_inner();
+    let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
+
+    let client_fut = async {
+        let (mut driver, mut client) = client::new(pair.client().await).await.unwrap();
+        let requests = async {
+            let request = || Request::get("https://localhost/").body(()).unwrap();
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+            //= type=test
+            //# When the server cancels a request without performing any application
+            //# processing, the request is considered "rejected".  The server SHOULD
+            //# abort its response stream with the error code H3_REQUEST_REJECTED.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+            //= type=test
+            //# When a server abandons a
+            //# response after partial processing, it SHOULD abort its response
+            //# stream with the error code H3_REQUEST_CANCELLED.
+            // Dropped before and after the headers are decoded, then after
+            // the request reached the application without a response.
+            let codes = [Code::H3_REQUEST_REJECTED, Code::H3_REQUEST_REJECTED];
+            for expected in codes.into_iter().chain([Code::H3_REQUEST_CANCELLED]) {
+                let mut stream = client.send_request(request()).await.unwrap();
+                assert_matches!(
+                    stream.recv_response().await,
+                    Err(StreamError::RemoteTerminate { code }) if code == expected
+                );
+            }
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+            //= type=test
+            //# The error code H3_NO_ERROR
+            //# SHOULD be used when requesting that the client stop sending on the
+            //# request stream.
+            // Dropped mid-body: the truncated response must not read as complete.
+            let mut stream = client.send_request(request()).await.unwrap();
+            stream.recv_response().await.unwrap();
+            let mut chunk = stream.recv_data().await.unwrap().unwrap();
+            assert_eq!(chunk.copy_to_bytes(chunk.remaining()), "partial");
+            partial_tx.send(()).unwrap();
+            assert_matches!(
+                stream.recv_data().await.map(|_| ()),
+                Err(StreamError::RemoteTerminate { code }) if code == Code::H3_REQUEST_CANCELLED
+            );
+            assert_eq!(
+                future::poll_fn(|cx| stream.poll_stopped(cx)).await.unwrap(),
+                Some(Code::H3_NO_ERROR)
+            );
+
+            // A split receive half dropped after its send half finished.
+            let mut stream = client.send_request(request()).await.unwrap();
+            stream.recv_response().await.unwrap();
+            assert!(stream.recv_data().await.unwrap().is_none());
+            assert_eq!(
+                future::poll_fn(|cx| stream.poll_stopped(cx)).await.unwrap(),
+                Some(Code::H3_NO_ERROR)
+            );
+        };
+        tokio::select! {
+            biased;
+            _ = requests => (),
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("connection failed: {error:?}"),
+        }
+    };
+
+    let server_fut = async {
+        let conn = endpoint.accept().await.unwrap().await.unwrap();
+        let mut incoming = server::Connection::new(http3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        drop(incoming.accept().await.unwrap().unwrap());
+        let mut resolver = incoming.accept().await.unwrap().unwrap();
+        let frame = future::poll_fn(|cx| resolver.frame_stream.poll_next(cx)).await;
+        drop(resolver.accept_with_frame(frame).unwrap());
+        drop(get_stream_blocking(&mut incoming).await.unwrap());
+
+        let (_, mut stream) = get_stream_blocking(&mut incoming).await.unwrap();
+        stream.send_response(Response::new(())).await.unwrap();
+        stream
+            .send_data(Bytes::from_static(b"partial"))
+            .await
+            .unwrap();
+        partial_rx.await.unwrap();
+        drop(stream);
+
+        let (_, stream) = get_stream_blocking(&mut incoming).await.unwrap();
+        let (mut send, recv) = stream.split();
+        send.send_response(Response::new(())).await.unwrap();
+        send.finish().await.unwrap();
+        drop(recv);
+        // Keep the connection open until the client is done.
+        let _ = incoming.accept().await;
     };
 
     tokio::join!(server_fut, client_fut);

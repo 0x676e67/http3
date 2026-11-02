@@ -115,9 +115,9 @@ SPECIFICATION: https://www.rfc-editor.org/rfc/rfc9114
     TEXT[!MAY,exception]:    not need to receive the remainder of the request, it MAY abort
     TEXT[!MAY,exception]:    reading the request stream, send a complete response, and cleanly
     TEXT[!MAY,exception]:    close the sending part of the stream.
-    TEXT[!SHOULD,exception]: The error code H3_NO_ERROR
-    TEXT[!SHOULD,exception]:    SHOULD be used when requesting that the client stop sending on the
-    TEXT[!SHOULD,exception]:    request stream.
+    TEXT[!SHOULD,implementation,test]: The error code H3_NO_ERROR
+    TEXT[!SHOULD,implementation,test]:    SHOULD be used when requesting that the client stop sending on the
+    TEXT[!SHOULD,implementation,test]:    request stream.
     TEXT[!MUST,exception]: Clients MUST NOT discard complete responses as a
     TEXT[!MUST,exception]:    result of having their request terminated abruptly, though clients
     TEXT[!MUST,exception]:    can always discard responses at their discretion for other reasons.
@@ -131,23 +131,23 @@ SPECIFICATION: https://www.rfc-editor.org/rfc/rfc9114
     TEXT[!SHOULD,exception]: When possible, it is RECOMMENDED that servers
     TEXT[!SHOULD,exception]:    send an HTTP response with an appropriate status code rather than
     TEXT[!SHOULD,exception]:    cancelling a request it has already begun processing.
-    TEXT[!SHOULD,todo]:    Implementations SHOULD cancel requests by abruptly terminating any
-    TEXT[!SHOULD,todo]:    directions of a stream that are still open.
-    TEXT[todo]:   To do so, an
-    TEXT[todo]:    implementation resets the sending parts of streams and aborts reading
-    TEXT[todo]:    on the receiving parts of streams; see Section 2.4 of
-    TEXT[todo]:    [QUIC-TRANSPORT].
-    TEXT[exception]:    When the server cancels a request without performing any application
-    TEXT[exception]:    processing, the request is considered "rejected".
-    TEXT[!SHOULD,exception]: The server SHOULD
-    TEXT[!SHOULD,exception]:    abort its response stream with the error code H3_REQUEST_REJECTED.
-    TEXT[!MUST,exception]:    Servers MUST NOT use the H3_REQUEST_REJECTED error code for requests
-    TEXT[!MUST,exception]:    that were partially or fully processed.
-    TEXT[!SHOULD,exception]: When a server abandons a
-    TEXT[!SHOULD,exception]:    response after partial processing, it SHOULD abort its response
-    TEXT[!SHOULD,exception]:    stream with the error code H3_REQUEST_CANCELLED.
-    TEXT[!SHOULD,exception]:    Client SHOULD use the error code H3_REQUEST_CANCELLED to cancel
-    TEXT[!SHOULD,exception]:    requests.
+    TEXT[!SHOULD,implementation]:    Implementations SHOULD cancel requests by abruptly terminating any
+    TEXT[!SHOULD,implementation]:    directions of a stream that are still open.
+    TEXT[implementation]:   To do so, an
+    TEXT[implementation]:    implementation resets the sending parts of streams and aborts reading
+    TEXT[implementation]:    on the receiving parts of streams; see Section 2.4 of
+    TEXT[implementation]:    [QUIC-TRANSPORT].
+    TEXT[implementation,test]:    When the server cancels a request without performing any application
+    TEXT[implementation,test]:    processing, the request is considered "rejected".
+    TEXT[!SHOULD,implementation,test]: The server SHOULD
+    TEXT[!SHOULD,implementation,test]:    abort its response stream with the error code H3_REQUEST_REJECTED.
+    TEXT[!MUST,implementation]:    Servers MUST NOT use the H3_REQUEST_REJECTED error code for requests
+    TEXT[!MUST,implementation]:    that were partially or fully processed.
+    TEXT[!SHOULD,implementation,test]: When a server abandons a
+    TEXT[!SHOULD,implementation,test]:    response after partial processing, it SHOULD abort its response
+    TEXT[!SHOULD,implementation,test]:    stream with the error code H3_REQUEST_CANCELLED.
+    TEXT[!SHOULD,implementation]:    Client SHOULD use the error code H3_REQUEST_CANCELLED to cancel
+    TEXT[!SHOULD,implementation]:    requests.
     TEXT[!MAY,exception]: Upon receipt of this error code, a server MAY abruptly
     TEXT[!MAY,exception]:    terminate the response using the error code H3_REQUEST_REJECTED if no
     TEXT[!MAY,exception]:    processing was performed.

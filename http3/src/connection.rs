@@ -7,7 +7,7 @@ use std::{
 
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{future, ready};
-use guard::StreamGuard;
+pub(crate) use guard::StreamGuard;
 use http::HeaderMap;
 use stream::WriteBuf;
 use tokio::sync::mpsc;
@@ -1702,7 +1702,10 @@ where
         );
 
         Self {
-            stream: StreamGuard::new(stream),
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+            //# Client SHOULD use the error code H3_REQUEST_CANCELLED to cancel
+            //# requests.
+            stream: StreamGuard::new(stream, Code::H3_REQUEST_CANCELLED),
             max_field_section_size,
             send_grease_frame: grease,
             send_state: SendState::Ready,
@@ -1712,18 +1715,18 @@ where
         }
     }
 
-    /// Creates a server request with both cancellation callbacks disarmed.
+    /// Creates a server request that keeps the cancellation armed by its resolver.
     /// Sending awaits the final response HEADERS before DATA, trailers, or FIN.
     /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1>.
     pub(crate) fn with_decode_state(
-        stream: FrameStream<S, B>,
+        stream: StreamGuard<S, B>,
         max_field_section_size: u64,
         conn_state: Arc<SharedState>,
         grease: bool,
         decode_state: RequestDecodeState,
     ) -> Self {
         Self {
-            stream: StreamGuard::without_cancellation(stream),
+            stream,
             conn_state,
             max_field_section_size,
             trailers: None,
@@ -2319,32 +2322,42 @@ mod guard {
 
     type Cancel<S, B> = fn(&mut FrameStream<S, B>, Code);
 
-    /// Cancels a client's open stream directions when their owner is dropped.
+    /// Cancels a request stream's open directions when their owner is dropped.
     ///
     /// Callbacks retain each direction's trait capability after splitting, without
     /// requiring receive-only streams to implement `SendStream` (or vice versa).
-    /// Server streams start disarmed and retain their transport's drop behavior.
+    /// A server changes the codes when it hands the request to the application.
     /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1>.
     pub(crate) struct StreamGuard<S, B> {
         inner: Option<FrameStream<S, B>>,
         reset_on_drop: Option<Cancel<S, B>>,
         stop_sending_on_drop: Option<Cancel<S, B>>,
+        reset_code: Code,
+        stop_sending_code: Code,
     }
 
     impl<S, B> StreamGuard<S, B> {
         /// Wraps a stream with both cancellation callbacks disabled.
-        /// Used for server streams and halves whose callbacks are transferred by split.
-        pub(super) fn without_cancellation(stream: FrameStream<S, B>) -> Self {
+        /// Used for halves whose callbacks are transferred by split.
+        pub(crate) fn without_cancellation(stream: FrameStream<S, B>) -> Self {
             Self {
                 inner: Some(stream),
                 reset_on_drop: None,
                 stop_sending_on_drop: None,
+                reset_code: Code::H3_REQUEST_CANCELLED,
+                stop_sending_code: Code::H3_REQUEST_CANCELLED,
             }
+        }
+
+        /// Sets the codes used by the callbacks still armed.
+        pub(crate) fn set_cancel_codes(&mut self, reset: Code, stop_sending: Code) {
+            self.reset_code = reset;
+            self.stop_sending_code = stop_sending;
         }
 
         /// Disables receive cancellation after EOF and any buffered trailers are processed.
         /// The send direction keeps its current state.
-        pub(super) fn finish_reading(&mut self) {
+        pub(crate) fn finish_reading(&mut self) {
             self.stop_sending_on_drop = None;
         }
 
@@ -2379,13 +2392,15 @@ mod guard {
     }
 
     impl<S: quic::SendStream<B> + quic::RecvStream, B: Buf> StreamGuard<S, B> {
-        /// Wraps a new client stream with cancellation armed for both directions.
+        /// Wraps a new request stream with cancellation armed for both directions.
         /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1>.
-        pub(super) fn new(stream: FrameStream<S, B>) -> Self {
+        pub(crate) fn new(stream: FrameStream<S, B>, code: Code) -> Self {
             Self {
                 inner: Some(stream),
                 reset_on_drop: Some(|stream, code| stream.reset(code.into())),
                 stop_sending_on_drop: Some(|stream, code| stream.stop_sending(code)),
+                reset_code: code,
+                stop_sending_code: code,
             }
         }
     }
@@ -2399,6 +2414,8 @@ mod guard {
             let (send, recv) = self.inner.take().expect("stream is present").split();
             let mut send = StreamGuard::without_cancellation(send);
             let mut recv = StreamGuard::without_cancellation(recv);
+            send.set_cancel_codes(self.reset_code, self.stop_sending_code);
+            recv.set_cancel_codes(self.reset_code, self.stop_sending_code);
 
             if self.reset_on_drop.take().is_some() {
                 send.reset_on_drop = Some(|stream, code| stream.reset(code.into()));
@@ -2478,11 +2495,17 @@ mod guard {
             let Some(stream) = self.inner.as_mut() else {
                 return;
             };
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+            //# Implementations SHOULD cancel requests by abruptly terminating any
+            //# directions of a stream that are still open.  To do so, an
+            //# implementation resets the sending parts of streams and aborts reading
+            //# on the receiving parts of streams; see Section 2.4 of
+            //# [QUIC-TRANSPORT].
             if let Some(reset) = self.reset_on_drop.take() {
-                reset(stream, Code::H3_REQUEST_CANCELLED);
+                reset(stream, self.reset_code);
             }
             if let Some(stop_sending) = self.stop_sending_on_drop.take() {
-                stop_sending(stream, Code::H3_REQUEST_CANCELLED);
+                stop_sending(stream, self.stop_sending_code);
             }
         }
     }
@@ -2891,6 +2914,7 @@ mod request_drop_tests {
         stream.set_max_field_section_size(1024);
 
         let decode_state = RequestDecodeState::new(stream.id(), &conn_state, 1024, None);
+        let stream = StreamGuard::new(stream, Code::H3_REQUEST_CANCELLED);
         let request_stream =
             RequestStream::with_decode_state(stream, u64::MAX, conn_state, false, decode_state);
 
@@ -3211,7 +3235,7 @@ mod request_drop_tests {
     }
 
     #[test]
-    fn split_transfers_only_its_direction_and_preserves_disarmed_state() {
+    fn split_transfers_each_direction_with_its_cancellation() {
         let (stream, probe) = stream();
         let (send, recv) = stream.split();
         assert!(probe.events.lock().unwrap().is_empty());
@@ -3242,13 +3266,19 @@ mod request_drop_tests {
             ]
         );
 
-        let (stream, probe) = server_stream_with_probe(Probe::default());
+        let (mut stream, probe) = server_stream_with_probe(Probe::default());
+        stream
+            .stream
+            .set_cancel_codes(Code::H3_REQUEST_REJECTED, Code::H3_NO_ERROR);
         let (send, recv) = stream.split();
         drop(send);
         drop(recv);
-        assert!(
-            probe.events.lock().unwrap().is_empty(),
-            "server construction remains disarmed"
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [
+                ("reset", Code::H3_REQUEST_REJECTED.value()),
+                ("stop", Code::H3_NO_ERROR.value()),
+            ]
         );
     }
 
@@ -3287,12 +3317,10 @@ mod request_drop_tests {
                     trailers
                 );
                 drop(stream);
-                let expected = if client {
-                    vec![("reset", Code::H3_REQUEST_CANCELLED.value())]
-                } else {
-                    Vec::new()
-                };
-                assert_eq!(*probe.events.lock().unwrap(), expected);
+                assert_eq!(
+                    *probe.events.lock().unwrap(),
+                    [("reset", Code::H3_REQUEST_CANCELLED.value())]
+                );
             }
         }
     }
