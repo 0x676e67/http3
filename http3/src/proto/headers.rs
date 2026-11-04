@@ -729,6 +729,29 @@ impl Pseudo {
     }
 }
 
+/// Parses Content-Length, accepting repeated or listed values only when equal.
+/// See <https://www.rfc-editor.org/rfc/rfc9110.html#section-8.6>.
+pub(crate) fn content_length(headers: &HeaderMap) -> Result<Option<u64>, HeaderError> {
+    let mut length = None;
+    for value in headers.get_all(header::CONTENT_LENGTH) {
+        for item in value.as_bytes().split(|&byte| byte == b',') {
+            let item = item.trim_ascii();
+            let parsed = std::str::from_utf8(item)
+                .ok()
+                .filter(|item| !item.is_empty() && item.bytes().all(|byte| byte.is_ascii_digit()))
+                .and_then(|item| item.parse::<u64>().ok())
+                .ok_or(HeaderError::InvalidContentLength)?;
+            if length
+                .replace(parsed)
+                .is_some_and(|previous| previous != parsed)
+            {
+                return Err(HeaderError::InvalidContentLength);
+            }
+        }
+    }
+    Ok(length)
+}
+
 #[derive(Debug)]
 pub enum HeaderError {
     InvalidHeaderName(String),
@@ -742,6 +765,7 @@ pub enum HeaderError {
     UnexpectedPseudo,
     DuplicatePseudo,
     PseudoAfterField,
+    InvalidContentLength,
 }
 
 impl HeaderError {
@@ -807,6 +831,7 @@ impl fmt::Display for HeaderError {
             HeaderError::UnexpectedPseudo => write!(f, "pseudo-header is invalid in this context"),
             HeaderError::DuplicatePseudo => write!(f, "duplicate pseudo-header"),
             HeaderError::PseudoAfterField => write!(f, "pseudo-header follows a regular field"),
+            HeaderError::InvalidContentLength => write!(f, "invalid content-length"),
         }
     }
 }
@@ -816,6 +841,34 @@ mod tests {
     use assert_matches::assert_matches;
 
     use super::*;
+
+    #[test]
+    fn content_length_accepts_one_decimal_value() {
+        let parse = |values: &[&'static str]| {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append(header::CONTENT_LENGTH, HeaderValue::from_static(value));
+            }
+            content_length(&headers).ok()
+        };
+        assert_eq!(parse(&[]), Some(None));
+        assert_eq!(parse(&["042"]), Some(Some(42)));
+        // Repeated or listed values are accepted only when they agree.
+        // https://www.rfc-editor.org/rfc/rfc9110.html#section-8.6
+        assert_eq!(parse(&["7", "7, 7"]), Some(Some(7)));
+        for invalid in [
+            &["7", "8"][..],
+            &["7, 8"],
+            &["7,"],
+            &[""],
+            &["+7"],
+            &["-1"],
+            &["0x7"],
+            &["18446744073709551616"],
+        ] {
+            assert_eq!(parse(invalid), None, "{invalid:?}");
+        }
+    }
 
     #[test]
     fn received_pseudo_fields_reject_duplicates_and_late_placement() {

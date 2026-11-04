@@ -1657,6 +1657,8 @@ pub struct RequestStream<S, B> {
     send_grease_frame: bool,
     send_state: SendState,
     decode_state: RequestDecodeState,
+    // DATA bytes the received Content-Length still allows.
+    content_length: Option<u64>,
 }
 
 // Tracks frame ownership and the point after which no more HTTP content may be queued.
@@ -1712,6 +1714,7 @@ where
             trailers: None,
             conn_state,
             decode_state,
+            content_length: None,
         }
     }
 
@@ -1733,6 +1736,7 @@ where
             send_grease_frame: grease,
             send_state: SendState::Head,
             decode_state,
+            content_length: None,
         }
     }
 }
@@ -1772,6 +1776,68 @@ where
         self.handle_frame_stream_error_on_request_stream(error)
     }
 
+    /// Requires the DATA frames that follow to carry exactly `length` bytes.
+    /// `None` leaves the body length unchecked.
+    pub(crate) fn expect_content_length(&mut self, length: Option<u64>) {
+        self.content_length = length;
+    }
+
+    /// Aborts the directions this handle still owns for a malformed message.
+    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.2>.
+    fn reject_malformed(&mut self, reason: &str) -> StreamError {
+        let code = Code::H3_MESSAGE_ERROR;
+        self.cancel_qpack_reading();
+        if self.stream.abort(code) {
+            self.send_state = SendState::Reset;
+        }
+        StreamError::StreamError {
+            code,
+            reason: reason.into(),
+        }
+    }
+
+    /// Reads the next body frame and checks DATA lengths against Content-Length.
+    fn poll_next_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Frame<PayloadLen>>, StreamError>> {
+        let frame = match ready!(self.stream.poll_next(cx)) {
+            Ok(frame) => frame,
+            Err(error) => return Poll::Ready(Err(self.handle_receive_stream_error(error))),
+        };
+        let Some(remaining) = self.content_length else {
+            return Poll::Ready(Ok(frame));
+        };
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+        //# A request or response that is defined as having content when it
+        //# contains a Content-Length header field (Section 8.6 of [HTTP]) is
+        //# malformed if the value of the Content-Length header field does not
+        //# equal the sum of the DATA frame lengths received.
+        match &frame {
+            Some(Frame::Data(PayloadLen(len))) => {
+                let len = u64::try_from(*len).unwrap_or(u64::MAX);
+                match remaining.checked_sub(len) {
+                    Some(remaining) => self.content_length = Some(remaining),
+                    None => {
+                        return Poll::Ready(Err(
+                            self.reject_malformed("DATA exceeds the content-length")
+                        ));
+                    }
+                }
+            }
+            // Trailers or the end of the stream end the body.
+            Some(Frame::Headers(_)) | None if remaining != 0 => {
+                return Poll::Ready(Err(
+                    self.reject_malformed("DATA is shorter than the content-length")
+                ));
+            }
+            Some(Frame::Headers(_)) | None => self.content_length = None,
+            Some(_) => {}
+        }
+        Poll::Ready(Ok(frame))
+    }
+
     /// Receive some of the request/response body.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_recv_data(
@@ -1790,10 +1856,8 @@ where
         // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
         // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.1
         while !self.stream.has_data() {
-            match ready!(self.stream.poll_next(cx)) {
-                Err(frame_stream_error) => {
-                    return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
-                }
+            match ready!(self.poll_next_frame(cx)) {
+                Err(error) => return Poll::Ready(Err(error)),
                 Ok(None) => {
                     self.finish_reading();
                     return Poll::Ready(Ok(None));
@@ -1842,10 +1906,8 @@ where
                     reason: "read the remaining body data before the trailers".into(),
                 }));
             }
-            match ready!(self.stream.poll_next(cx)) {
-                Err(frame_stream_error) => {
-                    return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
-                }
+            match ready!(self.poll_next_frame(cx)) {
+                Err(error) => return Poll::Ready(Err(error)),
                 Ok(None) => {
                     self.finish_reading();
                     return Poll::Ready(Ok(None));
@@ -2281,6 +2343,7 @@ where
                 send_grease_frame: self.send_grease_frame,
                 send_state: self.send_state,
                 decode_state: RequestDecodeState::SendOnly,
+                content_length: None,
             },
             RequestStream {
                 stream: recv,
@@ -2290,6 +2353,7 @@ where
                 send_grease_frame: self.send_grease_frame,
                 send_state: self.send_state,
                 decode_state: self.decode_state,
+                content_length: self.content_length,
             },
         )
     }
@@ -2353,6 +2417,15 @@ mod guard {
         pub(crate) fn set_cancel_codes(&mut self, reset: Code, stop_sending: Code) {
             self.reset_code = reset;
             self.stop_sending_code = stop_sending;
+        }
+
+        /// Cancels the directions still owned by this handle with `code` now.
+        /// Returns whether the send direction was reset.
+        pub(super) fn abort(&mut self, code: Code) -> bool {
+            let reset = self.reset_on_drop.is_some();
+            self.set_cancel_codes(code, code);
+            self.cancel_remaining();
+            reset
         }
 
         /// Disables receive cancellation after EOF and any buffered trailers are processed.

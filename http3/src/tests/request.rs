@@ -3,7 +3,7 @@ use std::{future::Future as _, hint::black_box, time::Duration};
 use assert_matches::assert_matches;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::future;
-use http::{HeaderMap, Request, Response, StatusCode, request};
+use http::{HeaderMap, Method, Request, Response, StatusCode, request};
 
 use super::{Pair, http3_quinn, init_tracing};
 use crate::{
@@ -2942,6 +2942,168 @@ async fn server_drop_aborts_request_by_phase() {
         drop(recv);
         // Keep the connection open until the client is done.
         let _ = incoming.accept().await;
+    };
+
+    tokio::join!(server_fut, client_fut);
+}
+
+#[tokio::test]
+async fn content_length_must_match_data_frames() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+
+    async fn read_body<S: crate::quic::RecvStream>(
+        stream: &mut client::RequestStream<S, Bytes>,
+    ) -> Result<Vec<u8>, StreamError> {
+        let mut body = Vec::new();
+        while let Some(mut chunk) = stream.recv_data().await? {
+            body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+        }
+        Ok(body)
+    }
+
+    let client_fut = async {
+        let (mut driver, mut client) = client::new(pair.client().await).await.unwrap();
+        let requests = async {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+            //= type=test
+            //# A request or response that is defined as having content when it
+            //# contains a Content-Length header field (Section 8.6 of [HTTP]) is
+            //# malformed if the value of the Content-Length header field does not
+            //# equal the sum of the DATA frame lengths received.
+            // The server rejects bodies that are short, too long, or end at
+            // trailers early, and an invalid value.
+            let cases: [(&str, &'static [u8], bool, bool); 5] = [
+                ("3", b"abc", false, true),
+                ("5", b"abc", false, false),
+                ("2", b"abc", false, false),
+                ("1", b"", true, false),
+                ("x", b"", false, false),
+            ];
+            for (length, body, trailers, accepted) in cases {
+                let request = Request::post("https://localhost/upload")
+                    .header("content-length", length)
+                    .body(())
+                    .unwrap();
+                let mut stream = client.send_request(request).await.unwrap();
+                // The server may already have reset the stream.
+                if !body.is_empty() {
+                    let _ = stream.send_data(Bytes::from_static(body)).await;
+                }
+                if trailers {
+                    let mut fields = HeaderMap::new();
+                    fields.insert("trailer", "value".parse().unwrap());
+                    let _ = stream.send_trailers(fields).await;
+                }
+                let _ = stream.finish().await;
+                match stream.recv_response().await {
+                    Ok(response) if accepted => assert_eq!(response.status(), StatusCode::OK),
+                    result => assert_matches!(
+                        result.map(|_| ()),
+                        Err(StreamError::RemoteTerminate { code }) if code == Code::H3_MESSAGE_ERROR
+                    ),
+                }
+            }
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+            //= type=test
+            //# A response that is
+            //# defined as never having content, even when a Content-Length is
+            //# present, can have a non-zero Content-Length header field even though
+            //# no content is included in DATA frames.
+            // The client rejects a short response body but not a response without
+            // content or a tunnel.
+            let cases: [(_, _, Option<&[u8]>); 5] = [
+                (Method::GET, "https://localhost/full", Some(b"abc")),
+                (Method::GET, "https://localhost/short", None),
+                (Method::HEAD, "https://localhost/head", Some(b"")),
+                (Method::GET, "https://localhost/no-content", Some(b"")),
+                (Method::CONNECT, "localhost:443", Some(b"tunnel")),
+            ];
+            for (method, uri, body) in cases {
+                let request = Request::builder().method(method).uri(uri).body(()).unwrap();
+                let mut stream = client.send_request(request).await.unwrap();
+                stream.finish().await.unwrap();
+                stream.recv_response().await.unwrap();
+                match body {
+                    Some(body) => assert_eq!(read_body(&mut stream).await.unwrap(), body),
+                    None => assert_matches!(
+                        read_body(&mut stream).await,
+                        Err(StreamError::StreamError {
+                            code: Code::H3_MESSAGE_ERROR,
+                            ..
+                        })
+                    ),
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = requests => (),
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("connection failed: {error:?}"),
+        }
+    };
+
+    let server_fut = async {
+        let mut incoming = server::Connection::new(server.next().await).await.unwrap();
+        for accepted in [true, false, false, false] {
+            let (_, mut stream) = get_stream_blocking(&mut incoming).await.unwrap();
+            let mut body = Ok(());
+            while body.is_ok() {
+                match stream.recv_data().await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(error) => body = Err(error),
+                }
+            }
+            if accepted {
+                body.unwrap();
+                stream.send_response(Response::new(())).await.unwrap();
+                stream.finish().await.unwrap();
+            } else {
+                assert_matches!(
+                    body,
+                    Err(StreamError::StreamError {
+                        code: Code::H3_MESSAGE_ERROR,
+                        ..
+                    })
+                );
+            }
+        }
+        let resolver = incoming.accept().await.unwrap().unwrap();
+        assert_matches!(
+            resolver.resolve_request().await.map(|_| ()),
+            Err(StreamError::StreamError {
+                code: Code::H3_MESSAGE_ERROR,
+                ..
+            })
+        );
+
+        while let Some((request, mut stream)) = get_stream_blocking(&mut incoming).await {
+            let (status, body): (_, &[u8]) = match request.uri().path() {
+                "/full" => (StatusCode::OK, b"abc"),
+                "/short" => (StatusCode::OK, b"abc"),
+                "/no-content" => (StatusCode::NO_CONTENT, b""),
+                _ if request.method() == Method::CONNECT => (StatusCode::OK, b"tunnel"),
+                _ => (StatusCode::OK, b""),
+            };
+            let length = match request.uri().path() {
+                "/full" => "3",
+                _ if request.method() == Method::CONNECT => "0",
+                _ => "5",
+            };
+            let response = Response::builder()
+                .status(status)
+                .header("content-length", length)
+                .body(())
+                .unwrap();
+            stream.send_response(response).await.unwrap();
+            if !body.is_empty() {
+                stream.send_data(Bytes::from_static(body)).await.unwrap();
+            }
+            stream.finish().await.unwrap();
+        }
     };
 
     tokio::join!(server_fut, client_fut);
