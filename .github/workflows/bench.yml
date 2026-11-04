@@ -39,6 +39,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Install Rust ${{ env.toolchain_benchmark_msrv }}
         uses: actions-rust-lang/setup-rust-toolchain@v2

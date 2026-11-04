@@ -86,6 +86,12 @@ impl Pair {
             .initial_rtt(Duration::from_millis(10));
     }
 
+    pub fn with_stream_receive_window(&mut self, window: u32) {
+        Arc::get_mut(&mut self.config)
+            .unwrap()
+            .stream_receive_window(window.into());
+    }
+
     pub fn server_inner(&mut self) -> http3_quinn::Endpoint {
         let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
