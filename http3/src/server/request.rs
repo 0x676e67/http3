@@ -233,7 +233,12 @@ where
         let result = Header::try_from(fields)
             .and_then(Header::into_request_parts)
             .and_then(|(method, uri, protocol, headers, pseudo_sensitivity)| {
-                let content_length = headers::content_length(&headers)?;
+                // A CONNECT request has no content; DATA frames carry the tunnel.
+                // https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6
+                let content_length = match method == Method::CONNECT {
+                    true => None,
+                    false => headers::content_length(&headers)?,
+                };
                 Ok((
                     method,
                     uri,
@@ -260,13 +265,9 @@ where
             }
         };
 
-        // A CONNECT request has no content; DATA frames carry the tunnel.
-        // https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6
-        if method != Method::CONNECT {
-            self.request_stream
-                .inner
-                .expect_content_length(content_length);
-        }
+        self.request_stream
+            .inner
+            .expect_content_length(content_length);
 
         let mut req = http::Request::new(());
         *req.method_mut() = method;

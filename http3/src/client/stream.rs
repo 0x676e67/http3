@@ -126,9 +126,18 @@ impl ResponseContent {
         }
     }
 
-    /// Whether a final response with `status` has content its Content-Length describes.
+    /// Whether a response with `status` has content its Content-Length describes.
+    ///
+    /// A successful response to CONNECT must ignore Content-Length
+    /// ([RFC 9110, Section 9.3.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6)).
     fn has_content(self, status: StatusCode) -> bool {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+        //# A response that is
+        //# defined as never having content, even when a Content-Length is
+        //# present, can have a non-zero Content-Length header field even though
+        //# no content is included in DATA frames.
         match self {
+            _ if status.is_informational() => false,
             _ if status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED => false,
             Self::Head => false,
             Self::Connect => !status.is_success(),
@@ -399,10 +408,10 @@ where
         let (status, headers, pseudo_sensitivity, content_length) = Header::try_from(fields)
             .and_then(Header::into_response_parts)
             .and_then(|(status, headers, pseudo_sensitivity)| {
-                // Only the final response describes the content.
-                let content_length = match status.is_informational() {
-                    true => None,
-                    false => headers::content_length(&headers)?,
+                // Content-Length of a response without content is not used.
+                let content_length = match content.has_content(status) {
+                    true => headers::content_length(&headers)?,
+                    false => None,
                 };
                 Ok((status, headers, pseudo_sensitivity, content_length))
             })
@@ -415,12 +424,7 @@ where
                 }
             })?;
 
-        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
-        //# A response that is
-        //# defined as never having content, even when a Content-Length is
-        //# present, can have a non-zero Content-Length header field even though
-        //# no content is included in DATA frames.
-        if !status.is_informational() && content.has_content(status) {
+        if !status.is_informational() {
             inner.expect_content_length(content_length);
         }
 
