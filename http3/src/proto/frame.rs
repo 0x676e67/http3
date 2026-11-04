@@ -1175,6 +1175,12 @@ mod tests {
                 FrameError::UnsupportedFrame(0xd),
             ),
             (
+                FrameType::PRIORITY_UPDATE_REQUEST,
+                0,
+                Request,
+                FrameError::UnsupportedFrame(0xf0700),
+            ),
+            (
                 FrameType::PRIORITY_UPDATE_PUSH,
                 0,
                 Request,
@@ -1206,6 +1212,12 @@ mod tests {
             ),
             (
                 FrameType::PRIORITY_UPDATE_REQUEST,
+                MAX_CONTROL_PAYLOAD + 1,
+                Control,
+                excessive(),
+            ),
+            (
+                FrameType::PRIORITY_UPDATE_PUSH,
                 MAX_CONTROL_PAYLOAD + 1,
                 Control,
                 excessive(),
