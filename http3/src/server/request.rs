@@ -1,7 +1,7 @@
 use std::{convert::TryFrom, sync::Arc};
 
 use bytes::{Buf, Bytes};
-use http::{Method, Request, StatusCode};
+use http::{Request, StatusCode};
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -233,12 +233,7 @@ where
         let result = Header::try_from(fields)
             .and_then(Header::into_request_parts)
             .and_then(|(method, uri, protocol, headers, pseudo_sensitivity)| {
-                // A CONNECT request has no content; DATA frames carry the tunnel.
-                // https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6
-                let content_length = match method == Method::CONNECT {
-                    true => None,
-                    false => headers::content_length(&headers)?,
-                };
+                let content_length = headers::content_length(&headers, &method, None)?;
                 Ok((
                     method,
                     uri,

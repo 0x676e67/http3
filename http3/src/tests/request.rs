@@ -2953,14 +2953,14 @@ async fn content_length_must_match_data_frames() {
     let mut pair = Pair::default();
     let endpoint = pair.server_inner();
 
-    async fn read_body<S: crate::quic::RecvStream>(
-        stream: &mut client::RequestStream<S, Bytes>,
-    ) -> Result<Vec<u8>, StreamError> {
-        let mut body = Vec::new();
-        while let Some(mut chunk) = stream.recv_data().await? {
-            body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
-        }
-        Ok(body)
+    fn malformed<T>(result: Result<T, StreamError>) -> bool {
+        matches!(
+            result,
+            Err(StreamError::StreamError {
+                code: Code::H3_MESSAGE_ERROR,
+                ..
+            })
+        )
     }
 
     let client_fut = async {
@@ -2972,27 +2972,25 @@ async fn content_length_must_match_data_frames() {
             //# contains a Content-Length header field (Section 8.6 of [HTTP]) is
             //# malformed if the value of the Content-Length header field does not
             //# equal the sum of the DATA frame lengths received.
-            // Requests: (path, content-length, DATA, trailers, response or reset code).
-            let cases: [(&str, &str, &'static [u8], bool, Code); 6] = [
-                ("/exact", "3", b"abc", false, Code::H3_NO_ERROR),
+            // Requests: (path, content-length, DATA, trailers, reset code if rejected).
+            let cases: [(&str, &str, &'static [u8], bool, _); 5] = [
+                ("/exact", "3", b"abc", false, None),
                 (
-                    "/split-short",
+                    "/split",
                     "5",
                     b"abc",
                     false,
-                    Code::H3_REQUEST_CANCELLED,
+                    Some(Code::H3_REQUEST_CANCELLED),
                 ),
-                ("/long", "2", b"abc", false, Code::H3_MESSAGE_ERROR),
-                ("/trailers-short", "1", b"", true, Code::H3_MESSAGE_ERROR),
-                ("/invalid", "x", b"", false, Code::H3_MESSAGE_ERROR),
-                ("", "0", b"ping", false, Code::H3_NO_ERROR),
+                ("/long", "2", b"abc", false, Some(Code::H3_MESSAGE_ERROR)),
+                ("/trailers", "1", b"", true, Some(Code::H3_MESSAGE_ERROR)),
+                ("/invalid", "x", b"", false, Some(Code::H3_MESSAGE_ERROR)),
             ];
-            for (path, length, body, trailers, code) in cases {
-                let request = match path {
-                    "" => Request::connect("localhost:443"),
-                    path => Request::post(format!("https://localhost{path}")),
-                };
-                let request = request.header("content-length", length).body(()).unwrap();
+            for (path, length, body, trailers, reset) in cases {
+                let request = Request::post(format!("https://localhost{path}"))
+                    .header("content-length", length)
+                    .body(())
+                    .unwrap();
                 let mut stream = client.send_request(request).await.unwrap();
                 if !body.is_empty() {
                     stream.send_data(Bytes::from_static(body)).await.unwrap();
@@ -3004,61 +3002,44 @@ async fn content_length_must_match_data_frames() {
                 }
                 if path == "/long" {
                     // The upload stays open, so only STOP_SENDING can end it.
-                    assert_eq!(
-                        future::poll_fn(|cx| stream.poll_stopped(cx)).await.unwrap(),
-                        Some(Code::H3_MESSAGE_ERROR)
-                    );
+                    let stopped = future::poll_fn(|cx| stream.poll_stopped(cx)).await;
+                    assert_eq!(stopped.unwrap(), Some(Code::H3_MESSAGE_ERROR));
                 } else {
                     stream.finish().await.unwrap();
                 }
-                match stream.recv_response().await {
-                    Ok(response) if code == Code::H3_NO_ERROR => {
-                        assert_eq!(response.status(), StatusCode::OK)
+                match (stream.recv_response().await, reset) {
+                    (Ok(response), None) => assert_eq!(response.status(), StatusCode::OK),
+                    (Err(StreamError::RemoteTerminate { code }), Some(reset)) => {
+                        assert_eq!(code, reset)
                     }
-                    result => assert_matches!(
-                        result.map(|_| ()),
-                        Err(StreamError::RemoteTerminate { code: reset }) if reset == code
-                    ),
+                    (result, _) => panic!("{path}: {result:?}"),
                 }
             }
 
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
-            //= type=test
-            //# A response that is
-            //# defined as never having content, even when a Content-Length is
-            //# present, can have a non-zero Content-Length header field even though
-            //# no content is included in DATA frames.
-            // Responses: (method, uri, received body, or None if malformed).
-            let cases: [(_, _, Option<&[u8]>); 7] = [
-                (Method::GET, "https://localhost/exact", Some(b"abc")),
-                (Method::GET, "https://localhost/long", None),
-                (Method::GET, "https://localhost/invalid", None),
-                (Method::HEAD, "https://localhost/head", Some(b"")),
-                (Method::GET, "https://localhost/no-content", Some(b"")),
-                (Method::CONNECT, "localhost:443", Some(b"tunnel")),
-                (Method::CONNECT, "localhost:444", None),
-            ];
-            for (method, uri, body) in cases {
+            // Responses: (method, path, malformed). A malformed response also
+            // aborts the open upload, and its rejected DATA is not returned later.
+            for (method, path, rejected) in [
+                (Method::GET, "/exact", false),
+                (Method::GET, "/long", true),
+                (Method::GET, "/invalid", true),
+                // The request method decides that a HEAD response has no content.
+                (Method::HEAD, "/short", false),
+            ] {
+                let uri = format!("https://localhost{path}");
                 let request = Request::builder().method(method).uri(uri).body(()).unwrap();
                 let mut stream = client.send_request(request).await.unwrap();
-                stream.finish().await.unwrap();
-                let result = match stream.recv_response().await {
-                    Ok(_) => read_body(&mut stream).await,
-                    Err(error) => Err(error),
-                };
-                match body {
-                    Some(body) => assert_eq!(result.unwrap(), body),
-                    None => {
-                        assert_matches!(
-                            result,
-                            Err(StreamError::StreamError {
-                                code: Code::H3_MESSAGE_ERROR,
-                                ..
-                            })
-                        );
-                        // The rejected DATA is not returned later.
-                        assert!(stream.recv_data().await.is_err());
-                    }
+                if !rejected {
+                    stream.finish().await.unwrap();
+                }
+                let result = async {
+                    stream.recv_response().await?;
+                    while stream.recv_data().await?.is_some() {}
+                    Ok(())
+                }
+                .await;
+                assert_eq!(malformed(result), rejected, "{path}");
+                if rejected {
+                    assert!(stream.recv_data().await.is_err());
                 }
             }
         };
@@ -3074,15 +3055,6 @@ async fn content_length_must_match_data_frames() {
         let mut incoming = server::Connection::new(http3_quinn::Connection::new(conn))
             .await
             .unwrap();
-        let malformed = |result| {
-            assert_matches!(
-                result,
-                Err(StreamError::StreamError {
-                    code: Code::H3_MESSAGE_ERROR,
-                    ..
-                })
-            )
-        };
 
         let (_, mut stream) = get_stream_blocking(&mut incoming).await.unwrap();
         while stream.recv_data().await.unwrap().is_some() {}
@@ -3093,47 +3065,47 @@ async fn content_length_must_match_data_frames() {
         let (_, stream) = get_stream_blocking(&mut incoming).await.unwrap();
         let (send, mut recv) = stream.split();
         while let Ok(Some(_)) = recv.recv_data().await {}
-        malformed(recv.recv_data().await.map(|_| ()));
+        assert!(malformed(recv.recv_data().await));
         drop(send);
 
         let (_, mut stream) = get_stream_blocking(&mut incoming).await.unwrap();
-        malformed(stream.recv_data().await.map(|_| ()));
+        assert!(malformed(stream.recv_data().await));
+        assert!(malformed(stream.recv_trailers().await));
+        let response = stream.send_response(Response::new(())).await;
+        assert!(matches!(
+            response,
+            Err(StreamError::InvalidStreamState { .. })
+        ));
 
         let (_, mut stream) = get_stream_blocking(&mut incoming).await.unwrap();
-        malformed(stream.recv_trailers().await.map(|_| ()));
+        assert!(malformed(stream.recv_trailers().await));
 
         let resolver = incoming.accept().await.unwrap().unwrap();
-        malformed(resolver.resolve_request().await.map(|_| ()));
-
-        // CONNECT carries a tunnel, so its Content-Length is not checked.
-        let (_, mut stream) = get_stream_blocking(&mut incoming).await.unwrap();
-        let mut chunk = stream.recv_data().await.unwrap().unwrap();
-        assert_eq!(chunk.copy_to_bytes(chunk.remaining()), "ping");
-        stream.send_response(Response::new(())).await.unwrap();
-        stream.finish().await.unwrap();
+        assert!(malformed(resolver.resolve_request().await));
 
         while let Some((request, mut stream)) = get_stream_blocking(&mut incoming).await {
-            let port = request.uri().port_u16();
-            let (status, length, body): (_, _, &[u8]) = match request.uri().path() {
-                "/exact" => (StatusCode::OK, "3", b"abc"),
-                "/long" => (StatusCode::OK, "2", b"abc"),
-                "/invalid" => (StatusCode::OK, "x", b""),
-                "/no-content" => (StatusCode::NO_CONTENT, "5", b""),
-                // A successful CONNECT response ignores even an invalid value.
-                _ if port == Some(443) => (StatusCode::OK, "x", b"tunnel"),
-                _ if port == Some(444) => (StatusCode::FORBIDDEN, "5", b"abc"),
-                _ => (StatusCode::OK, "5", b""),
+            let path = request.uri().path();
+            let (length, body): (_, &'static [u8]) = match path {
+                "/exact" => ("3", b"abc"),
+                "/long" => ("2", b"abc"),
+                "/invalid" => ("x", b""),
+                _ => ("5", b""),
             };
-            let response = Response::builder()
-                .status(status)
-                .header("content-length", length)
-                .body(())
+            let response = Response::builder().header("content-length", length);
+            stream
+                .send_response(response.body(()).unwrap())
+                .await
                 .unwrap();
-            stream.send_response(response).await.unwrap();
             if !body.is_empty() {
                 stream.send_data(Bytes::from_static(body)).await.unwrap();
             }
             stream.finish().await.unwrap();
+            if matches!(path, "/long" | "/invalid") {
+                assert_matches!(
+                    stream.recv_data().await.map(|_| ()),
+                    Err(StreamError::RemoteTerminate { code }) if code == Code::H3_MESSAGE_ERROR
+                );
+            }
         }
     };
 

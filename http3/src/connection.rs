@@ -1792,14 +1792,20 @@ where
         self.content_length = length.map_or(ContentLength::Unchecked, ContentLength::Remaining);
     }
 
-    /// Aborts the directions this handle still owns for a malformed message.
+    /// Aborts the directions this handle still owns as a stream error.
+    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-8>.
+    pub(crate) fn abort(&mut self, code: Code) {
+        self.cancel_qpack_reading();
+        if self.stream.abort(code) {
+            self.send_state = SendState::Reset;
+        }
+    }
+
+    /// Aborts the stream for a body that differs from its Content-Length.
     /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.2>.
     fn reject_malformed(&mut self, reason: &'static str) -> StreamError {
         self.content_length = ContentLength::Malformed(reason);
-        self.cancel_qpack_reading();
-        if self.stream.abort(Code::H3_MESSAGE_ERROR) {
-            self.send_state = SendState::Reset;
-        }
+        self.abort(Code::H3_MESSAGE_ERROR);
         Self::malformed(reason)
     }
 
@@ -1815,10 +1821,8 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Frame<PayloadLen>>, StreamError>> {
-        let frame = match ready!(self.stream.poll_next(cx)) {
-            Ok(frame) => frame,
-            Err(error) => return Poll::Ready(Err(self.handle_receive_stream_error(error))),
-        };
+        let frame = ready!(self.stream.poll_next(cx))
+            .map_err(|error| self.handle_receive_stream_error(error))?;
         let ContentLength::Remaining(remaining) = self.content_length else {
             return Poll::Ready(Ok(frame));
         };
@@ -1831,14 +1835,12 @@ where
         match &frame {
             Some(Frame::Data(PayloadLen(len))) => {
                 let len = u64::try_from(*len).unwrap_or(u64::MAX);
-                match remaining.checked_sub(len) {
-                    Some(remaining) => self.content_length = ContentLength::Remaining(remaining),
-                    None => {
-                        return Poll::Ready(Err(
-                            self.reject_malformed("DATA exceeds the content-length")
-                        ));
-                    }
-                }
+                let Some(remaining) = remaining.checked_sub(len) else {
+                    return Poll::Ready(Err(
+                        self.reject_malformed("DATA exceeds the content-length")
+                    ));
+                };
+                self.content_length = ContentLength::Remaining(remaining);
             }
             // Trailers or the end of the stream end the body.
             Some(Frame::Headers(_)) | None if remaining != 0 => {
@@ -1875,19 +1877,18 @@ where
         // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
         // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.1
         while !self.stream.has_data() {
-            match ready!(self.poll_next_frame(cx)) {
-                Err(error) => return Poll::Ready(Err(error)),
-                Ok(None) => {
+            match ready!(self.poll_next_frame(cx))? {
+                None => {
                     self.finish_reading();
                     return Poll::Ready(Ok(None));
                 }
-                Ok(Some(Frame::Headers(encoded))) => {
+                Some(Frame::Headers(encoded)) => {
                     self.trailers = Some(encoded);
                     // Received trailers, no more data expected
                     return Poll::Ready(Ok(None));
                 }
-                Ok(Some(Frame::Data { .. })) => (),
-                Ok(Some(other_frame)) => {
+                Some(Frame::Data { .. }) => (),
+                Some(other_frame) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                     //# Receipt of an invalid sequence of frames MUST be treated as a
                     //# connection error of type H3_FRAME_UNEXPECTED.
@@ -1929,21 +1930,20 @@ where
                     reason: "read the remaining body data before the trailers".into(),
                 }));
             }
-            match ready!(self.poll_next_frame(cx)) {
-                Err(error) => return Poll::Ready(Err(error)),
-                Ok(None) => {
+            match ready!(self.poll_next_frame(cx))? {
+                None => {
                     self.finish_reading();
                     return Poll::Ready(Ok(None));
                 }
-                Ok(Some(Frame::Headers(encoded))) => encoded,
+                Some(Frame::Headers(encoded)) => encoded,
                 // DATA may follow DATA, so only the local call order is wrong.
                 // The frame's payload stays readable through `poll_recv_data`.
-                Ok(Some(Frame::Data { .. })) => {
+                Some(Frame::Data { .. }) => {
                     return Poll::Ready(Err(StreamError::InvalidStreamState {
                         reason: "the body has not ended".into(),
                     }));
                 }
-                Ok(Some(other_frame)) => {
+                Some(other_frame) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                     //# Receipt of an invalid sequence of frames MUST be treated as a
                     //# connection error of type H3_FRAME_UNEXPECTED.

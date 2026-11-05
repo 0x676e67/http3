@@ -6,7 +6,7 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
-use http::{HeaderMap, Method, Response, StatusCode};
+use http::{HeaderMap, Method, Response};
 use quic::StreamId;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
@@ -102,48 +102,8 @@ pub struct RequestStream<S, B> {
     pub(super) inner: connection::RequestStream<S, B>,
     rejection: RequestRejection,
     head: ResponseHead,
-    content: ResponseContent,
-}
-
-/// How the request method shapes the response content.
-/// See <https://www.rfc-editor.org/rfc/rfc9110.html#section-6.4.1>.
-#[derive(Clone, Copy)]
-pub(super) enum ResponseContent {
-    /// Content-Length describes the response's DATA frames.
-    Body,
-    /// A response to HEAD never has content.
-    Head,
-    /// A 2xx response to CONNECT starts a tunnel instead.
-    Connect,
-}
-
-impl ResponseContent {
-    pub(super) fn of(method: &Method) -> Self {
-        match *method {
-            Method::HEAD => Self::Head,
-            Method::CONNECT => Self::Connect,
-            _ => Self::Body,
-        }
-    }
-
-    /// Whether a response with `status` has content its Content-Length describes.
-    ///
-    /// A successful response to CONNECT must ignore Content-Length
-    /// ([RFC 9110, Section 9.3.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6)).
-    fn has_content(self, status: StatusCode) -> bool {
-        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
-        //# A response that is
-        //# defined as never having content, even when a Content-Length is
-        //# present, can have a non-zero Content-Length header field even though
-        //# no content is included in DATA frames.
-        match self {
-            _ if status.is_informational() => false,
-            _ if status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED => false,
-            Self::Head => false,
-            Self::Connect => !status.is_success(),
-            Self::Body => true,
-        }
-    }
+    // Decides whether the response has content its Content-Length describes.
+    method: Method,
 }
 
 /// Progress of the response head, which gates the body operations.
@@ -204,7 +164,8 @@ where
     ///
     /// This returns a chunk of the response body, or `None` if the response body is finished.
     /// Before the final response was received it returns
-    /// [`StreamError::InvalidStreamState`].
+    /// [`StreamError::InvalidStreamState`]. A body that differs from its Content-Length
+    /// aborts the stream with [`Code::H3_MESSAGE_ERROR`].
     ///
     /// Published request errors take precedence over buffered data; see
     /// [`RequestStream`]'s error handling contract.
@@ -297,7 +258,7 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Response<()>, StreamError>> {
         let result = self.rejection.poll(cx, |cx| {
-            Self::poll_recv_response_inner(&mut self.inner, &mut self.head, self.content, cx)
+            Self::poll_recv_response_inner(&mut self.inner, &mut self.head, &self.method, cx)
         });
         result.map(|result| {
             self.head = match &result {
@@ -314,7 +275,7 @@ where
     fn poll_recv_response_inner(
         inner: &mut connection::RequestStream<S, B>,
         head: &mut ResponseHead,
-        content: ResponseContent,
+        method: &Method,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Response<()>, StreamError>> {
         let mut encoded = match head {
@@ -408,25 +369,19 @@ where
         let (status, headers, pseudo_sensitivity, content_length) = Header::try_from(fields)
             .and_then(Header::into_response_parts)
             .and_then(|(status, headers, pseudo_sensitivity)| {
-                // Content-Length of a response without content is not used.
-                let content_length = match content.has_content(status) {
-                    true => headers::content_length(&headers)?,
-                    false => None,
-                };
+                let content_length = headers::content_length(&headers, method, Some(status))?;
                 Ok((status, headers, pseudo_sensitivity, content_length))
             })
             .map_err(|error| {
                 let code = error.code();
-                inner.stop_sending(code);
+                inner.abort(code);
                 StreamError::StreamError {
                     code,
                     reason: format!("rejected response headers: {error}"),
                 }
             })?;
 
-        if !status.is_informational() {
-            inner.expect_content_length(content_length);
-        }
+        inner.expect_content_length(content_length);
 
         let mut resp = Response::new(());
         *resp.status_mut() = status;
@@ -584,7 +539,7 @@ where
             inner,
             rejection,
             head,
-            content,
+            method,
         } = self;
         let (send, recv) = inner.split();
         (
@@ -592,13 +547,13 @@ where
                 inner: send,
                 rejection: RequestRejection::new(rejection.state.clone(), rejection.stream_id),
                 head: ResponseHead::Pending,
-                content,
+                method: method.clone(),
             },
             RequestStream {
                 inner: recv,
                 rejection,
                 head,
-                content,
+                method,
             },
         )
     }
@@ -609,13 +564,13 @@ where
     S: quic::SendStream<B> + quic::RecvStream,
     B: Buf,
 {
-    pub(super) fn new(inner: connection::RequestStream<S, B>, content: ResponseContent) -> Self {
+    pub(super) fn new(inner: connection::RequestStream<S, B>, method: Method) -> Self {
         let rejection = RequestRejection::new(inner.conn_state.clone(), inner.stream.id());
         Self {
             inner,
             rejection,
             head: ResponseHead::Pending,
-            content,
+            method,
         }
     }
 }

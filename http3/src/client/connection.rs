@@ -13,7 +13,7 @@ use http::request;
 #[cfg(feature = "tracing")]
 use tracing::{info, instrument, trace};
 
-use super::stream::{RequestStream, ResponseContent};
+use super::stream::RequestStream;
 use crate::{
     PseudoOrder,
     connection::{self, ConnectionInner},
@@ -183,7 +183,7 @@ where
             extensions,
             ..
         } = parts;
-        let content = ResponseContent::of(&method);
+        let response_method = method.clone();
         let mut headers = Header::request(method, uri, headers, extensions).map_err(|error| {
             StreamError::InvalidRequest {
                 reason: error.to_string().into_boxed_str(),
@@ -325,7 +325,7 @@ where
                 self.conn_state.clone(),
                 self.decoder.clone(),
             ),
-            content,
+            response_method,
         );
         // send the grease frame only once
         self.send_grease_frame = false;
