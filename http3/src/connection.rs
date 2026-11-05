@@ -1662,7 +1662,6 @@ pub struct RequestStream<S, B> {
 
 /// Content-Length tracking for the received body.
 /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.2>.
-#[derive(Clone, Copy)]
 enum ContentLength {
     Unchecked,
     /// DATA bytes the received Content-Length still allows.
@@ -1795,8 +1794,9 @@ where
     /// Aborts the directions this handle still owns as a stream error.
     /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-8>.
     pub(crate) fn abort(&mut self, code: Code) {
-        self.cancel_qpack_reading();
-        if self.stream.abort(code) {
+        self.stream.set_cancel_codes(code, code);
+        self.cancel_request();
+        if self.send_state != SendState::Finished {
             self.send_state = SendState::Reset;
         }
     }
@@ -1848,8 +1848,7 @@ where
                     self.reject_malformed("DATA is shorter than the content-length")
                 ));
             }
-            Some(Frame::Headers(_)) | None => self.content_length = ContentLength::Unchecked,
-            Some(_) => {}
+            _ => {}
         }
         Poll::Ready(Ok(frame))
     }
@@ -2383,7 +2382,7 @@ where
 }
 
 impl<S, B> RequestStream<S, B> {
-    /// Abandons this handle's remaining directions after GOAWAY rejection.
+    /// Abandons this handle's remaining directions now, with their drop codes.
     /// Uses the same ownership state as Drop and releases QPACK at most once.
     pub(crate) fn cancel_request(&mut self) {
         self.decode_state.cancel_reading();
@@ -2440,15 +2439,6 @@ mod guard {
         pub(crate) fn set_cancel_codes(&mut self, reset: Code, stop_sending: Code) {
             self.reset_code = reset;
             self.stop_sending_code = stop_sending;
-        }
-
-        /// Cancels the directions still owned by this handle with `code` now.
-        /// Returns whether the send direction was reset.
-        pub(super) fn abort(&mut self, code: Code) -> bool {
-            let reset = self.reset_on_drop.is_some();
-            self.set_cancel_codes(code, code);
-            self.cancel_remaining();
-            reset
         }
 
         /// Disables receive cancellation after EOF and any buffered trailers are processed.

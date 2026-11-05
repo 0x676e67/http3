@@ -232,18 +232,15 @@ where
         // Parse the request headers
         let result = Header::try_from(fields)
             .and_then(Header::into_request_parts)
-            .and_then(|(method, uri, protocol, headers, pseudo_sensitivity)| {
-                let content_length = headers::content_length(&headers, &method, None)?;
-                Ok((
-                    method,
-                    uri,
-                    protocol,
-                    headers,
-                    pseudo_sensitivity,
-                    content_length,
-                ))
+            .and_then(|parts| {
+                let (method, _, _, headers, _) = &parts;
+                let content_length = headers::content_length(headers, method, None)?;
+                self.request_stream
+                    .inner
+                    .expect_content_length(content_length);
+                Ok(parts)
             });
-        let (method, uri, protocol, headers, pseudo_sensitivity, content_length) = match result {
+        let (method, uri, protocol, headers, pseudo_sensitivity) = match result {
             Ok(parts) => parts,
             Err(err) => {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
@@ -259,10 +256,6 @@ where
                 });
             }
         };
-
-        self.request_stream
-            .inner
-            .expect_content_length(content_length);
 
         let mut req = http::Request::new(());
         *req.method_mut() = method;
