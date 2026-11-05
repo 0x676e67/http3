@@ -1657,6 +1657,17 @@ pub struct RequestStream<S, B> {
     send_grease_frame: bool,
     send_state: SendState,
     decode_state: RequestDecodeState,
+    content_length: ContentLength,
+}
+
+/// Content-Length tracking for the received body.
+/// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.2>.
+enum ContentLength {
+    Unchecked,
+    /// DATA bytes the received Content-Length still allows.
+    Remaining(u64),
+    /// The body was rejected; later reads repeat the error.
+    Malformed(&'static str),
 }
 
 // Tracks frame ownership and the point after which no more HTTP content may be queued.
@@ -1712,6 +1723,7 @@ where
             trailers: None,
             conn_state,
             decode_state,
+            content_length: ContentLength::Unchecked,
         }
     }
 
@@ -1733,6 +1745,7 @@ where
             send_grease_frame: grease,
             send_state: SendState::Head,
             decode_state,
+            content_length: ContentLength::Unchecked,
         }
     }
 }
@@ -1772,12 +1785,85 @@ where
         self.handle_frame_stream_error_on_request_stream(error)
     }
 
+    /// Requires the DATA frames that follow to carry exactly `length` bytes.
+    /// `None` leaves the body length unchecked.
+    pub(crate) fn expect_content_length(&mut self, length: Option<u64>) {
+        self.content_length = length.map_or(ContentLength::Unchecked, ContentLength::Remaining);
+    }
+
+    /// Aborts the directions this handle still owns as a stream error.
+    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-8>.
+    pub(crate) fn abort(&mut self, code: Code) {
+        self.stream.set_cancel_codes(code, code);
+        self.cancel_request();
+        if self.send_state != SendState::Finished {
+            self.send_state = SendState::Reset;
+        }
+    }
+
+    /// Aborts the stream for a body that differs from its Content-Length.
+    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.2>.
+    fn reject_malformed(&mut self, reason: &'static str) -> StreamError {
+        self.content_length = ContentLength::Malformed(reason);
+        self.abort(Code::H3_MESSAGE_ERROR);
+        Self::malformed(reason)
+    }
+
+    fn malformed(reason: &str) -> StreamError {
+        StreamError::StreamError {
+            code: Code::H3_MESSAGE_ERROR,
+            reason: reason.into(),
+        }
+    }
+
+    /// Reads the next body frame and checks DATA lengths against Content-Length.
+    fn poll_next_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Frame<PayloadLen>>, StreamError>> {
+        let frame = ready!(self.stream.poll_next(cx))
+            .map_err(|error| self.handle_receive_stream_error(error))?;
+        let ContentLength::Remaining(remaining) = self.content_length else {
+            return Poll::Ready(Ok(frame));
+        };
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+        //# A request or response that is defined as having content when it
+        //# contains a Content-Length header field (Section 8.6 of [HTTP]) is
+        //# malformed if the value of the Content-Length header field does not
+        //# equal the sum of the DATA frame lengths received.
+        match &frame {
+            Some(Frame::Data(PayloadLen(len))) => {
+                let len = u64::try_from(*len).unwrap_or(u64::MAX);
+                let Some(remaining) = remaining.checked_sub(len) else {
+                    return Poll::Ready(Err(
+                        self.reject_malformed("DATA exceeds the content-length")
+                    ));
+                };
+                self.content_length = ContentLength::Remaining(remaining);
+            }
+            // Trailers or the end of the stream end the body.
+            Some(Frame::Headers(_)) | None if remaining != 0 => {
+                return Poll::Ready(Err(
+                    self.reject_malformed("DATA is shorter than the content-length")
+                ));
+            }
+            _ => {}
+        }
+        Poll::Ready(Ok(frame))
+    }
+
     /// Receive some of the request/response body.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_recv_data(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
+        // The rejected frame's payload must not be returned later.
+        if let ContentLength::Malformed(reason) = self.content_length {
+            return Poll::Ready(Err(Self::malformed(reason)));
+        }
+
         // Body EOF can precede decoding the trailers. Keep their QPACK state
         // armed until recv_trailers processes them or the caller abandons them.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2
@@ -1790,21 +1876,18 @@ where
         // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
         // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.1
         while !self.stream.has_data() {
-            match ready!(self.stream.poll_next(cx)) {
-                Err(frame_stream_error) => {
-                    return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
-                }
-                Ok(None) => {
+            match ready!(self.poll_next_frame(cx))? {
+                None => {
                     self.finish_reading();
                     return Poll::Ready(Ok(None));
                 }
-                Ok(Some(Frame::Headers(encoded))) => {
+                Some(Frame::Headers(encoded)) => {
                     self.trailers = Some(encoded);
                     // Received trailers, no more data expected
                     return Poll::Ready(Ok(None));
                 }
-                Ok(Some(Frame::Data { .. })) => (),
-                Ok(Some(other_frame)) => {
+                Some(Frame::Data { .. }) => (),
+                Some(other_frame) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                     //# Receipt of an invalid sequence of frames MUST be treated as a
                     //# connection error of type H3_FRAME_UNEXPECTED.
@@ -1834,6 +1917,10 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
+        if let ContentLength::Malformed(reason) = self.content_length {
+            return Poll::Ready(Err(Self::malformed(reason)));
+        }
+
         let mut trailers = if let Some(encoded) = self.trailers.take() {
             encoded
         } else {
@@ -1842,23 +1929,20 @@ where
                     reason: "read the remaining body data before the trailers".into(),
                 }));
             }
-            match ready!(self.stream.poll_next(cx)) {
-                Err(frame_stream_error) => {
-                    return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
-                }
-                Ok(None) => {
+            match ready!(self.poll_next_frame(cx))? {
+                None => {
                     self.finish_reading();
                     return Poll::Ready(Ok(None));
                 }
-                Ok(Some(Frame::Headers(encoded))) => encoded,
+                Some(Frame::Headers(encoded)) => encoded,
                 // DATA may follow DATA, so only the local call order is wrong.
                 // The frame's payload stays readable through `poll_recv_data`.
-                Ok(Some(Frame::Data { .. })) => {
+                Some(Frame::Data { .. }) => {
                     return Poll::Ready(Err(StreamError::InvalidStreamState {
                         reason: "the body has not ended".into(),
                     }));
                 }
-                Ok(Some(other_frame)) => {
+                Some(other_frame) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                     //# Receipt of an invalid sequence of frames MUST be treated as a
                     //# connection error of type H3_FRAME_UNEXPECTED.
@@ -2281,6 +2365,7 @@ where
                 send_grease_frame: self.send_grease_frame,
                 send_state: self.send_state,
                 decode_state: RequestDecodeState::SendOnly,
+                content_length: ContentLength::Unchecked,
             },
             RequestStream {
                 stream: recv,
@@ -2290,13 +2375,14 @@ where
                 send_grease_frame: self.send_grease_frame,
                 send_state: self.send_state,
                 decode_state: self.decode_state,
+                content_length: self.content_length,
             },
         )
     }
 }
 
 impl<S, B> RequestStream<S, B> {
-    /// Abandons this handle's remaining directions after GOAWAY rejection.
+    /// Abandons this handle's remaining directions now, with their drop codes.
     /// Uses the same ownership state as Drop and releases QPACK at most once.
     pub(crate) fn cancel_request(&mut self) {
         self.decode_state.cancel_reading();

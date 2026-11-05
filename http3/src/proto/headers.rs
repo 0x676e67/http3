@@ -729,6 +729,54 @@ impl Pseudo {
     }
 }
 
+/// Parses Content-Length for a message that has content; `status` is `None` for requests.
+///
+/// Other messages return `None` without parsing: CONNECT requests, responses to
+/// HEAD, 1xx, 204 and 304, and successful responses to CONNECT, which must ignore it
+/// ([RFC 9110, Section 9.3.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6)).
+/// Repeated or listed values must be equal
+/// ([Section 8.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.6)).
+pub(crate) fn content_length(
+    headers: &HeaderMap,
+    method: &Method,
+    status: Option<StatusCode>,
+) -> Result<Option<u64>, HeaderError> {
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+    //# A response that is
+    //# defined as never having content, even when a Content-Length is
+    //# present, can have a non-zero Content-Length header field even though
+    //# no content is included in DATA frames.
+    let has_content = match status {
+        None => *method != Method::CONNECT,
+        Some(status) => {
+            !(status.is_informational()
+                || status == StatusCode::NO_CONTENT
+                || status == StatusCode::NOT_MODIFIED
+                || *method == Method::HEAD
+                || (*method == Method::CONNECT && status.is_success()))
+        }
+    };
+    if !has_content {
+        return Ok(None);
+    }
+
+    let mut length = None;
+    for value in headers.get_all(header::CONTENT_LENGTH) {
+        for item in value.as_bytes().split(|&byte| byte == b',') {
+            let item = item.trim_ascii();
+            let parsed = item
+                .iter()
+                .all(u8::is_ascii_digit)
+                .then(|| std::str::from_utf8(item).ok()?.parse::<u64>().ok())
+                .flatten()
+                .filter(|&parsed| length.is_none_or(|length| length == parsed))
+                .ok_or_else(|| HeaderError::invalid_value(header::CONTENT_LENGTH, value))?;
+            length = Some(parsed);
+        }
+    }
+    Ok(length)
+}
+
 #[derive(Debug)]
 pub enum HeaderError {
     InvalidHeaderName(String),
@@ -816,6 +864,52 @@ mod tests {
     use assert_matches::assert_matches;
 
     use super::*;
+
+    #[test]
+    fn content_length_is_one_value_for_messages_with_content() {
+        let parse = |values: &[&'static str], method: Method, status: Option<u16>| {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append(header::CONTENT_LENGTH, HeaderValue::from_static(value));
+            }
+            let status = status.map(|status| StatusCode::from_u16(status).unwrap());
+            content_length(&headers, &method, status).ok()
+        };
+        let request = |values| parse(values, Method::POST, None);
+        assert_eq!(request(&[]), Some(None));
+        assert_eq!(request(&["042"]), Some(Some(42)));
+        assert_eq!(request(&["7", "7, 7"]), Some(Some(7)));
+        for invalid in [
+            &["7", "8"][..],
+            &["7, 8"],
+            &["7,"],
+            &["+7"],
+            &["18446744073709551616"],
+        ] {
+            assert_eq!(request(invalid), None, "{invalid:?}");
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+        //= type=test
+        //# A response that is
+        //# defined as never having content, even when a Content-Length is
+        //# present, can have a non-zero Content-Length header field even though
+        //# no content is included in DATA frames.
+        // Messages without content ignore even an invalid value.
+        for (method, status) in [
+            (Method::CONNECT, None),
+            (Method::HEAD, Some(200)),
+            (Method::GET, Some(103)),
+            (Method::GET, Some(204)),
+            (Method::GET, Some(304)),
+            (Method::CONNECT, Some(200)),
+        ] {
+            assert_eq!(parse(&["x"], method, status), Some(None));
+        }
+        // A HEAD request and a failed CONNECT have content.
+        assert_eq!(parse(&["x"], Method::HEAD, None), None);
+        assert_eq!(parse(&["x"], Method::CONNECT, Some(403)), None);
+    }
 
     #[test]
     fn received_pseudo_fields_reject_duplicates_and_late_placement() {

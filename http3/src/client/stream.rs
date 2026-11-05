@@ -6,7 +6,7 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
-use http::{HeaderMap, Response};
+use http::{HeaderMap, Method, Response};
 use quic::StreamId;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
@@ -17,7 +17,10 @@ use crate::{
         Code, StreamError, connection_error_creators::CloseStream,
         internal_error::InternalConnectionError,
     },
-    proto::{frame::Frame, headers::Header},
+    proto::{
+        frame::Frame,
+        headers::{self, Header},
+    },
     qpack,
     quic::{self},
     shared_state::{ConnectionState, SharedState},
@@ -99,6 +102,8 @@ pub struct RequestStream<S, B> {
     pub(super) inner: connection::RequestStream<S, B>,
     rejection: RequestRejection,
     head: ResponseHead,
+    // Decides whether the response has content its Content-Length describes.
+    method: Method,
 }
 
 /// Progress of the response head, which gates the body operations.
@@ -159,7 +164,8 @@ where
     ///
     /// This returns a chunk of the response body, or `None` if the response body is finished.
     /// Before the final response was received it returns
-    /// [`StreamError::InvalidStreamState`].
+    /// [`StreamError::InvalidStreamState`]. A body that differs from its Content-Length
+    /// aborts the stream with [`Code::H3_MESSAGE_ERROR`].
     ///
     /// Published request errors take precedence over buffered data; see
     /// [`RequestStream`]'s error handling contract.
@@ -252,7 +258,7 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Response<()>, StreamError>> {
         let result = self.rejection.poll(cx, |cx| {
-            Self::poll_recv_response_inner(&mut self.inner, &mut self.head, cx)
+            Self::poll_recv_response_inner(&mut self.inner, &mut self.head, &self.method, cx)
         });
         result.map(|result| {
             self.head = match &result {
@@ -269,6 +275,7 @@ where
     fn poll_recv_response_inner(
         inner: &mut connection::RequestStream<S, B>,
         head: &mut ResponseHead,
+        method: &Method,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Response<()>, StreamError>> {
         let mut encoded = match head {
@@ -359,16 +366,22 @@ where
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
         //# Clients MUST NOT
         //# accept a malformed response.
-        let (status, headers, pseudo_sensitivity) = Header::try_from(fields)
+        let (status, headers, pseudo_sensitivity, content_length) = Header::try_from(fields)
             .and_then(Header::into_response_parts)
+            .and_then(|(status, headers, pseudo_sensitivity)| {
+                let content_length = headers::content_length(&headers, method, Some(status))?;
+                Ok((status, headers, pseudo_sensitivity, content_length))
+            })
             .map_err(|error| {
                 let code = error.code();
-                inner.stop_sending(code);
+                inner.abort(code);
                 StreamError::StreamError {
                     code,
                     reason: format!("rejected response headers: {error}"),
                 }
             })?;
+
+        inner.expect_content_length(content_length);
 
         let mut resp = Response::new(());
         *resp.status_mut() = status;
@@ -526,6 +539,7 @@ where
             inner,
             rejection,
             head,
+            method,
         } = self;
         let (send, recv) = inner.split();
         (
@@ -533,11 +547,13 @@ where
                 inner: send,
                 rejection: RequestRejection::new(rejection.state.clone(), rejection.stream_id),
                 head: ResponseHead::Pending,
+                method: method.clone(),
             },
             RequestStream {
                 inner: recv,
                 rejection,
                 head,
+                method,
             },
         )
     }
@@ -548,12 +564,13 @@ where
     S: quic::SendStream<B> + quic::RecvStream,
     B: Buf,
 {
-    pub(super) fn new(inner: connection::RequestStream<S, B>) -> Self {
+    pub(super) fn new(inner: connection::RequestStream<S, B>, method: Method) -> Self {
         let rejection = RequestRejection::new(inner.conn_state.clone(), inner.stream.id());
         Self {
             inner,
             rejection,
             head: ResponseHead::Pending,
+            method,
         }
     }
 }

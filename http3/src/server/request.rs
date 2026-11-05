@@ -16,7 +16,7 @@ use crate::{
     frame::FrameStreamError,
     proto::{
         frame::{Frame, PayloadLen},
-        headers::Header,
+        headers::{self, Header},
     },
     qpack,
     quic::{self, SendStream},
@@ -230,13 +230,16 @@ where
         let fields = decoded.fields;
 
         // Parse the request headers
-        let result = match Header::try_from(fields) {
-            Ok(header) => match header.into_request_parts() {
-                Ok(parts) => Ok(parts),
-                Err(err) => Err(err),
-            },
-            Err(err) => Err(err),
-        };
+        let result = Header::try_from(fields)
+            .and_then(Header::into_request_parts)
+            .and_then(|parts| {
+                let (method, _, _, headers, _) = &parts;
+                let content_length = headers::content_length(headers, method, None)?;
+                self.request_stream
+                    .inner
+                    .expect_content_length(content_length);
+                Ok(parts)
+            });
         let (method, uri, protocol, headers, pseudo_sensitivity) = match result {
             Ok(parts) => parts,
             Err(err) => {
@@ -253,8 +256,6 @@ where
                 });
             }
         };
-
-        //  request_stream.stop_stream(Code::H3_MESSAGE_ERROR).await;
 
         let mut req = http::Request::new(());
         *req.method_mut() = method;
