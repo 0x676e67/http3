@@ -205,21 +205,11 @@ where
 }
 
 /// A local critical unidirectional stream.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum CriticalStream {
     Control,
     Encoder,
     Decoder,
-}
-
-impl CriticalStream {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Control => "control",
-            Self::Encoder => "QPACK encoder",
-            Self::Decoder => "QPACK decoder",
-        }
-    }
 }
 
 /// Setup of the local control and QPACK streams, driven by the connection driver.
@@ -267,7 +257,6 @@ where
         stream: CriticalStream,
         error: StreamErrorIncoming,
     ) -> ConnectionError {
-        let stream_name = stream.name();
         let opening = matches!(self.critical_streams, CriticalStreams::Open(..));
         let error = match error {
             StreamErrorIncoming::ConnectionErrorIncoming { connection_error } => {
@@ -278,18 +267,18 @@ where
             // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
             StreamErrorIncoming::StreamTerminated { error_code } => InternalConnectionError::new(
                 Code::H3_CLOSED_CRITICAL_STREAM,
-                format!("{stream_name} stream was terminated with error code {error_code}"),
+                format!("{stream:?} stream was terminated with error code {error_code}"),
             ),
             // No critical stream exists yet, so this local transport failure
             // cannot be reported as a stream closed by the peer.
             // https://www.rfc-editor.org/rfc/rfc9114.html#section-8.1
             StreamErrorIncoming::Unknown(error) if opening => InternalConnectionError::new(
                 Code::H3_INTERNAL_ERROR,
-                format!("failed to open {stream_name} stream: {error}"),
+                format!("failed to open {stream:?} stream: {error}"),
             ),
             StreamErrorIncoming::Unknown(error) => InternalConnectionError::new(
                 Code::H3_CLOSED_CRITICAL_STREAM,
-                format!("failed to write {stream_name} stream header: {error}"),
+                format!("failed to write {stream:?} stream header: {error}"),
             ),
         };
         self.handle_connection_error(error)
@@ -396,7 +385,7 @@ where
                         return Poll::Ready(Err(self.handle_connection_error(
                             InternalConnectionError::new(
                                 Code::H3_INTERNAL_ERROR,
-                                format!("{} stream was not initialized", stream.name()),
+                                format!("{stream:?} stream was not initialized"),
                             ),
                         )));
                     };
