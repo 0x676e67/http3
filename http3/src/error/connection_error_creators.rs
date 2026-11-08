@@ -164,22 +164,6 @@ pub trait CloseStream: ConnectionState {
 
 pub(crate) trait CloseRawQuicConnection<B: Buf>: quic::Connection<B> {
     // Used only before an HTTP/3 connection has been created.
-    fn handle_quic_error_raw(&mut self, error: ConnectionErrorIncoming) -> ConnectionError {
-        match error {
-            ConnectionErrorIncoming::Timeout => ConnectionError::Timeout,
-            ConnectionErrorIncoming::InternalError(reason) => {
-                let local_error = LocalError::Application {
-                    code: Code::H3_INTERNAL_ERROR,
-                    reason: reason.to_string(),
-                };
-                self.close(Code::H3_INTERNAL_ERROR, reason.as_bytes());
-                ConnectionError::Local { error: local_error }
-            }
-            _ => ConnectionError::Remote(error),
-        }
-    }
-
-    // Used only before an HTTP/3 connection has been created.
     fn close_raw_connection_with_h3_error(
         &mut self,
         internal_error: InternalConnectionError,

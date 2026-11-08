@@ -392,8 +392,10 @@ where
 /// required transfers and transport acknowledgments first. See
 /// [RFC 9114 Section 5.3](https://www.rfc-editor.org/rfc/rfc9114.html#section-5.3).
 ///
-/// It needs to be polled continuously via [`poll_close()`]. With a QPACK dynamic
-/// table, response decoding also pauses while too many decoder instructions are
+/// It needs to be polled continuously via [`poll_close()`]. It also sends
+/// SETTINGS and the QPACK stream types if the peer had not granted the stream
+/// credit for them when the connection was built. With a QPACK dynamic table,
+/// response decoding also pauses while too many decoder instructions are
 /// queued for this driver to write. On connection closure,
 /// this returns a [`ConnectionError`]; use [`ConnectionError::is_h3_no_error()`]
 /// to distinguish a normal close from an error.
@@ -516,6 +518,11 @@ where
     /// Maintain the connection state until it is closed
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ConnectionError> {
+        // Pending setup must not stall requests or the peer's control stream.
+        if let Poll::Ready(Err(err)) = self.inner.poll_critical_streams(cx) {
+            return Poll::Ready(err);
+        }
+
         if let Err(err) = self.inner.poll_accept_recv(cx) {
             return Poll::Ready(err);
         }

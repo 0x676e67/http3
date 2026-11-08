@@ -1,6 +1,9 @@
 //! HTTP/3 client builder
 
-use std::marker::PhantomData;
+use std::{
+    marker::PhantomData,
+    task::{Context, Poll, Waker},
+};
 
 use bytes::{Buf, Bytes, BytesMut};
 
@@ -245,6 +248,10 @@ impl Builder {
     }
 
     /// Create a new HTTP/3 client from a `quic` connection
+    ///
+    /// This does not wait for the peer. SETTINGS and the QPACK streams are sent
+    /// right away when the peer has granted the stream credit; otherwise the
+    /// returned [`Connection`] sends them when polled, which it must be anyway.
     pub async fn build<C, O, B>(
         &mut self,
         quic: C,
@@ -259,7 +266,19 @@ impl Builder {
             bound_decoder_instructions: true,
             ..self.config.clone()
         };
-        let inner = ConnectionInner::new(quic, config).await?;
+        let mut inner = ConnectionInner::new(quic, config)?;
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+        //= type=implication
+        //# Endpoints MUST NOT require any data to be received from
+        //# the peer prior to sending the SETTINGS frame; settings MUST be sent
+        //# as soon as the transport is ready to send data.
+        // One poll queues SETTINGS ahead of the first request when credit is
+        // available. Anything still pending continues in the driver.
+        let mut cx = Context::from_waker(Waker::noop());
+        if let Poll::Ready(Err(error)) = inner.poll_critical_streams(&mut cx) {
+            return Err(error);
+        }
         let send_request = SendRequest {
             open,
             conn_state: inner.shared.clone(),
