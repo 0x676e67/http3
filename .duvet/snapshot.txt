@@ -167,6 +167,14 @@ SPECIFICATION: https://www.rfc-editor.org/rfc/rfc9114
     TEXT[!SHOULD,exception]:    request was never applied.
 
   SECTION: [Malformed Requests and Responses](#section-4.1.2)
+    TEXT[implementation,test]:    A request or response that is defined as having content when it
+    TEXT[implementation,test]:    contains a Content-Length header field (Section 8.6 of [HTTP]) is
+    TEXT[implementation,test]:    malformed if the value of the Content-Length header field does not
+    TEXT[implementation,test]:    equal the sum of the DATA frame lengths received.
+    TEXT[implementation,test]: A response that is
+    TEXT[implementation,test]:    defined as never having content, even when a Content-Length is
+    TEXT[implementation,test]:    present, can have a non-zero Content-Length header field even though
+    TEXT[implementation,test]:    no content is included in DATA frames.
     TEXT[!MUST,exception]:    Intermediaries that process HTTP requests or responses (i.e., any
     TEXT[!MUST,exception]:    intermediary not acting as a tunnel) MUST NOT forward a malformed
     TEXT[!MUST,exception]:    request or response.
