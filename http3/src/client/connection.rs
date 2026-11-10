@@ -397,7 +397,7 @@ where
 /// [RFC 9114 Section 5.3](https://www.rfc-editor.org/rfc/rfc9114.html#section-5.3).
 ///
 /// It needs to be polled continuously via [`poll_close()`]. It also sends
-/// SETTINGS and the QPACK stream types if the peer had not granted the stream
+/// SETTINGS and opens the QPACK streams if the peer had not granted the stream
 /// credit for them when the connection was built. With a QPACK dynamic table,
 /// response decoding also pauses while too many decoder instructions are
 /// queued for this driver to write. On connection closure,

@@ -1833,12 +1833,14 @@ async fn blocked_grease_stream_does_not_hold_back_control_frames() {
         // The GOAWAY took effect while the GREASE stream was blocked, and a
         // fourth stream still lets the GREASE stream out.
         goaway_rx.await.unwrap();
-        // Hold the critical streams: closing one would return its credit.
-        let mut critical_streams = Vec::new();
-        for _ in 0..3 {
+        // Hold the critical streams: closing one would return its credit. The
+        // idle QPACK streams show up only once the GREASE stream opens them.
+        // https://www.rfc-editor.org/rfc/rfc9000#section-3.2
+        let mut critical_streams = vec![conn.accept_uni().await.unwrap()];
+        conn.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(4));
+        for _ in 0..2 {
             critical_streams.push(conn.accept_uni().await.unwrap());
         }
-        conn.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(4));
         let mut grease = conn.accept_uni().await.unwrap();
         let grease = grease.read_to_end(64).await.unwrap();
         let stream_type = StreamType::decode(&mut &grease[..]).unwrap().value();
@@ -1886,8 +1888,9 @@ async fn client_build_does_not_wait_for_critical_stream_credit() {
     init_tracing();
     let request = || Request::get("http://localhost/").body(()).unwrap();
 
-    // A compliant peer: the driver is never polled, so the critical streams
-    // were written by `build`, ahead of the first request's HEADERS.
+    // A compliant peer: the driver is never polled, so SETTINGS was written by
+    // `build`, ahead of the first request's HEADERS. The QPACK streams stay
+    // silent until they carry an instruction.
     let mut pair = Pair::default();
     let server = pair.server_inner();
     let (done_tx, done_rx) = oneshot::channel();
@@ -1902,16 +1905,8 @@ async fn client_build_does_not_wait_for_critical_stream_credit() {
     };
     let server_fut = async {
         let conn = server.accept().await.unwrap().await.unwrap();
-        let mut critical_streams = Vec::new();
-        for expected in [
-            StreamType::CONTROL,
-            StreamType::ENCODER,
-            StreamType::DECODER,
-        ] {
-            let mut recv = conn.accept_uni().await.unwrap();
-            assert_eq!(client_stream_type(&mut recv).await, expected);
-            critical_streams.push(recv);
-        }
+        let mut control = conn.accept_uni().await.unwrap();
+        assert_eq!(client_stream_type(&mut control).await, StreamType::CONTROL);
         let (_send, mut recv) = conn.accept_bi().await.unwrap();
         let head = recv.read_to_end(1024).await.unwrap();
         assert_matches!(Frame::decode(&mut &head[..]), Ok(Frame::Headers(_)));
@@ -1991,6 +1986,108 @@ async fn client_build_does_not_wait_for_critical_stream_credit() {
     })
     .await
     .expect("the driver did not open its critical streams after credit arrived");
+}
+
+#[tokio::test]
+async fn client_sets_up_critical_streams_in_order() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let server = pair.server_inner();
+    let (done_tx, done_rx) = oneshot::channel();
+
+    let client_fut = async {
+        let (mut driver, _send_request) = client::builder()
+            .qpack_encoder_table_capacity(4096)
+            .qpack_max_table_capacity(128)
+            .build::<_, _, Bytes>(pair.client().await)
+            .await
+            .unwrap();
+        tokio::select! {
+            biased;
+            _ = done_rx => {}
+            error = driver.wait_idle() => panic!("connection failed: {error}"),
+        }
+    };
+
+    let server_fut = async {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        // A dynamic table lets the client's encoder send its first instruction.
+        let mut settings = Settings::default();
+        settings
+            .insert(frame::SettingId::QPACK_MAX_TABLE_CAPACITY, 4096)
+            .unwrap();
+        let mut buf = BytesMut::new();
+        StreamType::CONTROL.encode(&mut buf);
+        Frame::<Bytes>::Settings(settings).encode(&mut buf);
+        let mut server_control = conn.open_uni().await.unwrap();
+        server_control.write_all(&buf).await.unwrap();
+
+        // The control stream carries SETTINGS and then one reserved frame.
+        let mut control = conn.accept_uni().await.unwrap();
+        assert_eq!(control.id().index(), 0);
+        let mut received = BytesMut::new();
+        let reserved = loop {
+            let chunk = control.read_chunk(usize::MAX, true).await.unwrap().unwrap();
+            received.extend_from_slice(&chunk.bytes);
+            let mut cursor = std::io::Cursor::new(&received[..]);
+            assert_eq!(StreamType::decode(&mut cursor), Ok(StreamType::CONTROL));
+            if !matches!(Frame::decode(&mut cursor), Ok(Frame::Settings(_))) {
+                continue;
+            }
+            let (Ok(ty), Ok(len)) = (VarInt::decode(&mut cursor), VarInt::decode(&mut cursor))
+            else {
+                continue;
+            };
+            if cursor.remaining() as u64 >= len.into_inner() {
+                break (ty.into_inner(), len.into_inner());
+            }
+        };
+        let n = (reserved.0 - 0x21) / 0x1f;
+        assert_eq!((reserved.0 - 0x21) % 0x1f, 0);
+        assert_eq!(reserved.1, n % 4);
+
+        // Decoder stream first, encoder second. Each writes its type only with its
+        // first instruction: Set Dynamic Table Capacity, then Insert Count Increment.
+        let mut decoder = conn.accept_uni().await.unwrap();
+        let mut encoder = conn.accept_uni().await.unwrap();
+        assert_eq!((decoder.id().index(), encoder.id().index()), (1, 2));
+        let mut received = BytesMut::new();
+        while received.len() < 2 {
+            let chunk = encoder.read_chunk(usize::MAX, true).await.unwrap().unwrap();
+            received.extend_from_slice(&chunk.bytes);
+        }
+        assert_eq!(received[0], 0x02);
+        assert_eq!(received[1] & 0xe0, 0x20);
+        let idle = tokio::time::timeout(Duration::from_millis(100), decoder.read_chunk(1, true));
+        assert!(idle.await.is_err(), "the decoder stream sent data");
+
+        let mut instructions = BytesMut::new();
+        StreamType::ENCODER.encode(&mut instructions);
+        qpack::DynamicTableSizeUpdate(128).encode(&mut instructions);
+        qpack::InsertWithoutNameRef::new("foo", "bar")
+            .encode(&mut instructions)
+            .unwrap();
+        let mut server_encoder = conn.open_uni().await.unwrap();
+        server_encoder.write_all(&instructions).await.unwrap();
+        let mut received = BytesMut::new();
+        while received.len() < 2 {
+            let chunk = decoder.read_chunk(usize::MAX, true).await.unwrap().unwrap();
+            received.extend_from_slice(&chunk.bytes);
+        }
+        assert_eq!(StreamType::decode(&mut received), Ok(StreamType::DECODER));
+        assert_eq!(
+            qpack::InsertCountIncrement::decode(&mut received),
+            Ok(Some(qpack::InsertCountIncrement(1)))
+        );
+        done_tx.send(()).unwrap();
+        (conn, server_control, server_encoder)
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("the client did not set up its critical streams");
 }
 
 #[tokio::test]

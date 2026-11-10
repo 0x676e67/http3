@@ -25,6 +25,7 @@ use crate::{
     },
     frame::{FrameStream, FrameStreamError},
     proto::{
+        coding::Encode,
         frame::{self, Frame, PayloadLen},
         headers::Header,
         stream::StreamType,
@@ -33,7 +34,7 @@ use crate::{
     qpack::{self, QpackDecoder, QpackEvent},
     quic::{self, RecvStream, SendStream, SendStreamUnframed, StreamErrorIncoming, StreamId},
     shared_state::{ConnectionState, SharedState},
-    stream::{self, AcceptRecvStream, AcceptedRecvStream, BufRecvStream, UniStreamHeader},
+    stream::{self, AcceptRecvStream, AcceptedRecvStream, BufRecvStream},
     webtransport::SessionId,
 };
 
@@ -82,6 +83,9 @@ where
     // None between batches so a consumed view does not retain shared storage.
     encoder_send_buf: Option<Bytes>,
     encoder_send: Option<C::SendStream>,
+    // Each stream type waits for the stream's first instruction.
+    encoder_type_pending: bool,
+    decoder_type_pending: bool,
     encoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
     decoder: QpackDecoder,
     blocked_streams: qpack::BlockedStreamRegistry,
@@ -96,6 +100,15 @@ fn invalid_qpack_decoder_configuration(error: qpack::DecoderError) -> InternalCo
         Code::H3_INTERNAL_ERROR,
         format!("invalid QPACK decoder configuration: {error}"),
     )
+}
+
+/// Prefixes the first instructions on a QPACK stream with its deferred stream type.
+/// See <https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2>.
+fn with_stream_type(ty: StreamType, instructions: &[u8]) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(VarInt::MAX_SIZE + instructions.len());
+    ty.encode(&mut buf);
+    buf.extend_from_slice(instructions);
+    buf
 }
 
 fn local_settings(config: &Config) -> Result<frame::Settings, frame::SettingsError> {
@@ -214,21 +227,21 @@ enum CriticalStream {
 
 /// Setup of the local control and QPACK streams, driven by the connection driver.
 ///
-/// Opens the control stream and writes SETTINGS, then opens the encoder and
-/// decoder streams and writes the decoder and encoder stream types. A peer that
-/// withholds the stream or flow-control credit it must grant ([RFC 9114, Section 6.2])
-/// keeps setup pending, like a silent HTTP/2 peer, until a request timeout or
-/// the QUIC idle timeout ends the connection.
+/// Opens the control stream and writes SETTINGS and a reserved frame on it, then
+/// opens the decoder and encoder streams. Each QPACK stream type goes out with
+/// that stream's first instruction. A peer that withholds the stream or
+/// flow-control credit it must grant ([RFC 9114, Section 6.2]) keeps setup
+/// pending until a request timeout or the QUIC idle timeout.
 ///
 /// [RFC 9114, Section 6.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2
 enum CriticalStreams {
     /// Opening the control stream; SETTINGS waits only for this stream.
     Control(frame::Settings),
-    /// Opening the encoder stream, then the decoder stream.
+    /// Writing SETTINGS; `None` once it was handed to the transport.
+    Settings(Option<frame::Settings>),
+    /// Opening the decoder stream, then the encoder stream.
     Qpack(CriticalStream),
-    /// Writing a stream header; `None` once it was handed to the transport.
-    Write(CriticalStream, Option<UniStreamHeader>),
-    /// Every header was written; the streams carry frames and instructions.
+    /// Every stream is open and SETTINGS was written.
     Ready,
 }
 
@@ -301,16 +314,16 @@ where
         );
     }
 
-    /// Drives the critical streams until SETTINGS and both QPACK stream types are written.
+    /// Drives the critical streams until every stream is open and SETTINGS is written.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_control_stream_headers(&mut self) -> Result<(), ConnectionError> {
         future::poll_fn(|cx| self.poll_critical_streams(cx)).await
     }
 
-    /// Opens the local control and QPACK streams and writes their headers.
+    /// Opens the local control and QPACK streams and writes SETTINGS.
     ///
     /// Requests do not wait for this: they use bidirectional streams and stay
-    /// stateless until the encoder stream is ready ([RFC 9204, Section 4.2]).
+    /// stateless until the encoder stream is open ([RFC 9204, Section 4.2]).
     /// A failure closes the connection like any critical-stream error.
     ///
     /// [RFC 9204, Section 4.2]: https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
@@ -367,10 +380,37 @@ where
                     #[cfg(feature = "tracing")]
                     tracing::debug!("Sending settings: {:#x?}", settings);
                     self.control_send = Some(send);
-                    self.critical_streams = CriticalStreams::Write(
-                        CriticalStream::Control,
-                        Some(UniStreamHeader::Control(settings)),
-                    );
+                    self.critical_streams = CriticalStreams::Settings(Some(settings));
+                    #[cfg(test)]
+                    if !self.config.send_settings {
+                        self.critical_streams = CriticalStreams::Qpack(CriticalStream::Decoder);
+                    }
+                }
+                CriticalStreams::Settings(settings) => {
+                    let settings = settings.take();
+                    let Some(send) = self.control_send.as_mut() else {
+                        return Poll::Ready(Err(self.handle_connection_error(
+                            InternalConnectionError::new(
+                                Code::H3_INTERNAL_ERROR,
+                                "control stream was not initialized".to_string(),
+                            ),
+                        )));
+                    };
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
+                    //# These frames have no semantics, and
+                    //# they MAY be sent on any stream where frames are allowed to be sent.
+                    if let Some(settings) = settings
+                        && let Err(error) =
+                            send.send_data(stream::WriteBuf::control_with_grease(settings))
+                    {
+                        let error = self.critical_stream_error(CriticalStream::Control, error);
+                        return Poll::Ready(Err(error));
+                    }
+                    if let Err(error) = ready!(send.poll_ready(cx)) {
+                        let error = self.critical_stream_error(CriticalStream::Control, error);
+                        return Poll::Ready(Err(error));
+                    }
+                    self.critical_streams = CriticalStreams::Qpack(CriticalStream::Decoder);
                 }
                 CriticalStreams::Qpack(stream) => {
                     let stream = *stream;
@@ -382,41 +422,8 @@ where
                     };
                     *self.critical_send(stream) = Some(send);
                     self.critical_streams = match stream {
-                        CriticalStream::Encoder => CriticalStreams::Qpack(CriticalStream::Decoder),
-                        _ => CriticalStreams::Write(
-                            CriticalStream::Decoder,
-                            Some(UniStreamHeader::Decoder),
-                        ),
-                    };
-                }
-                CriticalStreams::Write(stream, header) => {
-                    let stream = *stream;
-                    let header = header.take();
-                    #[cfg(test)]
-                    let header = header.filter(|_| self.config.send_settings);
-                    let Some(send) = self.critical_send(stream).as_mut() else {
-                        return Poll::Ready(Err(self.handle_connection_error(
-                            InternalConnectionError::new(
-                                Code::H3_INTERNAL_ERROR,
-                                format!("{stream:?} stream was not initialized"),
-                            ),
-                        )));
-                    };
-                    if let Some(header) = header
-                        && let Err(error) = send.send_data(header)
-                    {
-                        return Poll::Ready(Err(self.critical_stream_error(stream, error)));
-                    }
-                    if let Err(error) = ready!(send.poll_ready(cx)) {
-                        return Poll::Ready(Err(self.critical_stream_error(stream, error)));
-                    }
-                    self.critical_streams = match stream {
-                        CriticalStream::Control => CriticalStreams::Qpack(CriticalStream::Encoder),
-                        CriticalStream::Decoder => CriticalStreams::Write(
-                            CriticalStream::Encoder,
-                            Some(UniStreamHeader::Encoder),
-                        ),
-                        CriticalStream::Encoder => CriticalStreams::Ready,
+                        CriticalStream::Decoder => CriticalStreams::Qpack(CriticalStream::Encoder),
+                        _ => CriticalStreams::Ready,
                     };
                 }
                 CriticalStreams::Ready => return Poll::Ready(Ok(())),
@@ -451,7 +458,6 @@ where
         //# unidirectional streams required by mandatory extensions (such as the
         //# QPACK encoder and decoder streams) first, and then create additional
 
-        // Open the control stream first, then the QPACK encoder and decoder streams.
         let critical_streams = CriticalStreams::Control(settings);
 
         let (decoder_events_send, decoder_events_recv) = mpsc::unbounded_channel();
@@ -479,6 +485,8 @@ where
             decoder_recv: None,
             encoder_send: None,
             encoder_recv: None,
+            encoder_type_pending: true,
+            decoder_type_pending: true,
         };
 
         Ok(Self {
@@ -998,7 +1006,7 @@ where
     /// releases consumed batches before taking more output. Pending writes keep
     /// their unsent suffix for the next poll; no encoder lock is held during I/O.
     /// Returns ready when no output remains, or a connection error on failure.
-    /// Pending before the encoder stream type is written: queued output keeps
+    /// Pending until the critical streams are set up: queued output keeps
     /// `QpackEncoder::ready` false, so requests stay stateless.
     fn poll_flush_qpack_encoder(
         &mut self,
@@ -1027,6 +1035,11 @@ where
                             )));
                         }
                     };
+                if let Some(batch) = &mut self.qpack_streams.encoder_send_buf
+                    && mem::take(&mut self.qpack_streams.encoder_type_pending)
+                {
+                    *batch = with_stream_type(StreamType::ENCODER, batch).freeze();
+                }
             }
 
             let Some(buf) = self.qpack_streams.encoder_send_buf.as_mut() else {
@@ -1100,7 +1113,7 @@ where
         }
 
         // Feedback such as Stream Cancellation can be queued before the decoder
-        // stream type is written; it waits for the critical stream setup.
+        // stream is open; it waits for the critical stream setup.
         if !self.critical_streams.is_ready() {
             return if self.qpack_streams.decoder_send_buf.has_remaining() {
                 Poll::Pending
@@ -1120,6 +1133,13 @@ where
                 ),
             )));
         };
+
+        if self.qpack_streams.decoder_send_buf.has_remaining()
+            && mem::take(&mut self.qpack_streams.decoder_type_pending)
+        {
+            self.qpack_streams.decoder_send_buf =
+                with_stream_type(StreamType::DECODER, &self.qpack_streams.decoder_send_buf);
+        }
 
         while self.qpack_streams.decoder_send_buf.has_remaining() {
             match decoder_send.poll_send(cx, &mut self.qpack_streams.decoder_send_buf) {
