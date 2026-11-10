@@ -1925,7 +1925,8 @@ async fn client_build_does_not_wait_for_critical_stream_credit() {
 
     // A peer granting no unidirectional streams, below the three RFC 9114
     // Section 6.2 requires, delays only the critical streams: requests still
-    // complete, and the driver opens the streams once credit arrives.
+    // complete, SETTINGS needs just one stream, and setup finishes once credit
+    // arrives. A shutdown cancelled meanwhile does not drop its GOAWAY.
     let mut pair = Pair::default();
     std::sync::Arc::get_mut(&mut pair.config)
         .unwrap()
@@ -1948,12 +1949,13 @@ async fn client_build_does_not_wait_for_critical_stream_credit() {
             response = response => assert_eq!(response.status(), StatusCode::OK),
             error = driver.wait_idle() => panic!("connection failed: {error}"),
         }
-        credit_tx.send(()).unwrap();
-        tokio::select! {
-            biased;
-            _ = settings_rx => {}
-            error = driver.wait_idle() => panic!("connection failed: {error}"),
+        for _ in 0..2 {
+            let shutdown = tokio::time::timeout(Duration::from_millis(50), driver.shutdown(0));
+            assert!(shutdown.await.is_err(), "GOAWAY was skipped");
         }
+        credit_tx.send(()).unwrap();
+        driver.shutdown(0).await.unwrap();
+        settings_rx.await.unwrap();
     };
     let server_fut = async {
         let conn = server.accept().await.unwrap().await.unwrap();
@@ -1976,9 +1978,10 @@ async fn client_build_does_not_wait_for_critical_stream_credit() {
         send.finish().unwrap();
 
         credit_rx.await.unwrap();
-        conn.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(3));
+        conn.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(1));
         let mut control = conn.accept_uni().await.unwrap();
         assert_eq!(client_stream_type(&mut control).await, StreamType::CONTROL);
+        conn.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(3));
         settings_tx.send(()).unwrap();
         // Closing the control stream would be a connection error.
         (conn, control)

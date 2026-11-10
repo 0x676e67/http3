@@ -214,16 +214,18 @@ enum CriticalStream {
 
 /// Setup of the local control and QPACK streams, driven by the connection driver.
 ///
-/// Opens the control, encoder and decoder streams, then writes SETTINGS and the
-/// decoder and encoder stream types. A peer that withholds the stream or
-/// flow-control credit it must grant ([RFC 9114, Section 6.2]) keeps setup
-/// pending, like a silent HTTP/2 peer, until a request timeout or the QUIC idle
-/// timeout ends the connection.
+/// Opens the control stream and writes SETTINGS, then opens the encoder and
+/// decoder streams and writes the decoder and encoder stream types. A peer that
+/// withholds the stream or flow-control credit it must grant ([RFC 9114, Section 6.2])
+/// keeps setup pending, like a silent HTTP/2 peer, until a request timeout or
+/// the QUIC idle timeout ends the connection.
 ///
 /// [RFC 9114, Section 6.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2
 enum CriticalStreams {
-    /// Opening a stream; SETTINGS waits here until the control stream can carry it.
-    Open(CriticalStream, frame::Settings),
+    /// Opening the control stream; SETTINGS waits only for this stream.
+    Control(frame::Settings),
+    /// Opening the encoder stream, then the decoder stream.
+    Qpack(CriticalStream),
     /// Writing a stream header; `None` once it was handed to the transport.
     Write(CriticalStream, Option<UniStreamHeader>),
     /// Every header was written; the streams carry frames and instructions.
@@ -257,7 +259,10 @@ where
         stream: CriticalStream,
         error: StreamErrorIncoming,
     ) -> ConnectionError {
-        let opening = matches!(self.critical_streams, CriticalStreams::Open(..));
+        let opening = matches!(
+            self.critical_streams,
+            CriticalStreams::Control(_) | CriticalStreams::Qpack(_)
+        );
         let error = match error {
             StreamErrorIncoming::ConnectionErrorIncoming { connection_error } => {
                 return self.handle_connection_error(connection_error);
@@ -350,37 +355,45 @@ where
         //# stream.
         loop {
             match &mut self.critical_streams {
-                CriticalStreams::Open(stream, settings) => {
+                CriticalStreams::Control(settings) => {
                     let send = match ready!(self.conn.poll_open_send(cx)) {
                         Ok(send) => send,
                         Err(error) => {
-                            let stream = *stream;
+                            let error = self.critical_stream_error(CriticalStream::Control, error);
+                            return Poll::Ready(Err(error));
+                        }
+                    };
+                    let settings = mem::take(settings);
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!("Sending settings: {:#x?}", settings);
+                    self.control_send = Some(send);
+                    self.critical_streams = CriticalStreams::Write(
+                        CriticalStream::Control,
+                        Some(UniStreamHeader::Control(settings)),
+                    );
+                }
+                CriticalStreams::Qpack(stream) => {
+                    let stream = *stream;
+                    let send = match ready!(self.conn.poll_open_send(cx)) {
+                        Ok(send) => send,
+                        Err(error) => {
                             return Poll::Ready(Err(self.critical_stream_error(stream, error)));
                         }
                     };
-                    let opened = *stream;
-                    match opened {
-                        CriticalStream::Control => *stream = CriticalStream::Encoder,
-                        CriticalStream::Encoder => *stream = CriticalStream::Decoder,
-                        CriticalStream::Decoder => {
-                            let settings = mem::take(settings);
-                            #[cfg(feature = "tracing")]
-                            tracing::debug!("Sending settings: {:#x?}", settings);
-                            self.critical_streams = CriticalStreams::Write(
-                                CriticalStream::Control,
-                                Some(UniStreamHeader::Control(settings)),
-                            );
-                            #[cfg(test)]
-                            if !self.config.send_settings {
-                                self.critical_streams = CriticalStreams::Ready;
-                            }
-                        }
-                    }
-                    *self.critical_send(opened) = Some(send);
+                    *self.critical_send(stream) = Some(send);
+                    self.critical_streams = match stream {
+                        CriticalStream::Encoder => CriticalStreams::Qpack(CriticalStream::Decoder),
+                        _ => CriticalStreams::Write(
+                            CriticalStream::Decoder,
+                            Some(UniStreamHeader::Decoder),
+                        ),
+                    };
                 }
                 CriticalStreams::Write(stream, header) => {
                     let stream = *stream;
                     let header = header.take();
+                    #[cfg(test)]
+                    let header = header.filter(|_| self.config.send_settings);
                     let Some(send) = self.critical_send(stream).as_mut() else {
                         return Poll::Ready(Err(self.handle_connection_error(
                             InternalConnectionError::new(
@@ -398,10 +411,7 @@ where
                         return Poll::Ready(Err(self.critical_stream_error(stream, error)));
                     }
                     self.critical_streams = match stream {
-                        CriticalStream::Control => CriticalStreams::Write(
-                            CriticalStream::Decoder,
-                            Some(UniStreamHeader::Decoder),
-                        ),
+                        CriticalStream::Control => CriticalStreams::Qpack(CriticalStream::Encoder),
                         CriticalStream::Decoder => CriticalStreams::Write(
                             CriticalStream::Encoder,
                             Some(UniStreamHeader::Encoder),
@@ -442,7 +452,7 @@ where
         //# QPACK encoder and decoder streams) first, and then create additional
 
         // Open the control stream first, then the QPACK encoder and decoder streams.
-        let critical_streams = CriticalStreams::Open(CriticalStream::Control, settings);
+        let critical_streams = CriticalStreams::Control(settings);
 
         let (decoder_events_send, decoder_events_recv) = mpsc::unbounded_channel();
 
@@ -508,7 +518,6 @@ where
             return Ok(());
         }
 
-        *sent_closing = Some(max_id);
         self.set_closing();
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-3.3
@@ -517,9 +526,11 @@ where
         //# (Section 5.2) so that both endpoints can reliably determine whether
         //# previously sent frames have been processed and gracefully complete or
         //# terminate any necessary remaining tasks.
-        // GOAWAY follows SETTINGS on the control stream.
+        // GOAWAY follows SETTINGS on the control stream. Record its ID only
+        // after this wait, so a cancelled call does not suppress a retry.
         // https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
         self.send_control_stream_headers().await?;
+        *sent_closing = Some(max_id);
         let Some(control_send) = self.control_send.as_mut() else {
             return Err(self.handle_connection_error(InternalConnectionError::new(
                 Code::H3_INTERNAL_ERROR,
