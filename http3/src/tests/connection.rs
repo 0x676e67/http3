@@ -5,7 +5,7 @@ use std::{borrow::BorrowMut, time::Duration};
 
 use assert_matches::assert_matches;
 use bytes::{Buf, Bytes, BytesMut};
-use futures_util::future;
+use futures_util::{FutureExt as _, future};
 use http::{HeaderValue, Request, Response, StatusCode};
 use tokio::sync::oneshot::{self};
 
@@ -1934,6 +1934,139 @@ async fn blocked_grease_stream_does_not_hold_back_control_frames() {
     })
     .await
     .expect("the client stalled behind its blocked GREASE stream");
+}
+
+/// Reads a client unidirectional stream type; a control stream must start with SETTINGS.
+async fn client_stream_type(recv: &mut quinn::RecvStream) -> StreamType {
+    let mut buf = BytesMut::new();
+    loop {
+        let chunk = recv.read_chunk(usize::MAX, true).await.unwrap().unwrap();
+        buf.extend_from_slice(&chunk.bytes);
+        let mut cursor = std::io::Cursor::new(&buf[..]);
+        let Ok(stream_type) = StreamType::decode(&mut cursor) else {
+            continue;
+        };
+        if stream_type != StreamType::CONTROL {
+            return stream_type;
+        }
+        match Frame::decode(&mut cursor) {
+            Ok(Frame::Settings(_)) => return stream_type,
+            Err(frame::FrameError::Incomplete(_)) => {}
+            other => panic!("control stream did not start with SETTINGS: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn client_build_does_not_wait_for_critical_stream_credit() {
+    init_tracing();
+    let request = || Request::get("http://localhost/").body(()).unwrap();
+
+    // A compliant peer: the driver is never polled, so the critical streams
+    // were written by `build`, ahead of the first request's HEADERS.
+    let mut pair = Pair::default();
+    let server = pair.server_inner();
+    let (done_tx, done_rx) = oneshot::channel();
+    let client_fut = async {
+        let (_driver, mut send_request) = client::new(pair.client().await)
+            .now_or_never()
+            .expect("build waited for the peer")
+            .unwrap();
+        let mut stream = send_request.send_request(request()).await.unwrap();
+        stream.finish().await.unwrap();
+        done_rx.await.unwrap();
+    };
+    let server_fut = async {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let mut critical_streams = Vec::new();
+        for expected in [
+            StreamType::CONTROL,
+            StreamType::ENCODER,
+            StreamType::DECODER,
+        ] {
+            let mut recv = conn.accept_uni().await.unwrap();
+            assert_eq!(client_stream_type(&mut recv).await, expected);
+            critical_streams.push(recv);
+        }
+        let (_send, mut recv) = conn.accept_bi().await.unwrap();
+        let head = recv.read_to_end(1024).await.unwrap();
+        assert_matches!(Frame::decode(&mut &head[..]), Ok(Frame::Headers(_)));
+        done_tx.send(()).unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("SETTINGS was not sent by build");
+
+    // A peer granting no unidirectional streams, below the three RFC 9114
+    // Section 6.2 requires, delays only the critical streams: requests still
+    // complete, SETTINGS needs just one stream, and setup finishes once credit
+    // arrives. A shutdown cancelled meanwhile does not drop its GOAWAY.
+    let mut pair = Pair::default();
+    std::sync::Arc::get_mut(&mut pair.config)
+        .unwrap()
+        .max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+    let server = pair.server_inner();
+    let (credit_tx, credit_rx) = oneshot::channel();
+    let (settings_tx, settings_rx) = oneshot::channel();
+    let client_fut = async {
+        let (mut driver, mut send_request) = client::new(pair.client().await)
+            .now_or_never()
+            .expect("build waited for unidirectional stream credit")
+            .unwrap();
+        let response = async {
+            let mut stream = send_request.send_request(request()).await.unwrap();
+            stream.finish().await.unwrap();
+            stream.recv_response().await.unwrap()
+        };
+        tokio::select! {
+            biased;
+            response = response => assert_eq!(response.status(), StatusCode::OK),
+            error = driver.wait_idle() => panic!("connection failed: {error}"),
+        }
+        for _ in 0..2 {
+            let shutdown = tokio::time::timeout(Duration::from_millis(50), driver.shutdown(0));
+            assert!(shutdown.await.is_err(), "GOAWAY was skipped");
+        }
+        credit_tx.send(()).unwrap();
+        driver.shutdown(0).await.unwrap();
+        settings_rx.await.unwrap();
+    };
+    let server_fut = async {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+        let head = recv.read_to_end(1024).await.unwrap();
+        assert_matches!(Frame::decode(&mut &head[..]), Ok(Frame::Headers(_)));
+        let mut block = BytesMut::new();
+        qpack::encode_stateless(
+            &mut block,
+            &Header::response(
+                StatusCode::OK,
+                http::HeaderMap::new(),
+                &http::Extensions::new(),
+            ),
+        )
+        .unwrap();
+        let mut response = BytesMut::new();
+        Frame::headers(block.freeze()).encode_with_payload(&mut response);
+        send.write_all(&response).await.unwrap();
+        send.finish().unwrap();
+
+        credit_rx.await.unwrap();
+        conn.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(1));
+        let mut control = conn.accept_uni().await.unwrap();
+        assert_eq!(client_stream_type(&mut control).await, StreamType::CONTROL);
+        conn.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(3));
+        settings_tx.send(()).unwrap();
+        // Closing the control stream would be a connection error.
+        (conn, control)
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("the driver did not open its critical streams after credit arrived");
 }
 
 #[tokio::test]

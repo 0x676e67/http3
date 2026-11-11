@@ -160,11 +160,14 @@ impl Builder {
         C: quic::Connection<B>,
         B: Buf,
     {
+        let mut inner = ConnectionInner::new(conn, self.config.clone())?;
+        // The server still sends SETTINGS before it accepts requests.
+        inner.send_control_stream_headers().await?;
         let (sender, receiver) = mpsc::unbounded_channel();
         let max_field_section_size = self.config.settings.max_field_section_size;
         let max_qpack_decode_buffer_size = self.config.qpack_decode_buffer_size;
         Ok(Connection {
-            inner: ConnectionInner::new(conn, self.config.clone()).await?,
+            inner,
             max_field_section_size,
             max_qpack_decode_buffer_size,
             request_end_send: sender,

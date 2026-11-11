@@ -23,22 +23,23 @@ use crate::{
     stream::WriteBuf,
 };
 
-/// Bound for initial PRIORITY_UPDATE frames waiting for a busy control stream.
+/// Bound for initial PRIORITY_UPDATE frames waiting for a busy or unopened control stream.
 const MAX_QUEUED_PRIORITY_UPDATES: usize = 256;
 
-/// Writer for the local control stream: SETTINGS, GOAWAY, and initial PRIORITY_UPDATE frames.
+/// Writer for the local control stream after SETTINGS: GOAWAY and initial PRIORITY_UPDATE frames.
 pub(crate) struct ControlSend<S> {
     inner: Mutex<Inner<S>>,
     wake: Arc<Wake>,
 }
 
 struct Inner<S> {
-    stream: S,
+    /// `None` until the driver has written SETTINGS and hands the stream over.
+    stream: Option<S>,
     /// Initial PRIORITY_UPDATE frames the driver writes once the stream is ready.
     queue: VecDeque<RequestPriorityUpdate>,
 }
 
-/// Wakes the connection driver and a pending SETTINGS or GOAWAY write.
+/// Wakes the connection driver and a pending GOAWAY write.
 ///
 /// quinn wakes it while holding its connection lock, and a sender may hold `inner` while
 /// waiting for that lock in `poll_write`, so waking must never take `inner`.
@@ -50,10 +51,10 @@ struct Wake {
 // ===== impl ControlSend =====
 
 impl<S> ControlSend<S> {
-    pub(crate) fn new(stream: S, shared: Arc<SharedState>) -> Self {
+    pub(crate) fn new(shared: Arc<SharedState>) -> Self {
         Self {
             inner: Mutex::new(Inner {
-                stream,
+                stream: None,
                 queue: VecDeque::new(),
             }),
             wake: Arc::new(Wake {
@@ -66,6 +67,15 @@ impl<S> ControlSend<S> {
     fn lock(&self) -> MutexGuard<'_, Inner<S>> {
         // The stream and queue stay valid across a panic in the QUIC layer, so poison is ignored.
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Takes the control stream once SETTINGS is with the transport.
+    ///
+    /// SETTINGS must be the first frame on the control stream, so request senders only
+    /// reach the stream after it. See
+    /// [RFC 9114, Section 6.2.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1).
+    pub(crate) fn open(&self, stream: S) {
+        self.lock().stream = Some(stream);
     }
 
     /// Writes one frame from the task that owns the driver.
@@ -83,7 +93,12 @@ impl<S> ControlSend<S> {
             self.wake.writer.register(cx.waker());
             let waker = waker_ref(&self.wake);
             let mut cx = Context::from_waker(&waker);
-            let stream = &mut self.lock().stream;
+            let mut inner = self.lock();
+            let Some(stream) = inner.stream.as_mut() else {
+                return Poll::Ready(Err(StreamErrorIncoming::Unknown(
+                    "the control stream is not open".into(),
+                )));
+            };
             if let Some(frame) = data.take() {
                 if stream.poll_ready(&mut cx)?.is_pending() {
                     data = Some(frame);
@@ -102,8 +117,9 @@ impl<S> ControlSend<S> {
     /// Sends a request's initial priority without waiting.
     ///
     /// An idle stream takes the frame before the request writes its HEADERS; wire order and
-    /// packing are then up to the QUIC layer. A busy stream queues it for the driver, so it
-    /// may follow the HEADERS, or drops it when the queue is full; RFC 9218 allows both.
+    /// packing are then up to the QUIC layer. A busy stream, or one the driver has not opened
+    /// yet, queues it for the driver, so it may follow the HEADERS, or drops it when the queue
+    /// is full; RFC 9218 allows both.
     /// See [RFC 9218, Section 7](https://www.rfc-editor.org/rfc/rfc9218.html#section-7).
     pub(crate) fn send_now<B>(
         &self,
@@ -116,26 +132,26 @@ impl<S> ControlSend<S> {
         let waker = waker_ref(&self.wake);
         let mut cx = Context::from_waker(&waker);
         let mut inner = self.lock();
-        match inner.stream.poll_ready(&mut cx)? {
-            Poll::Ready(()) => {
-                inner.stream.send_data(update)?;
-                // Unaccepted bytes stay buffered; quinn wakes the driver to finish them.
-                if let Poll::Ready(Err(error)) = inner.stream.poll_ready(&mut cx) {
-                    return Err(error);
-                }
+        if let Some(stream) = inner.stream.as_mut()
+            && stream.poll_ready(&mut cx)?.is_ready()
+        {
+            stream.send_data(update)?;
+            // Unaccepted bytes stay buffered; quinn wakes the driver to finish them.
+            if let Poll::Ready(Err(error)) = stream.poll_ready(&mut cx) {
+                return Err(error);
             }
-            // The pending poll registered the composite waker, so the driver drains the queue
-            // once the stream is writable again.
-            Poll::Pending if inner.queue.len() < MAX_QUEUED_PRIORITY_UPDATES => {
-                inner.queue.push_back(update);
-            }
-            Poll::Pending => {
-                #[cfg(feature = "tracing")]
-                tracing::debug!(
-                    "control stream busy, dropped PRIORITY_UPDATE for {}",
-                    update.stream_id
-                );
-            }
+            return Ok(());
+        }
+        // A pending poll registered the composite waker, so the driver drains the queue once
+        // the stream is writable again; an unopened stream is drained when the driver opens it.
+        if inner.queue.len() < MAX_QUEUED_PRIORITY_UPDATES {
+            inner.queue.push_back(update);
+        } else {
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                "control stream busy, dropped PRIORITY_UPDATE for {}",
+                update.stream_id
+            );
         }
         Ok(())
     }
@@ -153,12 +169,21 @@ impl<S> ControlSend<S> {
         let waker = waker_ref(&self.wake);
         let mut cx = Context::from_waker(&waker);
         let mut inner = self.lock();
+        let Inner { stream, queue } = &mut *inner;
+        let Some(stream) = stream.as_mut() else {
+            // The driver opens the stream, writes SETTINGS, then flushes again.
+            return if queue.is_empty() {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            };
+        };
         loop {
-            ready!(inner.stream.poll_ready(&mut cx))?;
-            let Some(update) = inner.queue.pop_front() else {
+            ready!(stream.poll_ready(&mut cx))?;
+            let Some(update) = queue.pop_front() else {
                 return Poll::Ready(Ok(()));
             };
-            inner.stream.send_data(update)?;
+            stream.send_data(update)?;
         }
     }
 }

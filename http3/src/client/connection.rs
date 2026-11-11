@@ -330,7 +330,8 @@ where
             };
             self.control_send.send_now(update).map_err(|error| {
                 self.handle_connection_error_on_stream(connection::critical_send_stream_error(
-                    error, "control",
+                    error,
+                    connection::CriticalStream::Control,
                 ))
             })?;
         }
@@ -422,8 +423,10 @@ where
 /// required transfers and transport acknowledgments first. See
 /// [RFC 9114 Section 5.3](https://www.rfc-editor.org/rfc/rfc9114.html#section-5.3).
 ///
-/// It needs to be polled continuously via [`poll_close()`]. With a QPACK dynamic
-/// table, response decoding also pauses while too many decoder instructions are
+/// It needs to be polled continuously via [`poll_close()`]. It also sends
+/// SETTINGS and the QPACK stream types if the peer had not granted the stream
+/// credit for them when the connection was built. With a QPACK dynamic table,
+/// response decoding also pauses while too many decoder instructions are
 /// queued for this driver to write. On connection closure,
 /// this returns a [`ConnectionError`]; use [`ConnectionError::is_h3_no_error()`]
 /// to distinguish a normal close from an error.
@@ -546,6 +549,11 @@ where
     /// Maintain the connection state until it is closed
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ConnectionError> {
+        // Pending setup must not stall requests or the peer's control stream.
+        if let Poll::Ready(Err(err)) = self.inner.poll_critical_streams(cx) {
+            return Poll::Ready(err);
+        }
+
         if let Err(err) = self.inner.poll_accept_recv(cx) {
             return Poll::Ready(err);
         }
@@ -870,6 +878,12 @@ mod integration_tests {
         }
     }
 
+    fn open_control(state: &Arc<State>, shared: &Arc<SharedState>) -> Arc<ControlSend<Mock>> {
+        let control = Arc::new(ControlSend::new(shared.clone()));
+        control.open(Mock(state.clone(), 2));
+        control
+    }
+
     fn sender(state: &Arc<State>, dynamic: bool) -> SendRequest<Mock, Bytes> {
         let encoder = dynamic.then(|| {
             let encoder = QpackEncoder::default();
@@ -881,7 +895,7 @@ mod integration_tests {
         let conn_state = Arc::<SharedState>::default();
         SendRequest {
             open: Mock(state.clone(), 0),
-            control_send: Arc::new(ControlSend::new(Mock(state.clone(), 2), conn_state.clone())),
+            control_send: open_control(state, &conn_state),
             conn_state,
             decoder: None,
             encoder,
@@ -962,17 +976,23 @@ mod integration_tests {
         let driver = Arc::new(State::default());
         let writer = Arc::new(State::default());
         let shared = Arc::new(SharedState::default());
-        let control = ControlSend::new(Mock(state.clone(), 2), shared.clone());
-        state.block_write.store(true, Ordering::Relaxed);
-        state.written.store(true, Ordering::Relaxed);
+        let control = ControlSend::new(shared.clone());
         let update = |id| RequestPriorityUpdate {
             stream_id: StreamId::try_from(id).unwrap(),
             value: ext::PriorityUpdate::new(http::HeaderValue::from_static("u=1")),
         };
 
+        // Until the driver hands over the stream after SETTINGS, updates wait in the queue.
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        control.send_now::<Bytes>(update(0)).unwrap();
+        assert!(control.poll_flush::<Bytes>(&mut cx).is_pending());
+        control.open(Mock(state.clone(), 2));
+        state.block_write.store(true, Ordering::Relaxed);
+        state.written.store(true, Ordering::Relaxed);
+
         // Queueing leaves the wake to the stream, whose writable wake reaches the driver.
         shared.waker().register(&waker(driver.clone()));
-        for index in 0..256 {
+        for index in 1..256 {
             control.send_now::<Bytes>(update(index * 4)).unwrap();
         }
         assert_eq!(driver.wakes.load(Ordering::Relaxed), 0);
@@ -1009,7 +1029,6 @@ mod integration_tests {
         state.blocked_writer.lock().unwrap().take().unwrap().wake();
         assert_eq!(writer.wakes.load(Ordering::Relaxed), 2);
         state.block_write.store(false, Ordering::Relaxed);
-        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
         assert!(matches!(
             control.poll_flush::<Bytes>(&mut cx),
             Poll::Ready(Ok(()))
