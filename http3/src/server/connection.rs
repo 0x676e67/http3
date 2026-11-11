@@ -19,7 +19,7 @@ use tracing::{instrument, trace, warn};
 
 use super::request::RequestResolver;
 use crate::{
-    connection::{ConnectionInner, RequestDecodeState},
+    connection::{ConnectionInner, RequestDecodeState, StreamGuard},
     error::{Code, ConnectionError, internal_error::InternalConnectionError},
     frame::FrameStream,
     proto::{
@@ -176,7 +176,11 @@ where
                 request_end: self.request_end_send.clone(),
                 stream_id: stream.id(),
             }),
-            frame_stream: stream,
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+            //# When the server cancels a request without performing any application
+            //# processing, the request is considered "rejected".  The server SHOULD
+            //# abort its response stream with the error code H3_REQUEST_REJECTED.
+            frame_stream: StreamGuard::new(stream, Code::H3_REQUEST_REJECTED),
             send_grease_frame,
             max_field_section_size: self.max_field_section_size,
             shared: self.inner.shared.clone(),

@@ -3,7 +3,7 @@ use std::{future::Future as _, hint::black_box, time::Duration};
 use assert_matches::assert_matches;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::future;
-use http::{HeaderMap, Request, Response, StatusCode, request};
+use http::{HeaderMap, Method, Request, Response, StatusCode, request};
 
 use super::{Pair, http3_quinn, init_tracing};
 use crate::{
@@ -1494,11 +1494,18 @@ async fn header_too_big_response_from_server() {
                 .send_request(Request::get("http://localhost/salut").body(()).unwrap())
                 .await
                 .expect("request");
-            request_stream.finish().await.expect("client finish");
             let response = request_stream.recv_response().await.unwrap();
             assert_eq!(
                 response.status(),
                 StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+            );
+            // The 431 response is complete and the open upload is no longer needed.
+            assert!(request_stream.recv_data().await.unwrap().is_none());
+            assert_eq!(
+                future::poll_fn(|cx| request_stream.poll_stopped(cx))
+                    .await
+                    .unwrap(),
+                Some(Code::H3_NO_ERROR)
             );
         };
         tokio::select! {
@@ -2731,6 +2738,8 @@ where
 
             while stream.recv_data().await?.is_some() {}
             stream.recv_trailers().await?;
+            stream.send_response(Response::new(())).await?;
+            stream.finish().await?;
 
             Result::<(), StreamError>::Ok(())
         };
@@ -2743,10 +2752,19 @@ where
     ) = tokio::join!(server_fut, client_fut);
 
     if let Err(err) = client_result_stream {
-        // we have no influence wether the quinn returns the connection error to the stream api
-        // but if it returns an error it needs to be the expected one
-        assert_matches!(err, quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(code))
-            if code.error_code.into_inner() == expected_error_code.expect("If this is a error an error was expected").value());
+        // Quinn may return the connection error to the stream API, or the reset
+        // sent when the server dropped the failed request before closing.
+        let expected = expected_error_code.expect("If this is a error an error was expected");
+        match err {
+            quinn::ReadError::Reset(code) => assert!(
+                [Code::H3_REQUEST_REJECTED, Code::H3_REQUEST_CANCELLED]
+                    .contains(&Code::from(code.into_inner()))
+            ),
+            err => {
+                assert_matches!(err, quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(close))
+                if close.error_code.into_inner() == expected.value())
+            }
+        }
     }
 
     if let Some(expected_error_code) = expected_error_code {
@@ -2829,6 +2847,272 @@ async fn request_stream_drop_resets_request_body() {
         }
 
         let _ = server_done_tx.send(());
+    };
+
+    tokio::join!(server_fut, client_fut);
+}
+
+#[tokio::test]
+async fn server_drop_aborts_request_by_phase() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let endpoint = pair.server_inner();
+    let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
+
+    let client_fut = async {
+        let (mut driver, mut client) = client::new(pair.client().await).await.unwrap();
+        let requests = async {
+            let request = || Request::get("https://localhost/").body(()).unwrap();
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+            //= type=test
+            //# When the server cancels a request without performing any application
+            //# processing, the request is considered "rejected".  The server SHOULD
+            //# abort its response stream with the error code H3_REQUEST_REJECTED.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+            //= type=test
+            //# When a server abandons a
+            //# response after partial processing, it SHOULD abort its response
+            //# stream with the error code H3_REQUEST_CANCELLED.
+            // Dropped before and after the headers are decoded, then after
+            // the request reached the application without a response.
+            let codes = [Code::H3_REQUEST_REJECTED, Code::H3_REQUEST_REJECTED];
+            for expected in codes.into_iter().chain([Code::H3_REQUEST_CANCELLED]) {
+                let mut stream = client.send_request(request()).await.unwrap();
+                assert_matches!(
+                    stream.recv_response().await,
+                    Err(StreamError::RemoteTerminate { code }) if code == expected
+                );
+            }
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+            //= type=test
+            //# The error code H3_NO_ERROR
+            //# SHOULD be used when requesting that the client stop sending on the
+            //# request stream.
+            // Dropped mid-body: the truncated response must not read as complete.
+            let mut stream = client.send_request(request()).await.unwrap();
+            stream.recv_response().await.unwrap();
+            let mut chunk = stream.recv_data().await.unwrap().unwrap();
+            assert_eq!(chunk.copy_to_bytes(chunk.remaining()), "partial");
+            partial_tx.send(()).unwrap();
+            assert_matches!(
+                stream.recv_data().await.map(|_| ()),
+                Err(StreamError::RemoteTerminate { code }) if code == Code::H3_REQUEST_CANCELLED
+            );
+            assert_eq!(
+                future::poll_fn(|cx| stream.poll_stopped(cx)).await.unwrap(),
+                Some(Code::H3_NO_ERROR)
+            );
+
+            // A split receive half dropped after its send half finished.
+            let mut stream = client.send_request(request()).await.unwrap();
+            stream.recv_response().await.unwrap();
+            assert!(stream.recv_data().await.unwrap().is_none());
+            assert_eq!(
+                future::poll_fn(|cx| stream.poll_stopped(cx)).await.unwrap(),
+                Some(Code::H3_NO_ERROR)
+            );
+        };
+        tokio::select! {
+            biased;
+            _ = requests => (),
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("connection failed: {error:?}"),
+        }
+    };
+
+    let server_fut = async {
+        let conn = endpoint.accept().await.unwrap().await.unwrap();
+        let mut incoming = server::Connection::new(http3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        drop(incoming.accept().await.unwrap().unwrap());
+        let mut resolver = incoming.accept().await.unwrap().unwrap();
+        let frame = future::poll_fn(|cx| resolver.frame_stream.poll_next(cx)).await;
+        drop(resolver.accept_with_frame(frame).unwrap());
+        drop(get_stream_blocking(&mut incoming).await.unwrap());
+
+        let (_, mut stream) = get_stream_blocking(&mut incoming).await.unwrap();
+        stream.send_response(Response::new(())).await.unwrap();
+        stream
+            .send_data(Bytes::from_static(b"partial"))
+            .await
+            .unwrap();
+        partial_rx.await.unwrap();
+        drop(stream);
+
+        let (_, stream) = get_stream_blocking(&mut incoming).await.unwrap();
+        let (mut send, recv) = stream.split();
+        send.send_response(Response::new(())).await.unwrap();
+        send.finish().await.unwrap();
+        drop(recv);
+        // Keep the connection open until the client is done.
+        let _ = incoming.accept().await;
+    };
+
+    tokio::join!(server_fut, client_fut);
+}
+
+#[tokio::test]
+async fn content_length_must_match_data_frames() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let endpoint = pair.server_inner();
+
+    fn malformed<T>(result: Result<T, StreamError>) -> bool {
+        matches!(
+            result,
+            Err(StreamError::StreamError {
+                code: Code::H3_MESSAGE_ERROR,
+                ..
+            })
+        )
+    }
+
+    let client_fut = async {
+        let (mut driver, mut client) = client::new(pair.client().await).await.unwrap();
+        let requests = async {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+            //= type=test
+            //# A request or response that is defined as having content when it
+            //# contains a Content-Length header field (Section 8.6 of [HTTP]) is
+            //# malformed if the value of the Content-Length header field does not
+            //# equal the sum of the DATA frame lengths received.
+            // Requests: (path, content-length, DATA, trailers, reset code if rejected).
+            let cases: [(&str, &str, &'static [u8], bool, _); 5] = [
+                ("/exact", "3", b"abc", false, None),
+                (
+                    "/split",
+                    "5",
+                    b"abc",
+                    false,
+                    Some(Code::H3_REQUEST_CANCELLED),
+                ),
+                ("/long", "2", b"abc", false, Some(Code::H3_MESSAGE_ERROR)),
+                ("/trailers", "1", b"", true, Some(Code::H3_MESSAGE_ERROR)),
+                ("/invalid", "x", b"", false, Some(Code::H3_MESSAGE_ERROR)),
+            ];
+            for (path, length, body, trailers, reset) in cases {
+                let request = Request::post(format!("https://localhost{path}"))
+                    .header("content-length", length)
+                    .body(())
+                    .unwrap();
+                let mut stream = client.send_request(request).await.unwrap();
+                if !body.is_empty() {
+                    stream.send_data(Bytes::from_static(body)).await.unwrap();
+                }
+                if trailers {
+                    let mut fields = HeaderMap::new();
+                    fields.insert("trailer", "value".parse().unwrap());
+                    stream.send_trailers(fields).await.unwrap();
+                }
+                if path == "/long" {
+                    // The upload stays open, so only STOP_SENDING can end it.
+                    let stopped = future::poll_fn(|cx| stream.poll_stopped(cx)).await;
+                    assert_eq!(stopped.unwrap(), Some(Code::H3_MESSAGE_ERROR));
+                } else {
+                    stream.finish().await.unwrap();
+                }
+                match (stream.recv_response().await, reset) {
+                    (Ok(response), None) => assert_eq!(response.status(), StatusCode::OK),
+                    (Err(StreamError::RemoteTerminate { code }), Some(reset)) => {
+                        assert_eq!(code, reset)
+                    }
+                    (result, _) => panic!("{path}: {result:?}"),
+                }
+            }
+
+            // Responses: (method, path, malformed). A malformed response also
+            // aborts the open upload, and its rejected DATA is not returned later.
+            for (method, path, rejected) in [
+                (Method::GET, "/exact", false),
+                (Method::GET, "/long", true),
+                (Method::GET, "/invalid", true),
+                // The request method decides that a HEAD response has no content.
+                (Method::HEAD, "/short", false),
+            ] {
+                let uri = format!("https://localhost{path}");
+                let request = Request::builder().method(method).uri(uri).body(()).unwrap();
+                let mut stream = client.send_request(request).await.unwrap();
+                if !rejected {
+                    stream.finish().await.unwrap();
+                }
+                let result = async {
+                    stream.recv_response().await?;
+                    while stream.recv_data().await?.is_some() {}
+                    Ok(())
+                }
+                .await;
+                assert_eq!(malformed(result), rejected, "{path}");
+                if rejected {
+                    assert!(stream.recv_data().await.is_err());
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = requests => (),
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("connection failed: {error:?}"),
+        }
+    };
+
+    let server_fut = async {
+        let conn = endpoint.accept().await.unwrap().await.unwrap();
+        let mut incoming = server::Connection::new(http3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+
+        let (_, mut stream) = get_stream_blocking(&mut incoming).await.unwrap();
+        while stream.recv_data().await.unwrap().is_some() {}
+        stream.send_response(Response::new(())).await.unwrap();
+        stream.finish().await.unwrap();
+
+        // A split receive half keeps checking; its send half is dropped unfinished.
+        let (_, stream) = get_stream_blocking(&mut incoming).await.unwrap();
+        let (send, mut recv) = stream.split();
+        while let Ok(Some(_)) = recv.recv_data().await {}
+        assert!(malformed(recv.recv_data().await));
+        drop(send);
+
+        let (_, mut stream) = get_stream_blocking(&mut incoming).await.unwrap();
+        assert!(malformed(stream.recv_data().await));
+        assert!(malformed(stream.recv_trailers().await));
+        let response = stream.send_response(Response::new(())).await;
+        assert!(matches!(
+            response,
+            Err(StreamError::InvalidStreamState { .. })
+        ));
+
+        let (_, mut stream) = get_stream_blocking(&mut incoming).await.unwrap();
+        assert!(malformed(stream.recv_trailers().await));
+
+        let resolver = incoming.accept().await.unwrap().unwrap();
+        assert!(malformed(resolver.resolve_request().await));
+
+        while let Some((request, mut stream)) = get_stream_blocking(&mut incoming).await {
+            let path = request.uri().path();
+            let (length, body): (_, &'static [u8]) = match path {
+                "/exact" => ("3", b"abc"),
+                "/long" => ("2", b"abc"),
+                "/invalid" => ("x", b""),
+                _ => ("5", b""),
+            };
+            let response = Response::builder().header("content-length", length);
+            stream
+                .send_response(response.body(()).unwrap())
+                .await
+                .unwrap();
+            if !body.is_empty() {
+                stream.send_data(Bytes::from_static(body)).await.unwrap();
+            }
+            stream.finish().await.unwrap();
+            if matches!(path, "/long" | "/invalid") {
+                assert_matches!(
+                    stream.recv_data().await.map(|_| ()),
+                    Err(StreamError::RemoteTerminate { code }) if code == Code::H3_MESSAGE_ERROR
+                );
+            }
+        }
     };
 
     tokio::join!(server_fut, client_fut);

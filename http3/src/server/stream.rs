@@ -31,6 +31,8 @@ use crate::{
 /// The [`RequestStream`] struct is used to send and/or receive
 /// information from the client.
 /// After sending the final response, call [`RequestStream::finish`] to close the stream.
+/// Dropping it before then resets the response with [`Code::H3_REQUEST_CANCELLED`].
+/// Dropping it with the request body unread stops the body with [`Code::H3_NO_ERROR`].
 pub struct RequestStream<S, B> {
     pub(super) inner: crate::connection::RequestStream<S, B>,
     pub(super) request_end: Arc<RequestEnd>,
@@ -58,6 +60,8 @@ where
     /// Receive data sent from the client.
     ///
     /// This returns a chunk of the request body, or `None` if the request body is finished.
+    /// A body that differs from its Content-Length aborts the stream with
+    /// [`Code::H3_MESSAGE_ERROR`].
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_data(&mut self) -> Result<Option<impl Buf + use<S, B>>, StreamError> {
         future::poll_fn(|cx| self.poll_recv_data(cx)).await
@@ -223,14 +227,6 @@ where
     ) -> Poll<Result<Option<Code>, StreamError>> {
         self.inner.poll_stopped(cx)
     }
-
-    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
-    //= type=TODO
-    //# Implementations SHOULD cancel requests by abruptly terminating any
-    //# directions of a stream that are still open.  To do so, an
-    //# implementation resets the sending parts of streams and aborts reading
-    //# on the receiving parts of streams; see Section 2.4 of
-    //# [QUIC-TRANSPORT].
 
     /// Returns the underlying stream id
     pub fn send_id(&self) -> StreamId {

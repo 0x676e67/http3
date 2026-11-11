@@ -7,7 +7,7 @@ use std::{
 
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{future, ready};
-use guard::StreamGuard;
+pub(crate) use guard::StreamGuard;
 use http::HeaderMap;
 use stream::WriteBuf;
 use tokio::sync::mpsc;
@@ -1666,6 +1666,17 @@ pub struct RequestStream<S, B> {
     send_grease_frame: bool,
     send_state: SendState,
     decode_state: RequestDecodeState,
+    content_length: ContentLength,
+}
+
+/// Content-Length tracking for the received body.
+/// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.2>.
+enum ContentLength {
+    Unchecked,
+    /// DATA bytes the received Content-Length still allows.
+    Remaining(u64),
+    /// The body was rejected; later reads repeat the error.
+    Malformed(&'static str),
 }
 
 // Tracks frame ownership and the point after which no more HTTP content may be queued.
@@ -1711,34 +1722,39 @@ where
         );
 
         Self {
-            stream: StreamGuard::new(stream),
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+            //# Client SHOULD use the error code H3_REQUEST_CANCELLED to cancel
+            //# requests.
+            stream: StreamGuard::new(stream, Code::H3_REQUEST_CANCELLED),
             max_field_section_size,
             send_grease_frame: grease,
             send_state: SendState::Ready,
             trailers: None,
             conn_state,
             decode_state,
+            content_length: ContentLength::Unchecked,
         }
     }
 
-    /// Creates a server request with both cancellation callbacks disarmed.
+    /// Creates a server request that keeps the cancellation armed by its resolver.
     /// Sending awaits the final response HEADERS before DATA, trailers, or FIN.
     /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1>.
     pub(crate) fn with_decode_state(
-        stream: FrameStream<S, B>,
+        stream: StreamGuard<S, B>,
         max_field_section_size: u64,
         conn_state: Arc<SharedState>,
         grease: bool,
         decode_state: RequestDecodeState,
     ) -> Self {
         Self {
-            stream: StreamGuard::without_cancellation(stream),
+            stream,
             conn_state,
             max_field_section_size,
             trailers: None,
             send_grease_frame: grease,
             send_state: SendState::Head,
             decode_state,
+            content_length: ContentLength::Unchecked,
         }
     }
 }
@@ -1778,12 +1794,85 @@ where
         self.handle_frame_stream_error_on_request_stream(error)
     }
 
+    /// Requires the DATA frames that follow to carry exactly `length` bytes.
+    /// `None` leaves the body length unchecked.
+    pub(crate) fn expect_content_length(&mut self, length: Option<u64>) {
+        self.content_length = length.map_or(ContentLength::Unchecked, ContentLength::Remaining);
+    }
+
+    /// Aborts the directions this handle still owns as a stream error.
+    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-8>.
+    pub(crate) fn abort(&mut self, code: Code) {
+        self.stream.set_cancel_codes(code, code);
+        self.cancel_request();
+        if self.send_state != SendState::Finished {
+            self.send_state = SendState::Reset;
+        }
+    }
+
+    /// Aborts the stream for a body that differs from its Content-Length.
+    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.2>.
+    fn reject_malformed(&mut self, reason: &'static str) -> StreamError {
+        self.content_length = ContentLength::Malformed(reason);
+        self.abort(Code::H3_MESSAGE_ERROR);
+        Self::malformed(reason)
+    }
+
+    fn malformed(reason: &str) -> StreamError {
+        StreamError::StreamError {
+            code: Code::H3_MESSAGE_ERROR,
+            reason: reason.into(),
+        }
+    }
+
+    /// Reads the next body frame and checks DATA lengths against Content-Length.
+    fn poll_next_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Frame<PayloadLen>>, StreamError>> {
+        let frame = ready!(self.stream.poll_next(cx))
+            .map_err(|error| self.handle_receive_stream_error(error))?;
+        let ContentLength::Remaining(remaining) = self.content_length else {
+            return Poll::Ready(Ok(frame));
+        };
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+        //# A request or response that is defined as having content when it
+        //# contains a Content-Length header field (Section 8.6 of [HTTP]) is
+        //# malformed if the value of the Content-Length header field does not
+        //# equal the sum of the DATA frame lengths received.
+        match &frame {
+            Some(Frame::Data(PayloadLen(len))) => {
+                let len = u64::try_from(*len).unwrap_or(u64::MAX);
+                let Some(remaining) = remaining.checked_sub(len) else {
+                    return Poll::Ready(Err(
+                        self.reject_malformed("DATA exceeds the content-length")
+                    ));
+                };
+                self.content_length = ContentLength::Remaining(remaining);
+            }
+            // Trailers or the end of the stream end the body.
+            Some(Frame::Headers(_)) | None if remaining != 0 => {
+                return Poll::Ready(Err(
+                    self.reject_malformed("DATA is shorter than the content-length")
+                ));
+            }
+            _ => {}
+        }
+        Poll::Ready(Ok(frame))
+    }
+
     /// Receive some of the request/response body.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_recv_data(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
+        // The rejected frame's payload must not be returned later.
+        if let ContentLength::Malformed(reason) = self.content_length {
+            return Poll::Ready(Err(Self::malformed(reason)));
+        }
+
         // Body EOF can precede decoding the trailers. Keep their QPACK state
         // armed until recv_trailers processes them or the caller abandons them.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2
@@ -1796,21 +1885,18 @@ where
         // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
         // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.1
         while !self.stream.has_data() {
-            match ready!(self.stream.poll_next(cx)) {
-                Err(frame_stream_error) => {
-                    return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
-                }
-                Ok(None) => {
+            match ready!(self.poll_next_frame(cx))? {
+                None => {
                     self.finish_reading();
                     return Poll::Ready(Ok(None));
                 }
-                Ok(Some(Frame::Headers(encoded))) => {
+                Some(Frame::Headers(encoded)) => {
                     self.trailers = Some(encoded);
                     // Received trailers, no more data expected
                     return Poll::Ready(Ok(None));
                 }
-                Ok(Some(Frame::Data { .. })) => (),
-                Ok(Some(other_frame)) => {
+                Some(Frame::Data { .. }) => (),
+                Some(other_frame) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                     //# Receipt of an invalid sequence of frames MUST be treated as a
                     //# connection error of type H3_FRAME_UNEXPECTED.
@@ -1840,6 +1926,10 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
+        if let ContentLength::Malformed(reason) = self.content_length {
+            return Poll::Ready(Err(Self::malformed(reason)));
+        }
+
         let mut trailers = if let Some(encoded) = self.trailers.take() {
             encoded
         } else {
@@ -1848,23 +1938,20 @@ where
                     reason: "read the remaining body data before the trailers".into(),
                 }));
             }
-            match ready!(self.stream.poll_next(cx)) {
-                Err(frame_stream_error) => {
-                    return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
-                }
-                Ok(None) => {
+            match ready!(self.poll_next_frame(cx))? {
+                None => {
                     self.finish_reading();
                     return Poll::Ready(Ok(None));
                 }
-                Ok(Some(Frame::Headers(encoded))) => encoded,
+                Some(Frame::Headers(encoded)) => encoded,
                 // DATA may follow DATA, so only the local call order is wrong.
                 // The frame's payload stays readable through `poll_recv_data`.
-                Ok(Some(Frame::Data { .. })) => {
+                Some(Frame::Data { .. }) => {
                     return Poll::Ready(Err(StreamError::InvalidStreamState {
                         reason: "the body has not ended".into(),
                     }));
                 }
-                Ok(Some(other_frame)) => {
+                Some(other_frame) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                     //# Receipt of an invalid sequence of frames MUST be treated as a
                     //# connection error of type H3_FRAME_UNEXPECTED.
@@ -2287,6 +2374,7 @@ where
                 send_grease_frame: self.send_grease_frame,
                 send_state: self.send_state,
                 decode_state: RequestDecodeState::SendOnly,
+                content_length: ContentLength::Unchecked,
             },
             RequestStream {
                 stream: recv,
@@ -2296,13 +2384,14 @@ where
                 send_grease_frame: self.send_grease_frame,
                 send_state: self.send_state,
                 decode_state: self.decode_state,
+                content_length: self.content_length,
             },
         )
     }
 }
 
 impl<S, B> RequestStream<S, B> {
-    /// Abandons this handle's remaining directions after GOAWAY rejection.
+    /// Abandons this handle's remaining directions now, with their drop codes.
     /// Uses the same ownership state as Drop and releases QPACK at most once.
     pub(crate) fn cancel_request(&mut self) {
         self.decode_state.cancel_reading();
@@ -2328,32 +2417,42 @@ mod guard {
 
     type Cancel<S, B> = fn(&mut FrameStream<S, B>, Code);
 
-    /// Cancels a client's open stream directions when their owner is dropped.
+    /// Cancels a request stream's open directions when their owner is dropped.
     ///
     /// Callbacks retain each direction's trait capability after splitting, without
     /// requiring receive-only streams to implement `SendStream` (or vice versa).
-    /// Server streams start disarmed and retain their transport's drop behavior.
+    /// A server changes the codes when it hands the request to the application.
     /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1>.
     pub(crate) struct StreamGuard<S, B> {
         inner: Option<FrameStream<S, B>>,
         reset_on_drop: Option<Cancel<S, B>>,
         stop_sending_on_drop: Option<Cancel<S, B>>,
+        reset_code: Code,
+        stop_sending_code: Code,
     }
 
     impl<S, B> StreamGuard<S, B> {
         /// Wraps a stream with both cancellation callbacks disabled.
-        /// Used for server streams and halves whose callbacks are transferred by split.
-        pub(super) fn without_cancellation(stream: FrameStream<S, B>) -> Self {
+        /// Used for halves whose callbacks are transferred by split.
+        pub(crate) fn without_cancellation(stream: FrameStream<S, B>) -> Self {
             Self {
                 inner: Some(stream),
                 reset_on_drop: None,
                 stop_sending_on_drop: None,
+                reset_code: Code::H3_REQUEST_CANCELLED,
+                stop_sending_code: Code::H3_REQUEST_CANCELLED,
             }
+        }
+
+        /// Sets the codes used by the callbacks still armed.
+        pub(crate) fn set_cancel_codes(&mut self, reset: Code, stop_sending: Code) {
+            self.reset_code = reset;
+            self.stop_sending_code = stop_sending;
         }
 
         /// Disables receive cancellation after EOF and any buffered trailers are processed.
         /// The send direction keeps its current state.
-        pub(super) fn finish_reading(&mut self) {
+        pub(crate) fn finish_reading(&mut self) {
             self.stop_sending_on_drop = None;
         }
 
@@ -2388,13 +2487,15 @@ mod guard {
     }
 
     impl<S: quic::SendStream<B> + quic::RecvStream, B: Buf> StreamGuard<S, B> {
-        /// Wraps a new client stream with cancellation armed for both directions.
+        /// Wraps a new request stream with cancellation armed for both directions.
         /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1>.
-        pub(super) fn new(stream: FrameStream<S, B>) -> Self {
+        pub(crate) fn new(stream: FrameStream<S, B>, code: Code) -> Self {
             Self {
                 inner: Some(stream),
                 reset_on_drop: Some(|stream, code| stream.reset(code.into())),
                 stop_sending_on_drop: Some(|stream, code| stream.stop_sending(code)),
+                reset_code: code,
+                stop_sending_code: code,
             }
         }
     }
@@ -2408,6 +2509,8 @@ mod guard {
             let (send, recv) = self.inner.take().expect("stream is present").split();
             let mut send = StreamGuard::without_cancellation(send);
             let mut recv = StreamGuard::without_cancellation(recv);
+            send.set_cancel_codes(self.reset_code, self.stop_sending_code);
+            recv.set_cancel_codes(self.reset_code, self.stop_sending_code);
 
             if self.reset_on_drop.take().is_some() {
                 send.reset_on_drop = Some(|stream, code| stream.reset(code.into()));
@@ -2487,11 +2590,17 @@ mod guard {
             let Some(stream) = self.inner.as_mut() else {
                 return;
             };
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+            //# Implementations SHOULD cancel requests by abruptly terminating any
+            //# directions of a stream that are still open.  To do so, an
+            //# implementation resets the sending parts of streams and aborts reading
+            //# on the receiving parts of streams; see Section 2.4 of
+            //# [QUIC-TRANSPORT].
             if let Some(reset) = self.reset_on_drop.take() {
-                reset(stream, Code::H3_REQUEST_CANCELLED);
+                reset(stream, self.reset_code);
             }
             if let Some(stop_sending) = self.stop_sending_on_drop.take() {
-                stop_sending(stream, Code::H3_REQUEST_CANCELLED);
+                stop_sending(stream, self.stop_sending_code);
             }
         }
     }
@@ -2900,6 +3009,7 @@ mod request_drop_tests {
         stream.set_max_field_section_size(1024);
 
         let decode_state = RequestDecodeState::new(stream.id(), &conn_state, 1024, None);
+        let stream = StreamGuard::new(stream, Code::H3_REQUEST_CANCELLED);
         let request_stream =
             RequestStream::with_decode_state(stream, u64::MAX, conn_state, false, decode_state);
 
@@ -3220,7 +3330,7 @@ mod request_drop_tests {
     }
 
     #[test]
-    fn split_transfers_only_its_direction_and_preserves_disarmed_state() {
+    fn split_transfers_each_direction_with_its_cancellation() {
         let (stream, probe) = stream();
         let (send, recv) = stream.split();
         assert!(probe.events.lock().unwrap().is_empty());
@@ -3251,13 +3361,19 @@ mod request_drop_tests {
             ]
         );
 
-        let (stream, probe) = server_stream_with_probe(Probe::default());
+        let (mut stream, probe) = server_stream_with_probe(Probe::default());
+        stream
+            .stream
+            .set_cancel_codes(Code::H3_REQUEST_REJECTED, Code::H3_NO_ERROR);
         let (send, recv) = stream.split();
         drop(send);
         drop(recv);
-        assert!(
-            probe.events.lock().unwrap().is_empty(),
-            "server construction remains disarmed"
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [
+                ("reset", Code::H3_REQUEST_REJECTED.value()),
+                ("stop", Code::H3_NO_ERROR.value()),
+            ]
         );
     }
 
@@ -3296,12 +3412,10 @@ mod request_drop_tests {
                     trailers
                 );
                 drop(stream);
-                let expected = if client {
-                    vec![("reset", Code::H3_REQUEST_CANCELLED.value())]
-                } else {
-                    Vec::new()
-                };
-                assert_eq!(*probe.events.lock().unwrap(), expected);
+                assert_eq!(
+                    *probe.events.lock().unwrap(),
+                    [("reset", Code::H3_REQUEST_CANCELLED.value())]
+                );
             }
         }
     }

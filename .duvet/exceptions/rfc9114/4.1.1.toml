@@ -23,48 +23,6 @@ request processing.
 
 [[exception]]
 quote = '''
-When the server cancels a request without performing any application
-processing, the request is considered "rejected".  The server SHOULD
-abort its response stream with the error code H3_REQUEST_REJECTED.
-'''
-reason = '''
-The user should handle this, as http3 should not know anything about
-request processing.
-'''
-
-[[exception]]
-quote = '''
-Servers MUST NOT use the H3_REQUEST_REJECTED error code for requests
-that were partially or fully processed.
-'''
-reason = '''
-The user should handle this, as http3 should not know anything about
-request processing.
-'''
-
-[[exception]]
-quote = '''
-When a server abandons a
-response after partial processing, it SHOULD abort its response
-stream with the error code H3_REQUEST_CANCELLED.
-'''
-reason = '''
-The user should initiate this, as http3 should not know anything about
-request processing.
-'''
-
-[[exception]]
-quote = '''
-Client SHOULD use the error code H3_REQUEST_CANCELLED to cancel
-requests.
-'''
-reason = '''
-The user should initiate this, as http3 should not decide when to cancel
-requests.
-'''
-
-[[exception]]
-quote = '''
 Upon receipt of this error code, a server MAY abruptly
 terminate the response using the error code H3_REQUEST_REJECTED if no
 processing was performed.

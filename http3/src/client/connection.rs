@@ -193,7 +193,7 @@ where
             mut extensions,
             ..
         } = parts;
-
+        let response_method = method.clone();
         let mut headers = Header::request(method, uri, headers, &extensions).map_err(|error| {
             StreamError::InvalidRequest {
                 reason: error.to_string().into_boxed_str(),
@@ -341,14 +341,17 @@ where
         guard.complete = true;
         drop(guard);
 
-        let request_stream = RequestStream::new(connection::RequestStream::new(
-            FrameStream::request(BufRecvStream::new(stream)),
-            self.max_field_section_size,
-            self.max_qpack_decode_buffer_size,
-            self.send_grease_frame,
-            self.conn_state.clone(),
-            self.decoder.clone(),
-        ));
+        let request_stream = RequestStream::new(
+            connection::RequestStream::new(
+                FrameStream::request(BufRecvStream::new(stream)),
+                self.max_field_section_size,
+                self.max_qpack_decode_buffer_size,
+                self.send_grease_frame,
+                self.conn_state.clone(),
+                self.decoder.clone(),
+            ),
+            response_method,
+        );
         // send the grease frame only once
         self.send_grease_frame = false;
         Ok(request_stream)
