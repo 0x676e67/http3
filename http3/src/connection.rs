@@ -515,7 +515,8 @@ where
         if let Some(sent_id) = sent_closing
             && *sent_id <= max_id
         {
-            return Ok(());
+            // A cancelled call may have left that GOAWAY partly written.
+            return future::poll_fn(|cx| self.poll_control_flush(cx)).await;
         }
 
         self.set_closing();
@@ -526,23 +527,53 @@ where
         //# (Section 5.2) so that both endpoints can reliably determine whether
         //# previously sent frames have been processed and gracefully complete or
         //# terminate any necessary remaining tasks.
-        // GOAWAY follows SETTINGS on the control stream. Record its ID only
-        // after this wait, so a cancelled call does not suppress a retry.
+        // GOAWAY follows SETTINGS on the control stream.
         // https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
         self.send_control_stream_headers().await?;
-        *sent_closing = Some(max_id);
         let Some(control_send) = self.control_send.as_mut() else {
             return Err(self.handle_connection_error(InternalConnectionError::new(
                 Code::H3_INTERNAL_ERROR,
                 "control stream was not initialized".to_string(),
             )));
         };
-        match stream::write(control_send, Frame::Goaway(max_id.into())).await {
-            Ok(()) => Ok(()),
-            Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
-                Err(self.handle_connection_error(connection_error))
+        // Record the ID once the frame is in the stream: a call cancelled before
+        // that does not suppress a retry, and the driver finishes a frame
+        // cancelled after it in `poll_control_flush`.
+        let result = async {
+            // A cancelled call may have left an earlier GOAWAY in the stream.
+            future::poll_fn(|cx| control_send.poll_ready(cx)).await?;
+            control_send.send_data(Frame::Goaway(max_id.into()))?;
+            *sent_closing = Some(max_id);
+            future::poll_fn(|cx| control_send.poll_ready(cx)).await
+        }
+        .await;
+        result.map_err(|error| self.control_stream_error(error))
+    }
+
+    /// Finishes GOAWAY bytes that a cancelled [`Self::shutdown`] left on the control stream.
+    pub(crate) fn poll_control_flush(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectionError>> {
+        // Setup writes SETTINGS itself; only GOAWAY follows it.
+        let Some(control_send) = self
+            .control_send
+            .as_mut()
+            .filter(|_| self.critical_streams.is_ready())
+        else {
+            return Poll::Ready(Ok(()));
+        };
+        let result = ready!(control_send.poll_ready(cx));
+        Poll::Ready(result.map_err(|error| self.control_stream_error(error)))
+    }
+
+    /// Closes the connection after a write on the control stream failed.
+    fn control_stream_error(&mut self, error: StreamErrorIncoming) -> ConnectionError {
+        match error {
+            StreamErrorIncoming::ConnectionErrorIncoming { connection_error } => {
+                self.handle_connection_error(connection_error)
             }
-            Err(StreamErrorIncoming::StreamTerminated { error_code: err }) => Err(self
+            StreamErrorIncoming::StreamTerminated { error_code: err } => self
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
                 //# If either control
                 //# stream is closed at any point, this MUST be treated as a connection
@@ -553,12 +584,12 @@ where
                         "control stream was requested to stop sending with error code {}",
                         err
                     ),
-                ))),
-            Err(StreamErrorIncoming::Unknown(error)) => {
-                Err(self.handle_connection_error(InternalConnectionError::new(
+                )),
+            StreamErrorIncoming::Unknown(error) => {
+                self.handle_connection_error(InternalConnectionError::new(
                     Code::H3_CLOSED_CRITICAL_STREAM,
                     format!("an error occurred on the control stream {}", error),
-                )))
+                ))
             }
         }
     }
