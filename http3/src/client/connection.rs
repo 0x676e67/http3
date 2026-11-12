@@ -507,6 +507,10 @@ where
     B: Buf,
 {
     /// Initiate a graceful shutdown, accepting `max_push` potentially in-flight server pushes
+    ///
+    /// Dropping the future is safe: [`poll_close`](Self::poll_close) or a later call
+    /// finishes a GOAWAY already handed to the control stream, and a later call sends one
+    /// that was not.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn shutdown(&mut self, _max_push: usize) -> Result<(), ConnectionError> {
         // TODO: Calculate remaining pushes once server push is implemented.
@@ -532,6 +536,9 @@ where
         }
 
         if let Err(err) = self.inner.poll_qpack(cx) {
+            return Poll::Ready(err);
+        }
+        if let Poll::Ready(Err(err)) = self.inner.poll_control_flush(cx) {
             return Poll::Ready(err);
         }
 

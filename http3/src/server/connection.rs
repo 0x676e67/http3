@@ -191,7 +191,9 @@ where
     /// Initiate a graceful shutdown, accepting `max_requests` potentially still in-flight
     ///
     /// The GOAWAY identifies the first request stream that will not be processed:
-    /// the stream after the last accepted one, advanced by `max_requests`.
+    /// the stream after the last accepted one, advanced by `max_requests`. Dropping the
+    /// future is safe: polling [`accept`](Self::accept) or a later call finishes a GOAWAY
+    /// already handed to the control stream, and a later call sends one that was not.
     ///
     /// See [connection shutdown](https://www.rfc-editor.org/rfc/rfc9114.html#connection-shutdown) for more information.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
@@ -270,6 +272,10 @@ where
         // QPACK critical streams carry connection-level state and must keep
         // progressing while the server waits for another request stream.
         self.inner.poll_qpack(cx)?;
+        // Finishes GOAWAY bytes a cancelled shutdown left on the control stream.
+        if let Poll::Ready(Err(error)) = self.inner.poll_control_flush(cx) {
+            return Poll::Ready(Err(error));
+        }
 
         while (self.poll_next_control(cx)?).is_ready() {}
         Poll::Pending

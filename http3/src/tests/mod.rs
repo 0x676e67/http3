@@ -62,6 +62,7 @@ pub struct Pair {
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
     config: Arc<TransportConfig>,
+    client_transport: Arc<TransportConfig>,
 }
 
 impl Default for Pair {
@@ -72,6 +73,7 @@ impl Default for Pair {
             key,
             port: 0,
             config: Arc::new(TransportConfig::default()),
+            client_transport: Arc::new(TransportConfig::default()),
         }
     }
 }
@@ -134,9 +136,10 @@ impl Pair {
         crypto.enable_early_data = true;
         crypto.alpn_protocols = vec![b"h3".to_vec()];
 
-        let client_config = http3_quinn::quinn::ClientConfig::new(Arc::new(
+        let mut client_config = http3_quinn::quinn::ClientConfig::new(Arc::new(
             QuicClientConfig::try_from(crypto).unwrap(),
         ));
+        client_config.transport_config(self.client_transport.clone());
 
         let mut client_endpoint =
             http3_quinn::quinn::Endpoint::client("[::]:0".parse().unwrap()).unwrap();
