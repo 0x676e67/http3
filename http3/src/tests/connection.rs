@@ -2792,3 +2792,98 @@ async fn server_driver_drop_publishes_close_and_preserves_first_error() {
     .await
     .expect("server driver drop did not complete pending requests");
 }
+
+#[tokio::test]
+async fn cancelled_shutdown_still_delivers_its_goaway() {
+    init_tracing();
+    // One byte of stream credit takes GOAWAY into the control stream but not
+    // out of it, so the shutdown below is cancelled after the hand-off.
+    let mut pair = Pair::default();
+    std::sync::Arc::get_mut(&mut pair.config)
+        .unwrap()
+        .stream_receive_window(quinn::VarInt::from_u32(1));
+    let server = pair.server_inner();
+    let (cancelled_tx, cancelled_rx) = oneshot::channel();
+    let client_fut = async {
+        let mut builder = client::builder();
+        // Without stream types and SETTINGS, the control stream carries only GOAWAY.
+        builder.send_settings(false).send_grease(false);
+        let (mut driver, _send_request) = builder
+            .build::<_, _, Bytes>(pair.client().await)
+            .await
+            .unwrap();
+        let shutdown = tokio::time::timeout(Duration::from_millis(50), driver.shutdown(0));
+        assert!(shutdown.await.is_err(), "GOAWAY was not blocked");
+        // Like the first call, a retry returns only once the frame is written.
+        let retry = tokio::time::timeout(Duration::from_millis(50), driver.shutdown(0));
+        assert!(
+            retry.await.is_err(),
+            "the retry did not wait for the GOAWAY"
+        );
+        cancelled_tx.send(()).unwrap();
+        // The driver finishes the frame once the server grants credit.
+        future::poll_fn(|cx| driver.poll_close(cx)).await
+    };
+    let server_fut = async {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        cancelled_rx.await.unwrap();
+        let mut control = conn.accept_uni().await.unwrap();
+        let mut goaway = [0; 3];
+        control.read_exact(&mut goaway).await.unwrap();
+        assert_eq!(goaway, [0x07, 0x01, 0x00]);
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            error = client_fut => panic!("client closed: {error:?}"),
+            () = server_fut => {}
+        }
+    })
+    .await
+    .expect("the driver did not finish the cancelled GOAWAY");
+}
+
+#[tokio::test]
+async fn cancelled_server_shutdown_keeps_a_smaller_goaway_retryable() {
+    init_tracing();
+    // One byte of client stream credit holds back each GOAWAY after its first byte.
+    let mut pair = Pair::default();
+    std::sync::Arc::get_mut(&mut pair.client_transport)
+        .unwrap()
+        .stream_receive_window(quinn::VarInt::from_u32(1));
+    let mut server = pair.server();
+    let (cancelled_tx, cancelled_rx) = oneshot::channel();
+    let client_fut = async {
+        let conn = pair.client_inner().await;
+        cancelled_rx.await.unwrap();
+        let mut control = conn.accept_uni().await.unwrap();
+        let mut goaways = [0; 6];
+        control.read_exact(&mut goaways).await.unwrap();
+        // GOAWAY(4), then GOAWAY(0).
+        assert_eq!(goaways, [0x07, 0x01, 0x04, 0x07, 0x01, 0x00]);
+    };
+    let server_fut = async {
+        let mut builder = server::builder();
+        // Without stream types and SETTINGS, the control stream carries only GOAWAY.
+        builder.send_settings(false).send_grease(false);
+        let mut incoming = builder.build(server.next().await).await.unwrap();
+        let cancel = Duration::from_millis(50);
+        // GOAWAY(4) is handed to the stream, then the call is cancelled.
+        let shutdown = tokio::time::timeout(cancel, incoming.shutdown(1));
+        assert!(shutdown.await.is_err());
+        // GOAWAY(0) waits behind it, so this call is cancelled before the hand-off
+        // and must not suppress the retry below.
+        let shutdown = tokio::time::timeout(cancel, incoming.shutdown(0));
+        assert!(shutdown.await.is_err());
+        cancelled_tx.send(()).unwrap();
+        incoming.shutdown(0).await.unwrap();
+        future::pending::<()>().await
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            () = client_fut => {}
+            () = server_fut => {}
+        }
+    })
+    .await
+    .expect("the smaller GOAWAY was not sent");
+}

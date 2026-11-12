@@ -78,17 +78,19 @@ impl<S> ControlSend<S> {
         self.lock().stream = Some(stream);
     }
 
-    /// Writes one frame from the task that owns the driver.
+    /// Flushes buffered bytes and optionally writes one frame from the driver.
     ///
-    /// Bytes left by a cancelled write are finished first, and bytes of this frame left by a
-    /// cancellation are finished by the next flush, so the stream never sees two writes.
-    pub(crate) async fn write<B, D>(&self, data: D) -> Result<(), StreamErrorIncoming>
+    /// The callback runs once the transport accepts the frame. The next flush finishes any
+    /// bytes left by a cancelled write.
+    pub(crate) async fn write<B, D>(
+        &self,
+        mut pending: Option<(D, impl FnOnce())>,
+    ) -> Result<(), StreamErrorIncoming>
     where
         S: SendStream<B>,
         B: Buf,
         D: Into<WriteBuf<B>>,
     {
-        let mut data = Some(data);
         let result = future::poll_fn(|cx| {
             self.wake.writer.register(cx.waker());
             let waker = waker_ref(&self.wake);
@@ -99,12 +101,13 @@ impl<S> ControlSend<S> {
                     "the control stream is not open".into(),
                 )));
             };
-            if let Some(frame) = data.take() {
+            if let Some((frame, on_sent)) = pending.take() {
                 if stream.poll_ready(&mut cx)?.is_pending() {
-                    data = Some(frame);
+                    pending = Some((frame, on_sent));
                     return Poll::Pending;
                 }
                 stream.send_data(frame)?;
+                on_sent();
             }
             stream.poll_ready(&mut cx)
         })

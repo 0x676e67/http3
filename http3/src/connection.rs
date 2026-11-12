@@ -538,26 +538,28 @@ where
         T: From<VarInt> + PartialOrd<T> + Copy,
         VarInt: From<T>,
     {
-        if let Some(sent_id) = sent_closing
-            && *sent_id <= max_id
-        {
-            return Ok(());
-        }
+        let pending = if sent_closing.is_some_and(|sent_id| sent_id <= max_id) {
+            // A cancelled call may have left that GOAWAY partly written.
+            None
+        } else {
+            self.set_closing();
 
-        self.set_closing();
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-3.3
+            //# When either endpoint chooses to close the HTTP/3
+            //# connection, the terminating endpoint SHOULD first send a GOAWAY frame
+            //# (Section 5.2) so that both endpoints can reliably determine whether
+            //# previously sent frames have been processed and gracefully complete or
+            //# terminate any necessary remaining tasks.
+            // GOAWAY follows SETTINGS on the control stream.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
+            self.send_control_stream_headers().await?;
 
-        //= https://www.rfc-editor.org/rfc/rfc9114#section-3.3
-        //# When either endpoint chooses to close the HTTP/3
-        //# connection, the terminating endpoint SHOULD first send a GOAWAY frame
-        //# (Section 5.2) so that both endpoints can reliably determine whether
-        //# previously sent frames have been processed and gracefully complete or
-        //# terminate any necessary remaining tasks.
-        // GOAWAY follows SETTINGS on the control stream. Record its ID only
-        // after this wait, so a cancelled call does not suppress a retry.
-        // https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
-        self.send_control_stream_headers().await?;
-        *sent_closing = Some(max_id);
-        let result = self.control_send.write(Frame::Goaway(max_id.into())).await;
+            // A cancellation before the transport accepts the frame leaves it retryable.
+            Some((Frame::Goaway(max_id.into()), || {
+                *sent_closing = Some(max_id)
+            }))
+        };
+        let result = self.control_send.write(pending).await;
         result.map_err(|error| {
             self.handle_connection_error(critical_send_stream_error(error, CriticalStream::Control))
         })

@@ -534,6 +534,10 @@ where
     B: Buf,
 {
     /// Initiate a graceful shutdown, accepting `max_push` potentially in-flight server pushes
+    ///
+    /// Dropping the future is safe: [`poll_close`](Self::poll_close) or a later call
+    /// finishes a GOAWAY already handed to the control stream, and a later call sends one
+    /// that was not.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn shutdown(&mut self, _max_push: usize) -> Result<(), ConnectionError> {
         // TODO: Calculate remaining pushes once server push is implemented.
@@ -1003,10 +1007,15 @@ mod integration_tests {
         // through the waker of whichever polled last: the write, then a sender.
         let writer_waker = waker(writer.clone());
         let mut writer_cx = Context::from_waker(&writer_waker);
-        let mut goaway =
-            std::pin::pin!(control.write::<Bytes, _>(Frame::Goaway(VarInt::from_u32(0))));
+        let handed_off = std::cell::Cell::new(false);
+        let mut goaway = std::pin::pin!(
+            control.write::<Bytes, _>(Some(
+                (Frame::Goaway(VarInt::from_u32(0)), || handed_off.set(true),)
+            ))
+        );
         for (polled, sender) in [(1, false), (2, true)] {
             assert!(goaway.as_mut().poll(&mut writer_cx).is_pending());
+            assert!(!handed_off.get());
             if sender {
                 // The queue is full, so this update is dropped without a wake.
                 control.send_now::<Bytes>(update(256 * 4)).unwrap();
@@ -1022,6 +1031,7 @@ mod integration_tests {
             goaway.as_mut().poll(&mut writer_cx),
             Poll::Ready(Ok(()))
         ));
+        assert!(handed_off.get());
 
         // A finished write is not woken again.
         state.block_write.store(true, Ordering::Relaxed);

@@ -191,7 +191,9 @@ where
     /// Initiate a graceful shutdown, accepting `max_requests` potentially still in-flight
     ///
     /// The GOAWAY identifies the first request stream that will not be processed:
-    /// the stream after the last accepted one, advanced by `max_requests`.
+    /// the stream after the last accepted one, advanced by `max_requests`. Dropping the
+    /// future is safe: polling [`accept`](Self::accept) or a later call finishes a GOAWAY
+    /// already handed to the control stream, and a later call sends one that was not.
     ///
     /// See [connection shutdown](https://www.rfc-editor.org/rfc/rfc9114.html#connection-shutdown) for more information.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
