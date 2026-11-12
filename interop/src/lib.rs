@@ -284,7 +284,7 @@ pub async fn run_local_quic_client_interop_matrix_with_config(
         // Requests in one batch run concurrently. The batch size keeps the test
         // cheap enough for CI while still exercising independent request
         // streams and QPACK blocked-stream accounting.
-        for (case, path) in batch.iter().cloned() {
+        for (index, (case, path)) in batch.iter().cloned().enumerate() {
             let mut send_request = send_request.clone();
             let port = server_addr.port();
             let task_path = path.clone();
@@ -293,10 +293,16 @@ pub async fn run_local_quic_client_interop_matrix_with_config(
                 let path = task_path.clone();
                 let result = async {
                     let expected_status = http::StatusCode::from_u16(case.status)?;
-                    let req = http::Request::builder()
+                    let mut req = http::Request::builder()
                         .method(http::Method::GET)
                         .uri(format!("https://localhost:{port}{task_path}"))
                         .body(())?;
+                    // Every other request sends an RFC 9218 PRIORITY_UPDATE before its HEADERS.
+                    if index % 2 == 1 {
+                        req.extensions_mut().insert(http3::ext::PriorityUpdate::new(
+                            http::HeaderValue::from_static("u=1, i"),
+                        ));
+                    }
 
                     let mut stream: http3::client::RequestStream<http3_quic::BidiStream<Bytes>, _> =
                         send_request.send_request(req).await?;

@@ -63,9 +63,15 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3", default-features = false }
 tracing-tree = "0.4"
 
-# quic 0.12.2 lacks the fixes for GHSA-53rm-773f-4q8c and GHSA-wppq-2f6r-wfvm.
 [patch.crates-io]
+# quic 0.12.2 lacks the fixes for GHSA-53rm-773f-4q8c and GHSA-wppq-2f6r-wfvm.
 quic = { git = "https://github.com/0x676e67/quic", rev = "daca87d87be17f56b7112fd117bec1a3378e7228" }
+# Build the ngtcp2 bindings from interop/crates. A patch keeps them out of the
+# workspace members, and the -sys crates' `links` keys tie all four together.
+ngtcp2-sys = { path = "interop/crates/ngtcp2-sys" }
+nghttp3-sys = { path = "interop/crates/nghttp3-sys" }
+ngtcp2 = { path = "interop/crates/ngtcp2" }
+tokio-ngtcp2 = { path = "interop/crates/tokio-ngtcp2" }
 
 [profile.bench]
 opt-level = 3
