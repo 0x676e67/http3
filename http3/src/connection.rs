@@ -227,11 +227,11 @@ enum CriticalStream {
 
 /// Setup of the local control and QPACK streams, driven by the connection driver.
 ///
-/// Opens the control stream and writes SETTINGS and a reserved frame on it, then
-/// opens the decoder and encoder streams. Each QPACK stream type goes out with
-/// that stream's first instruction. A peer that withholds the stream or
-/// flow-control credit it must grant ([RFC 9114, Section 6.2]) keeps setup
-/// pending until a request timeout or the QUIC idle timeout.
+/// Opens the control stream and writes SETTINGS, followed by a reserved frame
+/// when GREASE is enabled. Then it opens the decoder and encoder streams. Each
+/// QPACK stream type goes out with that stream's first instruction. Setup stays
+/// pending until a request timeout or the QUIC idle timeout if the peer
+/// withholds the stream or flow-control credit required by [RFC 9114, Section 6.2].
 ///
 /// [RFC 9114, Section 6.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2
 enum CriticalStreams {
@@ -399,12 +399,16 @@ where
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
                     //# These frames have no semantics, and
                     //# they MAY be sent on any stream where frames are allowed to be sent.
-                    if let Some(settings) = settings
-                        && let Err(error) =
-                            send.send_data(stream::WriteBuf::control_with_grease(settings))
-                    {
-                        let error = self.critical_stream_error(CriticalStream::Control, error);
-                        return Poll::Ready(Err(error));
+                    if let Some(settings) = settings {
+                        let buf = if self.config.send_grease {
+                            stream::WriteBuf::control_with_grease(settings)
+                        } else {
+                            stream::UniStreamHeader::Control(settings).into()
+                        };
+                        if let Err(error) = send.send_data(buf) {
+                            let error = self.critical_stream_error(CriticalStream::Control, error);
+                            return Poll::Ready(Err(error));
+                        }
                     }
                     if let Err(error) = ready!(send.poll_ready(cx)) {
                         let error = self.critical_stream_error(CriticalStream::Control, error);

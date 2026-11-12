@@ -13,6 +13,7 @@ use super::{Pair, http3_quinn, init_tracing};
 use crate::{
     client,
     client::SendRequest,
+    config::Config,
     error::{Code, ConnectionError, LocalError, StreamError},
     proto::{
         coding::{Decode as _, Encode as _},
@@ -2088,6 +2089,55 @@ async fn client_sets_up_critical_streams_in_order() {
     })
     .await
     .expect("the client did not set up its critical streams");
+}
+
+#[tokio::test]
+async fn grease_disabled_on_control_stream() {
+    init_tracing();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut pair = Pair::default();
+        let endpoint = pair.server_inner();
+        let (client_quic, server_quic) = tokio::join!(pair.client_inner(), async {
+            endpoint.accept().await.unwrap().await.unwrap()
+        });
+        let (mut client, _send_request) = client::builder()
+            .send_grease(false)
+            .build::<_, _, Bytes>(http3_quinn::Connection::new(client_quic.clone()))
+            .await
+            .unwrap();
+        let mut server = server::builder()
+            .send_grease(false)
+            .build::<_, Bytes>(http3_quinn::Connection::new(server_quic.clone()))
+            .await
+            .unwrap();
+
+        // GOAWAY marks the end of the initial bytes without closing the stream.
+        client.shutdown(0).await.unwrap();
+        server.shutdown(0).await.unwrap();
+
+        let settings = Settings::try_from(Config {
+            send_grease: false,
+            ..Config::default()
+        })
+        .unwrap();
+        let mut expected = BytesMut::new();
+        StreamType::CONTROL.encode(&mut expected);
+        Frame::<Bytes>::Settings(settings).encode(&mut expected);
+        Frame::<Bytes>::Goaway(VarInt::from_u32(0)).encode(&mut expected);
+
+        for (role, peer) in [("client", server_quic), ("server", client_quic)] {
+            let mut control = peer.accept_uni().await.unwrap();
+            let mut received = vec![0; expected.len()];
+            control.read_exact(&mut received).await.unwrap();
+            assert_eq!(
+                received.as_slice(),
+                expected.as_ref(),
+                "{role} control stream"
+            );
+        }
+    })
+    .await
+    .expect("timed out reading the control streams");
 }
 
 #[tokio::test]
