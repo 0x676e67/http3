@@ -40,6 +40,6 @@ ngtcp2 = { workspace = true }
 h3-quinn = { version = "0.0.10", features = ["tracing"] }
 rustls-native-certs = { workspace = true }
 tempfile = "3"
-tokio-quiche = { version = "0.19.1", default-features = false }
+tokio-quiche = { version = "0.20.1", default-features = false }
 tquic = "1.6"
 tokio-ngtcp2 = { workspace = true }
