@@ -2,7 +2,7 @@
 
 use std::{
     marker::PhantomData,
-    mem,
+    mem::{self, DropGuard},
     sync::Arc,
     task::{Context, Poll},
 };
@@ -256,24 +256,21 @@ where
             }
             stream = Self::open_request_stream_with_state(&mut self.open, &self.conn_state).await?;
             let mut guard =
-                OpeningStream::<_, B>::new(&mut stream, self.decoder.as_ref(), &self.conn_state);
+                guard_opening_stream::<_, B>(&mut stream, self.decoder.as_ref(), &self.conn_state);
 
-            let encoder_instructions_queued = match encoder.encode(
-                guard.stream.send_id(),
-                &mut self.qpack_encode_buffer,
-                &headers,
-            ) {
-                Ok(encoded) => encoded,
-                Err(error) => {
-                    clear_qpack_encode_buffer(&mut self.qpack_encode_buffer);
-                    return Err(self.handle_connection_error_on_stream(
-                        InternalConnectionError::new(
-                            Code::H3_INTERNAL_ERROR,
-                            format!("failed to encode request headers: {error}"),
-                        ),
-                    ));
-                }
-            };
+            let encoder_instructions_queued =
+                match encoder.encode(guard.send_id(), &mut self.qpack_encode_buffer, &headers) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        clear_qpack_encode_buffer(&mut self.qpack_encode_buffer);
+                        return Err(self.handle_connection_error_on_stream(
+                            InternalConnectionError::new(
+                                Code::H3_INTERNAL_ERROR,
+                                format!("failed to encode request headers: {error}"),
+                            ),
+                        ));
+                    }
+                };
 
             drop(headers);
             let block = take_qpack_encode_buffer(&mut self.qpack_encode_buffer);
@@ -284,8 +281,8 @@ where
             // Keep dynamic references tracked once encoding commits. A canceled
             // write may already be peer-visible and can still produce a Section
             // Acknowledgment or Stream Cancellation.
-            Self::write_headers(guard.stream, block, &self.conn_state).await?;
-            guard.complete = true;
+            Self::write_headers(&mut **guard, block, &self.conn_state).await?;
+            DropGuard::dismiss(guard);
         } else {
             let mem_size = match qpack::encode_stateless(&mut self.qpack_encode_buffer, &headers) {
                 Ok(mem_size) => mem_size,
@@ -311,9 +308,9 @@ where
             }
             stream = Self::open_request_stream_with_state(&mut self.open, &self.conn_state).await?;
             let mut guard =
-                OpeningStream::<_, B>::new(&mut stream, self.decoder.as_ref(), &self.conn_state);
-            Self::write_headers(guard.stream, block, &self.conn_state).await?;
-            guard.complete = true;
+                guard_opening_stream::<_, B>(&mut stream, self.decoder.as_ref(), &self.conn_state);
+            Self::write_headers(&mut **guard, block, &self.conn_state).await?;
+            DropGuard::dismiss(guard);
         }
 
         let request_stream = RequestStream::new(
@@ -356,7 +353,7 @@ where
             .map_err(|e| state.handle_quic_stream_error(e))?;
         if let Some(error) = state.check_peer_connection_closing() {
             // GOAWAY can race the transport's successful open.
-            let _guard = OpeningStream::<_, B>::new(&mut stream, None, state);
+            let _guard = guard_opening_stream::<_, B>(&mut stream, None, state);
             return Err(error);
         }
         Ok(stream)
@@ -649,41 +646,27 @@ where
 
 // Protect the open stream before its public RequestStream owner exists.
 // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1
-struct OpeningStream<'a, S: quic::SendStream<B> + quic::RecvStream, B: Buf> {
+fn guard_opening_stream<'a, S, B>(
     stream: &'a mut S,
-    complete: bool,
-    buffer: PhantomData<fn(B)>,
     decoder: Option<&'a QpackDecoder>,
     shared: &'a SharedState,
-}
-
-impl<'a, S: quic::SendStream<B> + quic::RecvStream, B: Buf> OpeningStream<'a, S, B> {
-    fn new(stream: &'a mut S, decoder: Option<&'a QpackDecoder>, shared: &'a SharedState) -> Self {
-        Self {
-            stream,
-            complete: false,
-            buffer: PhantomData,
-            decoder,
-            shared,
+) -> DropGuard<&'a mut S, impl FnOnce(&'a mut S) + 'a>
+where
+    S: quic::SendStream<B> + quic::RecvStream,
+    B: Buf,
+{
+    DropGuard::new(stream, move |stream| {
+        stream.reset(Code::H3_REQUEST_CANCELLED.value());
+        stream.stop_sending(Code::H3_REQUEST_CANCELLED.value());
+        // Abandoning the response also releases the peer encoder's
+        // references; our request encoder still waits for peer feedback.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.2.2
+        if let Some(decoder) = decoder
+            && decoder.queue_stream_cancellation(stream.recv_id())
+        {
+            shared.waker().wake();
         }
-    }
-}
-
-impl<S: quic::SendStream<B> + quic::RecvStream, B: Buf> Drop for OpeningStream<'_, S, B> {
-    fn drop(&mut self) {
-        if !self.complete {
-            self.stream.reset(Code::H3_REQUEST_CANCELLED.value());
-            self.stream.stop_sending(Code::H3_REQUEST_CANCELLED.value());
-            // Abandoning the response also releases the peer encoder's
-            // references; our request encoder still waits for peer feedback.
-            // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.2.2
-            if let Some(decoder) = self.decoder
-                && decoder.queue_stream_cancellation(self.stream.recv_id())
-            {
-                self.shared.waker().wake();
-            }
-        }
-    }
+    })
 }
 
 #[cfg(test)]

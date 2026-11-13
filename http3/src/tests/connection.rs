@@ -1,9 +1,8 @@
 // identity_op: we write out how test values are computed
 #![allow(clippy::identity_op)]
 
-use std::{borrow::BorrowMut, time::Duration};
+use std::{assert_matches, borrow::BorrowMut, time::Duration};
 
-use assert_matches::assert_matches;
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{FutureExt as _, future};
 use http::{Request, Response, StatusCode};
