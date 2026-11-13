@@ -249,9 +249,10 @@ impl Builder {
 
     /// Create a new HTTP/3 client from a `quic` connection
     ///
-    /// This does not wait for the peer. SETTINGS and the QPACK streams are sent
-    /// right away when the peer has granted the stream credit; otherwise the
-    /// returned [`Connection`] sends them when polled, which it must be anyway.
+    /// This does not wait for the peer. SETTINGS is sent and the QPACK streams
+    /// are opened right away when the peer has granted the stream credit;
+    /// otherwise the returned [`Connection`] does so when polled, which it must
+    /// be anyway.
     pub async fn build<C, O, B>(
         &mut self,
         quic: C,

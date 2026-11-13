@@ -15,7 +15,7 @@ use crate::{
     frame::FrameStream,
     proto::{
         coding::Encode,
-        frame::{Frame, FrameHeader, Settings},
+        frame::{Frame, FrameHeader, Settings, encode_grease_frame},
         stream::StreamType,
         varint::VarInt,
     },
@@ -193,6 +193,20 @@ where
         let mut me = Self::inline(None);
         me.encode_stream_type(ty);
         me
+    }
+}
+
+impl<B: Buf> WriteBuf<B> {
+    /// The control stream header followed by a reserved frame.
+    pub(crate) fn control_with_grease(settings: Settings) -> Self {
+        let capacity = settings
+            .len()
+            .saturating_add(VarInt::MAX_SIZE.saturating_mul(5))
+            .saturating_add(3);
+        let mut encoded = BytesMut::with_capacity(capacity);
+        UniStreamHeader::Control(settings).encode(&mut encoded);
+        encode_grease_frame(&mut encoded);
+        Self::heap(encoded.freeze(), None)
     }
 }
 
