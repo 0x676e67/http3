@@ -3,6 +3,7 @@
 use std::{
     ffi::OsStr,
     io::{self, BufRead, BufReader, Read},
+    mem::DropGuard,
     path::Path,
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
@@ -59,45 +60,11 @@ impl ChildRole {
     }
 }
 
-struct ChildCleanupGuard {
-    child: Option<Child>,
-}
-
-impl ChildCleanupGuard {
-    fn child_mut(&mut self) -> Result<&mut Child> {
-        self.child
-            .as_mut()
-            .context("benchmark child process was already consumed")
-    }
-
-    fn kill(&mut self) {
-        if let Some(child) = &mut self.child {
-            let _ = child.kill();
-        }
-    }
-
-    fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
-        let child = self
-            .child
-            .take()
-            .ok_or_else(|| std::io::Error::other("benchmark child process was already consumed"))?;
-        child.wait_with_output()
-    }
-
-    fn into_child(mut self) -> Result<Child> {
-        self.child
-            .take()
-            .context("benchmark child process was already consumed")
-    }
-}
-
-impl Drop for ChildCleanupGuard {
-    fn drop(&mut self) {
-        if let Some(child) = &mut self.child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
+fn guard_child(child: Child) -> DropGuard<Child, impl FnOnce(Child)> {
+    DropGuard::new(child, |mut child| {
+        let _ = child.kill();
+        let _ = child.wait();
+    })
 }
 
 pub(crate) struct ClientRunner<'a> {
@@ -137,21 +104,18 @@ impl ClientRunner<'_> {
             } else {
                 Stdio::piped()
             });
-        let mut child = ChildCleanupGuard {
-            child: Some(
-                command
-                    .spawn()
-                    .with_context(|| format!("could not run {} client", self.library))?,
-            ),
-        };
+        let mut child = guard_child(
+            command
+                .spawn()
+                .with_context(|| format!("could not run {} client", self.library))?,
+        );
         if child
-            .child_mut()?
             .wait_timeout(client_timeout(case))
             .context("could not wait for benchmark client")?
             .is_none()
         {
-            child.kill();
-            let output = child
+            let _ = child.kill();
+            let output = DropGuard::dismiss(child)
                 .wait_with_output()
                 .context("could not collect timed-out benchmark client")?;
             bail!(
@@ -161,7 +125,7 @@ impl ClientRunner<'_> {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let output = child
+        let output = DropGuard::dismiss(child)
             .wait_with_output()
             .context("could not collect benchmark client output")?;
 
@@ -195,29 +159,25 @@ impl ServerGuard {
     pub(crate) fn start(executable: &Path, case: Case) -> Result<Self> {
         let body_bytes = case.body_bytes;
         let headers = case.headers;
-        let mut child = ChildCleanupGuard {
-            child: Some(
-                ChildRole::Server
-                    .command(executable)
-                    .arg(body_bytes.to_string())
-                    .arg(headers.to_string())
-                    .arg(case.qpack.to_string())
-                    .current_dir(workspace_root())
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit())
-                    .spawn()
-                    .context("could not start benchmark server")?,
-            ),
-        };
+        let mut child = guard_child(
+            ChildRole::Server
+                .command(executable)
+                .arg(body_bytes.to_string())
+                .arg(headers.to_string())
+                .arg(case.qpack.to_string())
+                .current_dir(workspace_root())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .context("could not start benchmark server")?,
+        );
         let stdin = child
-            .child_mut()?
             .stdin
             .take()
             .context("benchmark server stdin was not captured")?;
 
         let stdout = child
-            .child_mut()?
             .stdout
             .take()
             .context("benchmark server stdout was not captured")?;
@@ -251,7 +211,6 @@ impl ServerGuard {
         );
         if ready.trim() != expected {
             let status = child
-                .child_mut()?
                 .try_wait()
                 .context("could not inspect benchmark server")?;
             bail!(
@@ -261,7 +220,7 @@ impl ServerGuard {
         }
 
         Ok(Self {
-            child: child.into_child()?,
+            child: DropGuard::dismiss(child),
             stdin: Some(stdin),
             output: Some(output),
         })
