@@ -123,9 +123,7 @@ impl From<TryFromIntError> for Error {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
-    use assert_matches::assert_matches;
+    use std::{assert_matches, io::Cursor};
 
     use super::*;
 

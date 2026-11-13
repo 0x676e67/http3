@@ -1,6 +1,5 @@
-use std::{future::Future as _, hint::black_box, time::Duration};
+use std::{assert_matches, future::Future as _, hint::black_box, time::Duration};
 
-use assert_matches::assert_matches;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::future;
 use http::{HeaderMap, Method, Request, Response, StatusCode, request};

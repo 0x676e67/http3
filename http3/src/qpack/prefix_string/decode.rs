@@ -674,16 +674,16 @@ impl Iterator for DecodeIter<'_> {
                 self.finished = true;
                 Some(Err(Error::Eos))
             }
-            Decoded::Symbol { symbol, bit_count } => {
-                let Ok(symbol) = u8::try_from(symbol) else {
-                    self.finished = true;
-                    return Some(Err(Error::Eos));
-                };
+            Decoded::Symbol { symbol, bit_count } if let Ok(byte) = u8::try_from(symbol) => {
                 if self.consume(bit_count) {
-                    Some(Ok(symbol))
+                    Some(Ok(byte))
                 } else {
                     self.finish_tail()
                 }
+            }
+            Decoded::Symbol { .. } => {
+                self.finished = true;
+                Some(Err(Error::Eos))
             }
             Decoded::Incomplete => self.finish_tail(),
         }

@@ -22,38 +22,31 @@ pub use shared_state::{ConnectionState, SharedState};
 
 pub mod error;
 
-#[cfg(feature = "unstable")]
-#[allow(missing_docs)]
-pub mod connection;
-#[cfg(feature = "unstable")]
-#[allow(missing_docs)]
-pub mod frame;
-#[cfg(feature = "unstable")]
-#[allow(missing_docs)]
-pub mod proto;
-#[cfg(feature = "unstable")]
-#[allow(dead_code, missing_docs)]
-pub mod qpack;
-#[cfg(feature = "unstable")]
-#[allow(missing_docs)]
-pub mod stream;
-#[cfg(feature = "unstable")]
-#[allow(missing_docs)]
-pub mod webtransport;
-
-#[cfg(not(feature = "unstable"))]
-mod connection;
-#[cfg(not(feature = "unstable"))]
-mod frame;
-#[cfg(not(feature = "unstable"))]
-mod proto;
-#[cfg(not(feature = "unstable"))]
-#[allow(dead_code)]
-mod qpack;
-#[cfg(not(feature = "unstable"))]
-mod stream;
-#[cfg(not(feature = "unstable"))]
-mod webtransport;
+cfg_select! {
+    feature = "unstable" => {
+        #[allow(missing_docs)]
+        pub mod connection;
+        #[allow(missing_docs)]
+        pub mod frame;
+        #[allow(missing_docs)]
+        pub mod proto;
+        #[allow(dead_code, missing_docs)]
+        pub mod qpack;
+        #[allow(missing_docs)]
+        pub mod stream;
+        #[allow(missing_docs)]
+        pub mod webtransport;
+    }
+    _ => {
+        mod connection;
+        mod frame;
+        mod proto;
+        #[allow(dead_code)]
+        mod qpack;
+        mod stream;
+        mod webtransport;
+    }
+}
 
 #[cfg(feature = "unstable")]
 pub use proto::frame::{ExperimentalSettings, ExperimentalSettingsBuilder};

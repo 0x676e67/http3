@@ -50,11 +50,7 @@ impl BufList<Bytes> {
             self.remaining = self.remaining.saturating_sub(chunk.remaining());
         }
 
-        if let Some(front) = self.bufs.front()
-            && front.remaining() == 0
-        {
-            let _ = self.bufs.pop_front();
-        }
+        self.bufs.pop_front_if(|front| !front.has_remaining());
         chunk
     }
 
