@@ -668,22 +668,16 @@ impl Iterator for DecodeIter<'_> {
         // Keep per-symbol state in the shared whole-string loop, instead of
         // returning through an out-of-line Iterator call for every decoded byte.
         match decode_symbol(self.bits, self.bit_count) {
-            Decoded::Symbol {
-                symbol: EOS_SYMBOL, ..
-            } => {
-                self.finished = true;
-                Some(Err(Error::Eos))
-            }
-            Decoded::Symbol { symbol, bit_count } => {
-                let Ok(symbol) = u8::try_from(symbol) else {
-                    self.finished = true;
-                    return Some(Err(Error::Eos));
-                };
+            Decoded::Symbol { symbol, bit_count } if let Ok(byte) = u8::try_from(symbol) => {
                 if self.consume(bit_count) {
-                    Some(Ok(symbol))
+                    Some(Ok(byte))
                 } else {
                     self.finish_tail()
                 }
+            }
+            Decoded::Symbol { .. } => {
+                self.finished = true;
+                Some(Err(Error::Eos))
             }
             Decoded::Incomplete => self.finish_tail(),
         }
