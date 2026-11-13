@@ -136,6 +136,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(release-plz)* verify publishable crates before publishing
 
 ## [unreleased]
+## [0.3.0](https://github.com/0x676e67/http3/compare/v0.2.0..v0.3.0) - 2026-11-13
+
+### Bug Fixes
+
+- Flush buffered data before next write and finish ([#119](https://github.com/0x676e67/http3/issues/119)) - ([b7fd1eb](https://github.com/0x676e67/http3/commit/b7fd1eb48c44c11923e560de817767f3fa0c42a9))
+
+### Miscellaneous Tasks
+
+- Remove newly added license files - ([7436e7c](https://github.com/0x676e67/http3/commit/7436e7c8c000256204b6fcfaa3b9bc38cbb2645b))
+
+## [0.3.0](https://github.com/0x676e67/http3/compare/v0.2.0..v0.3.0) - 2026-11-13
+
+### Refactor
+
+- Adopt stable Rust APIs ([#177](https://github.com/0x676e67/http3/issues/177)) - ([58b7140](https://github.com/0x676e67/http3/commit/58b7140a6466eb592bcd77a3cdb315600996d9b9))
+
+## [0.3.0](https://github.com/0x676e67/http3/compare/v0.2.0..v0.3.0) - 2026-11-13
+
+### Features
+
+- *(client)* Open critical streams from the connection driver ([#170](https://github.com/0x676e67/http3/issues/170)) - ([449e733](https://github.com/0x676e67/http3/commit/449e7333a6a1480af52fa3dd99f4679a18441754))
+- *(client)* [**breaking**] Configure settings order and experimental settings with builders ([#156](https://github.com/0x676e67/http3/issues/156)) - ([15be8f4](https://github.com/0x676e67/http3/commit/15be8f47d29ee940abd0a670df76b451f2090e6a))
+- *(client)* Configure pseudo-header order on the builder ([#144](https://github.com/0x676e67/http3/issues/144)) - ([34844c5](https://github.com/0x676e67/http3/commit/34844c5f41805d04f30c54ae7e601e21b765c505))
+
+### Bug Fixes
+
+- *(client)* Reject body reads before the final response ([#135](https://github.com/0x676e67/http3/issues/135)) - ([ed8ea91](https://github.com/0x676e67/http3/commit/ed8ea919f9a7031d2d7de648110efeece85a9666))
+- *(qpack)* Bound decoder instructions queued for an idle connection driver ([#163](https://github.com/0x676e67/http3/issues/163)) - ([1df36d8](https://github.com/0x676e67/http3/commit/1df36d843cf31f336e96782245b0a84f6cb708d0))
+- *(server)* Abort dropped request streams with phase-specific error codes ([#166](https://github.com/0x676e67/http3/issues/166)) - ([78317e9](https://github.com/0x676e67/http3/commit/78317e919714e0be8c2ee9a761ddfe5a13ce28a5))
+- *(server)* Advertise the first unprocessed request in GOAWAY ([#133](https://github.com/0x676e67/http3/issues/133)) - ([de6ced7](https://github.com/0x676e67/http3/commit/de6ced7bd745fa060ad9e7c1093b59f442f777de))
+- *(server)* Consume GREASE flag when creating resolvers - ([200e6fd](https://github.com/0x676e67/http3/commit/200e6fdd81d4853ec06b95214790a354c1bc8d74))
+- Keep a cancelled GOAWAY retryable and let the driver finish it ([#175](https://github.com/0x676e67/http3/issues/175)) - ([79c763a](https://github.com/0x676e67/http3/commit/79c763a3a94547e3fc9a78b01a2be0ca47afdad0))
+- Reject messages whose DATA length differs from Content-Length ([#169](https://github.com/0x676e67/http3/issues/169)) - ([163a904](https://github.com/0x676e67/http3/commit/163a9047bfa3c4fa09f6027547a265d45d46edcf))
+- Parse unidirectional stream header varints from buffered bytes ([#167](https://github.com/0x676e67/http3/issues/167)) - ([41cee7a](https://github.com/0x676e67/http3/commit/41cee7a8166ba681847505f87ad61bfcab517473))
+- Bound frame payloads buffered before decoding ([#165](https://github.com/0x676e67/http3/issues/165)) - ([2606690](https://github.com/0x676e67/http3/commit/26066909f37307eb9c8a7da5d9ea04699fc6d870))
+- Reject an unknown frame before SETTINGS on the control stream ([#164](https://github.com/0x676e67/http3/issues/164)) - ([efcd09c](https://github.com/0x676e67/http3/commit/efcd09ca380f9fe7b622bdcfbc3a1fc55b661245))
+- Keep reading control frames while the GREASE stream is blocked ([#162](https://github.com/0x676e67/http3/issues/162)) - ([b0b5de4](https://github.com/0x676e67/http3/commit/b0b5de4f189893737d88692f83bc5da06e269268))
+- Reject boolean SETTINGS values other than 0 or 1 ([#154](https://github.com/0x676e67/http3/issues/154)) - ([f81d797](https://github.com/0x676e67/http3/commit/f81d797e86a00b1f979a0d817ddc00c197ede6a5))
+- Reject control frame payloads that do not match their fields ([#143](https://github.com/0x676e67/http3/issues/143)) - ([7ab9979](https://github.com/0x676e67/http3/commit/7ab9979e8f18f9e94113fe6805f1b220a3fbfcb5))
+- Reject trailers read before the body ends without a panic ([#134](https://github.com/0x676e67/http3/issues/134)) - ([7857a59](https://github.com/0x676e67/http3/commit/7857a59125f4e700c15da517a408c616f9ede998))
+- Release request tracking when resolver ends early - ([ee1d5ca](https://github.com/0x676e67/http3/commit/ee1d5ca52845dc624a2f1657ef3e905069e7be1f))
+- Require response headers before server body frames ([#121](https://github.com/0x676e67/http3/issues/121)) - ([88f9761](https://github.com/0x676e67/http3/commit/88f97610ba8abfd9e667e84ed48c7091baef536d))
+- Keep pending response headers in send state ([#120](https://github.com/0x676e67/http3/issues/120)) - ([db2b99c](https://github.com/0x676e67/http3/commit/db2b99c0659735e144a2ce9c92a648c6c4f4d142))
+- Flush buffered data before next write and finish ([#119](https://github.com/0x676e67/http3/issues/119)) - ([b7fd1eb](https://github.com/0x676e67/http3/commit/b7fd1eb48c44c11923e560de817767f3fa0c42a9))
+
+### Refactor
+
+- Adopt stable Rust APIs ([#177](https://github.com/0x676e67/http3/issues/177)) - ([58b7140](https://github.com/0x676e67/http3/commit/58b7140a6466eb592bcd77a3cdb315600996d9b9))
+
+### Documentation
+
+- Clarify recv_data and poll_recv_data results - ([82c2f52](https://github.com/0x676e67/http3/commit/82c2f5254ed6269424b78647e6d3332a81243e17))
+- Complete pseudo-header compliance backport - ([b390da2](https://github.com/0x676e67/http3/commit/b390da229da02439c36b15f037ad0100c7591567))
+- Backport applicable Duvet compliance annotations - ([6684ac6](https://github.com/0x676e67/http3/commit/6684ac627c2a23433094cdad5b430a39f2890b1c))
+
+### Styling
+
+- Format request resolver regression tests - ([6cf6adb](https://github.com/0x676e67/http3/commit/6cf6adb1378ab70b2071d76d3b3183cd6f61dec1))
+
+### Miscellaneous Tasks
+
+- Remove newly added license files - ([7436e7c](https://github.com/0x676e67/http3/commit/7436e7c8c000256204b6fcfaa3b9bc38cbb2645b))
+- Keep GREASE backport scoped to upstream fix - ([ba4f366](https://github.com/0x676e67/http3/commit/ba4f366d5ac9f2c7dcf2e4deb6e8d7269c0bb096))
+
 ## [0.2.0](https://github.com/0x676e67/http3/compare/v0.1.1..v0.2.0) - 2026-09-23
 
 ### Features
