@@ -16,7 +16,6 @@ h3 = { version = "0.0.8", features = [
     "tracing",
 ] }
 http3-quic = { workspace = true, features = ["tracing"] }
-h3-quinn = { version = "0.0.10", features = ["tracing"] }
 quic = { workspace = true, features = [
     "runtime-tokio",
     "rustls",
@@ -33,13 +32,14 @@ rustls = { workspace = true, features = [
     "ring",
     "std",
 ] }
-rustls-native-certs = { workspace = true }
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
-tempfile = "3"
 tokio = { workspace = true, features = ["full"] }
+ngtcp2 = { workspace = true }
 
-# QUIC/HTTP3 Server backends
+[dev-dependencies]
+h3-quinn = { version = "0.0.10", features = ["tracing"] }
+rustls-native-certs = { workspace = true }
+tempfile = "3"
 tokio-quiche = { version = "0.19.1", default-features = false }
 tquic = "1.6"
-ngtcp2 = { workspace = true }
 tokio-ngtcp2 = { workspace = true }
