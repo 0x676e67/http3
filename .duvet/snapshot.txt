@@ -721,8 +721,8 @@ SPECIFICATION: https://www.rfc-editor.org/rfc/rfc9114
     TEXT[implication]:    Frame types of the format 0x1f * N + 0x21 for non-negative integer
     TEXT[implication]:    values of N are reserved to exercise the requirement that unknown
     TEXT[implication]:    types be ignored (Section 9).
-    TEXT[!MAY,implication]: These frames have no semantics, and
-    TEXT[!MAY,implication]:    they MAY be sent on any stream where frames are allowed to be sent.
+    TEXT[!MAY,implementation]: These frames have no semantics, and
+    TEXT[!MAY,implementation]:    they MAY be sent on any stream where frames are allowed to be sent.
     TEXT[!MUST,implementation]: Endpoints MUST
     TEXT[!MUST,implementation]:    NOT consider these frames to have any meaning upon receipt.
     TEXT[!MUST,implementation]: These frame

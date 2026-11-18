@@ -566,6 +566,19 @@ impl FrameType {
     }
 }
 
+/// Encodes a reserved frame to follow SETTINGS: one random 32-bit `n` gives
+/// the type `0x1f * n + 0x21` and `n % 4` random payload bytes.
+/// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8>.
+pub(crate) fn encode_grease_frame<B: BufMut>(buf: &mut B) {
+    let n = fastrand::u32(..);
+    FrameType(0x1f * u64::from(n) + 0x21).encode(buf);
+    let len = n % 4;
+    buf.write_var(u64::from(len));
+    for _ in 0..len {
+        buf.put_u8(fastrand::u8(..));
+    }
+}
+
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct FrameType(u64);
 
@@ -1028,6 +1041,22 @@ mod tests {
 
     use super::*;
     use crate::stream::WriteBuf;
+
+    #[test]
+    fn grease_frame_type_and_length_share_one_value() {
+        for _ in 0..64 {
+            let mut buf = bytes::BytesMut::new();
+            encode_grease_frame(&mut buf);
+            let ty = buf.get_var().unwrap();
+            let len = buf.get_var().unwrap();
+            // One random 32-bit value picks the type and the payload length.
+            let n = (ty - 0x21) / 0x1f;
+            assert_eq!((ty - 0x21) % 0x1f, 0);
+            assert!(n <= u64::from(u32::MAX));
+            assert_eq!(len, n % 4);
+            assert_eq!(buf.remaining() as u64, len);
+        }
+    }
 
     fn frame_header(ty: FrameType, len: u64) -> Cursor<Vec<u8>> {
         let mut wire = Vec::new();
