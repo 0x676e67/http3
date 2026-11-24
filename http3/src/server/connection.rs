@@ -273,7 +273,7 @@ where
         // progressing while the server waits for another request stream.
         self.inner.poll_qpack(cx)?;
         // Finishes GOAWAY bytes a cancelled shutdown left on the control stream.
-        if let Poll::Ready(Err(error)) = self.inner.poll_control_flush(cx, None) {
+        if let Poll::Ready(Err(error)) = self.inner.poll_control_flush(cx) {
             return Poll::Ready(Err(error));
         }
 

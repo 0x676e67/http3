@@ -10,7 +10,6 @@ use std::{
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::future;
 use http::request;
-use tokio::sync::mpsc;
 #[cfg(feature = "tracing")]
 use tracing::{info, instrument, trace};
 
@@ -18,6 +17,7 @@ use super::stream::RequestStream;
 use crate::{
     PseudoOrder,
     connection::{self, ConnectionInner},
+    control::ControlSend,
     error::{
         Code, ConnectionError, StreamError, connection_error_creators::CloseStream,
         internal_error::InternalConnectionError,
@@ -147,7 +147,7 @@ where
     pub(super) send_grease_frame: bool,
     pub(super) qpack_encode_buffer: BytesMut,
     pub(super) pseudo_order: Option<PseudoOrder>,
-    pub(super) priority_updates: mpsc::Sender<RequestPriorityUpdate>,
+    pub(super) control_send: Arc<ControlSend<T::SendStream>>,
 }
 
 impl<T, B> ConnectionState for SendRequest<T, B>
@@ -174,8 +174,9 @@ where
 {
     /// Send an HTTP/3 request to the server
     ///
-    /// An [`ext::PriorityUpdate`] request extension queues a PRIORITY_UPDATE for the connection
-    /// driver. Request HEADERS can be sent without waiting for the control stream.
+    /// When the control stream is writable, an [`ext::PriorityUpdate`] request extension is
+    /// submitted to QUIC before this request's HEADERS. Otherwise the driver sends the
+    /// update from its bounded queue when the control stream becomes writable.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_request(
         &mut self,
@@ -319,13 +320,20 @@ where
             (guard, block)
         };
 
-        // Use the completed open's stream ID so the update is within the peer's stream limit.
+        // Submit the update before HEADERS when the control stream is writable. Opening
+        // the request first gives us a stream ID within the peer's stream limit.
         // https://www.rfc-editor.org/rfc/rfc9218.html#section-7.2
         if let Some(value) = priority_update {
-            let _ = self.priority_updates.try_send(RequestPriorityUpdate {
+            let update = RequestPriorityUpdate {
                 stream_id: guard.send_id(),
                 value,
-            });
+            };
+            self.control_send.send_now(update).map_err(|error| {
+                self.handle_connection_error_on_stream(connection::critical_send_stream_error(
+                    error,
+                    connection::CriticalStream::Control,
+                ))
+            })?;
         }
         // Keep dynamic references tracked once encoding commits. A canceled
         // write may already be peer-visible and can still produce a Section
@@ -399,7 +407,7 @@ where
             // allocation would add synchronization to the request hot path.
             qpack_encode_buffer: BytesMut::new(),
             pseudo_order: self.pseudo_order.clone(),
-            priority_updates: self.priority_updates.clone(),
+            control_send: self.control_send.clone(),
         }
     }
 }
@@ -506,7 +514,6 @@ where
     pub(super) sent_closing: Option<PushId>,
     // Has a GOAWAY frame been received? If so, this is StreamId the last the remote will accept.
     pub(super) recv_closing: Option<StreamId>,
-    pub(super) priority_updates: mpsc::Receiver<RequestPriorityUpdate>,
 }
 
 impl<C, B> ConnectionState for Connection<C, B>
@@ -557,10 +564,7 @@ where
         if let Err(err) = self.inner.poll_qpack(cx) {
             return Poll::Ready(err);
         }
-        if let Poll::Ready(Err(err)) = self
-            .inner
-            .poll_control_flush(cx, Some(&mut self.priority_updates))
-        {
+        if let Poll::Ready(Err(err)) = self.inner.poll_control_flush(cx) {
             return Poll::Ready(err);
         }
 
@@ -707,7 +711,10 @@ mod integration_tests {
     use futures_util::task::{ArcWake, waker};
 
     use super::*;
-    use crate::quic::{OpenStreams, RecvStream, StreamErrorIncoming, WriteBuf};
+    use crate::{
+        proto::varint::VarInt,
+        quic::{OpenStreams, RecvStream, StreamErrorIncoming, WriteBuf},
+    };
 
     #[derive(Default)]
     struct State {
@@ -727,6 +734,7 @@ mod integration_tests {
         /// Bytes given to `send_data`, reaching `sent` on the next ready poll as in http3-quic.
         pending: Mutex<std::collections::HashMap<u64, Bytes>>,
         sent: Mutex<Vec<Bytes>>,
+        blocked_writer: Mutex<Option<std::task::Waker>>,
     }
 
     impl ArcWake for State {
@@ -767,9 +775,11 @@ mod integration_tests {
     }
 
     impl SendStream<Bytes> for Mock {
-        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
             if self.0.block_write.load(Ordering::Relaxed) && self.0.written.load(Ordering::Relaxed)
             {
+                // Like quinn, keep only the latest blocked writer's waker.
+                *self.0.blocked_writer.lock().unwrap() = Some(cx.waker().clone());
                 Poll::Pending
             } else {
                 if let Some(bytes) = self.0.pending.lock().unwrap().remove(&self.1) {
@@ -853,13 +863,11 @@ mod integration_tests {
         }
     }
 
-    const _: () = {
-        fn check<T: OpenStreams<Bytes> + Send + Sync>() {
-            fn assert_send_sync<S: Send + Sync>() {}
-            assert_send_sync::<SendRequest<T, Bytes>>();
-        }
-        let _ = check::<Mock>;
-    };
+    fn open_control(state: &Arc<State>, shared: &Arc<SharedState>) -> Arc<ControlSend<Mock>> {
+        let control = Arc::new(ControlSend::new(shared.clone()));
+        control.open(Mock(state.clone(), 2));
+        control
+    }
 
     fn sender(state: &Arc<State>, dynamic: bool) -> SendRequest<Mock, Bytes> {
         let encoder = dynamic.then(|| {
@@ -872,7 +880,7 @@ mod integration_tests {
         let conn_state = Arc::<SharedState>::default();
         SendRequest {
             open: Mock(state.clone(), 0),
-            priority_updates: mpsc::channel(1).0,
+            control_send: open_control(state, &conn_state),
             conn_state,
             decoder: None,
             encoder,
@@ -921,55 +929,104 @@ mod integration_tests {
     }
 
     #[test]
-    fn priority_updates_are_queued_independently_of_headers() {
+    fn priority_update_precedes_headers_with_the_value_verbatim() {
+        // 64 bytes: a 2-byte Length, encoded outside the inline prefix.
         let long = format!("u=1, i, x=\"{}\"", "a".repeat(52));
+        let mut long_update = b"\x80\x0f\x07\x00\x40\x41\x08".to_vec();
+        long_update.extend_from_slice(long.as_bytes());
         for dynamic in [false, true] {
             let state = Arc::new(State::default());
             let mut sender = sender(&state, dynamic);
-            let (updates, mut queued) = mpsc::channel(2);
-            sender.priority_updates = updates;
             // Header with a different frame value, header only, frame only, neither.
             send(&mut sender, Some("u=0, i"), Some(""));
             send(&mut sender, Some("u=0, i"), None);
             send(&mut sender, None, Some(&long));
             send(&mut sender, None, None);
 
-            let first = queued.try_recv().unwrap();
-            let second = queued.try_recv().unwrap();
-            assert_eq!(first.stream_id, StreamId::try_from(0).unwrap());
-            assert_eq!(first.value.as_bytes(), b"");
-            assert_eq!(second.stream_id, StreamId::try_from(8).unwrap());
-            assert_eq!(second.value.as_bytes(), long.as_bytes());
-            assert!(matches!(
-                queued.try_recv(),
-                Err(mpsc::error::TryRecvError::Empty)
-            ));
-
+            // Each update names its own request and precedes its HEADERS; no extension, no frame.
             let sent = state.sent.lock().unwrap();
-            assert_eq!(sent.len(), 4);
+            assert_eq!(sent.len(), 6);
+            assert_eq!(sent[0], &b"\x80\x0f\x07\x00\x01\x00"[..]);
+            assert_eq!(sent[3], long_update);
             // The extension leaves the caller's HEADERS alone, and the header is encoded.
-            assert_eq!(sent[0], sent[1]);
-            assert_eq!(sent[2], sent[3]);
-            assert_ne!(sent[1], sent[3]);
+            assert_eq!(sent[1], sent[2]);
+            assert_eq!(sent[4], sent[5]);
+            assert_ne!(sent[2], sent[5]);
         }
     }
 
     #[test]
-    fn full_priority_update_queue_does_not_block_requests() {
+    fn busy_control_stream_queues_priority_updates_for_the_driver() {
         let state = Arc::new(State::default());
-        let mut sender = sender(&state, false);
-        let (updates, mut queued) = mpsc::channel(1);
-        sender.priority_updates = updates;
+        let driver = Arc::new(State::default());
+        let writer = Arc::new(State::default());
+        let shared = Arc::new(SharedState::default());
+        let control = ControlSend::new(shared.clone());
+        let update = |id| RequestPriorityUpdate {
+            stream_id: StreamId::try_from(id).unwrap(),
+            value: ext::PriorityUpdate::new(http::HeaderValue::from_static("u=1")),
+        };
 
-        send(&mut sender, None, Some("u=1"));
-        send(&mut sender, None, Some("u=2"));
+        // Until the driver hands over the stream after SETTINGS, updates wait in the queue.
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        control.send_now::<Bytes>(update(0)).unwrap();
+        assert!(control.poll_flush::<Bytes>(&mut cx).is_pending());
+        control.open(Mock(state.clone(), 2));
+        state.block_write.store(true, Ordering::Relaxed);
+        state.written.store(true, Ordering::Relaxed);
 
-        assert_eq!(state.sent.lock().unwrap().len(), 2);
-        assert_eq!(queued.try_recv().unwrap().value.as_bytes(), b"u=1");
+        // Queueing leaves the wake to the stream, whose writable wake reaches the driver.
+        shared.waker().register(&waker(driver.clone()));
+        for index in 1..256 {
+            control.send_now::<Bytes>(update(index * 4)).unwrap();
+        }
+        assert_eq!(driver.wakes.load(Ordering::Relaxed), 0);
+        state.blocked_writer.lock().unwrap().take().unwrap().wake();
+        assert_eq!(driver.wakes.load(Ordering::Relaxed), 1);
+
+        // The stream's writable wake reaches both the driver and a blocked GOAWAY write,
+        // through the waker of whichever polled last: the write, then a sender.
+        let writer_waker = waker(writer.clone());
+        let mut writer_cx = Context::from_waker(&writer_waker);
+        let handed_off = std::cell::Cell::new(false);
+        let mut goaway = std::pin::pin!(
+            control.write::<Bytes, _>(Some(
+                (Frame::Goaway(VarInt::from_u32(0)), || handed_off.set(true),)
+            ))
+        );
+        for (polled, sender) in [(1, false), (2, true)] {
+            assert!(goaway.as_mut().poll(&mut writer_cx).is_pending());
+            assert!(!handed_off.get());
+            if sender {
+                // The queue is full, so this update is dropped without a wake.
+                control.send_now::<Bytes>(update(256 * 4)).unwrap();
+            }
+            shared.waker().register(&waker(driver.clone()));
+            state.blocked_writer.lock().unwrap().take().unwrap().wake();
+            assert_eq!(driver.wakes.load(Ordering::Relaxed), 1 + polled);
+            assert_eq!(writer.wakes.load(Ordering::Relaxed), polled);
+        }
+
+        state.block_write.store(false, Ordering::Relaxed);
         assert!(matches!(
-            queued.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
+            goaway.as_mut().poll(&mut writer_cx),
+            Poll::Ready(Ok(()))
         ));
+        assert!(handed_off.get());
+
+        // A finished write is not woken again.
+        state.block_write.store(true, Ordering::Relaxed);
+        control.send_now::<Bytes>(update(256 * 4)).unwrap();
+        state.blocked_writer.lock().unwrap().take().unwrap().wake();
+        assert_eq!(writer.wakes.load(Ordering::Relaxed), 2);
+        state.block_write.store(false, Ordering::Relaxed);
+        assert!(matches!(
+            control.poll_flush::<Bytes>(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        let sent = state.sent.lock().unwrap();
+        assert_eq!(sent.len(), 257);
+        assert_eq!(sent[256], &b"\x80\x0f\x07\x00\x05\x43\xfcu=1"[..]);
     }
 
     fn request_operation(

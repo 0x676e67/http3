@@ -297,7 +297,7 @@ pub async fn run_local_quic_client_interop_matrix_with_config(
                         .method(http::Method::GET)
                         .uri(format!("https://localhost:{port}{task_path}"))
                         .body(())?;
-                    // Every other request queues an RFC 9218 PRIORITY_UPDATE.
+                    // Every other request includes an RFC 9218 priority update.
                     if index % 2 == 1 {
                         req.extensions_mut().insert(http3::ext::PriorityUpdate::new(
                             http::HeaderValue::from_static("u=1, i"),

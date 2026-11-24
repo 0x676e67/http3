@@ -92,9 +92,10 @@ pub(crate) enum StreamFrame {
 pub(crate) enum StreamKind {
     /// No stream-specific rules apply.
     Any,
+    /// A control stream that can carry PRIORITY_UPDATE.
     Control,
-    /// A control stream opened by the server.
-    ServerControl,
+    /// A control stream awaiting SETTINGS or opened by the server.
+    ControlWithoutPriorityUpdates,
     /// A request or push stream.
     Request,
 }
@@ -224,7 +225,10 @@ impl Frame<PayloadLen> {
             //# If a PUSH_PROMISE frame is received on the control stream, the client
             //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
             FrameType::DATA | FrameType::HEADERS | FrameType::PUSH_PROMISE
-                if matches!(kind, StreamKind::Control | StreamKind::ServerControl) =>
+                if matches!(
+                    kind,
+                    StreamKind::Control | StreamKind::ControlWithoutPriorityUpdates
+                ) =>
             {
                 return Err(FrameError::UnsupportedFrame(ty.0));
             }
@@ -259,7 +263,10 @@ impl Frame<PayloadLen> {
                 return Err(FrameError::UnsupportedFrame(ty.0));
             }
             FrameType::PRIORITY_UPDATE_REQUEST | FrameType::PRIORITY_UPDATE_PUSH
-                if matches!(kind, StreamKind::Request | StreamKind::ServerControl) =>
+                if matches!(
+                    kind,
+                    StreamKind::Request | StreamKind::ControlWithoutPriorityUpdates
+                ) =>
             {
                 return Err(FrameError::UnsupportedFrame(ty.0));
             }

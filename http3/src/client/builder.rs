@@ -6,7 +6,6 @@ use std::{
 };
 
 use bytes::{Buf, Bytes, BytesMut};
-use tokio::sync::mpsc;
 
 use super::connection::{Connection, SendRequest};
 #[cfg(feature = "unstable")]
@@ -19,8 +18,6 @@ use crate::{
     proto::frame::SettingsOrder,
     quic::{self},
 };
-
-const MAX_QUEUED_PRIORITY_UPDATES: usize = 256;
 
 /// Start building a new HTTP/3 client
 pub fn builder() -> Builder {
@@ -284,7 +281,6 @@ impl Builder {
         if let Poll::Ready(Err(error)) = inner.poll_critical_streams(&mut cx) {
             return Err(error);
         }
-        let (priority_updates_tx, priority_updates_rx) = mpsc::channel(MAX_QUEUED_PRIORITY_UPDATES);
         let send_request = SendRequest {
             open,
             conn_state: inner.shared.clone(),
@@ -295,7 +291,7 @@ impl Builder {
             send_grease_frame: self.config.send_grease,
             qpack_encode_buffer: BytesMut::new(),
             pseudo_order: self.pseudo_order.clone(),
-            priority_updates: priority_updates_tx,
+            control_send: inner.control_send(),
             _buf: PhantomData,
         };
 
@@ -304,7 +300,6 @@ impl Builder {
                 inner,
                 sent_closing: None,
                 recv_closing: None,
-                priority_updates: priority_updates_rx,
             },
             send_request,
         ))

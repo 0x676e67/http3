@@ -1672,6 +1672,67 @@ async fn client_rejects_server_priority_update_at_the_frame_header() {
 }
 
 #[tokio::test]
+async fn server_rejects_priority_update_before_settings_at_the_frame_header() {
+    init_tracing();
+    for ty in [
+        FrameType::PRIORITY_UPDATE_REQUEST,
+        FrameType::PRIORITY_UPDATE_PUSH,
+    ] {
+        for len in [1_u32, 0, 65_537] {
+            let mut control = Vec::new();
+            StreamType::CONTROL.encode(&mut control);
+            ty.encode(&mut control);
+            VarInt::from_u32(len).encode(&mut control);
+            server_rejects_control_stream(&control, Code::H3_MISSING_SETTINGS).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn priority_update_uses_writable_control_stream_without_polling_the_driver() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let server = pair.server_inner();
+    let (done_tx, done_rx) = oneshot::channel();
+
+    let client_fut = async {
+        let (_driver, mut sender) = client::new(pair.client().await).await.unwrap();
+        let request = Request::get("https://localhost/")
+            .extension(crate::ext::PriorityUpdate::new(HeaderValue::from_static(
+                "u=0, i",
+            )))
+            .body(())
+            .unwrap();
+        let _request = sender.send_request(request).await.unwrap();
+        done_rx.await.unwrap();
+    };
+    let server_fut = async {
+        let connection = server.accept().await.unwrap().await.unwrap();
+        let mut got_settings = false;
+        let (_, _streams) = read_peer_control_stream(&connection, |frame| match frame {
+            Frame::Settings(_) => {
+                got_settings = true;
+                None
+            }
+            Frame::PriorityUpdateRequest(id) => {
+                assert!(got_settings, "the update preceded SETTINGS");
+                assert_eq!(id, crate::quic::StreamId::try_from(0).unwrap());
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        done_tx.send(()).unwrap();
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("writable control stream did not send the update");
+}
+
+#[tokio::test]
 async fn priority_updates_queued_on_a_blocked_control_stream_reach_the_server() {
     init_tracing();
     const REQUESTS: u64 = 16;

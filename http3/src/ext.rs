@@ -59,9 +59,10 @@ impl FromStr for Protocol {
 
 /// Priority Field Value of a request's PRIORITY_UPDATE frame, set as a request extension.
 ///
-/// The connection driver writes the value verbatim on the control stream. The request sends its
-/// HEADERS independently, so they may arrive before the update. The update is dropped when the
-/// bounded queue is full. Set the `priority` header separately. A server MAY close the
+/// When the control stream is writable, the value is submitted verbatim to QUIC before the
+/// request's HEADERS. QUIC delivers the two streams independently. If the control stream is
+/// busy or still opening, the driver sends the update from a bounded queue and drops it
+/// when the queue is full. Set the `priority` header separately. A server MAY close the
 /// connection if the value is not a Structured Fields Dictionary; a server built on this crate also
 /// closes it with `H3_EXCESSIVE_LOAD` when the frame payload exceeds 64 KiB.
 /// See [RFC 9218, Section 7](https://www.rfc-editor.org/rfc/rfc9218.html#section-7).
