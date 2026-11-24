@@ -861,7 +861,7 @@ impl fmt::Display for HeaderError {
 
 #[cfg(test)]
 mod tests {
-    use assert_matches::assert_matches;
+    use std::assert_matches;
 
     use super::*;
 

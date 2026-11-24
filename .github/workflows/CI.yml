@@ -12,7 +12,7 @@ env:
     --exclude interop
     --exclude bench
   toolchain_style: nightly
-  toolchain_msrv: "1.98"
+  toolchain_msrv: "1.100"
   toolchain_doc: nightly
   toolchain_lint: stable
   toolchain_fuzz: nightly

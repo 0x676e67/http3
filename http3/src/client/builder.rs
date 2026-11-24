@@ -6,6 +6,7 @@ use std::{
 };
 
 use bytes::{Buf, Bytes, BytesMut};
+use tokio::sync::mpsc;
 
 use super::connection::{Connection, SendRequest};
 #[cfg(feature = "unstable")]
@@ -18,6 +19,8 @@ use crate::{
     proto::frame::SettingsOrder,
     quic::{self},
 };
+
+const MAX_QUEUED_PRIORITY_UPDATES: usize = 256;
 
 /// Start building a new HTTP/3 client
 pub fn builder() -> Builder {
@@ -249,9 +252,10 @@ impl Builder {
 
     /// Create a new HTTP/3 client from a `quic` connection
     ///
-    /// This does not wait for the peer. SETTINGS and the QPACK streams are sent
-    /// right away when the peer has granted the stream credit; otherwise the
-    /// returned [`Connection`] sends them when polled, which it must be anyway.
+    /// This does not wait for the peer. SETTINGS is sent and the QPACK streams
+    /// are opened right away when the peer has granted the stream credit;
+    /// otherwise the returned [`Connection`] does so when polled, which it must
+    /// be anyway.
     pub async fn build<C, O, B>(
         &mut self,
         quic: C,
@@ -267,6 +271,7 @@ impl Builder {
             ..self.config.clone()
         };
         let mut inner = ConnectionInner::new(quic, config)?;
+        inner.expect_server_control_stream();
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
         //= type=implication
@@ -279,6 +284,7 @@ impl Builder {
         if let Poll::Ready(Err(error)) = inner.poll_critical_streams(&mut cx) {
             return Err(error);
         }
+        let (priority_updates_tx, priority_updates_rx) = mpsc::channel(MAX_QUEUED_PRIORITY_UPDATES);
         let send_request = SendRequest {
             open,
             conn_state: inner.shared.clone(),
@@ -289,7 +295,7 @@ impl Builder {
             send_grease_frame: self.config.send_grease,
             qpack_encode_buffer: BytesMut::new(),
             pseudo_order: self.pseudo_order.clone(),
-            control_send: inner.control_send(),
+            priority_updates: priority_updates_tx,
             _buf: PhantomData,
         };
 
@@ -298,6 +304,7 @@ impl Builder {
                 inner,
                 sent_closing: None,
                 recv_closing: None,
+                priority_updates: priority_updates_rx,
             },
             send_request,
         ))

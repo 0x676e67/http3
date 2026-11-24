@@ -20,11 +20,9 @@ where
     B: Buf,
 {
     /// Creates a new datagram frame
-    // TODO: remove for MSRV >= 1.87 https://github.com/rust-lang/rust/issues/128101
-    #[allow(unknown_lints, clippy::manual_is_multiple_of)]
     pub fn new(stream_id: StreamId, payload: B) -> Self {
         assert!(
-            stream_id.into_inner() % 4 == 0,
+            stream_id.into_inner().is_multiple_of(4),
             "StreamId is not divisible by 4"
         );
         // StreamId will be divided by 4 when encoding the Datagram header

@@ -41,7 +41,6 @@ fastrand = { workspace = true }
 smallvec = { workspace = true }
 
 [dev-dependencies]
-assert_matches = { workspace = true }
 futures-util = { workspace = true, features = ["io"] }
 proptest = { workspace = true }
 quinn = { workspace = true, features = [

@@ -87,9 +87,7 @@ impl From<coding::UnexpectedEnd> for Error {
 
 #[cfg(test)]
 mod test {
-    use std::io::Cursor;
-
-    use assert_matches::assert_matches;
+    use std::{assert_matches, io::Cursor};
 
     use crate::qpack::prefix_int::Error;
 

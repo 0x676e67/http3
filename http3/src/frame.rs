@@ -64,6 +64,10 @@ impl<S, B> FrameStream<S, B> {
     pub(crate) fn set_max_field_section_size(&mut self, max: usize) {
         self.decoder.max_field_section_size = max;
     }
+
+    pub(crate) fn set_kind(&mut self, kind: StreamKind) {
+        self.decoder.kind = kind;
+    }
 }
 
 impl<S, B> FrameStream<S, B>
@@ -404,6 +408,7 @@ pub enum FrameProtocolError {
 #[cfg(test)]
 mod tests {
     use std::{
+        assert_matches,
         collections::VecDeque,
         sync::{
             Arc,
@@ -411,7 +416,6 @@ mod tests {
         },
     };
 
-    use assert_matches::assert_matches;
     use bytes::{BufMut, Bytes, BytesMut};
     use futures_util::future::poll_fn;
 

@@ -227,12 +227,15 @@ where
             actual_size,
             max_size,
             ..
+        }) if let Some(rejects) = header_limit_rejects => {
+            let _ = rejects.send((actual_size, max_size));
+            return Ok(());
+        }
+        Err(h3::error::StreamError::HeaderTooBig {
+            actual_size,
+            max_size,
+            ..
         }) => {
-            if let Some(rejects) = header_limit_rejects {
-                let _ = rejects.send((actual_size, max_size));
-                return Ok(());
-            }
-
             return Err(std::io::Error::other(format!(
                 "unexpected h3/quinn server-side field section rejection: {actual_size} > {max_size}"
             ))

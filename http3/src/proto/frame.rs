@@ -93,6 +93,8 @@ pub(crate) enum StreamKind {
     /// No stream-specific rules apply.
     Any,
     Control,
+    /// A control stream opened by the server.
+    ServerControl,
     /// A request or push stream.
     Request,
 }
@@ -222,7 +224,7 @@ impl Frame<PayloadLen> {
             //# If a PUSH_PROMISE frame is received on the control stream, the client
             //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
             FrameType::DATA | FrameType::HEADERS | FrameType::PUSH_PROMISE
-                if matches!(kind, StreamKind::Control) =>
+                if matches!(kind, StreamKind::Control | StreamKind::ServerControl) =>
             {
                 return Err(FrameError::UnsupportedFrame(ty.0));
             }
@@ -252,9 +254,12 @@ impl Frame<PayloadLen> {
             | FrameType::SETTINGS
             | FrameType::GOAWAY
             | FrameType::MAX_PUSH_ID
-            | FrameType::PRIORITY_UPDATE_REQUEST
-            | FrameType::PRIORITY_UPDATE_PUSH
                 if matches!(kind, StreamKind::Request) =>
+            {
+                return Err(FrameError::UnsupportedFrame(ty.0));
+            }
+            FrameType::PRIORITY_UPDATE_REQUEST | FrameType::PRIORITY_UPDATE_PUSH
+                if matches!(kind, StreamKind::Request | StreamKind::ServerControl) =>
             {
                 return Err(FrameError::UnsupportedFrame(ty.0));
             }
@@ -629,6 +634,26 @@ impl FrameType {
     /// format within the range of the Varint implementation
     pub fn grease() -> Self {
         FrameType(fastrand::u64(0..0x210842108421083) * 0x1f + 0x21)
+    }
+
+    pub(crate) fn is_priority_update(number: u64) -> bool {
+        matches!(
+            Self(number),
+            Self::PRIORITY_UPDATE_REQUEST | Self::PRIORITY_UPDATE_PUSH
+        )
+    }
+}
+
+/// Encodes a reserved frame to follow SETTINGS: one random 32-bit `n` gives
+/// the type `0x1f * n + 0x21` and `n % 4` random payload bytes.
+/// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8>.
+pub(crate) fn encode_grease_frame<B: BufMut>(buf: &mut B) {
+    let n = fastrand::u32(..);
+    FrameType(0x1f * u64::from(n) + 0x21).encode(buf);
+    let len = n % 4;
+    buf.write_var(u64::from(len));
+    for _ in 0..len {
+        buf.put_u8(fastrand::u8(..));
     }
 }
 
@@ -1090,12 +1115,26 @@ impl From<InvalidPushId> for FrameError {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
-    use assert_matches::assert_matches;
+    use std::{assert_matches, io::Cursor};
 
     use super::*;
     use crate::stream::WriteBuf;
+
+    #[test]
+    fn grease_frame_type_and_length_share_one_value() {
+        for _ in 0..64 {
+            let mut buf = bytes::BytesMut::new();
+            encode_grease_frame(&mut buf);
+            let ty = buf.get_var().unwrap();
+            let len = buf.get_var().unwrap();
+            // One random 32-bit value picks the type and the payload length.
+            let n = (ty - 0x21) / 0x1f;
+            assert_eq!((ty - 0x21) % 0x1f, 0);
+            assert!(n <= u64::from(u32::MAX));
+            assert_eq!(len, n % 4);
+            assert_eq!(buf.remaining() as u64, len);
+        }
+    }
 
     fn frame_header(ty: FrameType, len: u64) -> Cursor<Vec<u8>> {
         let mut wire = Vec::new();
