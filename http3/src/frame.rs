@@ -43,10 +43,10 @@ impl<S, B> FrameStream<S, B> {
         self.stream
     }
 
-    /// Creates a decoder for a peer control stream, where DATA, HEADERS and
-    /// PUSH_PROMISE are rejected at their frame header.
+    /// Creates a decoder for a peer control stream. PRIORITY_UPDATE can only
+    /// be enabled after the peer's SETTINGS.
     pub(crate) fn control(stream: BufRecvStream<S, B>) -> Self {
-        Self::with_kind(stream, StreamKind::Control)
+        Self::with_kind(stream, StreamKind::ControlWithoutPriorityUpdates)
     }
 
     /// Creates a decoder for a request or push stream, where control frames are
@@ -63,6 +63,10 @@ impl<S, B> FrameStream<S, B> {
 
     pub(crate) fn set_max_field_section_size(&mut self, max: usize) {
         self.decoder.max_field_section_size = max;
+    }
+
+    pub(crate) fn set_kind(&mut self, kind: StreamKind) {
+        self.decoder.kind = kind;
     }
 }
 

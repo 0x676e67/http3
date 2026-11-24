@@ -294,6 +294,20 @@ where
                 trace!("Got settings > {:?}", _setting);
             }
             &Frame::Goaway(id) => self.inner.process_goaway(&mut self.recv_closing, id)?,
+            // Priorities are not scheduled here, so an update naming a request stream is
+            // dropped; the stream-limit check is skipped since RFC 9218 makes it optional.
+            &Frame::PriorityUpdateRequest(id) if id.is_request() => {}
+            // A request update must name a client-initiated bidirectional stream, and this
+            // server promises no pushes, so every push update names an unpromised push.
+            // https://www.rfc-editor.org/rfc/rfc9218.html#section-7.2
+            Frame::PriorityUpdateRequest(_) | Frame::PriorityUpdatePush(_) => {
+                return Poll::Ready(Err(self.inner.handle_connection_error(
+                    InternalConnectionError::new(
+                        Code::H3_ID_ERROR,
+                        "invalid PRIORITY_UPDATE target".to_string(),
+                    ),
+                )));
+            }
             _frame @ Frame::MaxPushId(_) | _frame @ Frame::CancelPush(_) => {
                 #[cfg(feature = "tracing")]
                 warn!("Control frame ignored {:?}", _frame);

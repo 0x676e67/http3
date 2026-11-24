@@ -14,6 +14,7 @@ pub mod server;
 //pub use error::Error;
 
 mod buf;
+mod control;
 
 mod shared_state;
 

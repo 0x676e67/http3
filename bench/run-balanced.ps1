@@ -26,8 +26,8 @@ https://www.rfc-editor.org/rfc/rfc9114.html#section-3.3
 Cargo builds the native nghttp3/ngtcp2 Client and Server before Criterion;
 no separately prepared executable is required. Building it requires CMake,
 LLVM/libclang, NASM, and the Visual Studio 2022 MSVC C/C++ build tools.
-The published ngtcp2-sys and nghttp3-sys crates include the required C sources,
-so repository submodules are not needed for this benchmark.
+The ngtcp2-sys and nghttp3-sys crates build from interop/crates and need the
+repository submodules; their build scripts initialize them in a git checkout.
 
 The Rust Clients use a Tokio current-thread runtime, while the nghttp3 Client
 uses one synchronous event-loop thread. This script intentionally sets no CPU

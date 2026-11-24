@@ -268,6 +268,7 @@ impl Builder {
             ..self.config.clone()
         };
         let mut inner = ConnectionInner::new(quic, config)?;
+        inner.expect_server_control_stream();
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
         //= type=implication
@@ -290,6 +291,7 @@ impl Builder {
             send_grease_frame: self.config.send_grease,
             qpack_encode_buffer: BytesMut::new(),
             pseudo_order: self.pseudo_order.clone(),
+            control_send: inner.control_send(),
             _buf: PhantomData,
         };
 

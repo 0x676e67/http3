@@ -166,6 +166,10 @@ where
             .map_err(|e| StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error: convert_connection_error(e),
             })?;
+        // http3 opens only its control, QPACK and GREASE streams here and takes request
+        // streams from `opener()`, which keep priority 0. Send these first; quiche does the
+        // same for control and QPACK but sends GREASE last.
+        let _ = send.set_priority(i32::MAX);
         Poll::Ready(Ok(Self::SendStream::new(send)))
     }
 

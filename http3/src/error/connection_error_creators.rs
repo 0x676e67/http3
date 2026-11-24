@@ -124,11 +124,8 @@ pub(crate) fn convert_to_connection_error(error: ErrorOrigin) -> ConnectionError
 /// This trait is implemented for all types which can close a stream
 pub trait CloseStream: ConnectionState {
     /// Handles a connection error on a stream
-    fn handle_connection_error_on_stream(
-        &self,
-        internal_error: InternalConnectionError,
-    ) -> StreamError {
-        let err = self.set_conn_error_and_wake(internal_error);
+    fn handle_connection_error_on_stream<T: Into<ErrorOrigin>>(&self, error: T) -> StreamError {
+        let err = self.set_conn_error_and_wake(error);
         StreamError::ConnectionError(convert_to_connection_error(err))
     }
 

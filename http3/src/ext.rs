@@ -2,6 +2,8 @@
 
 use std::str::FromStr;
 
+use http::HeaderValue;
+
 /// Describes the `:protocol` pseudo-header for extended connect
 ///
 /// See: <https://www.rfc-editor.org/rfc/rfc8441#section-4>
@@ -52,5 +54,44 @@ impl FromStr for Protocol {
             "websocket" => Ok(Self(ProtocolInner::WebSocket)),
             _ => Err(InvalidProtocol),
         }
+    }
+}
+
+/// Priority Field Value of a request's PRIORITY_UPDATE frame, set as a request extension.
+///
+/// When the control stream is writable, the value is submitted verbatim to QUIC before the
+/// request's HEADERS. QUIC delivers the two streams independently. If the control stream is
+/// busy or still opening, the driver sends the update from a bounded queue and drops it
+/// when the queue is full. Set the `priority` header separately. A server MAY close the
+/// connection if the value is not a Structured Fields Dictionary; a server built on this crate also
+/// closes it with `H3_EXCESSIVE_LOAD` when the frame payload exceeds 64 KiB.
+/// See [RFC 9218, Section 7](https://www.rfc-editor.org/rfc/rfc9218.html#section-7).
+///
+/// ```
+/// use http::{HeaderValue, Request};
+/// use http3::ext::PriorityUpdate;
+///
+/// // Chrome sends the value as header and frame; Firefox sends only the header.
+/// let priority = HeaderValue::from_static("u=0, i");
+/// let request = Request::get("https://www.example.com/")
+///     .header("priority", priority.clone())
+///     .extension(PriorityUpdate::new(priority))
+///     .body(())?;
+/// # Ok::<_, http::Error>(())
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriorityUpdate(HeaderValue);
+
+// ===== impl PriorityUpdate =====
+
+impl PriorityUpdate {
+    /// Wraps a Priority Field Value such as `u=0, i`.
+    pub const fn new(value: HeaderValue) -> Self {
+        Self(value)
+    }
+
+    /// Returns the value as written to the frame.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
     }
 }

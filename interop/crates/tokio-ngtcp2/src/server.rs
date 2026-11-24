@@ -300,7 +300,14 @@ impl Server {
         conn.read_pkt(&self.local_addr, &from, &pkt_info, data, ts)?;
 
         // Create the HTTP/3 connection.
-        let h3_conn = Http3Connection::server_new(&self.h3_settings)?;
+        let mut h3_conn = Http3Connection::server_new(&self.h3_settings)?;
+
+        // nghttp3 rejects a PRIORITY_UPDATE for a stream beyond this limit with
+        // H3_ID_ERROR, and the limit starts at 0. ngtcp2 raises the peer's limit
+        // only through ngtcp2_conn_extend_max_streams_bidi, which this server
+        // never calls, so the initial value stays current.
+        // https://www.rfc-editor.org/rfc/rfc9218.html#section-7.2
+        h3_conn.set_max_client_streams_bidi(params.initial_max_streams_bidi);
 
         let server_conn = ServerConnection {
             conn,

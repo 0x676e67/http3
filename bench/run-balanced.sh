@@ -11,8 +11,8 @@
 # a Client-only ceiling. The native build requires CMake, a C compiler,
 # LLVM/libclang and pkg-config (NASM is for applicable x86 builds, not ARM Macs).
 # On macOS, use the Xcode command-line tools and make CMake available in PATH.
-# The published sys crates include the
-# required C sources, so repository submodules are not needed. Each batch timer
+# The sys crates build from interop/crates and need the repository submodules;
+# their build scripts initialize them in a git checkout. Each batch timer
 # includes request-state allocation, connection establishment, all response
 # validation and normal task aggregation. Runtime, trust/TLS configuration,
 # socket and address preparation precede it; shutdown and result serialization
@@ -68,8 +68,8 @@ Cargo builds the native nghttp3/ngtcp2 Client and Server automatically. The
 native build requires CMake, a C compiler, LLVM/libclang, and pkg-config.
 macOS requires Xcode command-line tools; ARM Macs do not require NASM.
 Criterion arguments such as --sample-size and --measurement-time override the
-harness defaults. The published sys crates include the required C sources, so
-repository submodules are not needed for this benchmark.
+harness defaults. The sys crates build from interop/crates and need the
+repository submodules; their build scripts initialize them in a git checkout.
 
 Default body sizes:
   0B,1KiB,10KiB,64KiB,128KiB,1MiB,2MiB,4MiB,100MiB

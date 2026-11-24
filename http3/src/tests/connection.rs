@@ -5,7 +5,7 @@ use std::{assert_matches, borrow::BorrowMut, time::Duration};
 
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{FutureExt as _, future};
-use http::{Request, Response, StatusCode};
+use http::{HeaderValue, Request, Response, StatusCode};
 use tokio::sync::oneshot::{self};
 
 use super::{Pair, http3_quinn, init_tracing};
@@ -1597,18 +1597,6 @@ fn malformed_control_streams(frames: &[&[u8]]) -> Vec<BytesMut> {
 async fn control_frame_payload_must_hold_exactly_its_fields() {
     init_tracing();
     // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
-    let frame_error = |error: ConnectionError| {
-        assert_matches!(
-            error,
-            ConnectionError::Local {
-                error: LocalError::Application {
-                    code: Code::H3_FRAME_ERROR,
-                    ..
-                }
-            }
-        );
-    };
-
     // Client role: the server's control stream carries the malformed frame.
     for control in malformed_control_streams(&[
         &[0x07, 0x00],             // GOAWAY without an identifier
@@ -1621,24 +1609,12 @@ async fn control_frame_payload_must_hold_exactly_its_fields() {
     // Server role: the client's control stream carries the malformed frame.
     for control in malformed_control_streams(&[
         &[0x0d, 0x00], // MAX_PUSH_ID without a push ID
+        // A valid PRIORITY_UPDATE, then one without a target ID
+        &[
+            0x80, 0x0f, 0x07, 0x00, 0x01, 0x00, 0x80, 0x0f, 0x07, 0x00, 0x00,
+        ],
     ]) {
-        let mut pair = Pair::default();
-        let mut server = pair.server();
-        let client_fut = async {
-            let connection = pair.client_inner().await;
-            let mut control_stream = connection.open_uni().await.unwrap();
-            control_stream.write_all(&control).await.unwrap();
-            connection.closed().await;
-        };
-        let server_fut = async {
-            let mut incoming = server::Connection::new(server.next().await).await.unwrap();
-            frame_error(incoming.accept().await.map(|_| ()).unwrap_err());
-        };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(client_fut, server_fut);
-        })
-        .await
-        .unwrap_or_else(|_| panic!("server did not reject {control:x?}"));
+        server_rejects_control_stream(&control, Code::H3_FRAME_ERROR).await;
     }
 }
 
@@ -1653,6 +1629,188 @@ async fn boolean_settings_must_be_zero_or_one() {
     ]) {
         client_rejects_control_stream(&control, Code::H3_SETTINGS_ERROR).await;
     }
+}
+
+#[tokio::test]
+async fn priority_update_flows_only_from_client_to_server() {
+    init_tracing();
+    // https://www.rfc-editor.org/rfc/rfc9218.html#section-7.2
+    let request_update: &[u8] = &[0x80, 0x0f, 0x07, 0x00, 0x01, 0x00];
+    client_rejects_control_stream(
+        &malformed_control_streams(&[request_update])[0],
+        Code::H3_FRAME_UNEXPECTED,
+    )
+    .await;
+    for control in malformed_control_streams(&[
+        &[0x80, 0x0f, 0x07, 0x00, 0x01, 0x01], // a server-initiated bidirectional stream
+        &[0x80, 0x0f, 0x07, 0x00, 0x01, 0x02], // a client-initiated unidirectional stream
+        &[0x80, 0x0f, 0x07, 0x01, 0x01, 0x00], // a push this server never promised
+    ]) {
+        server_rejects_control_stream(&control, Code::H3_ID_ERROR).await;
+    }
+}
+
+#[tokio::test]
+async fn client_rejects_server_priority_update_at_the_frame_header() {
+    init_tracing();
+    for ty in [
+        FrameType::PRIORITY_UPDATE_REQUEST,
+        FrameType::PRIORITY_UPDATE_PUSH,
+    ] {
+        for len in [0_u32, 1, 65537] {
+            let mut header = Vec::new();
+            ty.encode(&mut header);
+            VarInt::from_u32(len).encode(&mut header);
+            let mut control = vec![0x00];
+            control.extend_from_slice(&header);
+            client_rejects_control_stream(&control, Code::H3_MISSING_SETTINGS).await;
+
+            let control = &malformed_control_streams(&[&header])[0];
+            client_rejects_control_stream(control, Code::H3_FRAME_UNEXPECTED).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn server_rejects_priority_update_before_settings_at_the_frame_header() {
+    init_tracing();
+    for ty in [
+        FrameType::PRIORITY_UPDATE_REQUEST,
+        FrameType::PRIORITY_UPDATE_PUSH,
+    ] {
+        for len in [1_u32, 0, 65_537] {
+            let mut control = Vec::new();
+            StreamType::CONTROL.encode(&mut control);
+            ty.encode(&mut control);
+            VarInt::from_u32(len).encode(&mut control);
+            server_rejects_control_stream(&control, Code::H3_MISSING_SETTINGS).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn priority_update_uses_writable_control_stream_without_polling_the_driver() {
+    init_tracing();
+    let mut pair = Pair::default();
+    let server = pair.server_inner();
+    let (done_tx, done_rx) = oneshot::channel();
+
+    let client_fut = async {
+        let (_driver, mut sender) = client::new(pair.client().await).await.unwrap();
+        let request = Request::get("https://localhost/")
+            .extension(crate::ext::PriorityUpdate::new(HeaderValue::from_static(
+                "u=0, i",
+            )))
+            .body(())
+            .unwrap();
+        let _request = sender.send_request(request).await.unwrap();
+        done_rx.await.unwrap();
+    };
+    let server_fut = async {
+        let connection = server.accept().await.unwrap().await.unwrap();
+        let mut got_settings = false;
+        let (_, _streams) = read_peer_control_stream(&connection, |frame| match frame {
+            Frame::Settings(_) => {
+                got_settings = true;
+                None
+            }
+            Frame::PriorityUpdateRequest(id) => {
+                assert!(got_settings, "the update preceded SETTINGS");
+                assert_eq!(id, crate::quic::StreamId::try_from(0).unwrap());
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        done_tx.send(()).unwrap();
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .expect("writable control stream did not send the update");
+}
+
+#[tokio::test]
+async fn priority_updates_queued_on_a_blocked_control_stream_reach_the_server() {
+    init_tracing();
+    const REQUESTS: u64 = 16;
+    let mut pair = Pair::default();
+    // The client control stream blocks after SETTINGS and a few updates until the
+    // server reads it, so the driver has to write the queued ones.
+    pair.with_stream_receive_window(128);
+    let server = pair.server_inner();
+    let (sent_tx, sent_rx) = oneshot::channel();
+
+    let client_fut = async {
+        let (mut driver, mut client) = client::new(pair.client().await).await.unwrap();
+        let requests = async {
+            let mut streams = Vec::new();
+            for _ in 0..REQUESTS {
+                let mut request = Request::get("https://localhost/").body(()).unwrap();
+                request
+                    .extensions_mut()
+                    .insert(crate::ext::PriorityUpdate::new(HeaderValue::from_static(
+                        "u=0, i",
+                    )));
+                streams.push(client.send_request(request).await.unwrap());
+            }
+            sent_tx.send(()).unwrap();
+            future::pending::<()>().await
+        };
+        tokio::select! {
+            () = requests => {}
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => {
+                panic!("client closed: {error:?}")
+            }
+        }
+    };
+    let server_fut = async {
+        let connection = server.accept().await.unwrap().await.unwrap();
+        sent_rx.await.unwrap();
+        let mut updates = 0;
+        let _streams = read_peer_control_stream(&connection, |frame| {
+            updates += u64::from(matches!(frame, Frame::PriorityUpdateRequest(_)));
+            (updates == REQUESTS).then_some(())
+        })
+        .await;
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            () = client_fut => {}
+            () = server_fut => {}
+        }
+    })
+    .await
+    .expect("PRIORITY_UPDATE frames did not reach the server");
+}
+
+/// Opens `control` as the client's control stream and expects the server to
+/// close the connection with `code`.
+async fn server_rejects_control_stream(control: &[u8], code: Code) {
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+    let client_fut = async {
+        let connection = pair.client_inner().await;
+        let mut control_stream = connection.open_uni().await.unwrap();
+        control_stream.write_all(control).await.unwrap();
+        connection.closed().await;
+    };
+    let server_fut = async {
+        let mut incoming = server::Connection::new(server.next().await).await.unwrap();
+        assert_matches!(
+            incoming.accept().await.map(|_| ()).unwrap_err(),
+            ConnectionError::Local {
+                error: LocalError::Application { code: actual, .. }
+            } if actual == code
+        );
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server_fut);
+    })
+    .await
+    .unwrap_or_else(|_| panic!("server did not reject {control:x?}"));
 }
 
 #[tokio::test]
@@ -1963,7 +2121,7 @@ async fn client_build_does_not_wait_for_critical_stream_credit() {
             &Header::response(
                 StatusCode::OK,
                 http::HeaderMap::new(),
-                http::Extensions::new(),
+                &http::Extensions::new(),
             ),
         )
         .unwrap();
@@ -2282,7 +2440,7 @@ async fn graceful_shutdown_goaway_identifies_first_unprocessed_request() {
                     http::Method::GET,
                     "https://localhost/".parse().unwrap(),
                     http::HeaderMap::new(),
-                    http::Extensions::new(),
+                    &http::Extensions::new(),
                 )
                 .unwrap(),
             )
@@ -2305,7 +2463,12 @@ async fn graceful_shutdown_goaway_identifies_first_unprocessed_request() {
             };
             let mut rejected = open_request().await;
 
-            let (goaway, _server_streams) = server_goaway(&connection).await;
+            let (goaway, _server_streams) =
+                read_peer_control_stream(&connection, |frame| match frame {
+                    Frame::Goaway(id) => Some(id.into_inner()),
+                    _ => None,
+                })
+                .await;
             assert_eq!(goaway, 4);
             assert!(!processed.read_to_end(1024).await.unwrap().is_empty());
             assert_matches!(
@@ -2324,11 +2487,14 @@ async fn graceful_shutdown_goaway_identifies_first_unprocessed_request() {
     }
 }
 
-/// Reads the server's control stream until its first GOAWAY frame.
+/// Reads the peer's control stream until `find` returns a value.
 ///
-/// Returns every server stream it accepted as well: dropping a quinn receive stream sends
-/// STOP_SENDING, which the server treats as closing a critical stream.
-async fn server_goaway(connection: &quinn::Connection) -> (u64, Vec<quinn::RecvStream>) {
+/// Returns every peer stream it accepted as well: dropping a quinn receive stream sends
+/// STOP_SENDING, which the peer treats as closing a critical stream.
+async fn read_peer_control_stream<T>(
+    connection: &quinn::Connection,
+    mut find: impl FnMut(Frame<frame::PayloadLen>) -> Option<T>,
+) -> (T, Vec<quinn::RecvStream>) {
     let mut streams = Vec::new();
     loop {
         let mut recv = connection.accept_uni().await.unwrap();
@@ -2343,20 +2509,22 @@ async fn server_goaway(connection: &quinn::Connection) -> (u64, Vec<quinn::RecvS
         StreamType::decode(&mut buf).unwrap();
         loop {
             let mut cursor = std::io::Cursor::new(&buf[..]);
-            match Frame::decode(&mut cursor) {
-                Ok(Frame::Goaway(id)) => {
-                    streams.push(recv);
-                    return (id.into_inner(), streams);
-                }
-                Ok(_) | Err(frame::FrameError::UnknownFrame(_)) => {
-                    let consumed = cursor.position() as usize;
+            let result = Frame::decode(&mut cursor);
+            let consumed = cursor.position() as usize;
+            match result {
+                Ok(frame) => {
                     buf.advance(consumed);
+                    if let Some(found) = find(frame) {
+                        streams.push(recv);
+                        return (found, streams);
+                    }
                 }
+                Err(frame::FrameError::UnknownFrame(_)) => buf.advance(consumed),
                 Err(frame::FrameError::Incomplete(_)) => {
                     let chunk = recv.read_chunk(usize::MAX, true).await.unwrap().unwrap();
                     buf.extend_from_slice(&chunk.bytes);
                 }
-                Err(error) => panic!("invalid server control frame: {error}"),
+                Err(error) => panic!("invalid peer control frame: {error}"),
             }
         }
     }
