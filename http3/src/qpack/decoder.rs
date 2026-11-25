@@ -1,16 +1,21 @@
 use std::{convert::TryInto, fmt, io::Cursor, num::TryFromIntError};
 
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes};
+use smallvec::SmallVec;
 #[cfg(feature = "tracing")]
 use tracing::trace;
 
+#[cfg(test)]
+use super::dynamic::DynamicTable;
 use super::{
     block::{
         HeaderBlockField, HeaderPrefix, Indexed, IndexedWithPostBase, Literal, LiteralWithNameRef,
         LiteralWithPostBaseNameRef,
     },
-    dynamic::{DynamicTable, DynamicTableDecoder, Error as DynamicTableError},
-    field::HeaderField,
+    dynamic::{
+        DecoderDynamicTable, DecoderDynamicTableView, DecoderEntry, Error as DynamicTableError,
+    },
+    field::{ESTIMATED_OVERHEAD_BYTES, HeaderField},
     parse_error::ParseError,
     prefix_int, prefix_string,
     static_::{Error as StaticError, StaticTable},
@@ -20,6 +25,7 @@ use super::{
     },
     vas,
 };
+use crate::proto::headers::DecodedField;
 
 #[derive(Debug, PartialEq)]
 pub enum DecoderError {
@@ -136,8 +142,16 @@ impl FieldSectionPrefix {
     }
 }
 
+pub(crate) type DecodedFieldList = SmallVec<[DecodedField; 16]>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DecodedMeta {
+    pub(crate) dyn_ref: bool,
+    pub(crate) mem_size: u64,
+}
+
 pub struct Decoder {
-    table: DynamicTable,
+    table: DecoderDynamicTable,
     // SETTINGS_QPACK_MAX_TABLE_CAPACITY is a fixed decoding limit. The table's
     // current capacity is separate and starts at zero.
     // https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3
@@ -159,7 +173,7 @@ impl Decoder {
         // The peer encoder raises the current capacity with a Set Dynamic Table
         // Capacity instruction before inserting entries.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3.1
-        let table = DynamicTable::new();
+        let table = DecoderDynamicTable::new();
         Ok(Self {
             table,
             max_table_capacity,
@@ -295,7 +309,7 @@ impl Decoder {
             match instruction {
                 // Peer insertions must update the decoder table. They cannot use
                 // the local encoder's literal fallback.
-                Instruction::Insert(field) => self.table.put_decoder(field)?,
+                Instruction::Insert(entry) => self.table.put(entry)?,
                 Instruction::TableSizeUpdate(size) => {
                     // The encoder may change the current capacity within the
                     // limit advertised in our SETTINGS.
@@ -395,7 +409,9 @@ impl Decoder {
         };
 
         read.advance(before - buf.remaining());
-        Ok(Some(Instruction::Insert(HeaderField::new(name, value))))
+        Ok(Some(Instruction::Insert(DecoderEntry::from_literal(
+            name, value,
+        ))))
     }
 
     fn decode_instruction<R: Buf>(&self, buf: &mut R) -> Result<Option<Instruction>, DecoderError> {
@@ -408,7 +424,7 @@ impl Decoder {
             }
             EncoderInstruction::InsertWithoutNameRef => {
                 InsertWithoutNameRef::decode_limited(&mut *buf, self.max_encoded_string_size)?
-                    .map(|x| Instruction::Insert(HeaderField::new(x.name, x.value)))
+                    .map(|x| Instruction::Insert(DecoderEntry::from_literal(x.name, x.value)))
             }
             EncoderInstruction::Duplicate => match Duplicate::decode(&mut *buf)? {
                 Some(Duplicate(index)) => {
@@ -418,9 +434,14 @@ impl Decoder {
             },
             EncoderInstruction::InsertWithNameRef => {
                 match InsertWithNameRef::decode_limited(&mut *buf, self.max_encoded_string_size)? {
-                    Some(InsertWithNameRef::Static { index, value }) => Some(Instruction::Insert(
-                        StaticTable::get(index)?.with_value(value),
-                    )),
+                    Some(InsertWithNameRef::Static { index, value }) => {
+                        let (_, parsed) = StaticTable::get_parsed(index)?;
+                        Some(Instruction::Insert(DecoderEntry::from_static_name(
+                            parsed.name_bytes,
+                            parsed.name.clone(),
+                            value,
+                        )))
+                    }
                     Some(InsertWithNameRef::Dynamic { index, value }) => Some(Instruction::Insert(
                         self.table.get_relative(index)?.with_value(value),
                     )),
@@ -433,7 +454,7 @@ impl Decoder {
     }
 
     fn parse_header_field<R: Buf>(
-        table: &DynamicTableDecoder,
+        table: &DecoderDynamicTableView<'_>,
         buf: &mut R,
         max_encoded_string_size: usize,
     ) -> Result<HeaderField<'static>, DecoderError> {
@@ -441,11 +462,11 @@ impl Decoder {
         let field = match HeaderBlockField::decode(first) {
             HeaderBlockField::Indexed => match Indexed::decode(buf)? {
                 Indexed::Static(index) => StaticTable::get(index)?.clone(),
-                Indexed::Dynamic(index) => table.get_relative(index)?.clone(),
+                Indexed::Dynamic(index) => table.get_relative(index)?.to_header_field(),
             },
             HeaderBlockField::IndexedWithPostBase => {
                 let index = IndexedWithPostBase::decode(buf)?.0;
-                table.get_postbase(index)?.clone()
+                table.get_postbase(index)?.to_header_field()
             }
             HeaderBlockField::LiteralWithNameRef => {
                 match LiteralWithNameRef::decode_limited(buf, max_encoded_string_size)? {
@@ -462,7 +483,7 @@ impl Decoder {
                         never_indexed,
                     } => table
                         .get_relative(index)?
-                        .with_value(value)
+                        .to_header_field_with_value(value)
                         .with_sensitive(never_indexed),
                 }
             }
@@ -471,7 +492,7 @@ impl Decoder {
                     LiteralWithPostBaseNameRef::decode_limited(buf, max_encoded_string_size)?;
                 table
                     .get_postbase(literal.index)?
-                    .with_value(literal.value)
+                    .to_header_field_with_value(literal.value)
                     .with_sensitive(literal.never_indexed)
             }
             HeaderBlockField::Literal => {
@@ -482,6 +503,161 @@ impl Decoder {
         };
         Ok(field)
     }
+
+    /// Decodes a field section directly into pre-validated [`DecodedField`] items
+    /// to avoid cloning raw dynamic table byte buffers or re-parsing cached names
+    /// and values on every hit.
+    pub(crate) fn decode_fields_limited<T: Buf>(
+        &self,
+        buf: &mut T,
+        max_size: u64,
+        prefix: &mut Option<FieldSectionPrefix>,
+        out: &mut DecodedFieldList,
+    ) -> Result<DecodedMeta, DecoderError> {
+        let FieldSectionPrefix { required_ref, base } = match *prefix {
+            Some(prefix) => prefix,
+            None => {
+                let (required_ref, base) = HeaderPrefix::decode(buf)?
+                    .get(self.table.total_inserted(), self.max_table_capacity)?;
+                let decoded = FieldSectionPrefix { required_ref, base };
+                *prefix = Some(decoded);
+                decoded
+            }
+        };
+
+        if required_ref > self.table.total_inserted() {
+            return Err(DecoderError::MissingRefs(required_ref));
+        }
+
+        let decoder_table = self.table.decoder(base, required_ref);
+        let mut mem_size = 0_u64;
+        while buf.has_remaining() {
+            let (field, field_mem_size) = Self::parse_header_field_decoded(
+                &decoder_table,
+                buf,
+                self.max_encoded_string_size,
+            )?;
+            mem_size = mem_size
+                .checked_add(field_mem_size as u64)
+                .ok_or(DecoderError::HeaderTooLong(u64::MAX))?;
+            if mem_size > max_size {
+                return Err(DecoderError::HeaderTooLong(mem_size));
+            }
+            out.push(field);
+        }
+
+        Ok(DecodedMeta {
+            dyn_ref: required_ref > 0,
+            mem_size,
+        })
+    }
+
+    fn parse_header_field_decoded<R: Buf>(
+        table: &DecoderDynamicTableView<'_>,
+        buf: &mut R,
+        max_encoded_string_size: usize,
+    ) -> Result<(DecodedField, usize), DecoderError> {
+        let first = buf.chunk()[0];
+        let parsed = match HeaderBlockField::decode(first) {
+            HeaderBlockField::Indexed => match Indexed::decode(buf)? {
+                Indexed::Static(index) => static_indexed_decoded(index)?,
+                Indexed::Dynamic(index) => {
+                    let entry = table.get_relative(index)?;
+                    (entry.to_decoded_field(), entry.mem_size())
+                }
+            },
+            HeaderBlockField::IndexedWithPostBase => {
+                let index = IndexedWithPostBase::decode(buf)?.0;
+                let entry = table.get_postbase(index)?;
+                (entry.to_decoded_field(), entry.mem_size())
+            }
+            HeaderBlockField::LiteralWithNameRef => {
+                match LiteralWithNameRef::decode_limited(buf, max_encoded_string_size)? {
+                    LiteralWithNameRef::Static {
+                        index,
+                        value,
+                        never_indexed,
+                    } => static_name_ref_decoded(index, value, never_indexed)?,
+                    LiteralWithNameRef::Dynamic {
+                        index,
+                        value,
+                        never_indexed,
+                    } => {
+                        let entry = table.get_relative(index)?;
+                        let mem_size = field_mem_size(entry.name().len(), value.len())?;
+                        (entry.to_decoded_name_ref(value, never_indexed), mem_size)
+                    }
+                }
+            }
+            HeaderBlockField::LiteralWithPostBaseNameRef => {
+                let literal =
+                    LiteralWithPostBaseNameRef::decode_limited(buf, max_encoded_string_size)?;
+                let entry = table.get_postbase(literal.index)?;
+                let mem_size = field_mem_size(entry.name().len(), literal.value.len())?;
+                (
+                    entry.to_decoded_name_ref(literal.value, literal.never_indexed),
+                    mem_size,
+                )
+            }
+            HeaderBlockField::Literal => {
+                let literal = Literal::decode_limited(buf, max_encoded_string_size)?;
+                let mem_size = field_mem_size(literal.name.len(), literal.value.len())?;
+                (
+                    DecodedField::Literal {
+                        name: literal.name,
+                        value: literal.value,
+                        sensitive: literal.never_indexed,
+                    },
+                    mem_size,
+                )
+            }
+            _ => return Err(DecoderError::UnknownPrefix(first)),
+        };
+        Ok(parsed)
+    }
+}
+
+fn field_mem_size(name_len: usize, value_len: usize) -> Result<usize, DecoderError> {
+    name_len
+        .checked_add(value_len)
+        .and_then(|len| len.checked_add(ESTIMATED_OVERHEAD_BYTES))
+        .ok_or(DecoderError::HeaderTooLong(u64::MAX))
+}
+
+fn static_indexed_decoded(index: usize) -> Result<(DecodedField, usize), DecoderError> {
+    let (raw, parsed) = StaticTable::get_parsed(index)?;
+    let decoded = match &parsed.field {
+        Some(field) => DecodedField::Parsed {
+            field: field.clone(),
+            sensitive: false,
+        },
+        None => DecodedField::InvalidRaw {
+            name: Bytes::from_static(parsed.name_bytes),
+            value: Bytes::from_static(parsed.value_bytes),
+        },
+    };
+    Ok((decoded, raw.mem_size()))
+}
+
+fn static_name_ref_decoded(
+    index: usize,
+    value: Vec<u8>,
+    sensitive: bool,
+) -> Result<(DecodedField, usize), DecoderError> {
+    let (_, parsed) = StaticTable::get_parsed(index)?;
+    let mem_size = field_mem_size(parsed.name_bytes.len(), value.len())?;
+    let decoded = match &parsed.name {
+        Some(name) => DecodedField::NameRef {
+            name: name.clone(),
+            value,
+            sensitive,
+        },
+        None => DecodedField::InvalidRaw {
+            name: Bytes::from_static(parsed.name_bytes),
+            value: Bytes::from(value),
+        },
+    };
+    Ok((decoded, mem_size))
 }
 
 // Decode field lines received on a request or push stream.
@@ -546,12 +722,77 @@ pub(crate) fn decode_stateless_limited<T: Buf>(
     })
 }
 
+/// Decodes a stateless QPACK field section directly into [`DecodedField`] items
+/// using cached static table names and values.
+pub(crate) fn decode_stateless_fields_limited<T: Buf>(
+    buf: &mut T,
+    max_size: u64,
+    max_encoded_string_size: usize,
+    out: &mut DecodedFieldList,
+) -> Result<DecodedMeta, DecoderError> {
+    let (required_ref, _base) = HeaderPrefix::decode(buf)?.get(0, 0)?;
+
+    if required_ref > 0 {
+        return Err(DecoderError::MissingRefs(required_ref));
+    }
+
+    let mut mem_size = 0_u64;
+    while buf.has_remaining() {
+        let first = buf.chunk()[0];
+        let (field, field_mem_size) = match HeaderBlockField::decode(first) {
+            HeaderBlockField::IndexedWithPostBase => return Err(DecoderError::MissingRefs(0)),
+            HeaderBlockField::LiteralWithPostBaseNameRef => {
+                return Err(DecoderError::MissingRefs(0));
+            }
+            HeaderBlockField::Indexed => match Indexed::decode(buf)? {
+                Indexed::Static(index) => static_indexed_decoded(index)?,
+                Indexed::Dynamic(_) => return Err(DecoderError::MissingRefs(0)),
+            },
+            HeaderBlockField::LiteralWithNameRef => {
+                match LiteralWithNameRef::decode_limited(buf, max_encoded_string_size)? {
+                    LiteralWithNameRef::Dynamic { .. } => return Err(DecoderError::MissingRefs(0)),
+                    LiteralWithNameRef::Static {
+                        index,
+                        value,
+                        never_indexed,
+                    } => static_name_ref_decoded(index, value, never_indexed)?,
+                }
+            }
+            HeaderBlockField::Literal => {
+                let literal = Literal::decode_limited(buf, max_encoded_string_size)?;
+                let size = field_mem_size(literal.name.len(), literal.value.len())?;
+                (
+                    DecodedField::Literal {
+                        name: literal.name,
+                        value: literal.value,
+                        sensitive: literal.never_indexed,
+                    },
+                    size,
+                )
+            }
+            _ => return Err(DecoderError::UnknownPrefix(first)),
+        };
+        mem_size = mem_size
+            .checked_add(field_mem_size as u64)
+            .ok_or(DecoderError::HeaderTooLong(u64::MAX))?;
+        if mem_size > max_size {
+            return Err(DecoderError::HeaderTooLong(mem_size));
+        }
+        out.push(field);
+    }
+
+    Ok(DecodedMeta {
+        dyn_ref: false,
+        mem_size,
+    })
+}
+
 #[cfg(test)]
 impl From<DynamicTable> for Decoder {
     fn from(table: DynamicTable) -> Self {
         let max_table_capacity = table.max_mem_size();
         Self {
-            table,
+            table: DecoderDynamicTable::from(table),
             max_table_capacity,
             max_blocked_streams: 0,
             max_encoded_string_size: crate::config::DEFAULT_QPACK_DECODE_BUFFER_SIZE,
@@ -560,16 +801,20 @@ impl From<DynamicTable> for Decoder {
     }
 }
 
-#[derive(PartialEq)]
 enum Instruction {
-    Insert(HeaderField<'static>),
+    Insert(DecoderEntry),
     TableSizeUpdate(usize),
 }
 
 impl fmt::Debug for Instruction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Instruction::Insert(h) => write!(f, "Instruction::Insert {{ {} }}", h),
+            Instruction::Insert(entry) => write!(
+                f,
+                "Instruction::Insert {{ \"{}\": \"{}\" }}",
+                String::from_utf8_lossy(entry.name()),
+                String::from_utf8_lossy(entry.value())
+            ),
             Instruction::TableSizeUpdate(n) => {
                 write!(f, "Instruction::TableSizeUpdate {{ {} }}", n)
             }
@@ -921,8 +1166,12 @@ mod tests {
         assert!(decoder.on_encoder_recv(&mut enc, &mut dec).is_ok());
 
         assert_eq!(
-            decoder.table.decoder(1, 1).get_relative(0),
-            Ok(&StaticTable::get(1).unwrap().with_value("serial value"))
+            decoder
+                .table
+                .decoder(1, 1)
+                .get_relative(0)
+                .map(DecoderEntry::to_header_field),
+            Ok(StaticTable::get(1).unwrap().with_value("serial value"))
         );
 
         let mut dec_cursor = Cursor::new(&dec);
@@ -989,8 +1238,12 @@ mod tests {
         assert!(decoder.on_encoder_recv(&mut enc, &mut dec).is_ok());
 
         assert_eq!(
-            decoder.table.decoder(1, 1).get_relative(0),
-            Ok(&HeaderField::new("key", "value"))
+            decoder
+                .table
+                .decoder(1, 1)
+                .get_relative(0)
+                .map(DecoderEntry::to_header_field),
+            Ok(HeaderField::new("key", "value"))
         );
 
         let mut dec_cursor = Cursor::new(&dec);
@@ -1061,12 +1314,12 @@ mod tests {
         let mut buf = vec![];
         {
             let mut enc = Cursor::new(&buf);
-            assert_eq!(decoder.parse_instruction(&mut enc), Ok(None));
+            assert!(matches!(decoder.parse_instruction(&mut enc), Ok(None)));
         }
 
         buf.push(0b1000_0000);
         let mut enc = Cursor::new(&buf);
-        assert_eq!(decoder.parse_instruction(&mut enc), Ok(None));
+        assert!(matches!(decoder.parse_instruction(&mut enc), Ok(None)));
     }
 
     #[test]

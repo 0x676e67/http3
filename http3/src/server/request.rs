@@ -1,4 +1,4 @@
-use std::{convert::TryFrom, sync::Arc};
+use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
 use http::{Request, StatusCode};
@@ -182,14 +182,14 @@ where
     pub async fn resolve(
         mut self,
     ) -> Result<(Request<()>, RequestStream<C::BidiStream, B>), StreamError> {
-        let decoded = match std::future::poll_fn(|cx| {
+        let header = match std::future::poll_fn(|cx| {
             self.request_stream
                 .inner
-                .poll_decode_field_section(cx, &mut self.encoded)
+                .poll_decode_header(cx, &mut self.encoded)
         })
         .await
         {
-            Ok(decoded) => decoded,
+            Ok(header) => header,
             Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
                 // The request is still unprocessed, but the rest of it is not needed
                 // once the 431 response is complete.
@@ -227,10 +227,9 @@ where
                 ));
             }
         };
-        let fields = decoded.fields;
 
         // Parse the request headers
-        let result = Header::try_from(fields)
+        let result = header
             .and_then(Header::into_request_parts)
             .and_then(|parts| {
                 let (method, _, _, headers, _) = &parts;

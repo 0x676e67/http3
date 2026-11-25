@@ -27,7 +27,7 @@ use crate::{
     proto::{
         coding::Encode,
         frame::{self, Frame, PayloadLen},
-        headers::Header,
+        headers::{Header, HeaderError},
         stream::StreamType,
         varint::VarInt,
     },
@@ -471,12 +471,14 @@ where
         //# The
         //# sender MUST NOT close the control stream, and the receiver MUST NOT
         //# request that the sender close the control stream.
+        let shared = Arc::new(SharedState::default());
         let blocked_streams = qpack::BlockedStreamRegistry::new(decoder.max_blocked_streams());
-        let decoder = if config.bound_decoder_instructions {
-            QpackDecoder::with_instruction_bound(decoder, decoder_events_send)
-        } else {
-            QpackDecoder::new(decoder, decoder_events_send)
-        };
+        let decoder = QpackDecoder::for_connection(
+            decoder,
+            decoder_events_send,
+            config.bound_decoder_instructions,
+            shared.clone(),
+        );
 
         let qpack_streams = QpackStreams {
             decoder_send: None,
@@ -494,7 +496,7 @@ where
         };
 
         Ok(Self {
-            shared: Arc::new(SharedState::default()),
+            shared,
             conn,
             control_send: None,
             critical_streams,
@@ -1646,7 +1648,6 @@ where
 
 pub(crate) struct DecoderGuard {
     stream_id: StreamId,
-    shared: Arc<SharedState>,
     cancel_on_drop: bool,
     // A Stream Cancellation was queued, so no later field section is decoded.
     cancelled: bool,
@@ -1695,7 +1696,7 @@ impl DecoderGuard {
     fn acknowledge(&mut self, dyn_ref: bool) -> Result<(), qpack::DecoderError> {
         if dyn_ref {
             self.decoder.queue_section_acknowledgment(self.stream_id)?;
-            self.shared.waker().wake();
+            self.decoder.wake_driver();
         }
 
         Ok(())
@@ -1722,7 +1723,7 @@ impl DecoderGuard {
         if std::mem::take(&mut self.cancel_on_drop) {
             self.cancelled = true;
             if self.decoder.queue_stream_cancellation(self.stream_id) {
-                self.shared.waker().wake();
+                self.decoder.wake_driver();
             }
         }
     }
@@ -1743,14 +1744,12 @@ pub(crate) enum RequestDecodeState {
 impl RequestDecodeState {
     pub(crate) fn new(
         stream_id: StreamId,
-        shared: &Arc<SharedState>,
         max_encoded_string_size: usize,
         decoder: Option<QpackDecoder>,
     ) -> Self {
         match decoder {
             Some(decoder) => Self::Dynamic(Box::new(DecoderGuard {
                 stream_id,
-                shared: shared.clone(),
                 // Dropping before end of stream abandons any remaining field section
                 // and requires Stream Cancellation.
                 cancel_on_drop: true,
@@ -1842,12 +1841,8 @@ where
         B: Buf,
     {
         stream.set_max_field_section_size(max_qpack_decode_buffer_size);
-        let decode_state = RequestDecodeState::new(
-            stream.id(),
-            &conn_state,
-            max_qpack_decode_buffer_size,
-            decoder,
-        );
+        let decode_state =
+            RequestDecodeState::new(stream.id(), max_qpack_decode_buffer_size, decoder);
 
         Self {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
@@ -2132,7 +2127,7 @@ where
             }
         }
 
-        let decode_result = match self.poll_decode_field_section(cx, &mut trailers) {
+        let decode_result = match self.poll_decode_header(cx, &mut trailers) {
             Poll::Ready(decode_result) => decode_result,
             Poll::Pending => {
                 self.trailers = Some(trailers);
@@ -2140,7 +2135,7 @@ where
             }
         };
 
-        let qpack::Decoded { fields, .. } = match decode_result {
+        let header = match decode_result {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
             //# An HTTP/3 implementation MAY impose a limit on the maximum size of
             //# the message header it will accept on an individual HTTP message.
@@ -2151,7 +2146,7 @@ where
                     max_size: self.max_field_section_size,
                 }));
             }
-            Ok(decoded) => decoded,
+            Ok(header) => header,
             Err(error) => {
                 let code = if error.is_internal() {
                     Code::H3_INTERNAL_ERROR
@@ -2168,24 +2163,22 @@ where
         };
 
         self.finish_reading();
-        Poll::Ready(Ok(Some(
-            Header::try_from(fields)
-                .and_then(Header::into_trailers)
-                .map_err(|error| {
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
-                    //# Malformed requests or responses that are
-                    //# detected MUST be treated as a stream error of type H3_MESSAGE_ERROR.
-                    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
-                    //# Clients MUST NOT
-                    //# accept a malformed response.
-                    let code = error.code();
-                    self.stop_sending(code);
-                    StreamError::StreamError {
-                        code,
-                        reason: format!("rejected trailers: {error}"),
-                    }
-                })?,
-        )))
+        Poll::Ready(Ok(Some(header.and_then(Header::into_trailers).map_err(
+            |error| {
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+                //# Malformed requests or responses that are
+                //# detected MUST be treated as a stream error of type H3_MESSAGE_ERROR.
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+                //# Clients MUST NOT
+                //# accept a malformed response.
+                let code = error.code();
+                self.stop_sending(code);
+                StreamError::StreamError {
+                    code,
+                    reason: format!("rejected trailers: {error}"),
+                }
+            },
+        )?)))
     }
 
     /// Stops receiving with `err_code` and cancels outstanding QPACK decoding.
@@ -2197,6 +2190,7 @@ where
         self.stream.stop_sending(err_code);
     }
 
+    #[cfg(test)]
     #[inline(always)]
     pub(crate) fn poll_decode_field_section(
         &mut self,
@@ -2224,12 +2218,61 @@ where
             }
         };
 
+        self.finish_field_section_decode(cx, decode_result, |decoded| decoded.dyn_ref)
+    }
+
+    /// Decodes a QPACK field section into an HTTP [`Header`] using pre-validated
+    /// static and dynamic table entries.
+    ///
+    /// QPACK decompression, size limits, Section Acknowledgment, blocked-stream
+    /// release, and EOS completion always run before HTTP syntax validation
+    /// returns any [`HeaderError`].
+    #[inline(never)]
+    pub(crate) fn poll_decode_header(
+        &mut self,
+        cx: &mut Context<'_>,
+        field_section: &mut Bytes,
+    ) -> Poll<Result<Result<Header, HeaderError>, qpack::DecoderError>> {
+        let mut fields = qpack::DecodedFieldList::new();
+        let decode_result = match &mut self.decode_state {
+            RequestDecodeState::Stateless {
+                max_encoded_string_size,
+            } => Poll::Ready(qpack::decode_stateless_fields_limited(
+                field_section,
+                self.max_field_section_size,
+                *max_encoded_string_size,
+                &mut fields,
+            )),
+            RequestDecodeState::Dynamic(state) => state.decoder.poll_decode_fields(
+                cx,
+                field_section,
+                self.max_field_section_size,
+                &mut state.prefix,
+                &mut fields,
+            ),
+            RequestDecodeState::SendOnly => {
+                return Poll::Ready(Err(qpack::DecoderError::Internal(
+                    "attempted to decode a field section on a send-only stream half",
+                )));
+            }
+        };
+
+        ready!(self.finish_field_section_decode(cx, decode_result, |meta| meta.dyn_ref))?;
+        Poll::Ready(Ok(Header::try_from_decoded(fields.drain(..))))
+    }
+
+    fn finish_field_section_decode<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        decode_result: Poll<Result<T, qpack::DecoderError>>,
+        is_dynamic_ref: impl FnOnce(&T) -> bool,
+    ) -> Poll<Result<T, qpack::DecoderError>> {
         match decode_result {
             Poll::Ready(Ok(decoded)) => {
                 if let RequestDecodeState::Dynamic(state) = &mut self.decode_state {
                     state.prefix = None;
                     state.unblock();
-                    if let Some(err) = state.acknowledge(decoded.dyn_ref).err() {
+                    if let Some(err) = state.acknowledge(is_dynamic_ref(&decoded)).err() {
                         return Poll::Ready(Err(err));
                     }
 
@@ -2247,7 +2290,7 @@ where
                 // A blocked-stream limit violation wakes all registered requests
                 // before closing the connection. Do not queue another waiter.
                 if let RequestDecodeState::Dynamic(state) = &mut self.decode_state {
-                    if state.shared.get_conn_error().is_some() {
+                    if self.conn_state.get_conn_error().is_some() {
                         return Poll::Ready(Err(qpack::DecoderError::Internal(
                             "connection closed while a QPACK field section was blocked",
                         )));
@@ -2744,13 +2787,17 @@ mod qpack_field_section_tests {
 
     fn field_section_guard() -> (DecoderGuard, mpsc::UnboundedReceiver<QpackEvent>) {
         let (events_send, events_recv) = mpsc::unbounded_channel();
-        let decoder = QpackDecoder::new(qpack::Decoder::new(0, 0).unwrap(), events_send);
         let shared = Arc::new(SharedState::default());
+        let decoder = QpackDecoder::for_connection(
+            qpack::Decoder::new(0, 0).unwrap(),
+            events_send,
+            false,
+            shared,
+        );
 
         (
             DecoderGuard {
                 stream_id: StreamId(0),
-                shared,
                 cancel_on_drop: true,
                 cancelled: false,
                 blocked: None,
@@ -3137,7 +3184,7 @@ mod request_drop_tests {
         let mut stream = FrameStream::new(BufRecvStream::new(probe.clone()));
         stream.set_max_field_section_size(1024);
 
-        let decode_state = RequestDecodeState::new(stream.id(), &conn_state, 1024, None);
+        let decode_state = RequestDecodeState::new(stream.id(), 1024, None);
         let stream = StreamGuard::new(stream, Code::H3_REQUEST_CANCELLED);
         let request_stream =
             RequestStream::with_decode_state(stream, u64::MAX, conn_state, false, decode_state);
@@ -3291,8 +3338,7 @@ mod request_drop_tests {
         });
         let (events_send, mut events) = mpsc::unbounded_channel();
         let decoder = QpackDecoder::new(qpack::Decoder::new(1024, 1).unwrap(), events_send);
-        stream.decode_state =
-            RequestDecodeState::new(StreamId(0), &stream.conn_state, 1024, Some(decoder));
+        stream.decode_state = RequestDecodeState::new(StreamId(0), 1024, Some(decoder));
         for _ in 0..2 {
             assert!(
                 future::poll_fn(|cx| stream.poll_recv_data(cx))
@@ -3358,12 +3404,7 @@ mod request_drop_tests {
             if !blocked {
                 insert();
             }
-            stream.decode_state = RequestDecodeState::new(
-                StreamId(0),
-                &stream.conn_state,
-                1024,
-                Some(decoder.clone()),
-            );
+            stream.decode_state = RequestDecodeState::new(StreamId(0), 1024, Some(decoder.clone()));
 
             // The trailers are buffered before reading stops.
             assert!(
@@ -3407,13 +3448,49 @@ mod request_drop_tests {
         }
     }
 
+    #[tokio::test]
+    async fn invalid_cached_dynamic_header_acknowledges_section_before_http_error() {
+        let (mut stream, _probe) = stream();
+        let (events_send, mut events) = mpsc::unbounded_channel();
+        let decoder = QpackDecoder::for_connection(
+            qpack::Decoder::new(1024, 1).unwrap(),
+            events_send,
+            false,
+            stream.conn_state.clone(),
+        );
+        let mut encoder_stream = BytesMut::new();
+        qpack::DynamicTableSizeUpdate(1024).encode(&mut encoder_stream);
+        qpack::InsertWithoutNameRef::new("X-Upper", "value")
+            .encode(&mut encoder_stream)
+            .unwrap();
+        assert_eq!(
+            decoder.poll_on_recv_encoder(
+                &mut Context::from_waker(futures_util::task::noop_waker_ref()),
+                &mut std::io::Cursor::new(encoder_stream),
+                &mut Vec::new(),
+            ),
+            Poll::Ready(Ok(1))
+        );
+        stream.decode_state = RequestDecodeState::new(StreamId(0), 1024, Some(decoder));
+
+        // Required Insert Count 1, Base 1, dynamic entry 0 (`X-Upper: value`).
+        let mut field_section = Bytes::from_static(&[0x02, 0x00, 0x80]);
+        let result = future::poll_fn(|cx| stream.poll_decode_header(cx, &mut field_section)).await;
+        assert!(matches!(result, Ok(Err(HeaderError::InvalidHeaderName(_)))));
+        // QPACK Section Acknowledgment must still be emitted so peer dynamic
+        // table tracking stays synchronized (RFC 9204 Section 2.2.2.1).
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QpackEvent::HeaderAck(StreamId(0)))
+        ));
+    }
+
     #[test]
     fn receive_drop_cancels_quic_and_qpack_once_after_split() {
         let (mut stream, probe) = stream();
         let (events_send, mut events) = mpsc::unbounded_channel();
         let decoder = QpackDecoder::new(qpack::Decoder::new(1024, 1).unwrap(), events_send);
-        stream.decode_state =
-            RequestDecodeState::new(StreamId(0), &stream.conn_state, 1024, Some(decoder));
+        stream.decode_state = RequestDecodeState::new(StreamId(0), 1024, Some(decoder));
         // Required Insert Count 1, Base 1, dynamic entry 0: the table is empty.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1
         let mut field_section = Bytes::from_static(&[0x02, 0x00, 0x80]);

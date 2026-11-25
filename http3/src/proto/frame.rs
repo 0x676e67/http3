@@ -74,6 +74,9 @@ pub enum Frame<B> {
 /// A frame header read by the stream decoder.
 pub(crate) enum StreamFrame {
     Known(Frame<PayloadLen>),
+    /// A complete HEADERS frame whose `len`-byte payload immediately follows the
+    /// decoded frame header in the input buffer.
+    Headers(usize),
     /// A frame of unknown type, whose `len` payload bytes follow and carry no
     /// meaning. <https://www.rfc-editor.org/rfc/rfc9114#section-9>
     Unknown {
@@ -144,6 +147,7 @@ impl Frame<PayloadLen> {
         let remaining = buf.remaining();
         match Self::decode_with_limits(buf, max_addressable, usize::MAX, StreamKind::Any)? {
             StreamFrame::Known(frame) => Ok(frame),
+            StreamFrame::Headers(len) => Ok(Frame::Headers(buf.copy_to_bytes(len))),
             StreamFrame::Unknown {
                 ty,
                 len: encoded_len,
@@ -307,8 +311,18 @@ impl Frame<PayloadLen> {
         #[cfg(feature = "tracing")]
         trace!("frame ty: {:?}", ty);
 
+        if ty == FrameType::HEADERS {
+            #[cfg(feature = "tracing")]
+            trace!(
+                "got frame Headers({} bytes), len: {}, remaining: {}",
+                len,
+                encoded_len,
+                buf.remaining()
+            );
+            return Ok(StreamFrame::Headers(len));
+        }
+
         let frame = match ty {
-            FrameType::HEADERS => Ok(Frame::Headers(buf.copy_to_bytes(len))),
             FrameType::SETTINGS => decode_payload(buf, len, |payload| {
                 Settings::decode(payload)
                     .map(Frame::Settings)

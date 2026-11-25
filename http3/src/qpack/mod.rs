@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, TryLockError,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering, fence},
     },
     task::{Context, Poll, Waker},
 };
@@ -21,10 +21,16 @@ pub use self::{
     field::HeaderField,
 };
 pub(crate) use self::{
-    decoder::{FieldSectionPrefix, decode_stateless_limited},
+    decoder::{
+        DecodedFieldList, DecodedMeta, FieldSectionPrefix, decode_stateless_fields_limited,
+        decode_stateless_limited,
+    },
     encoder::Encoder,
 };
-use crate::quic::StreamId;
+use crate::{
+    quic::StreamId,
+    shared_state::{ConnectionState, SharedState},
+};
 
 mod block;
 mod dynamic;
@@ -456,6 +462,12 @@ struct QpackDecoderInner {
     instruction_bound: bool,
     /// Connection-driver waker used while a request holds a read guard.
     write_waker: AtomicWaker,
+    /// Fast-path flag indicating the connection driver registered `write_waker`
+    /// and is waiting to acquire the write lock. Avoids atomic RMW traffic on
+    /// `write_waker` during steady-state read-only decoding.
+    writer_waiting: AtomicBool,
+    /// Connection shared state used to wake the driver when decoder feedback is queued.
+    driver_state: Option<Arc<SharedState>>,
 }
 
 /// Shared QPACK decoder state for a single HTTP/3 connection.
@@ -477,7 +489,7 @@ impl QpackDecoder {
         decoder: Decoder,
         decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
     ) -> Self {
-        Self::build(decoder, decoder_events_send, false)
+        Self::build(decoder, decoder_events_send, false, None)
     }
 
     /// Like [`Self::new`], but dynamic field sections pause while
@@ -486,13 +498,14 @@ impl QpackDecoder {
         decoder: Decoder,
         decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
     ) -> Self {
-        Self::build(decoder, decoder_events_send, true)
+        Self::build(decoder, decoder_events_send, true, None)
     }
 
     fn build(
         decoder: Decoder,
         decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
         instruction_bound: bool,
+        driver_state: Option<Arc<SharedState>>,
     ) -> Self {
         QpackDecoder(Arc::new(QpackDecoderInner {
             decoder_dynamic_table: decoder.dynamic_table_enabled(),
@@ -503,6 +516,8 @@ impl QpackDecoder {
             queued_instructions: AtomicUsize::new(0),
             instruction_bound,
             write_waker: AtomicWaker::new(),
+            writer_waiting: AtomicBool::new(false),
+            driver_state,
         }))
     }
 
@@ -694,7 +709,12 @@ impl QpackDecoder {
         write: &mut W,
     ) -> Poll<Result<usize, DecoderError>> {
         match self.0.decoder.try_write() {
-            Ok(mut decoder) => return Poll::Ready(decoder.on_encoder_recv_buffered(read, write)),
+            Ok(mut decoder) => {
+                if self.0.writer_waiting.load(Ordering::Relaxed) {
+                    self.0.writer_waiting.store(false, Ordering::Release);
+                }
+                return Poll::Ready(decoder.on_encoder_recv_buffered(read, write));
+            }
             Err(TryLockError::WouldBlock) => {}
             _ => {
                 return Poll::Ready(Err(DecoderError::Internal(
@@ -704,10 +724,19 @@ impl QpackDecoder {
         }
 
         // The last reader may finish between the first attempt and registration.
+        // Register the waker, publish `writer_waiting`, then issue a SeqCst fence
+        // before retrying `try_write`. Pairing this fence with the SeqCst fence
+        // in `finish_decode` forbids a Store-Buffering race even when a failing
+        // `RwLock::try_write` performs only a Relaxed load.
         self.0.write_waker.register(cx.waker());
+        self.0.writer_waiting.store(true, Ordering::Release);
+        fence(Ordering::SeqCst);
 
         match self.0.decoder.try_write() {
-            Ok(mut decoder) => Poll::Ready(decoder.on_encoder_recv_buffered(read, write)),
+            Ok(mut decoder) => {
+                self.0.writer_waiting.store(false, Ordering::Release);
+                Poll::Ready(decoder.on_encoder_recv_buffered(read, write))
+            }
             Err(TryLockError::WouldBlock) => Poll::Pending,
             _ => Poll::Ready(Err(DecoderError::Internal(
                 "QPACK decoder lock is poisoned",
@@ -716,14 +745,21 @@ impl QpackDecoder {
     }
 
     /// Releases a decode guard and wakes a driver waiting to update the table.
-    fn finish_decode(
+    fn finish_decode<T>(
         &self,
         decoder: RwLockReadGuard<'_, Decoder>,
-        decoded: Result<Decoded, DecoderError>,
-    ) -> Poll<Result<Decoded, DecoderError>> {
+        decoded: Result<T, DecoderError>,
+    ) -> Poll<Result<T, DecoderError>> {
         // A driver blocked in poll_on_recv_encoder can continue after the guard drops.
+        // The SeqCst fence pairs with the writer's SeqCst fence before `try_write`,
+        // keeping `writer_waiting` read-only in steady state when no writer waits.
         drop(decoder);
-        self.0.write_waker.wake();
+        fence(Ordering::SeqCst);
+        if self.0.writer_waiting.load(Ordering::Acquire)
+            && self.0.writer_waiting.swap(false, Ordering::AcqRel)
+        {
+            self.0.write_waker.wake();
+        }
         Poll::Ready(decoded)
     }
 
@@ -753,11 +789,75 @@ impl QpackDecoder {
             ));
         }
 
+        self.poll_read_decode(
+            cx,
+            references_dynamic_table(prefix.as_ref(), field_section),
+            |decoder| decoder.decode_header_limited(field_section, max_field_section_size, prefix),
+        )
+    }
+
+    /// Creates a connection-owned decoder wired to wake `driver_state` when
+    /// decoder feedback is queued.
+    pub(crate) fn for_connection(
+        decoder: Decoder,
+        decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
+        instruction_bound: bool,
+        driver_state: Arc<SharedState>,
+    ) -> Self {
+        Self::build(
+            decoder,
+            decoder_events_send,
+            instruction_bound,
+            Some(driver_state),
+        )
+    }
+
+    /// Wakes the owning connection driver, if attached.
+    pub(crate) fn wake_driver(&self) {
+        if let Some(shared) = &self.0.driver_state {
+            shared.waker().wake();
+        }
+    }
+
+    /// Decodes one QPACK field section into pre-validated [`DecodedField`] items
+    /// while holding the decoder read lock only for QPACK parsing and table lookups.
+    pub(crate) fn poll_decode_fields<T: Buf>(
+        &self,
+        cx: &mut Context<'_>,
+        field_section: &mut T,
+        max_field_section_size: u64,
+        prefix: &mut Option<FieldSectionPrefix>,
+        out: &mut DecodedFieldList,
+    ) -> Poll<Result<DecodedMeta, DecoderError>> {
+        if !self.0.decoder_dynamic_table {
+            return Poll::Ready(decode_stateless_fields_limited(
+                field_section,
+                max_field_section_size,
+                self.0.max_encoded_string_size,
+                out,
+            ));
+        }
+
+        self.poll_read_decode(
+            cx,
+            references_dynamic_table(prefix.as_ref(), field_section),
+            |decoder| {
+                decoder.decode_fields_limited(field_section, max_field_section_size, prefix, out)
+            },
+        )
+    }
+
+    fn poll_read_decode<R>(
+        &self,
+        cx: &mut Context<'_>,
+        references_dynamic: bool,
+        decode: impl FnOnce(&Decoder) -> Result<R, DecoderError>,
+    ) -> Poll<Result<R, DecoderError>> {
         // Only sections with dynamic references queue a Section Acknowledgment.
         // The driver wakes this request after writing the instructions before it.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.2.1
         if self.0.instruction_bound
-            && references_dynamic_table(prefix.as_ref(), field_section)
+            && references_dynamic
             && self.0.queued_instructions.load(Ordering::Relaxed) >= MAX_QUEUED_DECODER_INSTRUCTIONS
         {
             self.queue_decoder_waiter(cx)?;
@@ -768,8 +868,7 @@ impl QpackDecoder {
 
         match self.0.decoder.try_read() {
             Ok(decoder) => {
-                let decoded =
-                    decoder.decode_header_limited(field_section, max_field_section_size, prefix);
+                let decoded = decode(&decoder);
                 return self.finish_decode(decoder, decoded);
             }
             Err(TryLockError::WouldBlock) => {}
@@ -787,8 +886,7 @@ impl QpackDecoder {
 
         match self.0.decoder.try_read() {
             Ok(decoder) => {
-                let decoded =
-                    decoder.decode_header_limited(field_section, max_field_section_size, prefix);
+                let decoded = decode(&decoder);
                 self.finish_decode(decoder, decoded)
             }
             Err(TryLockError::WouldBlock) => Poll::Pending,

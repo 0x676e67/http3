@@ -1,6 +1,6 @@
 use std::task::{Context, Poll};
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 #[cfg(feature = "tracing")]
 use tracing::trace;
 
@@ -94,7 +94,7 @@ where
 
         loop {
             // Decode buffered frames before reading more from the transport.
-            return match self.decoder.decode(self.stream.buf_mut())? {
+            return match self.decoder.decode_bytes(self.stream.buf_mut())? {
                 Some(Frame::Data(PayloadLen(len))) => {
                     self.remaining_data = len;
                     self.data_until_eos = false;
@@ -279,9 +279,27 @@ impl Default for FrameDecoder {
 }
 
 impl FrameDecoder {
+    #[cfg(test)]
     fn decode<B: Buf>(
         &mut self,
         src: &mut BufList<B>,
+    ) -> Result<Option<Frame<PayloadLen>>, FrameStreamError> {
+        self.decode_with(src, |src, len| {
+            (src.remaining() >= len).then(|| src.copy_to_bytes(len))
+        })
+    }
+
+    fn decode_bytes(
+        &mut self,
+        src: &mut BufList<Bytes>,
+    ) -> Result<Option<Frame<PayloadLen>>, FrameStreamError> {
+        self.decode_with(src, BufList::take_bytes)
+    }
+
+    fn decode_with<B: Buf>(
+        &mut self,
+        src: &mut BufList<B>,
+        take_headers: impl FnOnce(&mut BufList<B>, usize) -> Option<Bytes>,
     ) -> Result<Option<Frame<PayloadLen>>, FrameStreamError> {
         // Decode in a loop since we ignore unknown frames, and there may be
         // other frames already in our BufList.
@@ -341,6 +359,12 @@ impl FrameDecoder {
                     src.advance(pos);
                     self.expected = None;
                     return Ok(Some(frame));
+                }
+                Ok(StreamFrame::Headers(len)) => {
+                    src.advance(pos);
+                    self.expected = None;
+                    let payload = take_headers(src, len).ok_or(FrameStreamError::UnexpectedEnd)?;
+                    return Ok(Some(Frame::Headers(payload)));
                 }
                 // -------------- Map the error Values --------------
                 Err(frame::FrameError::InvalidStreamId(e)) => {
@@ -586,6 +610,56 @@ mod tests {
             Ok(Some(Frame::Data(PayloadLen(4))))
         );
         assert_matches!(decoder.decode(&mut buf), Ok(None));
+    }
+
+    #[test]
+    fn decode_bytes_slices_contiguous_headers_without_copy() {
+        let mut wire = BytesMut::new();
+        Frame::headers(&b"salut"[..]).encode_with_payload(&mut wire);
+        let sole = wire.freeze();
+        let sole_ptr = sole.as_ptr();
+
+        let mut buf = BufList::from(sole);
+        let mut decoder = FrameDecoder::default();
+        let Ok(Some(Frame::Headers(payload))) = decoder.decode_bytes(&mut buf) else {
+            panic!("expected HEADERS frame");
+        };
+        assert_eq!(&payload[..], b"salut");
+        assert_eq!(payload.as_ptr(), sole_ptr.wrapping_add(2));
+        assert_eq!(buf.remaining(), 0);
+
+        // HEADERS followed by DATA in the same Bytes chunk stays zero-copy too.
+        let mut wire = BytesMut::new();
+        Frame::headers(&b"hdr"[..]).encode_with_payload(&mut wire);
+        Frame::Data(&b"body"[..]).encode_with_payload(&mut wire);
+        let combined = wire.freeze();
+        let combined_ptr = combined.as_ptr();
+
+        let mut buf = BufList::from(combined);
+        let Ok(Some(Frame::Headers(payload))) = decoder.decode_bytes(&mut buf) else {
+            panic!("expected HEADERS frame");
+        };
+        assert_eq!(&payload[..], b"hdr");
+        assert_eq!(payload.as_ptr(), combined_ptr.wrapping_add(2));
+        assert_matches!(
+            decoder.decode_bytes(&mut buf),
+            Ok(Some(Frame::Data(PayloadLen(4))))
+        );
+
+        // Multi-chunk HEADERS payload and empty HEADERS both decode identically.
+        let mut fragmented = BufList::new();
+        fragmented.push(Bytes::from_static(&[0x01, 0x05, b'a', b'b']));
+        fragmented.push(Bytes::from_static(b"cde"));
+        let Ok(Some(Frame::Headers(payload))) = decoder.decode_bytes(&mut fragmented) else {
+            panic!("expected fragmented HEADERS frame");
+        };
+        assert_eq!(&payload[..], b"abcde");
+
+        let mut empty = BufList::from(Bytes::from_static(&[0x01, 0x00]));
+        let Ok(Some(Frame::Headers(payload))) = decoder.decode_bytes(&mut empty) else {
+            panic!("expected empty HEADERS frame");
+        };
+        assert!(payload.is_empty());
     }
 
     // FrameStream
@@ -916,12 +990,8 @@ mod tests {
             let mut recv = FakeRecv::default();
             recv.chunk(wire.freeze());
             let shared = Arc::default();
-            let decode_state = crate::connection::RequestDecodeState::new(
-                recv.recv_id(),
-                &shared,
-                usize::MAX,
-                None,
-            );
+            let decode_state =
+                crate::connection::RequestDecodeState::new(recv.recv_id(), usize::MAX, None);
             let mut stream = crate::connection::RequestStream::<_, Bytes>::with_decode_state(
                 StreamGuard::without_cancellation(FrameStream::new(BufRecvStream::new(recv))),
                 u64::MAX,
@@ -985,7 +1055,6 @@ mod tests {
             let shared = Arc::default();
             let decode_state = crate::connection::RequestDecodeState::new(
                 recv.recv_id(),
-                &shared,
                 usize::MAX,
                 Some(QpackDecoder::new(decoder, events_tx)),
             );
@@ -1037,7 +1106,7 @@ mod tests {
         recv.chunk(wire.freeze());
         let shared = Arc::default();
         let decode_state =
-            crate::connection::RequestDecodeState::new(recv.recv_id(), &shared, usize::MAX, None);
+            crate::connection::RequestDecodeState::new(recv.recv_id(), usize::MAX, None);
         let frames = FrameStream::new(BufRecvStream::new(recv));
         let mut stream = crate::connection::RequestStream::<_, Bytes>::with_decode_state(
             StreamGuard::without_cancellation(frames),

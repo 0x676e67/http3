@@ -3,8 +3,16 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque, hash_map::Entry},
 };
 
-use super::{field::HeaderField, static_::StaticTable};
-use crate::qpack::vas::{self, VirtualAddressSpace};
+use bytes::Bytes;
+
+use super::{
+    field::{ESTIMATED_OVERHEAD_BYTES, HeaderField},
+    static_::StaticTable,
+};
+use crate::{
+    proto::headers::{DecodedField, ParsedField, ParsedName},
+    qpack::vas::{self, VirtualAddressSpace},
+};
 
 // Bound encoder bookkeeping even if a peer advances the Known Received Count
 // but never acknowledges or cancels field sections.
@@ -778,6 +786,336 @@ impl DynamicTable {
 
     pub(super) fn max_mem_size(&self) -> usize {
         self.max_size
+    }
+}
+
+/// Decoder dynamic table entry backed by independently owned [`Bytes`] and
+/// pre-validated HTTP field representations.
+///
+/// Entries are validated opportunistically upon insertion; invalid HTTP syntax
+/// does not fail the QPACK encoder stream because RFC 9204 Section 3.2 allows
+/// arbitrary octets in the dynamic table. Unreferenced invalid entries remain
+/// harmless, while referenced entries fail at HTTP message conversion after
+/// QPACK decompression and size checks complete.
+#[derive(Clone, Debug)]
+pub(super) struct DecoderEntry {
+    name: Bytes,
+    value: Bytes,
+    parsed_name: Option<ParsedName>,
+    parsed_field: Option<ParsedField>,
+}
+
+impl DecoderEntry {
+    pub(super) fn from_literal(name: Vec<u8>, value: Vec<u8>) -> Self {
+        let name = Bytes::from(name);
+        let value = Bytes::from(value);
+        let parsed_name = ParsedName::parse(&name).ok();
+        let parsed_field = parsed_name
+            .as_ref()
+            .and_then(|parsed_name| ParsedField::parse_with_name(parsed_name, value.clone()).ok());
+        Self {
+            name,
+            value,
+            parsed_name,
+            parsed_field,
+        }
+    }
+
+    pub(super) fn from_static_name(
+        name: &'static [u8],
+        parsed_name: Option<ParsedName>,
+        value: Vec<u8>,
+    ) -> Self {
+        let value = Bytes::from(value);
+        let parsed_field = parsed_name
+            .as_ref()
+            .and_then(|parsed_name| ParsedField::parse_with_name(parsed_name, value.clone()).ok());
+        Self {
+            name: Bytes::from_static(name),
+            value,
+            parsed_name,
+            parsed_field,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_header_field(field: HeaderField<'static>) -> Self {
+        let name = match field.name {
+            Cow::Borrowed(bytes) => Bytes::from_static(bytes),
+            Cow::Owned(bytes) => Bytes::from(bytes),
+        };
+        let value = match field.value {
+            Cow::Borrowed(bytes) => Bytes::from_static(bytes),
+            Cow::Owned(bytes) => Bytes::from(bytes),
+        };
+        let parsed_name = ParsedName::parse(&name).ok();
+        let parsed_field = parsed_name
+            .as_ref()
+            .and_then(|parsed_name| ParsedField::parse_with_name(parsed_name, value.clone()).ok());
+        Self {
+            name,
+            value,
+            parsed_name,
+            parsed_field,
+        }
+    }
+
+    pub(super) fn with_value(&self, value: Vec<u8>) -> Self {
+        let value = Bytes::from(value);
+        let parsed_field = self
+            .parsed_name
+            .as_ref()
+            .and_then(|parsed_name| ParsedField::parse_with_name(parsed_name, value.clone()).ok());
+        Self {
+            name: self.name.clone(),
+            value,
+            parsed_name: self.parsed_name.clone(),
+            parsed_field,
+        }
+    }
+
+    pub(super) fn mem_size(&self) -> usize {
+        self.name
+            .len()
+            .saturating_add(self.value.len())
+            .saturating_add(ESTIMATED_OVERHEAD_BYTES)
+    }
+
+    pub(super) fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    pub(super) fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    pub(super) fn to_header_field(&self) -> HeaderField<'static> {
+        HeaderField {
+            name: Cow::Owned(self.name.to_vec()),
+            value: Cow::Owned(self.value.to_vec()),
+            sensitive: false,
+        }
+    }
+
+    pub(super) fn to_header_field_with_value(&self, value: Vec<u8>) -> HeaderField<'static> {
+        HeaderField {
+            name: Cow::Owned(self.name.to_vec()),
+            value: Cow::Owned(value),
+            sensitive: false,
+        }
+    }
+
+    pub(super) fn to_decoded_field(&self) -> DecodedField {
+        match &self.parsed_field {
+            Some(field) => DecodedField::Parsed {
+                field: field.clone(),
+                sensitive: false,
+            },
+            None => DecodedField::InvalidRaw {
+                name: self.name.clone(),
+                value: self.value.clone(),
+            },
+        }
+    }
+
+    pub(super) fn to_decoded_name_ref(&self, value: Vec<u8>, sensitive: bool) -> DecodedField {
+        match &self.parsed_name {
+            Some(name) => DecodedField::NameRef {
+                name: name.clone(),
+                value,
+                sensitive,
+            },
+            None => DecodedField::InvalidRaw {
+                name: self.name.clone(),
+                value: Bytes::from(value),
+            },
+        }
+    }
+}
+
+/// Decoder-only dynamic table storing [`DecoderEntry`] without encoder lookup
+/// maps or reference-tracking state.
+#[derive(Default)]
+pub(super) struct DecoderDynamicTable {
+    entries: VecDeque<DecoderEntry>,
+    curr_size: usize,
+    max_size: usize,
+    vas: VirtualAddressSpace,
+}
+
+pub(super) struct DecoderDynamicTableView<'a> {
+    table: &'a DecoderDynamicTable,
+    base: usize,
+    required_ref: usize,
+}
+
+impl<'a> DecoderDynamicTableView<'a> {
+    pub(super) fn get_relative(&self, index: usize) -> Result<&'a DecoderEntry, Error> {
+        // A field section cannot reference an insertion newer than its declared
+        // Required Insert Count.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
+        let absolute = self
+            .base
+            .checked_sub(index)
+            .filter(|absolute| *absolute != 0 && *absolute <= self.required_ref)
+            .ok_or(Error::BadRelativeIndex(index))?;
+        let real_index = self.table.vas.relative_base(self.base, index)?;
+        debug_assert_eq!(self.table.vas.index(real_index), Ok(absolute));
+        self.table
+            .entries
+            .get(real_index)
+            .ok_or(Error::BadIndex(real_index))
+    }
+
+    pub(super) fn get_postbase(&self, index: usize) -> Result<&'a DecoderEntry, Error> {
+        // Post-base references are also bounded by Required Insert Count.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1
+        self.base
+            .checked_add(index)
+            .and_then(|absolute| absolute.checked_add(1))
+            .filter(|absolute| *absolute <= self.required_ref)
+            .ok_or(Error::BadPostbaseIndex(index))?;
+        let real_index = self.table.vas.post_base(self.base, index)?;
+        self.table
+            .entries
+            .get(real_index)
+            .ok_or(Error::BadIndex(real_index))
+    }
+}
+
+impl DecoderDynamicTable {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn decoder(&self, base: usize, required_ref: usize) -> DecoderDynamicTableView<'_> {
+        DecoderDynamicTableView {
+            table: self,
+            base,
+            required_ref,
+        }
+    }
+
+    pub(super) fn set_max_size(&mut self, size: usize) -> Result<(), Error> {
+        if size >= self.max_size {
+            self.max_size = size;
+            return Ok(());
+        }
+
+        let mut remaining = self.curr_size;
+        let mut to_evict = 0;
+        for entry in &self.entries {
+            if remaining <= size {
+                break;
+            }
+            remaining -= entry.mem_size();
+            to_evict += 1;
+        }
+        self.evict(to_evict)?;
+        self.max_size = size;
+        Ok(())
+    }
+
+    /// Adds an entry received from the peer's encoder stream.
+    ///
+    /// Decoded field bytes remain independently owned; sharing slices of a
+    /// connection receive buffer here could retain a much larger allocation
+    /// for the table's lifetime, as seen in <https://github.com/hyperium/h2/issues/923>.
+    ///
+    /// See [RFC 9204, Section 3.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2)
+    /// and [Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3).
+    pub(super) fn put(&mut self, entry: DecoderEntry) -> Result<(), Error> {
+        if self.max_size == 0 {
+            return Err(Error::MaxTableSizeReached);
+        }
+
+        let entry_size = entry
+            .name
+            .len()
+            .checked_add(entry.value.len())
+            .and_then(|len| len.checked_add(ESTIMATED_OVERHEAD_BYTES))
+            .ok_or(Error::MaxTableSizeReached)?;
+        let to_evict = self.count_evictable(entry_size)?;
+
+        // Check the lifetime insertion limit before eviction or table mutation.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4
+        self.vas.ensure_can_add()?;
+        self.evict(to_evict)?;
+
+        self.curr_size += entry_size;
+        self.entries.push_back(entry);
+        self.vas.add()?;
+        Ok(())
+    }
+
+    pub(super) fn get_relative(&self, index: usize) -> Result<&DecoderEntry, Error> {
+        let real_index = self.vas.relative(index)?;
+        self.entries
+            .get(real_index)
+            .ok_or(Error::BadIndex(real_index))
+    }
+
+    pub(super) fn total_inserted(&self) -> usize {
+        self.vas.total_inserted()
+    }
+
+    #[cfg(test)]
+    pub(super) fn max_mem_size(&self) -> usize {
+        self.max_size
+    }
+
+    fn count_evictable(&self, required: usize) -> Result<usize, Error> {
+        if required > self.max_size {
+            return Err(Error::MaxTableSizeReached);
+        }
+
+        if self.max_size - self.curr_size >= required {
+            return Ok(0);
+        }
+
+        let lower_bound = self.max_size - required;
+        let mut hypothetic_mem_size = self.curr_size;
+        let mut evictable = 0;
+
+        for entry in &self.entries {
+            if hypothetic_mem_size <= lower_bound {
+                break;
+            }
+            evictable += 1;
+            hypothetic_mem_size -= entry.mem_size();
+        }
+
+        if required <= self.max_size - hypothetic_mem_size {
+            Ok(evictable)
+        } else {
+            Err(Error::MaxTableSizeReached)
+        }
+    }
+
+    fn evict(&mut self, to_evict: usize) -> Result<(), Error> {
+        for _ in 0..to_evict {
+            let entry = self.entries.pop_front().ok_or(Error::MaxTableSizeReached)?;
+            self.curr_size -= entry.mem_size();
+            self.vas.drop()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl From<DynamicTable> for DecoderDynamicTable {
+    fn from(table: DynamicTable) -> Self {
+        let entries = table
+            .fields
+            .into_iter()
+            .map(DecoderEntry::from_header_field)
+            .collect();
+        Self {
+            entries,
+            curr_size: table.curr_size,
+            max_size: table.max_size,
+            vas: table.vas,
+        }
     }
 }
 

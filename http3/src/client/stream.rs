@@ -1,7 +1,5 @@
 use std::{
-    convert::TryFrom,
     future::poll_fn,
-    sync::Arc,
     task::{Context, Poll, ready},
 };
 
@@ -182,9 +180,9 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
-        let result = self.rejection.poll(cx, |cx| {
+        let result = poll_with_rejection(&mut self.inner, self.rejection, cx, |inner, cx| {
             self.head.require_received()?;
-            self.inner.poll_recv_data(cx)
+            inner.poll_recv_data(cx)
         });
         result.map(|result| self.handle_result(result))
     }
@@ -207,9 +205,9 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
-        let res = self.rejection.poll(cx, |cx| {
+        let res = poll_with_rejection(&mut self.inner, self.rejection, cx, |inner, cx| {
             self.head.require_received()?;
-            self.inner.poll_recv_trailers(cx)
+            inner.poll_recv_trailers(cx)
         });
         if let Poll::Ready(Err(StreamError::HeaderTooBig { .. })) = &res {
             self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
@@ -257,8 +255,8 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Response<()>, StreamError>> {
-        let result = self.rejection.poll(cx, |cx| {
-            Self::poll_recv_response_inner(&mut self.inner, &mut self.head, &self.method, cx)
+        let result = poll_with_rejection(&mut self.inner, self.rejection, cx, |inner, cx| {
+            Self::poll_recv_response_inner(inner, &mut self.head, &self.method, cx)
         });
         result.map(|result| {
             self.head = match &result {
@@ -329,7 +327,7 @@ where
             }
         };
 
-        let fields = match inner.poll_decode_field_section(cx, &mut encoded) {
+        let header = match inner.poll_decode_header(cx, &mut encoded) {
             Poll::Pending => {
                 *head = ResponseHead::Decoding(encoded);
                 return Poll::Pending;
@@ -344,7 +342,7 @@ where
                     max_size: inner.max_field_section_size,
                 }));
             }
-            Poll::Ready(Ok(qpack::Decoded { fields, .. })) => fields,
+            Poll::Ready(Ok(header)) => header,
             Poll::Ready(Err(error)) => {
                 let code = if error.is_internal() {
                     Code::H3_INTERNAL_ERROR
@@ -366,7 +364,7 @@ where
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
         //# Clients MUST NOT
         //# accept a malformed response.
-        let (status, headers, pseudo_sensitivity, content_length) = Header::try_from(fields)
+        let (status, headers, pseudo_sensitivity, content_length) = header
             .and_then(Header::into_response_parts)
             .and_then(|(status, headers, pseudo_sensitivity)| {
                 let content_length = headers::content_length(&headers, method, Some(status))?;
@@ -462,7 +460,9 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Code>, StreamError>> {
-        let result = self.rejection.poll(cx, |cx| self.inner.poll_stopped(cx));
+        let result = poll_with_rejection(&mut self.inner, self.rejection, cx, |inner, cx| {
+            inner.poll_stopped(cx)
+        });
         result.map(|result| self.handle_result(result))
     }
 
@@ -473,7 +473,9 @@ where
     /// credit or wait for acknowledgment. After trailers, only finish is allowed.
     /// Dropping the polling future leaves queued bytes owned by the stream.
     pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
-        let result = self.rejection.poll(cx, |cx| self.inner.poll_ready(cx));
+        let result = poll_with_rejection(&mut self.inner, self.rejection, cx, |inner, cx| {
+            inner.poll_ready(cx)
+        });
         result.map(|result| self.handle_result(result))
     }
 
@@ -484,7 +486,11 @@ where
     /// error. Pending output, trailers, finish or reset cause a local
     /// [`StreamError::InvalidStreamState`] without discarding queued bytes.
     pub fn start_send_data(&mut self, buf: B) -> Result<(), StreamError> {
-        let result = match self.rejection.state.request_error(self.rejection.stream_id) {
+        let result = match self
+            .inner
+            .conn_state
+            .request_error(self.rejection.stream_id)
+        {
             Some(error) => Err(error),
             None => self.inner.start_send_data(buf),
         };
@@ -498,7 +504,11 @@ where
     /// field section limit is checked before queuing; an error consumes the
     /// supplied headers. Invalid send order is a local error, not a wire error.
     pub fn start_send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
-        let result = match self.rejection.state.request_error(self.rejection.stream_id) {
+        let result = match self
+            .inner
+            .conn_state
+            .request_error(self.rejection.stream_id)
+        {
             Some(error) => Err(error),
             None => self.inner.start_send_trailers(trailers),
         };
@@ -512,7 +522,9 @@ where
     /// Success is repeatable and does not wait for FIN acknowledgment; use
     /// [`Self::poll_stopped`] for that. Receiving is unaffected.
     pub fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
-        let result = self.rejection.poll(cx, |cx| self.inner.poll_finish(cx));
+        let result = poll_with_rejection(&mut self.inner, self.rejection, cx, |inner, cx| {
+            inner.poll_finish(cx)
+        });
         result.map(|result| self.handle_result(result))
     }
 }
@@ -545,7 +557,7 @@ where
         (
             RequestStream {
                 inner: send,
-                rejection: RequestRejection::new(rejection.state.clone(), rejection.stream_id),
+                rejection,
                 head: ResponseHead::Pending,
                 method: method.clone(),
             },
@@ -565,7 +577,7 @@ where
     B: Buf,
 {
     pub(super) fn new(inner: connection::RequestStream<S, B>, method: Method) -> Self {
-        let rejection = RequestRejection::new(inner.conn_state.clone(), inner.stream.id());
+        let rejection = RequestRejection::new(inner.stream.id());
         Self {
             inner,
             rejection,
@@ -575,35 +587,40 @@ where
     }
 }
 
-// GOAWAY rejection is a state snapshot checked around each poll. The server's
-// reset or the closing connection provides the transport wakeup.
+// GOAWAY rejection is a state snapshot checked around each poll against
+// `inner.conn_state`. The server's reset or the closing connection provides the
+// transport wakeup.
+#[derive(Clone, Copy)]
 struct RequestRejection {
-    state: Arc<SharedState>,
     stream_id: StreamId,
 }
 
 impl RequestRejection {
-    fn new(state: Arc<SharedState>, stream_id: StreamId) -> Self {
-        Self { state, stream_id }
+    fn new(stream_id: StreamId) -> Self {
+        Self { stream_id }
     }
+}
 
-    fn poll<T>(
-        &self,
-        cx: &mut Context<'_>,
-        operation: impl FnOnce(&mut Context<'_>) -> Poll<Result<T, StreamError>>,
-    ) -> Poll<Result<T, StreamError>> {
-        if let Some(error) = self.state.request_error(self.stream_id) {
+fn poll_with_rejection<S, B, T>(
+    inner: &mut connection::RequestStream<S, B>,
+    rejection: RequestRejection,
+    cx: &mut Context<'_>,
+    operation: impl FnOnce(
+        &mut connection::RequestStream<S, B>,
+        &mut Context<'_>,
+    ) -> Poll<Result<T, StreamError>>,
+) -> Poll<Result<T, StreamError>> {
+    if let Some(error) = inner.conn_state.request_error(rejection.stream_id) {
+        return Poll::Ready(Err(error));
+    }
+    let result = operation(inner, cx);
+    if result.is_pending() {
+        // GOAWAY can be published during the transport poll without a wakeup.
+        if let Some(error) = inner.conn_state.request_error(rejection.stream_id) {
             return Poll::Ready(Err(error));
         }
-        let result = operation(cx);
-        if result.is_pending() {
-            // GOAWAY can be published during the transport poll without a wakeup.
-            if let Some(error) = self.state.request_error(self.stream_id) {
-                return Poll::Ready(Err(error));
-            }
-        }
-        result
     }
+    result
 }
 
 impl<S, B> RequestStream<S, B> {

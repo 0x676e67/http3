@@ -6,6 +6,7 @@ use std::{
     str::FromStr,
 };
 
+use bytes::Bytes;
 use http::{
     Extensions, HeaderMap, Method, StatusCode,
     header::{self, HeaderName, HeaderValue},
@@ -332,6 +333,50 @@ impl Header {
     pub(crate) fn authory_mut(&mut self) -> &mut Option<Authority> {
         &mut self.pseudo.authority
     }
+
+    /// Builds an HTTP [`Header`] from QPACK-decoded fields that may already carry
+    /// cached, pre-validated HTTP names or field pairs from the static or dynamic table.
+    ///
+    /// Preserves RFC 9114 Section 4.2 and Section 4.3 validation order after QPACK
+    /// decompression and field-section size checks have completed.
+    pub(crate) fn try_from_decoded(
+        decoded: impl ExactSizeIterator<Item = DecodedField>,
+    ) -> Result<Self, HeaderError> {
+        // The decoded field count is peer-controlled, and a valid QPACK block
+        // can exceed HeaderMap's capacity even within the compressed-size limit.
+        let mut fields =
+            HeaderMap::try_with_capacity(decoded.len()).map_err(|_| HeaderError::TooManyFields)?;
+        let mut pseudo = Pseudo::default();
+        let mut seen = 0_u8;
+
+        for item in decoded {
+            let (field, sensitive) = match item {
+                DecodedField::Parsed { field, sensitive } => (field, sensitive),
+                DecodedField::NameRef {
+                    name,
+                    value,
+                    sensitive,
+                } => (
+                    ParsedField::parse_with_name(&name, Bytes::from(value))?,
+                    sensitive,
+                ),
+                DecodedField::Literal {
+                    name,
+                    value,
+                    sensitive,
+                } => (
+                    ParsedField::parse_bytes(&name, Bytes::from(value))?,
+                    sensitive,
+                ),
+                DecodedField::InvalidRaw { name, value } => {
+                    (ParsedField::parse_bytes(&name, value)?, false)
+                }
+            };
+            insert_parsed_field(&mut fields, &mut pseudo, &mut seen, field, sensitive)?;
+        }
+
+        Ok(Header { pseudo, fields })
+    }
 }
 
 impl<'a> IntoIterator for &'a Header {
@@ -395,93 +440,87 @@ impl TryFrom<Vec<HeaderField<'static>>> for Header {
         for field in headers.into_iter() {
             let sensitive = field.is_sensitive();
             let (name, value) = field.into_inner();
-            let field = Field::parse(name, value)?;
-            if let Some(id) = field.pseudo_id() {
-                // A HeaderMap cannot retain wire order or duplicate pseudo
-                // fields. Validate before inserting either kind of field.
-                // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
-                //# Any request or response that contains a
-                //# pseudo-header field that appears in a header section after a regular
-                //# header field MUST be treated as malformed.
-                if !fields.is_empty() {
-                    return Err(HeaderError::PseudoAfterField);
-                }
-                if seen & id.mask_id() != 0 {
-                    return Err(HeaderError::DuplicatePseudo);
-                }
-                seen |= id.mask_id();
-            }
-            match field {
-                Field::Method(m) => {
-                    pseudo.method = Some(m);
-                    pseudo.len += 1;
-                    pseudo.set_sensitive(PseudoId::Method, sensitive);
-                }
-                Field::Scheme(s) => {
-                    pseudo.scheme = Some(s);
-                    pseudo.len += 1;
-                    pseudo.set_sensitive(PseudoId::Scheme, sensitive);
-                }
-                Field::Authority(a) => {
-                    pseudo.authority = Some(a);
-                    pseudo.len += 1;
-                    pseudo.set_sensitive(PseudoId::Authority, sensitive);
-                }
-                Field::Path(p) => {
-                    pseudo.path = Some(p);
-                    pseudo.len += 1;
-                    pseudo.set_sensitive(PseudoId::Path, sensitive);
-                }
-                Field::Status(s) => {
-                    pseudo.status = Some(s);
-                    pseudo.len += 1;
-                    pseudo.set_sensitive(PseudoId::Status, sensitive);
-                }
-                Field::Header((n, mut v)) => {
-                    v.set_sensitive(sensitive);
-                    fields
-                        .try_append(n, v)
-                        .map_err(|_| HeaderError::TooManyFields)?;
-                }
-                Field::Protocol(p) => {
-                    pseudo.protocol = Some(p);
-                    pseudo.len += 1;
-                    pseudo.set_sensitive(PseudoId::Protocol, sensitive);
-                }
-            }
+            let field = ParsedField::parse(name, value)?;
+            insert_parsed_field(&mut fields, &mut pseudo, &mut seen, field, sensitive)?;
         }
 
         Ok(Header { pseudo, fields })
     }
 }
 
-enum Field {
-    Method(Method),
-    Scheme(Scheme),
-    Authority(Authority),
-    Path(PathAndQuery),
-    Status(StatusCode),
-    Protocol(Protocol),
-    Header((HeaderName, HeaderValue)),
-}
-
-impl Field {
-    /// Identifies message-control fields before their wire order is lost.
-    fn pseudo_id(&self) -> Option<PseudoId> {
-        match self {
-            Self::Method(_) => Some(PseudoId::Method),
-            Self::Scheme(_) => Some(PseudoId::Scheme),
-            Self::Authority(_) => Some(PseudoId::Authority),
-            Self::Path(_) => Some(PseudoId::Path),
-            Self::Status(_) => Some(PseudoId::Status),
-            Self::Protocol(_) => Some(PseudoId::Protocol),
-            Self::Header(_) => None,
+fn insert_parsed_field(
+    fields: &mut HeaderMap,
+    pseudo: &mut Pseudo,
+    seen: &mut u8,
+    field: ParsedField,
+    sensitive: bool,
+) -> Result<(), HeaderError> {
+    if let Some(id) = field.pseudo_id() {
+        // A HeaderMap cannot retain wire order or duplicate pseudo
+        // fields. Validate before inserting either kind of field.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+        //# Any request or response that contains a
+        //# pseudo-header field that appears in a header section after a regular
+        //# header field MUST be treated as malformed.
+        if !fields.is_empty() {
+            return Err(HeaderError::PseudoAfterField);
+        }
+        if *seen & id.mask_id() != 0 {
+            return Err(HeaderError::DuplicatePseudo);
+        }
+        *seen |= id.mask_id();
+    }
+    match field {
+        ParsedField::Method(m) => {
+            pseudo.method = Some(m);
+            pseudo.len += 1;
+            pseudo.set_sensitive(PseudoId::Method, sensitive);
+        }
+        ParsedField::Scheme(s) => {
+            pseudo.scheme = Some(s);
+            pseudo.len += 1;
+            pseudo.set_sensitive(PseudoId::Scheme, sensitive);
+        }
+        ParsedField::Authority(a) => {
+            pseudo.authority = Some(a);
+            pseudo.len += 1;
+            pseudo.set_sensitive(PseudoId::Authority, sensitive);
+        }
+        ParsedField::Path(p) => {
+            pseudo.path = Some(p);
+            pseudo.len += 1;
+            pseudo.set_sensitive(PseudoId::Path, sensitive);
+        }
+        ParsedField::Status(s) => {
+            pseudo.status = Some(s);
+            pseudo.len += 1;
+            pseudo.set_sensitive(PseudoId::Status, sensitive);
+        }
+        ParsedField::Header(n, mut v) => {
+            v.set_sensitive(sensitive);
+            fields
+                .try_append(n, v)
+                .map_err(|_| HeaderError::TooManyFields)?;
+        }
+        ParsedField::Protocol(p) => {
+            pseudo.protocol = Some(p);
+            pseudo.len += 1;
+            pseudo.set_sensitive(PseudoId::Protocol, sensitive);
         }
     }
+    Ok(())
+}
 
-    fn parse(name: Cow<'static, [u8]>, value: Cow<'static, [u8]>) -> Result<Self, HeaderError> {
-        let name = name.as_ref();
+/// Pre-validated HTTP field name cached in the QPACK static or decoder dynamic table.
+#[derive(Clone, Debug)]
+pub(crate) enum ParsedName {
+    Pseudo(PseudoId),
+    Header(HeaderName),
+}
+
+impl ParsedName {
+    pub(crate) fn parse(name: &[u8]) -> Result<Self, HeaderError> {
         if name.is_empty() {
             return Err(HeaderError::InvalidHeaderName("name is empty".into()));
         }
@@ -489,11 +528,6 @@ impl Field {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-10.3
         //# Requests or responses containing invalid field names MUST be treated
         //# as malformed.
-
-        //= https://www.rfc-editor.org/rfc/rfc9114#section-10.3
-        //# Any request or response that contains a
-        //# character not permitted in a field value MUST be treated as
-        //# malformed.
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
         //= type=implication
@@ -503,7 +537,7 @@ impl Field {
 
         if name[0] != b':' {
             // Connection-specific fields are malformed in HTTP/3. TE is
-            // restricted further by the request/response/trailer context.
+            // restricted further by the value check and message context.
             // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2
             if matches!(
                 name,
@@ -515,43 +549,134 @@ impl Field {
             ) {
                 return Err(HeaderError::invalid_name(name));
             }
-            if name == b"te" && !value.as_ref().eq_ignore_ascii_case(b"trailers") {
-                return Err(HeaderError::invalid_value(name, value));
-            }
-            let value = match value {
-                Cow::Borrowed(value) => bytes::Bytes::from_static(value),
-                Cow::Owned(value) => bytes::Bytes::from(value),
-            };
-            // The constructor validates and consumes the bytes, so its error
-            // stands in for the value rather than cloning every valid one.
-            return Ok(Field::Header((
-                HeaderName::from_lowercase(name).map_err(|_| HeaderError::invalid_name(name))?,
-                HeaderValue::from_maybe_shared(value)
-                    .map_err(|error| HeaderError::invalid_value_from(name, error))?,
-            )));
+            return HeaderName::from_lowercase(name)
+                .map(Self::Header)
+                .map_err(|_| HeaderError::invalid_name(name));
         }
 
         Ok(match name {
-            b":scheme" => Field::Scheme(try_value(name, value)?),
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
-            //# If these fields are present, they MUST NOT be
-            //# empty.
-            b":authority" => Field::Authority(try_value(name, value)?),
-            b":path" => Field::Path(try_value(name, value)?),
-            b":method" => Field::Method(
-                Method::from_bytes(value.as_ref())
-                    .map_err(|_| HeaderError::invalid_value(name, value))?,
-            ),
-            b":status" => Field::Status(
-                StatusCode::from_bytes(value.as_ref())
-                    .map_err(|_| HeaderError::invalid_value(name, value))?,
-            ),
-            b":protocol" => Field::Protocol(try_value(name, value)?),
+            b":scheme" => Self::Pseudo(PseudoId::Scheme),
+            b":authority" => Self::Pseudo(PseudoId::Authority),
+            b":path" => Self::Pseudo(PseudoId::Path),
+            b":method" => Self::Pseudo(PseudoId::Method),
+            b":status" => Self::Pseudo(PseudoId::Status),
+            b":protocol" => Self::Pseudo(PseudoId::Protocol),
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
             //# Endpoints MUST treat a request or response that contains
             //# undefined or invalid pseudo-header fields as malformed.
             _ => return Err(HeaderError::invalid_name(name)),
         })
+    }
+}
+
+/// Pre-validated HTTP field cached in the QPACK static or decoder dynamic table.
+#[derive(Clone, Debug)]
+pub(crate) enum ParsedField {
+    Method(Method),
+    Scheme(Scheme),
+    Authority(Authority),
+    Path(PathAndQuery),
+    Status(StatusCode),
+    Protocol(Protocol),
+    Header(HeaderName, HeaderValue),
+}
+
+/// One field line emitted by the internal QPACK decoder path.
+#[derive(Debug)]
+pub(crate) enum DecodedField {
+    /// Fully validated static or dynamic table hit.
+    Parsed { field: ParsedField, sensitive: bool },
+    /// Literal value paired with a pre-validated static or dynamic table name.
+    NameRef {
+        name: ParsedName,
+        value: Vec<u8>,
+        sensitive: bool,
+    },
+    /// Literal name and value not present in either table.
+    Literal {
+        name: Vec<u8>,
+        value: Vec<u8>,
+        sensitive: bool,
+    },
+    /// Raw bytes retained for a table entry that failed HTTP pre-validation,
+    /// deferred until QPACK decompression and size limits succeed.
+    InvalidRaw { name: Bytes, value: Bytes },
+}
+
+impl ParsedField {
+    /// Identifies message-control fields before their wire order is lost.
+    fn pseudo_id(&self) -> Option<PseudoId> {
+        match self {
+            Self::Method(_) => Some(PseudoId::Method),
+            Self::Scheme(_) => Some(PseudoId::Scheme),
+            Self::Authority(_) => Some(PseudoId::Authority),
+            Self::Path(_) => Some(PseudoId::Path),
+            Self::Status(_) => Some(PseudoId::Status),
+            Self::Protocol(_) => Some(PseudoId::Protocol),
+            Self::Header(_, _) => None,
+        }
+    }
+
+    pub(crate) fn parse_with_name(name: &ParsedName, value: Bytes) -> Result<Self, HeaderError> {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-10.3
+        //# Any request or response that contains a
+        //# character not permitted in a field value MUST be treated as
+        //# malformed.
+        match name {
+            ParsedName::Header(header_name) => {
+                if *header_name == header::TE && !value.as_ref().eq_ignore_ascii_case(b"trailers") {
+                    return Err(HeaderError::invalid_value(header_name.as_str(), value));
+                }
+                // The constructor validates and consumes the bytes, so its error
+                // stands in for the value rather than cloning every valid one.
+                let value = HeaderValue::from_maybe_shared(value).map_err(|error| {
+                    HeaderError::invalid_value_from(header_name.as_str(), error)
+                })?;
+                Ok(Self::Header(header_name.clone(), value))
+            }
+            ParsedName::Pseudo(PseudoId::Scheme) => Ok(Self::Scheme(try_value(b":scheme", value)?)),
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+            //# If these fields are present, they MUST NOT be
+            //# empty.
+            ParsedName::Pseudo(PseudoId::Authority) => {
+                std::str::from_utf8(value.as_ref())
+                    .map_err(|_| HeaderError::invalid_value(b":authority", &value))?;
+                let authority = Authority::from_maybe_shared(value.clone())
+                    .map_err(|_| HeaderError::invalid_value(b":authority", value))?;
+                Ok(Self::Authority(authority))
+            }
+            ParsedName::Pseudo(PseudoId::Path) => {
+                std::str::from_utf8(value.as_ref())
+                    .map_err(|_| HeaderError::invalid_value(b":path", &value))?;
+                let path = PathAndQuery::from_maybe_shared(value.clone())
+                    .map_err(|_| HeaderError::invalid_value(b":path", value))?;
+                Ok(Self::Path(path))
+            }
+            ParsedName::Pseudo(PseudoId::Method) => Ok(Self::Method(
+                Method::from_bytes(value.as_ref())
+                    .map_err(|_| HeaderError::invalid_value(b":method", value))?,
+            )),
+            ParsedName::Pseudo(PseudoId::Status) => Ok(Self::Status(
+                StatusCode::from_bytes(value.as_ref())
+                    .map_err(|_| HeaderError::invalid_value(b":status", value))?,
+            )),
+            ParsedName::Pseudo(PseudoId::Protocol) => {
+                Ok(Self::Protocol(try_value(b":protocol", value)?))
+            }
+        }
+    }
+
+    pub(crate) fn parse_bytes(name: &[u8], value: Bytes) -> Result<Self, HeaderError> {
+        let parsed_name = ParsedName::parse(name)?;
+        Self::parse_with_name(&parsed_name, value)
+    }
+
+    fn parse(name: Cow<'static, [u8]>, value: Cow<'static, [u8]>) -> Result<Self, HeaderError> {
+        let value = match value {
+            Cow::Borrowed(value) => Bytes::from_static(value),
+            Cow::Owned(value) => Bytes::from(value),
+        };
+        Self::parse_bytes(name.as_ref(), value)
     }
 }
 

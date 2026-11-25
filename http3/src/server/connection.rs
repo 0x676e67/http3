@@ -167,7 +167,6 @@ where
         stream.set_max_field_section_size(self.max_qpack_decode_buffer_size);
         let decode_state = RequestDecodeState::new(
             stream.id(),
-            &self.inner.shared,
             self.max_qpack_decode_buffer_size,
             self.inner.dynamic_qpack_decoder(),
         );

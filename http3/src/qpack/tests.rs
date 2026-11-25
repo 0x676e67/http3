@@ -565,3 +565,199 @@ fn forwarded_never_indexed_post_base_name_reference_remains_literal() {
         Ok(Literal::new("x-private", "secret").with_never_indexed())
     );
 }
+
+#[test]
+fn cached_dynamic_entries_preserve_http_and_qpack_error_boundaries() {
+    use crate::{
+        proto::headers::HeaderError,
+        qpack::{
+            DecodedFieldList,
+            stream::{Duplicate, InsertWithNameRef},
+        },
+    };
+
+    // Unreferenced invalid HTTP entries on the encoder stream must not fail
+    // QPACK decoding (RFC 9204 Section 3.2), and referencing a valid name with
+    // a new literal value succeeds even when the cached entry's value is invalid.
+    let mut encoder_stream = Vec::new();
+    DynamicTableSizeUpdate(512).encode(&mut encoder_stream);
+    InsertWithoutNameRef::new("X-Upper", "v")
+        .encode(&mut encoder_stream)
+        .unwrap();
+    InsertWithoutNameRef::new("x-custom", "bad\r\nval")
+        .encode(&mut encoder_stream)
+        .unwrap();
+    InsertWithoutNameRef::new("connection", "close")
+        .encode(&mut encoder_stream)
+        .unwrap();
+    InsertWithNameRef::new_static(25, "200")
+        .encode(&mut encoder_stream)
+        .unwrap();
+    InsertWithNameRef::new_dynamic(2, "good")
+        .encode(&mut encoder_stream)
+        .unwrap();
+    Duplicate(0).encode(&mut encoder_stream);
+
+    let mut decoder = Decoder::new(512, 1).unwrap();
+    let mut acks = Vec::new();
+    assert_eq!(
+        decoder.on_encoder_recv(&mut Cursor::new(encoder_stream), &mut acks),
+        Ok(6)
+    );
+
+    // 1) Referencing only valid dynamic entries (`:status: 200`, duplicated `x-custom: good`)
+    // succeeds even though invalid entries coexist in the table.
+    let mut valid_block = Vec::new();
+    HeaderPrefix::new(6, 6, 6, 512).encode(&mut valid_block);
+    Indexed::Dynamic(2).encode(&mut valid_block); // :status: 200 (abs 4)
+    Indexed::Dynamic(0).encode(&mut valid_block); // x-custom: good (abs 6)
+    LiteralWithNameRef::new_dynamic(4, "literal-good")
+        .with_never_indexed()
+        .encode(&mut valid_block)
+        .unwrap(); // name from abs 2 (`x-custom`) whose own value is invalid
+    let mut out = DecodedFieldList::new();
+    let meta = decoder
+        .decode_fields_limited(&mut Cursor::new(valid_block), u64::MAX, &mut None, &mut out)
+        .unwrap();
+    assert!(meta.dyn_ref);
+    let (status, headers, _) = Header::try_from_decoded(out.into_iter())
+        .unwrap()
+        .into_response_parts()
+        .unwrap();
+    assert_eq!(status, http::StatusCode::OK);
+    let values: Vec<_> = headers.get_all("x-custom").iter().collect();
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0], "good");
+    assert!(!values[0].is_sensitive());
+    assert_eq!(values[1], "literal-good");
+    assert!(values[1].is_sensitive());
+
+    // 2) Referencing an invalid cached dynamic entry succeeds at QPACK level and
+    // fails at HTTP conversion with InvalidHeaderName / InvalidHeaderValue.
+    for (rel_idx, expect_name_err) in [(5, true), (4, false), (3, true)] {
+        let mut block = Vec::new();
+        HeaderPrefix::new(6, 6, 6, 512).encode(&mut block);
+        Indexed::Dynamic(rel_idx).encode(&mut block);
+        let mut out = DecodedFieldList::new();
+        let meta = decoder
+            .decode_fields_limited(&mut Cursor::new(block), u64::MAX, &mut None, &mut out)
+            .unwrap();
+        assert!(meta.dyn_ref);
+        let err = Header::try_from_decoded(out.into_iter()).unwrap_err();
+        if expect_name_err {
+            assert!(matches!(err, HeaderError::InvalidHeaderName(_)), "{err:?}");
+        } else {
+            assert!(matches!(err, HeaderError::InvalidHeaderValue(_)), "{err:?}");
+        }
+    }
+
+    // 3) QPACK decompression errors and HeaderTooLong still take precedence over
+    // an earlier invalid cached dynamic entry.
+    let mut qpack_err_block = Vec::new();
+    HeaderPrefix::new(6, 6, 6, 512).encode(&mut qpack_err_block);
+    Indexed::Dynamic(5).encode(&mut qpack_err_block); // invalid HTTP: X-Upper
+    Indexed::Dynamic(99).encode(&mut qpack_err_block); // invalid QPACK index
+    let mut out = DecodedFieldList::new();
+    assert!(matches!(
+        decoder.decode_fields_limited(
+            &mut Cursor::new(qpack_err_block),
+            u64::MAX,
+            &mut None,
+            &mut out
+        ),
+        Err(DecoderError::DynamicTable(
+            DynamicTableError::BadRelativeIndex(99)
+        ))
+    ));
+
+    let mut too_long_block = Vec::new();
+    HeaderPrefix::new(6, 6, 6, 512).encode(&mut too_long_block);
+    Indexed::Dynamic(5).encode(&mut too_long_block);
+    let mut out = DecodedFieldList::new();
+    assert!(matches!(
+        decoder.decode_fields_limited(&mut Cursor::new(too_long_block), 10, &mut None, &mut out),
+        Err(DecoderError::HeaderTooLong(_))
+    ));
+}
+
+#[test]
+fn duplicate_and_name_ref_survive_evicting_source_entry() {
+    use crate::qpack::{
+        DecodedFieldList,
+        stream::{Duplicate, InsertWithNameRef},
+    };
+
+    // Capacity fits exactly one `x-dup: val` entry (5 + 3 + 32 = 40 bytes).
+    // RFC 9204 Section 3.2.2 requires Duplicate and InsertWithNameRef to copy
+    // or retain the referenced name/value before evicting the old entry.
+    let mut encoder_stream = Vec::new();
+    DynamicTableSizeUpdate(40).encode(&mut encoder_stream);
+    InsertWithoutNameRef::new("x-dup", "val")
+        .encode(&mut encoder_stream)
+        .unwrap();
+    Duplicate(0).encode(&mut encoder_stream);
+    InsertWithNameRef::new_dynamic(0, "new")
+        .encode(&mut encoder_stream)
+        .unwrap();
+
+    let mut decoder = Decoder::new(40, 1).unwrap();
+    assert_eq!(
+        decoder.on_encoder_recv(&mut Cursor::new(encoder_stream), &mut Vec::new()),
+        Ok(3)
+    );
+
+    let mut block = Vec::new();
+    HeaderPrefix::new(3, 3, 3, 40).encode(&mut block);
+    Indexed::Dynamic(0).encode(&mut block);
+    let mut out = DecodedFieldList::new();
+    decoder
+        .decode_fields_limited(&mut Cursor::new(block), u64::MAX, &mut None, &mut out)
+        .unwrap();
+    let trailers = Header::try_from_decoded(out.into_iter())
+        .unwrap()
+        .into_trailers()
+        .unwrap();
+    assert_eq!(trailers["x-dup"], "new");
+}
+
+#[test]
+fn shared_decoder_wakes_blocked_writer_when_read_guard_drops() {
+    use std::sync::atomic::Ordering;
+
+    let (events_send, _events_recv) = tokio::sync::mpsc::unbounded_channel();
+    let decoder = QpackDecoder::new(Decoder::new(256, 1).unwrap(), events_send);
+
+    // Hold a read guard to force `poll_on_recv_encoder` to register its waker.
+    let read_guard = decoder.0.decoder.try_read().unwrap();
+    let wake_count = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    let waker = futures_util::task::waker(wake_count.clone());
+    let mut cx = Context::from_waker(&waker);
+
+    let mut encoder_stream = Vec::new();
+    DynamicTableSizeUpdate(256).encode(&mut encoder_stream);
+    InsertWithoutNameRef::new("x-test", "ok")
+        .encode(&mut encoder_stream)
+        .unwrap();
+    let mut cursor = Cursor::new(encoder_stream);
+    let mut acks = Vec::new();
+
+    assert!(
+        decoder
+            .poll_on_recv_encoder(&mut cx, &mut cursor, &mut acks)
+            .is_pending()
+    );
+    assert!(decoder.0.writer_waiting.load(Ordering::Relaxed));
+    assert_eq!(wake_count.0.load(Ordering::Relaxed), 0);
+
+    // Dropping the read guard through `finish_decode` must wake the writer and
+    // clear the waiting flag.
+    let _ = decoder.finish_decode(read_guard, Ok(()));
+    assert_eq!(wake_count.0.load(Ordering::Relaxed), 1);
+    assert!(!decoder.0.writer_waiting.load(Ordering::Relaxed));
+
+    // Retry succeeds now that no reader holds the lock.
+    assert_eq!(
+        decoder.poll_on_recv_encoder(&mut cx, &mut cursor, &mut acks),
+        Poll::Ready(Ok(1))
+    );
+}
