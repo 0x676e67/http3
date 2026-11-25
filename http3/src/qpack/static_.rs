@@ -1,6 +1,9 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::LazyLock};
+
+use bytes::Bytes;
 
 use super::field::HeaderField;
+use crate::proto::headers::{ParsedField, ParsedName};
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -199,7 +202,46 @@ impl StaticTable {
             _ => None,
         }
     }
+
+    pub(super) fn get_parsed(
+        index: usize,
+    ) -> Result<(&'static HeaderField<'static>, &'static StaticParsedEntry), Error> {
+        let field = Self::get(index)?;
+        let parsed = PARSED_HEADERS.get(index).ok_or(Error::Unknown(index))?;
+        Ok((field, parsed))
+    }
 }
+
+pub(super) struct StaticParsedEntry {
+    pub(super) name_bytes: &'static [u8],
+    pub(super) value_bytes: &'static [u8],
+    pub(super) name: Option<ParsedName>,
+    pub(super) field: Option<ParsedField>,
+}
+
+static PARSED_HEADERS: LazyLock<[StaticParsedEntry; 99]> = LazyLock::new(|| {
+    std::array::from_fn(|index| {
+        let field = &PREDEFINED_HEADERS[index];
+        let name_bytes = match &field.name {
+            Cow::Borrowed(bytes) => *bytes,
+            Cow::Owned(_) => &[],
+        };
+        let value_bytes = match &field.value {
+            Cow::Borrowed(bytes) => *bytes,
+            Cow::Owned(_) => &[],
+        };
+        let name = ParsedName::parse(name_bytes).ok();
+        let parsed = name.as_ref().and_then(|name| {
+            ParsedField::parse_with_name(name, Bytes::from_static(value_bytes)).ok()
+        });
+        StaticParsedEntry {
+            name_bytes,
+            value_bytes,
+            name,
+            field: parsed,
+        }
+    })
+});
 
 macro_rules! decl_fields {
     [ $( ($key:expr, $value:expr) ),* ] => {
@@ -379,5 +421,30 @@ mod tests {
 
         assert_eq!(StaticTable::find(&HeaderField::new("foo", "bar")), None);
         assert_eq!(StaticTable::lookup(b"foo", b"bar"), StaticLookup::NotFound);
+    }
+
+    #[test]
+    fn parsed_static_table_matches_predefined_headers() {
+        for (index, field) in PREDEFINED_HEADERS.iter().enumerate() {
+            let (raw, parsed) = StaticTable::get_parsed(index).unwrap();
+            assert_eq!(raw, field);
+            assert_eq!(parsed.name_bytes, field.name.as_ref());
+            assert_eq!(parsed.value_bytes, field.value.as_ref());
+            assert!(
+                parsed.name.is_some(),
+                "static entry {index} name should parse"
+            );
+            // Static entry 0 is `(:authority, "")`, which is valid as a name
+            // reference but malformed as an indexed empty `:authority` field.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3.1
+            if index == 0 {
+                assert!(parsed.field.is_none());
+            } else {
+                assert!(
+                    parsed.field.is_some(),
+                    "static entry {index} field should parse"
+                );
+            }
+        }
     }
 }

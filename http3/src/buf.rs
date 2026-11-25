@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, io::IoSlice};
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 
 #[derive(Debug)]
 pub(crate) struct BufList<T> {
@@ -41,17 +41,14 @@ impl BufList<Bytes> {
     }
 
     pub fn take_chunk(&mut self, max_len: usize) -> Option<Bytes> {
-        let chunk = self
-            .bufs
-            .front_mut()
-            .map(|chunk| chunk.split_to(usize::min(max_len, chunk.remaining())));
-
-        if let Some(chunk) = chunk.as_ref() {
-            self.remaining = self.remaining.saturating_sub(chunk.remaining());
-        }
-
-        self.bufs.pop_front_if(|front| !front.has_remaining());
-        chunk
+        let front = self.bufs.front_mut()?;
+        let chunk = if max_len >= front.remaining() {
+            self.bufs.pop_front()?
+        } else {
+            front.split_to(max_len)
+        };
+        self.remaining = self.remaining.saturating_sub(chunk.remaining());
+        Some(chunk)
     }
 
     pub fn push_bytes<T>(&mut self, buf: &mut T)
@@ -60,6 +57,44 @@ impl BufList<Bytes> {
     {
         debug_assert!(buf.has_remaining());
         self.push(buf.copy_to_bytes(buf.remaining()))
+    }
+
+    /// Consumes `len` bytes, returning an existing `Bytes` chunk or slice without
+    /// copying whenever the range lies within the front chunk.
+    ///
+    /// Returns `None` without mutating the buffer if fewer than `len` bytes remain.
+    pub(crate) fn take_bytes(&mut self, len: usize) -> Option<Bytes> {
+        if len > self.remaining {
+            return None;
+        }
+        if len == 0 {
+            return Some(Bytes::new());
+        }
+
+        if let Some(front) = self.bufs.front_mut() {
+            let front_len = front.remaining();
+            if len == front_len {
+                if let Some(chunk) = self.bufs.pop_front() {
+                    self.remaining = self.remaining.saturating_sub(len);
+                    return Some(chunk);
+                }
+            } else if len < front_len {
+                let chunk = front.split_to(len);
+                self.remaining = self.remaining.saturating_sub(len);
+                return Some(chunk);
+            }
+        }
+
+        let mut out = BytesMut::with_capacity(len);
+        let mut needed = len;
+        while needed > 0 {
+            let Some(chunk) = self.take_chunk(needed) else {
+                break;
+            };
+            needed = needed.saturating_sub(chunk.len());
+            out.extend_from_slice(&chunk);
+        }
+        Some(out.freeze())
     }
 }
 
@@ -203,5 +238,37 @@ mod tests {
 
         assert_eq!(buf.take_first_chunk(), Some(Bytes::from_static(b"e")));
         assert_eq!(buf.remaining(), 0);
+    }
+
+    #[test]
+    fn take_chunk_and_take_bytes_avoid_copying_contiguous_chunks() {
+        let whole = Bytes::from(b"hello".to_vec());
+        let whole_ptr = whole.as_ptr();
+        let mut buf = BufList::from(whole);
+        let taken = buf.take_chunk(16).unwrap();
+        assert_eq!(taken.as_ptr(), whole_ptr);
+        assert_eq!(buf.remaining(), 0);
+
+        let combined = Bytes::from(b"abcdef".to_vec());
+        let combined_ptr = combined.as_ptr();
+        let mut buf = BufList::from(combined);
+        assert!(buf.take_bytes(7).is_none());
+        assert_eq!(buf.remaining(), 6);
+        let prefix = buf.take_bytes(3).unwrap();
+        assert_eq!(&prefix[..], b"abc");
+        assert_eq!(prefix.as_ptr(), combined_ptr);
+        let rest = buf.take_bytes(3).unwrap();
+        assert_eq!(&rest[..], b"def");
+        assert_eq!(rest.as_ptr(), combined_ptr.wrapping_add(3));
+        assert_eq!(buf.remaining(), 0);
+
+        // Multi-chunk take_bytes concatenates seamlessly.
+        let mut fragmented = BufList::new();
+        fragmented.push(Bytes::from_static(b"ab"));
+        fragmented.push(Bytes::from_static(b"cde"));
+        assert_eq!(fragmented.take_bytes(0), Some(Bytes::new()));
+        assert_eq!(fragmented.take_bytes(4), Some(Bytes::from_static(b"abcd")));
+        assert_eq!(fragmented.take_bytes(1), Some(Bytes::from_static(b"e")));
+        assert_eq!(fragmented.remaining(), 0);
     }
 }
